@@ -116,9 +116,31 @@ swiftc -O Sources/ScreenSender.swift -o screensender
 
 ## 第四步：Windows 端
 
+### 4.0 先双击 check.bat
+
+不需要编译器，直接显示屏幕分辨率、显卡、DPI、硬件解码能力。
+
+```cmd
+check.bat
+```
+
+想测到 Mac 的连通性：
+
+```cmd
+check.bat 192.168.77.1
+```
+
 ### 4.1 编译
 
-在「x64 Native Tools Command Prompt for VS」里执行（**必须是这个专用命令行，普通 cmd 找不到编译器**）：
+**双击 `build.bat`**，会自动找 Visual Studio 并编译两个程序。
+
+如果它说找不到 Visual Studio，说明没装。装 Visual Studio 2022 社区版，
+勾选「使用 C++ 的桌面开发」：
+https://visualstudio.microsoft.com/zh-hans/downloads/
+
+装好后再双击 `build.bat`。
+
+也可以手动在「x64 Native Tools Command Prompt for VS」里执行：
 
 ```cmd
 cd prototype\windows

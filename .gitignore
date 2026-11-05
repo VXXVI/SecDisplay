@@ -31,3 +31,9 @@ prototype/_scratch/
 **/__pycache__/
 *.pyc
 .DS_Store
+
+# Visual Studio 编译产物
+prototype/windows/SelfCheck.exe
+prototype/windows/SecDisplayReceiver.exe
+prototype/windows/*.obj
+prototype/windows/*.pdb

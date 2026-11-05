@@ -71,21 +71,24 @@ swiftc -O Sources/ScreenSender.swift -o screensender
 
 打开「系统设置 → 显示器」能看到多了一块 **SecDisplay**，把它拖到合适位置。
 
-### 3. Windows 端编译运行
+### 3. Windows 端
 
-先跑自检确认环境：
+**双击 `prototype\windows\check.bat`** 先看环境。它不需要编译器也能跑，
+会直接显示屏幕分辨率、显卡、DPI 缩放、硬件解码能力。
+
+如果想测到 Mac 的连通性：
 
 ```cmd
-cd prototype\windows
-cl /EHsc /std:c++17 /O2 SelfCheck.cpp
-SelfCheck.exe <Mac的IP>
+check.bat 192.168.77.1
 ```
 
-全部通过再跑接收端：
+要编译完整程序，双击 **`build.bat`**，它会自动找 Visual Studio 并编译
+`SelfCheck.exe` 和 `SecDisplayReceiver.exe`。
+
+编译完成后运行：
 
 ```cmd
-cl /EHsc /std:c++17 /O2 SecDisplayReceiver.cpp
-SecDisplayReceiver.exe <Mac的IP> 9922 2560 1600
+SecDisplayReceiver.exe <Mac的IP> 9922 2240 1400
 ```
 
 所需的库都通过 `#pragma comment` 自动链接，不需要手动指定。
