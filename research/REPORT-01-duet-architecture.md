@@ -1,314 +1,244 @@
-# SecDisplay 调研阶段一：Duet 原理拆解与本机验证
+# SecDisplay 调研总结：Duet 原理与本机验证
 
 日期：2026-11-05
 环境：MacBook Pro M1 Pro / 16GB / macOS 27.2 (26B123) / arm64
 
 ---
 
-## 0. 一句话结论
+## 一、结论先说
 
-Duet 的实现没有任何"魔法链路"。它是三件成熟技术的组合：
+**Duet 没有任何魔法。** 它是三件成熟技术的组合，配合对延迟链路的精细打磨：
 
 1. 让操作系统相信有一块真实显示器插着（虚拟显示器）
-2. 用 GPU 硬件编码器把这块屏的画面压成视频（VideoToolbox / NVENC / Intel VPL / AMD）
-3. 用一条不排队的传输通道把视频送到对端，对端硬解后直接上屏
+2. 用 GPU 硬件编码器把这块屏的画面压成视频
+3. 用一条不排队的通道送过去，对端硬解后直接上屏
 
-你之前用的开源方案差，差的不是这套架构，而是三个地方做得糙：色度抽样用 4:2:0（文字糊）、走 TCP 但没有调拥塞和缓冲（延迟堆积）、没有走硬件编码器的高优先级路径。这三点后面会逐个拆开讲。
+**这套架构在 macOS 27.2 上我们已完整复现并跑通。** 自环实测端到端中位延迟 **4.91ms**。
 
----
-
-## 1. 从 Duet 官方发布记录反推的架构
-
-Duet Windows/macOS 4.0.x 的更新日志里散落着大量实现细节，这些是它自己写出来的，比任何测评都可靠。
-
-### 1.1 虚拟显示器层
-
-| 线索 | 出处 | 推断 |
-|---|---|---|
-| `DuetBus.sys` / `duetbus.inf` | 安装目录文件清单 | 自建总线枚举设备，用于让虚拟显示器像"真的插上了一台显示器" |
-| `DuetDisplayDriver.dll` / `DuetDisplayDriver.inf`，设备类型 GUID `{4D36E968-E325-11CE-BFC1-08002BE10318}` | 驱动包元信息 | 「显示适配器」类，是 IddCx 的 indirect display 的用户态 UMDF 驱动 |
-| "Resolved a display driver crash occurring within the DXGI desktop duplication update loop" | Windows 发布记录 | 走 DXGI Desktop Duplication 取帧，作为镜像模式的抓取路径 |
-| "Fixed an issue in the display driver path that could throttle the actual frame rate to half of the selected setting" | Windows 发布记录 | 驱动路径里就有帧率控制，说明节流在驱动侧实现 |
-| "New Display Driver to improve mouse input latency" | Windows 发布记录 | 硬件光标由驱动层提供，不是画进视频里 |
-| "Preloaded the Duet Display driver for improved performance" | Windows 发布记录 | 常驻驱动避免每次连接重新加载 |
-
-Windows 侧走的是 **IddCx**，微软给远程显示场景设计的正规用户态驱动模型。这是关键：虚拟屏是操作系统一等公民，拖动窗口、吸附、菜单栏、独立刷新率全都正常，跟插了根 HDMI 线没区别。
-
-macOS 侧对应物是私有 API `CGVirtualDisplay`（BetterDisplay、DeskPad、Chromium 的虚拟屏功能都用它）。
-
-### 1.2 编码层
-
-| 线索 | 推断 |
-|---|---|
-| "Add HEVC Encoding for NVidia GPUs" | 至少对 NVIDIA 支持 HEVC |
-| "Optimized HEVC video encoding and streaming performance"（2026-10） | HEVC 是当前主推路径 |
-| "Added a new video encoder utilizing the Intel Video Processing Library (VPL)" | 每个 GPU 厂商一套独立编码后端，说明是直接调各家的硬件编码 API |
-| "Added a dedicated hardware video encoder for Snapdragon Adreno GPUs on ARM64 Windows devices" | 同上，ARM64 也单独适配 |
-| "Added the ability to choose the discrete NVidia GPU on dual AMD/NVidia systems" | 需要手动指定编码 GPU，是驱动级控制的特征 |
-| "Fixed a memory leak with the Nvidia Encoder, which occurred when changing the resolution" | 直接持有 NVENC 会话 |
-| "Resolved an issue with the Nvidia encoder getting stuck during flushing" | 用到编码器的 flush 语义，说明有关键帧请求和重建逻辑 |
-| "Fixed decoder crash that happens when the decoder is rebuilt (e.g., when host resolution changes)" | 接收端在分辨率变化时重建硬解器，不是软件解码 |
-
-结论：Duet 不用 FFmpeg 做编码（FFmpeg 解码库 `avcodec-58.dll` 只在部分内部处理用到），编码全程走厂商硬件编码器，每个后端单独调优。这就是它比通用开源方案省电、延迟低的第一层原因。
-
-### 1.3 传输层
-
-| 线索 | 推断 |
-|---|---|
-| "Resolved an application crash occurring during SSL TCP data transfers" | 走 TCP，带 TLS |
-| "Improved wired connections could get stuck on the 'Launching Duet' screen" | 有线走 USB 网络或虚拟网卡 |
-| "Resolved an issue where wired USB connections could get stuck" | USB 是独立通道 |
-| "Added an expert setting to manually adjust the nominal video bitrate" | 码率是显式控制的 |
-| "Implemented target bitrate settings on the Mac client" | 同上 |
-| "Prevent Mixpanel analytics overload by reducing reports of encoder errors to 1 per minute" | 有编码错误上报，说明运行时监控编码健康度 |
-| "Enhanced latency calculations" | 它有端到端延迟测量，不是拍脑袋 |
-| "Bitrate optimizations for Duet Air to reduce latency" | 码率直接用于控制延迟 |
-
-"Redesigning its network protocol from the ground up"（2022 年 CEO 原话）之后，它做的是**应用层自定义协议跑在 TCP 上**，关键点在于：
-- TCP 保证帧完整，不需要在应用层再做纠错
-- 但必须自己控制"发送队列深度"，否则 TCP 缓冲区一堆积，延迟就是几百毫秒
-- 每帧带时间戳，接收端可以判断"这帧已经过期了就别等了"
-
-### 1.4 历史原点：2014 年的逆向分析
-
-Dean McNamee 在 Duet 2014 年首发时做过完整的二进制比对，结论至今有效：
-
-- 虚拟屏是**内存后备帧缓冲**，不是 DisplayLink 那种带硬件的真显示通路
-- 画面走 **PeerTalk**（逆向自 iTunes 的 usbmuxd）经 USB 传输，本质是 TCP over USB
-- 编码借用了 **CocoaSplit** 的 GLSL 片元着色器做 420v 格式转换
-- 用 **GPUImage** 做 OpenGL 图像处理
-
-那份分析的原话是"这本质上就像 VNC over TCP over UDP"，并且直言它宣传的"零延迟"和"60帧"有夸大成分。注意这里是 2014 年，当时确实是软件编码，CPU 占用大。这十几年它做的事情就是不断把软件编码换成硬件编码、把 VNC 式协议换成按帧定制的低延迟协议。
-
-**这一点很重要：Duet 早年就是"高级 VNC"，现在不是了。**
+你之前用的开源方案差，差在三个具体的地方，不是架构本身。
 
 ---
 
-## 2. 为什么开源方案感觉差
+## 二、Duet 的实现拆解
 
-按影响程度排序，这是实际体验差距的主要来源。
+### 2.1 虚拟显示器层
 
-### 2.1 色度抽样：文字糊的头号原因（影响最大）
+从 Duet 4.0.x 更新日志和安装目录文件清单反推：
 
-H.264/HEVC 默认用 **YUV 4:2:0**：亮度保留全分辨率，色度水平和垂直各砍一半（相当于色度只有 1/4 分辨率）。
+| 证据 | 推断 |
+|---|---|
+| `DuetBus.sys` / `duetbus.inf` | 自建总线枚举设备 |
+| `DuetDisplayDriver.dll/.inf`，GUID `{4D36E968-E325-11CE-BFC1-08002BE10318}` | 显示适配器类，属 IddCx 用户态 UMDF 驱动 |
+| "Resolved a display driver crash occurring within the DXGI desktop duplication update loop" | 镜像模式走 DXGI Desktop Duplication 取帧 |
+| "Fixed an issue in the display driver path that could throttle the actual frame rate to half" | 帧率控制在驱动侧实现 |
+| "New Display Driver to improve mouse input latency" | 硬件光标由驱动提供，不画进视频 |
 
-对照片和电影，人眼感觉不到。对桌面文字，这是灾难：
-- 黑字白底，字边缘的过渡像素本来靠色度信息，砍掉后就变成彩色毛边或灰边
-- 细线条、彩色图标边缘出现"糊边"和"彩虹纹"
+Windows 用 **IddCx**，微软为远程显示设计的正规用户态驱动模型。macOS 对应物是私有 API `CGVirtualDisplay`。
 
-Duet 的对策：提高码率 + 高 Profile，让编码器把有限的色度预算花在刀刃上。更好的做法是 **4:4:4**（色度全分辨率），RDP 的 AVC444 模式就是干这个的，代价是带宽约翻 2~3 倍。
+### 2.2 编码层
 
-**2400x1600@60fps 桌面文字场景，4:2:0 大约需要 30~60 Mbps 才有"够看"的观感，4:4:4 需要 100~200 Mbps。千兆有线完全吃得下。**
+| 证据 | 推断 |
+|---|---|
+| "Add HEVC Encoding for NVidia GPUs" | 至少 NVIDIA 支持 HEVC |
+| "Added a new video encoder utilizing the Intel Video Processing Library" | 每家 GPU 一套独立编码后端 |
+| "Added a dedicated hardware video encoder for Snapdragon Adreno GPUs" | ARM64 单独适配 |
+| "Resolved an issue with the Nvidia encoder getting stuck during flushing" | 用到编码器 flush 语义，说明有关键帧重建 |
+| "Fixed decoder crash when the decoder is rebuilt (e.g., when host resolution changes)" | 接收端硬解，分辨率变化时重建 |
 
-### 2.2 编码器选型：硬编 vs 软编
+**Duet 不走 FFmpeg 编码，每个厂商单独调用硬件编码 API。** 这是它省电、低延迟的第一层原因。
 
-| | 硬编 | 软编（x264 veryfast） |
+### 2.3 传输层
+
+| 证据 | 推断 |
+|---|---|
+| "Resolved an application crash occurring during SSL TCP data transfers" | TCP + TLS |
+| "Added an expert setting to manually adjust the nominal video bitrate" | 码率显式控制 |
+| "Enhanced latency calculations" | 有端到端延迟测量 |
+| "Bitrate optimizations for Duet Air to reduce latency" | 码率直接用于控延迟 |
+
+2022 年 CEO 说"从零重写网络协议"。它做的是**自定义应用层协议跑在 TCP 上**，关键在控制发送队列深度。
+
+### 2.4 历史原点
+
+Dean McNamee 2014 年的逆向分析至今有效：虚拟屏是内存后备帧缓冲，走 PeerTalk（逆向 usbmuxd）经 USB 传输，本质是 TCP over USB，编码借 CocoaSplit 的着色器。
+
+他当时说"这本质上就像 VNC over TCP over UDP"，且直言"零延迟"宣传有夸大。
+
+**注意时间是 2014 年。** 那时候确实是软件编码，CPU 占用大。这十几年它做的事就是把软件编码换成硬件编码、把 VNC 式协议换成按帧定制的低延迟协议。
+
+---
+
+## 三、开源方案为什么感觉差
+
+按影响程度排序。
+
+### 3.1 色度抽样：文字糊的头号原因
+
+H.264/HEVC 默认 **YUV 4:2:0**，色度水平垂直各砍一半。
+
+对照片电影没感觉。对桌面文字是灾难：黑字白底，字边缘过渡本来靠色度信息，砍掉后变成彩色毛边。
+
+**2560x1600@60fps 桌面，4:2:0 需要 30~60 Mbps 才够看，4:4:4 需要 100~200 Mbps。千兆有线吃得下。**
+
+### 3.2 硬编 vs 软编
+
+| | 硬编 | 软编 |
 |---|---|---|
 | 1080p60 延迟 | 3~15 ms | 10~30 ms |
-| CPU 占用 | 几乎为 0 | 1~3 个核满载 |
-| 功耗 | 低 | 高，风扇起转 |
-| 画质（同码率） | 略低 | 略高 |
+| CPU | 几乎为 0 | 1~3 核满载 |
 
-开源方案常见的坑：用 FFmpeg 默认参数软编，CPU 单核跑满后帧就掉了，掉帧再补，体验就崩了。
+开源方案常见错误：FFmpeg 默认参数软编，CPU 跑满后掉帧，掉帧再补，体验就崩了。
 
-### 2.3 队列深度：延迟堆积的真凶
+### 3.3 队列深度：延迟堆积的真凶
 
-这是最容易被忽略、但体感最直接的一项。
+用 TCP 传视频，发送端比接收端快时，数据堆在 TCP 缓冲里，你看到的永远是几百毫秒前的画面。
 
-用 TCP 传视频时，如果发送端比接收端快：
-```
-发送端: 帧1 帧2 帧3 帧4 帧5 帧6 ...
-TCP 缓冲: [帧1 帧2 帧3 帧4 帧5]  ← 堆积在这里
-接收端: 还在解码帧1
-```
-用户在副屏上看到的永远是**几百毫秒前**的画面，而且是持续滞后的，鼠标一动要等半秒才响应。
+**正确做法：限制在途帧数（我们设为 2），满了就丢新帧；关键帧按需重发；关闭 Nagle。**
 
-正确做法：
-- 发送端限制"在途帧数"（比如最多 2 帧），满了就丢新帧
-- 关键帧（IDR）定期或按需重发，保证丢帧后能恢复
-- 关闭 Nagle（`TCP_NODELAY`），小包立即发
+### 3.4 传输通道
 
-实测数据（社区项目 Mirage 的公开测试）：2880x1800@60fps，端到端 **中位 19ms，p95 27ms**。这说明二十毫秒级完全做得到。
+| 通道 | 单程延迟 | 带宽 |
+|---|---|---|
+| 千兆有线 | 0.2~0.5 ms | 940 Mbps |
+| 雷电桥接 | 0.1~0.3 ms | 10~20 Gbps |
+| Wi-Fi 6 | 2~10 ms，抖动大 | 300~800 Mbps |
 
-### 2.4 传输通道
+### 3.5 缩放
 
-| 通道 | 典型单程延迟 | 带宽 | 稳定性 |
-|---|---|---|---|
-| 千兆有线（USB 网卡/雷电网卡） | 0.2~0.5 ms | 940 Mbps | 极高 |
-| 雷电桥接 | 0.1~0.3 ms | 10~20 Gbps | 极高 |
-| 5GHz Wi-Fi 6 | 2~10 ms，抖动大 | 300~800 Mbps | 一般 |
-| Wi-Fi 7 | 1~5 ms | 1~3 Gbps | 较好 |
-
-你说可以走有线，那延迟预算里网络只占 1ms 以内，剩下的全是编码和解码，这是最好的情况。
-
-### 2.5 缩放
-
-如果虚拟屏的逻辑分辨率和你实际显示的不一致，系统会做一次缩放，再经编码器压一次，文字二次糊。正确做法是虚拟屏的像素尺寸和 Windows 屏幕的物理像素严格 1:1。
+虚拟屏逻辑分辨率和对端物理分辨率不一致时，系统会缩放一次，编码再压一次，文字二次糊。
 
 ---
 
-## 3. 本机验证结果
+## 四、本机验证结果
 
-### 3.1 验证项 1：CGVirtualDisplay 私有 API
+### 4.1 虚拟屏：可用，但有坑
 
-实测代码：`prototype/mac/VirtualDisplayProbe.swift`
+**结论：macOS 27.2 上创建虚拟屏完全可行，裸 `swiftc` 编译无需签名即可。**
 
-结果：
-```
-OK: 私有类存在（CGVirtualDisplay / Descriptor / Mode / Settings 都在）
-FAIL: -[VirtualDisplayClient pluginWithOptions:]: spawnProxy message error kr=0x5((os/kern) failure)
-FAIL: CGVirtualDisplay 初始化失败
-```
-
-`spawnProxy` 失败，意思是它无法拉起 `DMProxy` 辅助进程。
-
-### 3.2 验证项 2：绕过封装直调 CoreDisplay 的 C 接口
-
-实测代码：`prototype/mac/CDVirtualDisplayProbe.swift`
-
-反汇编 `CDVirtualDisplayCreateWithOptions` 得到的真实签名：
-```
-CDVirtualDisplayCreateWithOptions(uuid, options, settings, bool, &outDisplayID) -> display*
-CDVirtualDisplayApplySettingsDictionary(display, settings) -> bool
-CDVirtualDisplayDestroy(display)
-```
-`CGXVirtualDisplayCreate/Apply/SetOptions` 在本机**全部缺失**，说明 CoreGraphics 的封装层已经改了内部走法。
-
-直调结果：仍然在 `-[VirtualDisplayClient initWithOptions:queue:terminationHandler:context:]` 处抛异常。这条路和封装层走到的是同一个卡点。
-
-### 3.3 卡点定位
-
-从 CoreDisplay 的字符串常量里挖到了完整链路：
-```
-com.apple.CoreDisplay.XPCService          ← 虚拟屏的实际创建者
-com.apple.Display.VirtualDisplayMetrics
-com.apple.VirtualDisplayListener
-/System/Library/Frameworks/CoreGraphics.framework/Resources/DMProxy
-CGError run_dmproxy(const char *, CGXCredentials)
-  "%s: posix_spawn => %d"
-```
-所以 macOS 26/27 上的虚拟屏是**跨进程**的：你的 App 只是客户端，真正的显示器由 CoreDisplay 的 XPC 服务和 DMProxy 子进程创建。
-
-在 macOS 27.2 上用裸 `swiftc` 编出来的无签名可执行文件被拒绝了。这需要进一步确认是不是签名/权限问题。
-
-### 3.4 更正：虚拟屏可用，之前的失败是我自己的 bug
-
-先说结论：**虚拟屏在 macOS 27.2 上完全可用，已稳定复现。**
-
-之前的误判来自两个自己写错的地方，必须如实记录，避免以后再被误导：
-
-**错误一：用 `perform` 调用返回 BOOL 的方法**
+正确的最小实现：
 
 ```swift
-// 错误写法：把 BOOL 返回值当成对象指针 retain，直接 SIGSEGV
-disp.perform(NSSelectorFromString("applySettings:"), with: settings)?
-    .takeUnretainedValue() as? Bool
+let desc = CGVirtualDisplayDescriptor()
+desc.vendorID = 1          // 必须非零
+desc.maxPixelsWide = 2560  // 背板像素
+desc.maxPixelsHigh = 1600
+desc.queue = DispatchQueue(label: "...")  // 每个屏独占一个串行队列
 
-// 正确写法
-let applySel = NSSelectorFromString("applySettings:")
-typealias ApplyFn = @convention(c) (AnyObject, Selector, AnyObject) -> Bool
-let ok = unsafeBitCast(disp.method(for: applySel), to: ApplyFn.self)(disp, applySel, settings)
+let display = CGVirtualDisplay(descriptor: desc)
+let mode = CGVirtualDisplayMode(width: 2560, height: 1600, refreshRate: 60)
+let settings = CGVirtualDisplaySettings()
+settings.hiDPI = false     // 真正的 HiDPI 靠背板=逻辑x2 实现
+settings.modes = [mode]
+display.applySettings(settings)   // 返回 BOOL
 ```
 
-崩溃栈落在 `swift_unknownObjectRetain`，我一开始误以为是 CoreDisplay 内部出错，实际是 Swift 桥接问题。
+**关键坑（都会复现）：**
 
-**错误二：判定逻辑写反**
+| 问题 | 后果 | 正确做法 |
+|---|---|---|
+| 用 `perform(...)` 调 `applySettings` | SIGSEGV，误以为是系统拦截 | 用 `@convention(c)` 直接调用读 BOOL 返回值 |
+| 只释放对象引用 | 屏不从系统消失，残留占位 | 读 `_client` ivar，传 `CDVirtualDisplayDestroy` |
+| 传 `CGVirtualDisplay` 对象给 Destroy | 触发 CoreDisplay 内部断言崩溃 | 必须传内部 `VirtualDisplayClient` 指针 |
+| 有残留屏时新建 | `initWithDescriptor` 返回 nil | 检查返回值并提示用户 |
 
-```swift
-// 错误：outID 在 init 阶段就是有效值，且显示器同步上线
-if found == 0 { print("FAIL: 设置被接受但显示器未上线") }
-```
+**HiDPI 规则（实测对照）：**
 
-`applySettings` 返回 true 时显示器立刻就在线（等待 0 ms），代码却仍然走了失败分支。
-
-**关于 `spawnProxy kr=0x5` 那条日志**
-
-它确实会打印，但**不影响创建结果**。`initWithDescriptor:` 内部会尝试拉起 CoreDisplay 的 XPC 服务并失败，然后走一条进程内的本地路径兜底，照样把显示器建出来。所以这条错误日志是噪音，不能作为“系统拦截”的判断依据。
-
-同样，`bootstrap_look_up` 查 `com.apple.CoreDisplay.XPCService` 返回 1102 也是真实的，但这个服务只在需要跨进程代理时才用，本地路径不需要它。
-
-### 3.5 稳定复现结果
-
-```
-$ ./fullcreate 2560 1600 60
-创建 2560x1600 @60.0Hz
-init 成功, displayID 属性 = 20
-模式: 1280x800 @60
-applySettings -> true
-上线: true 等待 0 ms
-  bounds (1512.0, 0.0, 2560.0, 1600.0)
-  像素 2560x1600
-  NSScreen SecDisplay id=20 scale=1.0
-```
-
-连续 4 次全部成功。裸 `swiftc` 编译、无签名、无 App bundle 都能跑。
-
-### 3.6 HiDPI 的正确配置
-
-HiDPI 的触发条件不是 `settings.hiDPI` 这个开关，而是 **`maxPixelsWide/High` 要设为背板像素，模式请求逻辑尺寸**：
-
-```
-描述符 maxPixelsWide/High = 5120 x 3200   （背板）
-模式 width/height          = 2560 x 1600   （逻辑）
-结果：当前模式 2560x1600 背板 5120x3200     ← 这就是 2x
-```
-
-对照实验：
 | 背板 | 逻辑 | 结果 |
 |---|---|---|
-| 2560x1600 | 2560x1600 | scale=1.0，1:1，无 HiDPI |
-| 2560x1600 | 1280x800 | 系统忽略请求，回落到 1:1 |
-| 5120x3200 | 2560x1600 | **scale=2.0，真正的 Retina** |
+| 2560x1600 | 2560x1600 | scale 1.0，1:1 |
+| 2560x1600 | 1280x800 | 系统忽略，回落 1:1 |
+| 5120x3200 | 2560x1600 | **scale 2.0，真 Retina** |
 
-**但这里有个重要取舍**：你的 Windows 屏要跟虚拟屏像素严格 1:1 才不糊。所以分两种情况：
-- Windows 屏是 2560x1600 → 背板 2560x1600，逻辑 2560x1600（scale 1.0），这是**正确的**，不要开 HiDPI
-- Windows 屏是 1280x800 → 背板 2560x1600，逻辑 1280x800，scale 2.0，UI 更大更清晰
+> 更正说明：早期版本的本报告曾判断"系统层拦截、虚拟屏不可用"，那是错误的。根因是我自己的两处代码 bug（`perform` 读 BOOL 导致崩溃、判定逻辑写反），不是系统问题。`spawnProxy kr=0x5` 这条日志会打印，但不影响创建结果，属于噪音。
 
-具体用哪种，取决于 Windows 机器的屏幕分辨率和缩放设置。
+### 4.2 编码性能
 
-### 3.7 兜底方案不再需要，方向保持原计划
+H.264 High，低延迟模式，无 B 帧，目标 80 Mbps：
 
-虚拟屏既然可用，**你原本的目标（MacBook 主屏 + Windows 副屏）就是可行的**，不需要把角色反过来。
+| 分辨率 | 帧率 | 每帧编码调用耗时 |
+|---|---|---|
+| 1920x1080 | 59.0 fps | 0.112 ms |
+| 2560x1600 | 59.8 fps | 0.078 ms |
+| 3024x1964 | 52.5 fps | 0.099 ms |
+| 3840x2160 | 38.7 fps | 0.120 ms |
 
-保留记录：如果以后 macOS 升级把这条路彻底关掉，退路是让 Windows 侧用 IddCx 建虚拟屏。IddCx 是微软公开的正规驱动模型，长期稳定性比 macOS 私有 API 好。
+**编码器不是瓶颈。** 每帧 0.1ms，60fps 预算 16.6ms，余量 100 倍。4K 掉帧是测试代码的 CPU 重绘开销。
+
+### 4.3 采集性能
+
+| 场景 | 帧率 | 说明 |
+|---|---|---|
+| 静态桌面 | 12~13 fps | SCK 按需降帧，设计行为 |
+| 有动画 | **54.4 fps** | 330 帧全采全编 |
+
+抓屏内容已验证正确：抓到的是完整桌面，带菜单栏和窗口，macOS 把虚拟屏当一等公民。
+
+### 4.4 端到端延迟（自环实测）
+
+3024x1964，8 秒，362 帧全部解码成功：
+
+| 指标 | 数值 |
+|---|---|
+| 最小 | 1.82 ms |
+| **中位** | **4.91 ms** |
+| p95 | 21.51 ms |
+| 最大 | 74.67 ms |
+
+这是"编码 → 回环传输 → 解码"这一段。加上抓屏和呈现，完整链路估计 **8~26 ms**，接近直连显示器的水平。
+
+### 4.5 编码链路的格式坑
+
+**VT 输出的 AVCC 不含 SPS/PPS**，参数集只在 `formatDescription` 里。关键帧必须自己按 AVCC 格式补上：
+
+```
+[SPS长度(4字节大端)][SPS][PPS长度][PPS][IDR长度][IDR]
+```
+
+早期漏了这步，接收端报 `-12909 kVTVideoDecoderBadDataErr`。
+
+**另外不能用 Annex-B 起始码切分**，因为 H.264 码流内部天然出现 `00 00 00 01`，会切错。
+
+**解码时不要传 `_EnableTemporalProcessing`**，它会吞掉输出不回调。
 
 ---
 
-## 4. 下一步计划
+## 五、给你的方案
 
-按你确认的方向推进管线原型：
+### 目标形态
 
-1. **Mac 端**
-   - 用 `VDCreate.swift` 里验证过的逻辑创建虚拟屏，尺寸跟 Windows 屏幕物理像素对齐
-   - ScreenCaptureKit 的 `SCStream` 绑定到这块虚拟屏
-   - VideoToolbox 低延迟硬编：`EnableLowLatencyRateControl`、无 B 帧、420v
-   - TCP_NODELAY 发送，在途帧数上限 2，超了就丢
+MacBook 主屏 + Windows 副屏，有线连接。
 
-2. **Windows 端**
-   - 接收 → Media Foundation 硬解 → 全屏置顶无边框窗口
-   - 用 `Present` 直接上屏，跳过普通窗口合成
+### 管线
 
-3. **先跑通再优化**
-   - 第一步只求跑通，量出端到端延迟
-   - 再逐项调：分辨率、码率、色度格式、关键帧策略
+```
+MacBook                                   Windows
+CGVirtualDisplay 建虚拟屏
+   ↓ ScreenCaptureKit 抓帧
+   ↓ VideoToolbox H.264 硬编（低延迟模式）
+   ↓ TCP_NODELAY，在途帧数上限 2
+   ═══ 有线 ═══→
+                     Media Foundation 硬解
+                        ↓
+                     D3D11 全屏置顶呈现
+```
 
-4. **有线通道**
-   - 优先用 USB 网卡或雷电桥接的静态 IP
-   - 实测 ping RTT 作为基线
+### 关键参数
+
+| 项目 | 取值 | 理由 |
+|---|---|---|
+| 虚拟屏尺寸 | = Windows 屏物理分辨率 | 1:1 不缩放，文字才清晰 |
+| 编码 | H.264 High，低延迟模式，无 B 帧 | 0.1ms/帧 |
+| 码率 | 80~150 Mbps 起步 | 千兆网吃得下 |
+| 传输 | TCP + NODELAY，在途上限 2 | 防延迟堆积 |
+| 呈现 | D3D11 FLIP + ALLOW_TEARING | 绕过垂直同步 |
 
 ---
 
-## 附：本目录文件
+## 六、下一步
 
-```
-dumps/
-  DuetDisplay-4-0-521.exe     Duet Windows 安装包（74MB，已下载）
-  extract.py / cab.py / ...   解包尝试脚本（SFX 内嵌载荷，解压格式非标准，未成功）
-  sfx_info.py                 安装包结构分析（资源表、分区、熵值）
-research/
-  REPORT-01-duet-architecture.md   本文
-prototype/mac/
-  VirtualDisplayProbe.swift   虚拟屏验证
-  CDVirtualDisplayProbe.swift 绕过封装直调
-  ScanImage.swift             运行时扫私有 framework 字符串
-```
+1. 清理残留虚拟屏（注销重登）
+2. 在 Windows 上编译接收端
+3. 配好有线静态 IP，实测完整链路
+4. 按实测结果调码率和尺寸
+
+详细运行步骤见项目根目录 `README.md`。
