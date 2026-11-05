@@ -14,3 +14,11 @@ prototype/mac/scanimage
 prototype/_scratch/
 .DS_Store
 prototype/mac/encodebench2
+prototype/mac/capturetest
+prototype/mac/capturebench
+prototype/mac/capturebench2
+prototype/mac/capturedump
+prototype/mac/destroyprobe
+prototype/mac/destroyprobe2
+prototype/mac/destroyprobe3
+prototype/mac/encodebench
