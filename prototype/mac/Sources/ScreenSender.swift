@@ -34,12 +34,15 @@ setvbuf(stdout, nil, _IONBF, 0)
 // MARK: - 配置
 
 struct Config {
-    var width = 2560
-    var height = 1600
-    var logicalWidth = 2560
-    var logicalHeight = 1600
+    // 默认值对应 Lenovo Yoga Slim 7 Pro 14IHU5（机器型号 82NC）
+    // 屏幕 2240x1400。若你的是 2880x1800 高刷版，改成 2880/1800 与 1440/900
+    var width = 2240
+    var height = 1400
+    var logicalWidth = 2240
+    var logicalHeight = 1400
     var refreshRate = 60.0
-    var bitrateMbps = 60
+    // 2.2K 桌面文字需要足够码率才清晰。千兆网给到 120 仍有余量。
+    var bitrateMbps = 120
     var port: UInt16 = 9922
 }
 

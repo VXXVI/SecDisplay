@@ -109,22 +109,24 @@ ping -c 5 192.168.77.2
 
 ```swift
 struct Config {
-    var width = 2560          // 虚拟屏背板宽度 = Windows 屏物理宽度
-    var height = 1600
-    var logicalWidth = 2560   // 逻辑宽度
-    var logicalHeight = 1600
+    var width = 2240          // 虚拟屏背板宽度 = Windows 屏物理宽度
+    var height = 1400
+    var logicalWidth = 2240   // 逻辑宽度
+    var logicalHeight = 1400
     var refreshRate = 60.0
-    var bitrateMbps = 60
+    var bitrateMbps = 120
     var port: UInt16 = 9922
 }
 ```
+
+默认值按 Lenovo 82NC（2240x1400）预设。其他机器改这四行即可。
 
 ### 尺寸怎么配
 
 | Windows 屏 | width/height | logical | 效果 |
 |---|---|---|---|
-| 2560x1600 | 2560x1600 | 2560x1600 | 1:1，UI 正常 |
-| 2560x1600 | 2560x1600 | 1280x800 | Retina，UI 大一号 |
+| 2240x1400 | 2240x1400 | 2240x1400 | 1:1，UI 正常 |
+| 2880x1800 | 2880x1800 | 1440x900 | Retina，UI 大一号 |
 | 1920x1080 | 1920x1080 | 1920x1080 | 1:1 |
 
 **width/height 必须等于 Windows 屏物理像素，否则缩放后文字会糊。**
@@ -133,9 +135,9 @@ struct Config {
 
 | 内容 | 码率 |
 |---|---|
-| 纯文字 | 20~40 Mbps |
-| 混合 | 60~100 Mbps |
-| 有视频 | 150~250 Mbps |
+| 纯文字 | 40~80 Mbps |
+| 混合办公 | 100~150 Mbps |
+| 有视频 | 200~300 Mbps |
 
 ---
 
@@ -165,6 +167,7 @@ struct Config {
 | 文档 | 内容 |
 |---|---|
 | `DEPLOY.md` | 从零到跑通的完整部署步骤与排障 |
+| `research/ADAPT-82NC.md` | 针对 Lenovo 82NC（小新 Pro 14 2021）的适配说明 |
 | `research/VS-DUET.md` | 与 Duet Display 的详细对比 |
 | `research/REPORT-01-duet-architecture.md` | Duet 原理拆解 + 开源方案差距分析 |
 
