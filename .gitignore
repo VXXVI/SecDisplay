@@ -1,0 +1,15 @@
+dumps/*.exe
+dumps/payload/
+dumps/unpack/
+dumps/selfheal/
+dumps/out_*/
+prototype/mac/vdtest
+prototype/mac/screensender
+prototype/mac/reqperm
+prototype/mac/fullcreate
+prototype/mac/vdcreate
+prototype/mac/vdmodes
+prototype/mac/pipeprobe
+prototype/mac/scanimage
+prototype/_scratch/
+.DS_Store
