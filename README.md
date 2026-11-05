@@ -73,8 +73,17 @@ swiftc -O Sources/ScreenSender.swift -o screensender
 
 ### 3. Windows 端编译运行
 
+先跑自检确认环境：
+
 ```cmd
 cd prototype\windows
+cl /EHsc /std:c++17 /O2 SelfCheck.cpp
+SelfCheck.exe <Mac的IP>
+```
+
+全部通过再跑接收端：
+
+```cmd
 cl /EHsc /std:c++17 /O2 SecDisplayReceiver.cpp
 SecDisplayReceiver.exe <Mac的IP> 9922 2560 1600
 ```
@@ -168,6 +177,7 @@ struct Config {
 |---|---|
 | `DEPLOY.md` | 从零到跑通的完整部署步骤与排障 |
 | `research/ADAPT-82NC.md` | 针对 Lenovo 82NC（小新 Pro 14 2021）的适配说明 |
+| `research/OFFICE-GUIDE.md` | 办公场景的画质与延迟调优指南 |
 | `research/VS-DUET.md` | 与 Duet Display 的详细对比 |
 | `research/REPORT-01-duet-architecture.md` | Duet 原理拆解 + 开源方案差距分析 |
 

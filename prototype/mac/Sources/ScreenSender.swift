@@ -177,6 +177,7 @@ final class Encoder {
         self.width = Int32(width)
         self.height = Int32(height)
         self.bitrate = bitrateMbps * 1_000_000
+        self.currentMbps = bitrateMbps
     }
 
     func start() -> Bool {
@@ -248,6 +249,18 @@ final class Encoder {
             sourceFrameRefcon: UnsafeMutableRawPointer(box), infoFlagsOut: &flags)
         if status != noErr { box.deallocate() }
     }
+
+    /// 动态调整码率。按接收端反馈或本地丢帧情况调用。
+    /// - Parameter mbps: 目标码率（Mbps）
+    func setBitrate(_ mbps: Int) {
+        guard let s = session, mbps > 0 else { return }
+        let clamped = max(8, min(mbps, 300))
+        VTSessionSetProperty(s, key: kVTCompressionPropertyKey_AverageBitRate,
+                             value: (clamped * 1_000_000) as CFNumber)
+        currentMbps = clamped
+    }
+
+    private(set) var currentMbps = 0
 
     /// 请求下一帧编码为 IDR。由接收端 0x02 控制消息触发。
     private let wantKeyframeLock = NSLock()
@@ -381,7 +394,7 @@ final class Capture: NSObject, SCStreamOutput, SCStreamDelegate {
 // MARK: - 网络发送
 
 final class Sender {
-    private var conn: NWConnection?
+    private(set) var conn: NWConnection?
     private let queue = DispatchQueue(label: "SecDisplay.net")
     private(set) var inFlight = 0
     private let maxInFlight = 2
@@ -499,6 +512,21 @@ encoder.onFrame = { data, isKey, ts in
 
 do {
     try vd.create(cfg)
+} catch VirtualDisplayManager.Err.initFailed {
+    // 系统里已有残留虚拟屏占位时，新建会被拒绝
+    var n: UInt32 = 0
+    CGGetOnlineDisplayList(32, nil, &n)
+    var ids = [CGDirectDisplayID](repeating: 0, count: Int(n))
+    CGGetOnlineDisplayList(n, &ids, &n)
+    Log.info("虚拟屏创建被拒绝（initWithDescriptor 返回 nil）")
+    Log.info("当前在线显示器: \(ids)")
+    if ids.count > 1 {
+        Log.info("原因：上一次运行异常退出，留下了残留虚拟屏占住了位置")
+        Log.info("处理：注销并重新登录（或重启）后再运行")
+    } else {
+        Log.info("原因不明，请检查系统日志")
+    }
+    exit(2)
 } catch {
     Log.info("虚拟屏创建失败: \(error)")
     exit(2)
@@ -520,11 +548,63 @@ Task {
     }
 }
 
+// MARK: - 自适应码率
+//
+// 原则：宁可降码率保流畅。画面糊一点还能办公，卡住没法用。
+//   - 连续丢帧 → 码率下调（检测到拥塞）
+//   - 长时间无丢帧 → 缓慢上调（回到目标值，但不超上限）
+final class RateController {
+    let encoder: Encoder
+    let targetMbps: Int
+    private var current: Int
+    private var lastDropped = 0
+    private var cleanRounds = 0
+
+    init(encoder: Encoder, targetMbps: Int) {
+        self.encoder = encoder
+        self.targetMbps = targetMbps
+        self.current = targetMbps
+    }
+
+    /// 每 2 秒调用一次，参数是本轮丢帧数
+    func tick(dropped: Int) {
+        let delta = dropped - lastDropped
+        lastDropped = dropped
+
+        if delta > 0 {
+            // 有丢帧说明拥塞：一次下调 20%，最少 15 Mbps
+            cleanRounds = 0
+            let next = max(15, Int(Double(current) * 0.8))
+            if next != current {
+                current = next
+                encoder.setBitrate(current)
+                Log.info("网络拥塞，码率下调至 \(current) Mbps")
+            }
+        } else if current < targetMbps {
+            // 连续 3 轮（约 6 秒）无丢帧才回升，避免来回抖
+            cleanRounds += 1
+            if cleanRounds >= 3 {
+                cleanRounds = 0
+                let next = min(targetMbps, Int(Double(current) * 1.15) + 1)
+                if next != current {
+                    current = next
+                    encoder.setBitrate(current)
+                    Log.info("网络良好，码率回升至 \(current) Mbps")
+                }
+            }
+        }
+    }
+}
+
+let rateCtl = RateController(encoder: encoder, targetMbps: cfg.bitrateMbps)
+
 // 统计
 Timer.scheduledTimer(withTimeInterval: 2.0, repeats: true) { _ in
     let mbps = Double(sender.sentBytes) * 8 / 2.0 / 1_000_000
-    Log.info(String(format: "采集 %d 帧  编码 %d  发送 %d  丢弃 %d  %.1f Mbps  在途 %d",
-                    cap.captured, encoder.encoded, sender.sent, sender.dropped, mbps, sender.inFlight))
+    rateCtl.tick(dropped: sender.dropped)
+    Log.info(String(format: "采集 %d 帧  编码 %d  发送 %d  丢弃 %d  %.1f Mbps  目标 %d  在途 %d",
+                    cap.captured, encoder.encoded, sender.sent, sender.dropped, mbps,
+                    encoder.currentMbps, sender.inFlight))
     sender.sentBytes = 0
     sender.sent = 0
 }
@@ -532,14 +612,33 @@ Timer.scheduledTimer(withTimeInterval: 2.0, repeats: true) { _ in
 // 信号处理只置标志位，实际清理在主循环里做
 VirtualDisplayGuard.install()
 
+/// 有序退出：先停采集并断开连接，再销毁虚拟屏。
+/// 采集流还连着显示器时直接销毁，系统会拒绝移除，留下残影。
+func shutdown(signal sig: Int32) -> Never {
+    Log.info("收到信号 \(sig)，开始清理")
+    var finished = false
+    Task {
+        try? await cap.stream?.stopCapture()
+        sender.conn?.cancel()
+        // 给系统一点时间释放采集管线
+        try? await Task.sleep(nanoseconds: 300_000_000)
+        vd.destroy()
+        finished = true
+    }
+    let deadline = Date().addingTimeInterval(2.0)
+    while !finished && Date() < deadline {
+        RunLoop.current.run(mode: .default, before: Date().addingTimeInterval(0.05))
+    }
+    vd.destroy()   // 幂等，兜底
+    exit(128 + sig)
+}
+
 // 每 100ms 检查一次退出信号
 Timer.scheduledTimer(withTimeInterval: 0.1, repeats: true) { _ in
     let sig = VirtualDisplayGuard.pendingSignal
     guard sig != 0 else { return }
     VirtualDisplayGuard.pendingSignal = 0
-    Log.info("收到信号 \(sig)，清理虚拟屏后退出")
-    vd.destroy()
-    exit(128 + sig)
+    shutdown(signal: sig)
 }
 
 Log.info("SecDisplay 服务已启动，Ctrl-C 退出")
