@@ -202,8 +202,9 @@ final class Encoder {
         guard let s = session else { return }
         currentCaptureTime = captureTimeMicros
         var flags: VTEncodeInfoFlags = []
+        let props = currentFrameProps
         VTCompressionSessionEncodeFrame(s, imageBuffer: pb, presentationTimeStamp: pts,
-                                        duration: .invalid, frameProperties: currentFrameProps,
+                                        duration: .invalid, frameProperties: props,
                                         sourceFrameRefcon: nil, infoFlagsOut: &flags)
         currentFrameProps = nil
     }
@@ -233,9 +234,13 @@ final class Encoder {
             isKey = !(first[kCMSampleAttachmentKey_NotSync] as? Bool ?? false)
         }
 
+        // 实测结论（见 research/BENCH-03-latency.md 坑 1、坑 2）：
+        //   1. VT 输出的 AVCC 里不含 SPS/PPS，参数集只在 formatDescription 中，
+        //      关键帧必须自己按 AVCC 长度前缀补上，不能用 Annex-B 起始码。
+        //   2. 全程保持 AVCC，绝不转 Annex-B：H.264 码流内部天然会出现 00 00 00 01，
+        //      用起始码扫描切分会切错位置。
         var out = Data()
         if isKey, let fmt = CMSampleBufferGetFormatDescription(sample) {
-            // 关键帧前拼接 SPS/PPS，接收端可自恢复
             var count = 0
             CMVideoFormatDescriptionGetH264ParameterSetAtIndex(fmt, parameterSetIndex: 0,
                                                               parameterSetPointerOut: nil,
@@ -251,23 +256,14 @@ final class Encoder {
                                                                   parameterSetCountOut: nil,
                                                                   nalUnitHeaderLengthOut: nil)
                 if let p, sz > 0 {
-                    out.append(contentsOf: [0, 0, 0, 1])
+                    var l = UInt32(sz).bigEndian
+                    withUnsafeBytes(of: &l) { out.append(contentsOf: $0) }
                     out.append(p, count: sz)
                 }
             }
         }
-        // 将 AVCC 长度前缀转成 Annex-B
-        let raw = UnsafeRawPointer(ptr).assumingMemoryBound(to: UInt8.self)
-        var offset = 0
-        while offset + 4 <= length {
-            let nalLen = (Int(raw[offset]) << 24) | (Int(raw[offset+1]) << 16)
-                       | (Int(raw[offset+2]) << 8) | Int(raw[offset+3])
-            offset += 4
-            guard nalLen > 0, offset + nalLen <= length else { break }
-            out.append(contentsOf: [0, 0, 0, 1])
-            out.append(raw + offset, count: nalLen)
-            offset += nalLen
-        }
+        // 编码器输出的视频数据本身就是 AVCC，原样追加
+        out.append(Data(bytes: ptr, count: length))
 
         encoded += 1
         bytes += out.count
@@ -398,13 +394,19 @@ final class Sender {
 
     var keyframeRequested = false
 
+    private let counterLock = NSLock()
+
     func send(frame: Data, captureTimeMicros: UInt64) {
         guard connected, let c = conn else { return }
         // 在途帧数超限：丢这一帧，保住实时性
+        counterLock.lock()
         if inFlight >= maxInFlight {
             dropped += 1
+            counterLock.unlock()
             return
         }
+        inFlight += 1
+        counterLock.unlock()
         var packet = Data(capacity: frame.count + 13)
         var len = UInt32(frame.count + 9).bigEndian
         withUnsafeBytes(of: &len) { packet.append(contentsOf: $0) }
@@ -413,12 +415,13 @@ final class Sender {
         withUnsafeBytes(of: &ts) { packet.append(contentsOf: $0) }
         packet.append(frame)
 
-        inFlight += 1
         sent += 1
         sentBytes += packet.count
         c.send(content: packet, completion: .contentProcessed { [weak self] err in
             guard let self else { return }
+            self.counterLock.lock()
             self.inFlight = max(0, self.inFlight - 1)
+            self.counterLock.unlock()
             if err != nil { self.connected = false }
         })
     }

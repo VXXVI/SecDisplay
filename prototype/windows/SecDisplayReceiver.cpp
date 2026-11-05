@@ -99,6 +99,7 @@ private:
     DWORD inputId_ = 0, outputId_ = 0;
     bool streaming_ = false;
     std::vector<uint8_t> spspps_;
+    bool fmtSet_ = false;
     LONGLONG sampleTime_ = 0;
     int width_ = 0, height_ = 0;
 };
@@ -160,9 +161,53 @@ bool Decoder::Init(int width, int height) {
     return true;
 }
 
+// 从 AVCC 数据里取出 SPS(7)/PPS(8)。Mac 端已保证关键帧开头带参数集，
+// 用 4 字节长度前缀切分，不要用 Annex-B 起始码（码流内部会出现 00 00 00 01）。
+static bool ExtractParamSets(const uint8_t* data, size_t len,
+                             std::vector<uint8_t>& sps, std::vector<uint8_t>& pps) {
+    sps.clear(); pps.clear();
+    size_t i = 0;
+    while (i + 4 <= len) {
+        uint32_t n = ((uint32_t)data[i] << 24) | ((uint32_t)data[i+1] << 16)
+                   | ((uint32_t)data[i+2] << 8) | (uint32_t)data[i+3];
+        i += 4;
+        if (n == 0 || i + n > len) break;
+        uint8_t type = data[i] & 0x1F;
+        if (type == 7) sps.assign(data + i, data + i + n);
+        else if (type == 8) pps.assign(data + i, data + i + n);
+        i += n;
+    }
+    return !sps.empty() && !pps.empty();
+}
+
 bool Decoder::Decode(const Frame& f, IMFSample** outSample) {
     *outSample = nullptr;
     if (!transform_) return false;
+
+    // 首次收到带参数集的关键帧时，用它刷新输入格式，确保解码器拿到 SPS/PPS
+    std::vector<uint8_t> sps, pps;
+    if (ExtractParamSets(f.data.data(), f.data.size(), sps, pps)) {
+        if (!fmtSet_ || sps != spspps_) {
+            spspps_ = sps;
+            spspps_.insert(spspps_.end(), pps.begin(), pps.end());
+            fmtSet_ = true;
+            ComPtr<IMFMediaType> in;
+            MFCreateMediaType(&in);
+            in->SetGUID(MF_MT_MAJOR_TYPE, MFMediaType_Video);
+            in->SetGUID(MF_MT_SUBTYPE, MFVideoFormat_H264);
+            MFSetAttributeSize(in.Get(), MF_MT_FRAME_SIZE, width_, height_);
+            in->SetBlob(MF_MT_MPEG_SEQUENCE_HEADER, spspps_.data(), (UINT32)spspps_.size());
+            HRESULT r = transform_->SetInputType(0, in.Get(), 0);
+            if (FAILED(r)) {
+                Log("设置输入格式(含SPS/PPS)失败 %08X", r);
+            } else {
+                Log("已注入 SPS(%zu 字节) PPS(%zu 字节)", sps.size(), pps.size());
+            }
+            transform_->ProcessMessage(MFT_MESSAGE_COMMAND_FLUSH, 0);
+            transform_->ProcessMessage(MFT_MESSAGE_NOTIFY_BEGIN_STREAMING, 0);
+            transform_->ProcessMessage(MFT_MESSAGE_NOTIFY_START_OF_STREAM, 0);
+        }
+    }
 
     ComPtr<IMFMediaBuffer> buffer;
     if (FAILED(MFCreateMemoryBuffer((DWORD)f.data.size(), &buffer))) return false;
