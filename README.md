@@ -160,6 +160,14 @@ struct Config {
 
 ---
 
+## 文档
+
+| 文档 | 内容 |
+|---|---|
+| `DEPLOY.md` | 从零到跑通的完整部署步骤与排障 |
+| `research/VS-DUET.md` | 与 Duet Display 的详细对比 |
+| `research/REPORT-01-duet-architecture.md` | Duet 原理拆解 + 开源方案差距分析 |
+
 ## 实测数据
 
 | 文档 | 内容 |
@@ -168,6 +176,7 @@ struct Config {
 | `research/BENCH-01-encoding.md` | 编码性能：各分辨率帧率与耗时 |
 | `research/BENCH-02-pipeline.md` | 虚拟屏、采集、编码各段实测 |
 | `research/BENCH-03-latency.md` | 端到端延迟实测与踩坑记录 |
+| `research/REVIEW-01-code-audit.md` | 两轮代码审查记录 |
 
 ---
 
@@ -189,6 +198,6 @@ prototype/mac/
 prototype/windows/
   SecDisplayReceiver.cpp      接收端
 
-research/                     实测数据与调研报告
-dumps/                        Duet 安装包分析（74MB 载荷为加密流，未能解包）
+tools/duet-inspect/           Duet 安装包结构分析脚本
+research/                     实测数据、调研报告、代码审查记录
 ```

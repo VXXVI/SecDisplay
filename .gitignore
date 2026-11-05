@@ -1,8 +1,4 @@
-dumps/*.exe
-dumps/payload/
-dumps/unpack/
-dumps/selfheal/
-dumps/out_*/
+# 编译产物
 prototype/mac/vdtest
 prototype/mac/screensender
 prototype/mac/reqperm
@@ -11,8 +7,7 @@ prototype/mac/vdcreate
 prototype/mac/vdmodes
 prototype/mac/pipeprobe
 prototype/mac/scanimage
-prototype/_scratch/
-.DS_Store
+prototype/mac/encodebench
 prototype/mac/encodebench2
 prototype/mac/capturetest
 prototype/mac/capturebench
@@ -21,5 +16,18 @@ prototype/mac/capturedump
 prototype/mac/destroyprobe
 prototype/mac/destroyprobe2
 prototype/mac/destroyprobe3
-prototype/mac/encodebench
+prototype/mac/loopback
 prototype/mac/loopbackb
+prototype/mac/*.dSYM
+
+# Windows 编译产物
+prototype/windows/*.obj
+prototype/windows/*.exe
+prototype/windows/*.pdb
+prototype/windows/*.ilk
+
+# 临时文件
+prototype/_scratch/
+**/__pycache__/
+*.pyc
+.DS_Store
