@@ -11,6 +11,14 @@ import CoreGraphics
 import AppKit
 import Darwin
 
+/// 统一日志
+enum VDLog {
+    static func info(_ s: String) {
+        let t = String(format: "%.3f", CFAbsoluteTimeGetCurrent().truncatingRemainder(dividingBy: 100000))
+        FileHandle.standardError.write("[\(t)] \(s)\n".data(using: .utf8)!)
+    }
+}
+
 /// 虚拟显示器句柄。持有对象期间屏一直在线。
 final class VirtualDisplay {
     private let object: NSObject
@@ -21,6 +29,13 @@ final class VirtualDisplay {
 
     private static var live: [ObjectIdentifier: VirtualDisplay] = [:]
     private static let lock = NSLock()
+    private var destroyed = false
+
+    fileprivate static func drop(_ vd: VirtualDisplay) {
+        lock.lock()
+        live.removeValue(forKey: ObjectIdentifier(vd))
+        lock.unlock()
+    }
 
     private init(object: NSObject, id: CGDirectDisplayID, w: Int, h: Int, queue: DispatchQueue) {
         self.object = object
@@ -136,36 +151,41 @@ final class VirtualDisplay {
     }
 
     /// 显式销毁。销毁后屏立刻从系统消失。
+    ///
+    /// 正确路径：CGVirtualDisplay 内部持有一个 VirtualDisplayClient（存于 ivar `_client`，
+    /// 类型是裸指针 ^v），必须把**这个指针**传给 CDVirtualDisplayDestroy。
+    /// 传 CGVirtualDisplay 对象本身会触发 CoreDisplay 的内部断言并崩溃。
+    /// 单纯释放对象引用不会让屏消失。
     func destroy() {
-        // 方式一：CGVirtualDisplay 在 macOS 15+ 暴露了 unplug（部分版本有）
-        for selName in ["unplug", "disconnect"] {
-            let sel = NSSelectorFromString(selName)
-            if object.responds(to: sel) {
-                typealias VoidFn = @convention(c) (AnyObject, Selector) -> Void
-                unsafeBitCast(object.method(for: sel), to: VoidFn.self)(object, sel)
-                usleep(50_000)
-            }
+        guard !destroyed else { return }
+        destroyed = true
+
+        // 1. 取出内部 client 指针
+        guard let cls = NSClassFromString("CGVirtualDisplay"),
+              let ivar = class_getInstanceVariable(cls, "_client") else {
+            VDLog.info("找不到 _client ivar，改用释放引用")
+            VirtualDisplay.drop(self)
+            return
+        }
+        let raw = UnsafeRawPointer(Unmanaged.passUnretained(object).toOpaque())
+            .advanced(by: ivar_getOffset(ivar))
+        guard let clientPtr = raw.load(as: UnsafeMutableRawPointer?.self) else {
+            VDLog.info("_client 为空，改用释放引用")
+            VirtualDisplay.drop(self)
+            return
         }
 
-        // 方式二：交给 ARC，dealloc 会通知系统移除
-        VirtualDisplay.lock.lock()
-        VirtualDisplay.live.removeValue(forKey: ObjectIdentifier(self))
-        VirtualDisplay.lock.unlock()
-        usleep(150_000)
-
-        // 方式三：如果还在线，用 CGDisplay 配置接口把这个屏从活动配置里摘掉
-        var n: UInt32 = 0
-        CGGetOnlineDisplayList(32, nil, &n)
-        var ids = [CGDirectDisplayID](repeating: 0, count: Int(n))
-        CGGetOnlineDisplayList(n, &ids, &n)
-        if ids.contains(displayID) {
-            var cfg: CGDisplayConfigRef?
-            if CGBeginDisplayConfiguration(&cfg) == .success, let c = cfg {
-                CGConfigureDisplayMirrorOfDisplay(c, displayID, kCGNullDirectDisplay)
-                CGCompleteDisplayConfiguration(c, .permanently)
-                usleep(100_000)
-            }
+        // 2. 调用 CDVirtualDisplayDestroy(client)
+        if let h = dlopen("/System/Library/Frameworks/CoreDisplay.framework/Versions/A/CoreDisplay", RTLD_NOW),
+           let sym = dlsym(h, "CDVirtualDisplayDestroy") {
+            typealias DestroyFn = @convention(c) (UnsafeMutableRawPointer) -> Void
+            unsafeBitCast(sym, to: DestroyFn.self)(clientPtr)
+        } else {
+            VDLog.info("CDVirtualDisplayDestroy 不可用")
         }
+
+        // 3. 从全局登记表移除，让对象释放
+        VirtualDisplay.drop(self)
     }
 
     static func destroyAll() {

@@ -24,6 +24,7 @@ import CoreVideo
 import VideoToolbox
 import ScreenCaptureKit
 import Network
+import ObjectiveC.runtime
 import AppKit
 import Darwin
 
@@ -110,11 +111,21 @@ final class VirtualDisplayManager {
         Log.info("虚拟屏就绪 id=\(displayID) \(cfg.width)x\(cfg.height)")
     }
 
+    /// 正确销毁：取出 CGVirtualDisplay 内部的 _client 指针，交给 CDVirtualDisplayDestroy。
+    /// 传对象本身会触发 CoreDisplay 内部断言；只释放引用屏不会消失。
     func destroy() {
-        for sel in ["unplug"] where object?.responds(to: NSSelectorFromString(sel)) == true {
-            let s = NSSelectorFromString(sel)
-            typealias F = @convention(c) (AnyObject, Selector) -> Void
-            unsafeBitCast(object!.method(for: s), to: F.self)(object!, s)
+        guard let obj = object else { return }
+        if let cls = NSClassFromString("CGVirtualDisplay"),
+           let ivar = class_getInstanceVariable(cls, "_client") {
+            let raw = UnsafeRawPointer(Unmanaged.passUnretained(obj).toOpaque())
+                .advanced(by: ivar_getOffset(ivar))
+            if let clientPtr = raw.load(as: UnsafeMutableRawPointer?.self),
+               let h = dlopen("/System/Library/Frameworks/CoreDisplay.framework/Versions/A/CoreDisplay", RTLD_NOW),
+               let sym = dlsym(h, "CDVirtualDisplayDestroy") {
+                typealias DestroyFn = @convention(c) (UnsafeMutableRawPointer) -> Void
+                unsafeBitCast(sym, to: DestroyFn.self)(clientPtr)
+                Log.info("虚拟屏已销毁")
+            }
         }
         object = nil
     }
