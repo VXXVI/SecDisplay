@@ -188,12 +188,12 @@ final class VirtualDisplay {
         VirtualDisplay.drop(self)
     }
 
+    /// 销毁所有现存虚拟屏。destroy() 幂等，重复调用安全。
     static func destroyAll() {
         lock.lock()
         let all = Array(live.values)
-        live.removeAll()
         lock.unlock()
-        _ = all
+        for vd in all { vd.destroy() }
         usleep(100_000)
     }
 
@@ -206,18 +206,30 @@ final class VirtualDisplay {
 
 enum VirtualDisplayGuard {
     private static var installed = false
+    /// 信号处理器里只置标志位。真正的清理放在主循环轮询里做，
+    /// 因为 signal handler 中调用 ObjC runtime / dlopen 属于 async-signal-unsafe。
+    nonisolated(unsafe) static var pendingSignal: Int32 = 0
 
     static func install() {
         guard !installed else { return }
         installed = true
         for sig in [SIGINT, SIGTERM, SIGHUP] {
-            signal(sig, { s in
-                VirtualDisplay.destroyAll()
-                exit(128 + s)
-            })
+            signal(sig) { s in
+                VirtualDisplayGuard.pendingSignal = s
+            }
         }
         atexit {
             VirtualDisplay.destroyAll()
         }
+    }
+
+    /// 在主循环里定期调用。收到信号时清理并退出。
+    static func checkAndExitIfNeeded() {
+        let sig = pendingSignal
+        guard sig != 0 else { return }
+        pendingSignal = 0
+        VDLog.info("收到信号 \(sig)，清理虚拟屏后退出")
+        VirtualDisplay.destroyAll()
+        exit(128 + sig)
     }
 }

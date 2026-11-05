@@ -10,12 +10,13 @@
 //   3. TCP_NODELAY，禁止 Nagle 攒包
 //   4. 在途帧数上限 2，缓冲满时丢新帧而不是排队（防延迟堆积）
 //   5. 每个包头带采集时间戳，接收端可据此丢弃过期帧
-//   6. 静态画面降帧，省带宽也省电
 //
 // 协议（每帧）:
 //   [4 字节大端长度][1 字节类型][8 字节采集时间戳 us][载荷]
-//   类型 0x01 = 视频帧（Annex-B，关键帧前置 SPS/PPS）
-//   类型 0x02 = 请求关键帧
+//   长度字段 = 1 + 8 + 载荷长度，不含长度字段自身
+//   类型 0x01 = 视频帧，载荷为 AVCC（[4 字节大端长度][NAL] 重复）
+//               关键帧开头由本端拼上 SPS/PPS（VT 输出不含参数集）
+//   类型 0x02 = 请求关键帧（接收端 → 本端，1 字节）
 // ============================================================================
 
 import Foundation
@@ -40,7 +41,6 @@ struct Config {
     var refreshRate = 60.0
     var bitrateMbps = 60
     var port: UInt16 = 9922
-    var staticAdaptive = true
 }
 
 // MARK: - 虚拟屏
@@ -133,6 +133,20 @@ final class VirtualDisplayManager {
     enum Err: Error { case classesMissing, initFailed, modeFailed, applyFailed }
 }
 
+// MARK: - 退出清理
+
+/// 信号处理器里只置标志位。真正的清理在主循环里做，
+/// 因为 signal handler 中调用 ObjC runtime / dlopen 属于 async-signal-unsafe。
+enum VirtualDisplayGuard {
+    nonisolated(unsafe) static var pendingSignal: Int32 = 0
+
+    static func install() {
+        for sig in [SIGINT, SIGTERM, SIGHUP] {
+            signal(sig) { s in VirtualDisplayGuard.pendingSignal = s }
+        }
+    }
+}
+
 // MARK: - 日志
 
 enum Log {
@@ -172,9 +186,18 @@ final class Encoder {
             kCVPixelBufferHeightKey as String: height,
             kCVPixelBufferIOSurfacePropertiesKey as String: [:],
         ]
-        let cb: VTCompressionOutputCallback = { ref, _, status, _, sample in
-            guard status == noErr, let sample, let ref else { return }
-            Unmanaged<Encoder>.fromOpaque(ref).takeUnretainedValue().emit(sample)
+        let cb: VTCompressionOutputCallback = { ref, sourceFrameRefcon, status, _, sample in
+            guard let ref else {
+                // 回调仍会到来，必须释放 box 防止泄漏
+                if let sourceFrameRefcon { UnsafeMutablePointer<UInt64>(OpaquePointer(sourceFrameRefcon)).deallocate() }
+                return
+            }
+            let enc = Unmanaged<Encoder>.fromOpaque(ref).takeUnretainedValue()
+            guard status == noErr, let sample else {
+                if let sourceFrameRefcon { UnsafeMutablePointer<UInt64>(OpaquePointer(sourceFrameRefcon)).deallocate() }
+                return
+            }
+            enc.emit(sample, refcon: sourceFrameRefcon)
         }
         let st = VTCompressionSessionCreate(
             allocator: kCFAllocatorDefault, width: width, height: height,
@@ -200,27 +223,51 @@ final class Encoder {
 
     func encode(_ pb: CVPixelBuffer, pts: CMTime, captureTimeMicros: UInt64) {
         guard let s = session else { return }
-        currentCaptureTime = captureTimeMicros
+        // 时间戳随帧走：经 sourceFrameRefcon 传给输出回调，避免跨线程共享变量。
+        // 堆上分配一个 box，由 emit 负责释放；即使帧被编码器丢弃也不会泄漏
+        //（VT 保证每个 refcon 都会在输出或丢弃时被回调一次）。
+        let box = UnsafeMutablePointer<UInt64>.allocate(capacity: 1)
+        box.pointee = captureTimeMicros
+
+        // 接收端请求关键帧时，这一帧强制 IDR
+        wantKeyframeLock.lock()
+        let forceKey = wantKeyframe
+        wantKeyframe = false
+        wantKeyframeLock.unlock()
+        let props: CFDictionary? = forceKey
+            ? ([kVTEncodeFrameOptionKey_ForceKeyFrame as String: true] as CFDictionary)
+            : nil
+
         var flags: VTEncodeInfoFlags = []
-        let props = currentFrameProps
-        VTCompressionSessionEncodeFrame(s, imageBuffer: pb, presentationTimeStamp: pts,
-                                        duration: .invalid, frameProperties: props,
-                                        sourceFrameRefcon: nil, infoFlagsOut: &flags)
-        currentFrameProps = nil
+        let status = VTCompressionSessionEncodeFrame(
+            s, imageBuffer: pb, presentationTimeStamp: pts,
+            duration: .invalid, frameProperties: props,
+            sourceFrameRefcon: UnsafeMutableRawPointer(box), infoFlagsOut: &flags)
+        if status != noErr { box.deallocate() }
     }
 
-    private var currentCaptureTime: UInt64 = 0
+    /// 请求下一帧编码为 IDR。由接收端 0x02 控制消息触发。
+    private let wantKeyframeLock = NSLock()
+    private var wantKeyframe = false
 
     func requestKeyframe() {
-        guard let s = session else { return }
-        // 强制下一帧为 IDR
-        let props: [String: Any] = [kVTEncodeFrameOptionKey_ForceKeyFrame as String: true]
-        currentFrameProps = props as CFDictionary
-        _ = s
+        wantKeyframeLock.lock()
+        wantKeyframe = true
+        wantKeyframeLock.unlock()
     }
-    private var currentFrameProps: CFDictionary?
 
-    private func emit(_ sample: CMSampleBuffer) {
+    func stop() {
+        if let s = session { VTCompressionSessionCompleteFrames(s, untilPresentationTimeStamp: .invalid) }
+    }
+
+    private func emit(_ sample: CMSampleBuffer, refcon: UnsafeMutableRawPointer?) {
+        // 取出并释放时间戳 box
+        var captureTime: UInt64 = 0
+        if let refcon {
+            let box = refcon.assumingMemoryBound(to: UInt64.self)
+            captureTime = box.pointee
+            box.deallocate()
+        }
         guard let bb = CMSampleBufferGetDataBuffer(sample) else { return }
         var length = 0
         var ptr: UnsafeMutablePointer<Int8>?
@@ -267,12 +314,9 @@ final class Encoder {
 
         encoded += 1
         bytes += out.count
-        onFrame?(out, isKey, currentCaptureTime)
+        onFrame?(out, isKey, captureTime)
     }
 
-    func stop() {
-        if let s = session { VTCompressionSessionCompleteFrames(s, untilPresentationTimeStamp: .invalid) }
-    }
 }
 
 // MARK: - 抓屏
@@ -353,7 +397,13 @@ final class Sender {
             tcp.enableKeepalive = true
             tcp.keepaliveIdle = 2
         }
-        let listener = try! NWListener(using: params, on: NWEndpoint.Port(rawValue: port)!)
+        let listener: NWListener
+        do {
+            listener = try NWListener(using: params, on: NWEndpoint.Port(rawValue: port)!)
+        } catch {
+            Log.info("端口 \(port) 监听失败（可能被占用）: \(error)")
+            exit(6)
+        }
         listener.newConnectionHandler = { [weak self] c in
             guard let self else { return }
             Log.info("接收端已连接: \(String(describing: c.endpoint))")
@@ -384,7 +434,10 @@ final class Sender {
             guard let self else { return }
             if let data, !data.isEmpty {
                 for b in data {
-                    if b == 0x02 { /* 请求关键帧 */ self.keyframeRequested = true }
+                    if b == 0x02 {
+                        // 接收端请求关键帧（例如启动入流或丢帧后恢复）
+                        self.onKeyframeRequest?()
+                    }
                 }
             }
             if done || err != nil { self.connected = false; return }
@@ -392,7 +445,8 @@ final class Sender {
         }
     }
 
-    var keyframeRequested = false
+    /// 收到对端 0x02 时回调，由外部接到编码器
+    var onKeyframeRequest: (() -> Void)?
 
     private let counterLock = NSLock()
 
@@ -447,6 +501,8 @@ do {
     exit(2)
 }
 
+// 接收端的 0x02 控制消息 → 让编码器下一帧强制 IDR
+sender.onKeyframeRequest = { encoder.requestKeyframe() }
 sender.listen(port: cfg.port)
 
 let cap = Capture(encoder: encoder)
@@ -470,11 +526,18 @@ Timer.scheduledTimer(withTimeInterval: 2.0, repeats: true) { _ in
     sender.sent = 0
 }
 
-signal(SIGINT) { _ in
+// 信号处理只置标志位，实际清理在主循环里做
+VirtualDisplayGuard.install()
+
+// 每 100ms 检查一次退出信号
+Timer.scheduledTimer(withTimeInterval: 0.1, repeats: true) { _ in
+    let sig = VirtualDisplayGuard.pendingSignal
+    guard sig != 0 else { return }
+    VirtualDisplayGuard.pendingSignal = 0
+    Log.info("收到信号 \(sig)，清理虚拟屏后退出")
     vd.destroy()
-    exit(0)
+    exit(128 + sig)
 }
-atexit { }
 
 Log.info("SecDisplay 服务已启动，Ctrl-C 退出")
 RunLoop.main.run()

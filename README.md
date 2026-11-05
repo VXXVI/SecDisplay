@@ -14,7 +14,7 @@ MacBook 当主屏，Windows 笔记本当副屏。纯软件，走有线。
 | 硬件编码性能 | 实测 2560x1600@60fps，0.078ms/帧 |
 | 屏幕采集 | 实测有内容时 54fps |
 | 端到端链路（自环）| 实测中位延迟 4.91ms |
-| Windows 端接收显示 | 代码完成，待 Windows 机器编译验证 |
+| Windows 端接收显示 | 代码完成，经两轮代码审查，**未在 Windows 上编译运行过** |
 | Mac↔Windows 真实联调 | 待进行 |
 
 ---
@@ -75,9 +75,11 @@ swiftc -O Sources/ScreenSender.swift -o screensender
 
 ```cmd
 cd prototype\windows
-cl /EHsc /std:c++17 /O2 SecDisplayReceiver.cpp /link ole32.lib
+cl /EHsc /std:c++17 /O2 SecDisplayReceiver.cpp
 SecDisplayReceiver.exe <Mac的IP> 9922 2560 1600
 ```
+
+所需的库都通过 `#pragma comment` 自动链接，不需要手动指定。
 
 按 Esc 退出。
 
