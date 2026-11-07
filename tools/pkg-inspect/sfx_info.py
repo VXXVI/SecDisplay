@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Duet SFX 安装包结构分析：资源索引 + 数据区指纹定位。"""
+"""SFX 安装包结构分析：资源索引 + 数据区指纹定位。"""
 import struct, sys, collections
 
 def secmap(d, off):
@@ -83,4 +83,4 @@ def main(path):
         print(f'  {a:#x}: {ent(d[a:a + 0x60000]):.3f} bits/byte')
 
 if __name__ == '__main__':
-    main(sys.argv[1] if len(sys.argv) > 1 else 'DuetDisplay-4-0-521.exe')
+    main(sys.argv[1] if len(sys.argv) > 1 else 'setup.exe')

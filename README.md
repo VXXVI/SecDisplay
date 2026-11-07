@@ -2,7 +2,7 @@
 
 MacBook 当主屏，Windows 笔记本当副屏。纯软件，走有线。
 
-自研实现，不依赖 Duet 或任何商业方案。
+自研实现，不依赖任何商业方案。
 
 ---
 
@@ -181,14 +181,13 @@ struct Config {
 | `DEPLOY.md` | 从零到跑通的完整部署步骤与排障 |
 | `research/ADAPT-82NC.md` | 针对 Lenovo 82NC（小新 Pro 14 2021）的适配说明 |
 | `research/OFFICE-GUIDE.md` | 办公场景的画质与延迟调优指南 |
-| `research/VS-DUET.md` | 与 Duet Display 的详细对比 |
-| `research/REPORT-01-duet-architecture.md` | Duet 原理拆解 + 开源方案差距分析 |
+| `research/VS-COMMERCIAL.md` | 与商业方案的详细对比 |
+| `research/REPORT-01-architecture.md` | 技术原理拆解 + 开源方案差距分析 |
 
 ## 实测数据
 
 | 文档 | 内容 |
 |---|---|
-| `research/REPORT-01-duet-architecture.md` | Duet 原理拆解 + 开源方案差距分析 + 本机验证总结 |
 | `research/BENCH-01-encoding.md` | 编码性能：各分辨率帧率与耗时 |
 | `research/BENCH-02-pipeline.md` | 虚拟屏、采集、编码各段实测 |
 | `research/BENCH-03-latency.md` | 端到端延迟实测与踩坑记录 |
@@ -214,6 +213,6 @@ prototype/mac/
 prototype/windows/
   SecDisplayReceiver.cpp      接收端
 
-tools/duet-inspect/           Duet 安装包结构分析脚本
+tools/pkg-inspect/            第三方安装包结构分析脚本
 research/                     实测数据、调研报告、代码审查记录
 ```

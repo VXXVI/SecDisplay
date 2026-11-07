@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Duet SFX 内嵌载荷提取器。
+"""SFX 自解压安装包内嵌载荷提取器。
 
 该安装包的 CAB 数据块与标准 MSZip 不同：块头为
     'CK' | u32 magic | u16 size | u16 uncompressed

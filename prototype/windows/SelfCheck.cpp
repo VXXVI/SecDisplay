@@ -97,12 +97,12 @@ static void CheckGPU() {
         wprintf(L"  显卡 %u: %s\n", i, desc.Description);
         printf("         显存 %.1f GB，厂商 %04X", desc.DedicatedVideoMemory / 1073741824.0, desc.VendorId);
 
-        // 标出虚拟显示器适配器，这类通常不能做视频解码
+        // 标出第三方虚拟显示器适配器（远程控制、投屏软件等），这类通常不能做视频解码
         {
             std::wstring n(desc.Description);
             for (auto& c : n) c = towlower(c);
             bool virt = n.find(L"virtual") != std::wstring::npos
-                     || n.find(L"duet") != std::wstring::npos
+                     || n.find(L"spacedesk") != std::wstring::npos
                      || n.find(L"gameviewer") != std::wstring::npos
                      || n.find(L"parsec") != std::wstring::npos
                      || n.find(L"sunlogin") != std::wstring::npos;

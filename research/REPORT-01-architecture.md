@@ -1,4 +1,4 @@
-# SecDisplay 调研总结：Duet 原理与本机验证
+# SecDisplay 技术原理与本机验证
 
 日期：2026-11-05
 环境：MacBook Pro M1 Pro / 16GB / macOS 27.2 (26B123) / arm64
@@ -7,7 +7,7 @@
 
 ## 一、结论先说
 
-**Duet 没有任何魔法。** 它是三件成熟技术的组合，配合对延迟链路的精细打磨：
+**这类方案没有任何魔法。** 它是三件成熟技术的组合，配合对延迟链路的精细打磨：
 
 1. 让操作系统相信有一块真实显示器插着（虚拟显示器）
 2. 用 GPU 硬件编码器把这块屏的画面压成视频
@@ -19,16 +19,16 @@
 
 ---
 
-## 二、Duet 的实现拆解
+## 二、商业方案的实现拆解
 
 ### 2.1 虚拟显示器层
 
-从 Duet 4.0.x 更新日志和安装目录文件清单反推：
+从商业方案的更新日志和安装目录文件清单反推：
 
 | 证据 | 推断 |
 |---|---|
-| `DuetBus.sys` / `duetbus.inf` | 自建总线枚举设备 |
-| `DuetDisplayDriver.dll/.inf`，GUID `{4D36E968-E325-11CE-BFC1-08002BE10318}` | 显示适配器类，属 IddCx 用户态 UMDF 驱动 |
+| 自建总线驱动 `*.sys` / `*.inf` | 总线枚举设备 |
+| 显示驱动 `.dll/.inf`，GUID `{4D36E968-E325-11CE-BFC1-08002BE10318}` | 显示适配器类，属 IddCx 用户态 UMDF 驱动 |
 | "Resolved a display driver crash occurring within the DXGI desktop duplication update loop" | 镜像模式走 DXGI Desktop Duplication 取帧 |
 | "Fixed an issue in the display driver path that could throttle the actual frame rate to half" | 帧率控制在驱动侧实现 |
 | "New Display Driver to improve mouse input latency" | 硬件光标由驱动提供，不画进视频 |
@@ -45,7 +45,7 @@ Windows 用 **IddCx**，微软为远程显示设计的正规用户态驱动模�
 | "Resolved an issue with the Nvidia encoder getting stuck during flushing" | 用到编码器 flush 语义，说明有关键帧重建 |
 | "Fixed decoder crash when the decoder is rebuilt (e.g., when host resolution changes)" | 接收端硬解，分辨率变化时重建 |
 
-**Duet 不走 FFmpeg 编码，每个厂商单独调用硬件编码 API。** 这是它省电、低延迟的第一层原因。
+**商业方案不走 FFmpeg 编码，每个厂商单独调用硬件编码 API。** 这是它省电、低延迟的第一层原因。
 
 ### 2.3 传输层
 
@@ -54,7 +54,7 @@ Windows 用 **IddCx**，微软为远程显示设计的正规用户态驱动模�
 | "Resolved an application crash occurring during SSL TCP data transfers" | TCP + TLS |
 | "Added an expert setting to manually adjust the nominal video bitrate" | 码率显式控制 |
 | "Enhanced latency calculations" | 有端到端延迟测量 |
-| "Bitrate optimizations for Duet Air to reduce latency" | 码率直接用于控延迟 |
+| "Bitrate optimizations for remote mode to reduce latency" | 码率直接用于控延迟 |
 
 2022 年 CEO 说"从零重写网络协议"。它做的是**自定义应用层协议跑在 TCP 上**，关键在控制发送队列深度。
 
