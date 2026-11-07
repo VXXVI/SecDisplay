@@ -201,21 +201,67 @@ private:
     bool CreateDevice();
 };
 
+// 这台机器上常驻多个显示适配器：真实核显、远程控制的虚拟屏、其他投屏软件的虚拟屏。
+// 直接传 nullptr 让系统挑，选中的未必是真显卡。这里显式枚举，
+// 优先选带 VIDEO_SUPPORT 能力、且不是软件/虚拟适配器的那个。
 bool Graphics::CreateDevice() {
     D3D_FEATURE_LEVEL levels[] = { D3D_FEATURE_LEVEL_11_1, D3D_FEATURE_LEVEL_11_0 };
     UINT flags = D3D11_CREATE_DEVICE_VIDEO_SUPPORT | D3D11_CREATE_DEVICE_BGRA_SUPPORT;
 
-    HRESULT hr = D3D11CreateDevice(nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr, flags,
-                                   levels, ARRAYSIZE(levels), D3D11_SDK_VERSION,
-                                   &device, nullptr, &context);
-    if (FAILED(hr)) {
-        // 11_1 在某些环境不可用，退回 11_0
-        D3D_FEATURE_LEVEL lv[] = { D3D_FEATURE_LEVEL_11_0 };
+    ComPtr<IDXGIFactory1> factory;
+    if (FAILED(CreateDXGIFactory1(IID_PPV_ARGS(&factory)))) {
+        Log("CreateDXGIFactory1 失败");
+        return false;
+    }
+
+    HRESULT hr = E_FAIL;
+    ComPtr<IDXGIAdapter1> chosen;
+
+    for (UINT i = 0; ; ++i) {
+        ComPtr<IDXGIAdapter1> adapter;
+        if (factory->EnumAdapters1(i, &adapter) == DXGI_ERROR_NOT_FOUND) break;
+
+        DXGI_ADAPTER_DESC1 desc{};
+        adapter->GetDesc1(&desc);
+        if (desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE) continue;
+
+        wchar_t nameW[128] = {};
+        wcsncpy_s(nameW, desc.Description, _TRUNCATE);
+
+        ComPtr<ID3D11Device> trial;
+        HRESULT r = D3D11CreateDevice(adapter.Get(), D3D_DRIVER_TYPE_UNKNOWN, nullptr,
+                                      flags, levels, ARRAYSIZE(levels),
+                                      D3D11_SDK_VERSION, &trial, nullptr, nullptr);
+        if (FAILED(r)) {
+            wprintf(L"  跳过显示适配器（无法创建设备）: %s\n", nameW);
+            continue;
+        }
+
+        // 虚拟显示器适配器通常能创建设备，但没有视频解码能力。
+        // 必须验证它真的支持 H.264 硬解，否则选了也白选。
+        ComPtr<ID3D11VideoDevice> vd;
+        if (FAILED(trial.As(&vd)) || vd->GetVideoDecoderProfileCount() == 0) {
+            wprintf(L"  跳过显示适配器（无视频解码能力）: %s\n", nameW);
+            continue;
+        }
+
+        device = trial;
+        trial->GetImmediateContext(&context);
+        wprintf(L"  选用显示适配器: %s（%u 个解码 profile）\n",
+                nameW, vd->GetVideoDecoderProfileCount());
+        chosen = adapter;
+        hr = S_OK;
+        break;
+    }
+
+    if (FAILED(hr) || !device) {
+        // 兜底：枚举失败时退回系统默认
+        Log("枚举适配器未成功，退回系统默认设备");
         hr = D3D11CreateDevice(nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr, flags,
-                               lv, ARRAYSIZE(lv), D3D11_SDK_VERSION,
+                               levels, ARRAYSIZE(levels), D3D11_SDK_VERSION,
                                &device, nullptr, &context);
     }
-    if (FAILED(hr)) { Log("D3D11CreateDevice 失败 %08X", hr); return false; }
+    if (FAILED(hr) || !device) { Log("D3D11CreateDevice 失败 %08X", hr); return false; }
 
     // 多线程保护：解码线程与呈现线程共享同一台设备
     ComPtr<ID3D11Multithread> mt;

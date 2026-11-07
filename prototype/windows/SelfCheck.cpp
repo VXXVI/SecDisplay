@@ -27,6 +27,8 @@
 #include <wrl/client.h>
 #include <cstdio>
 #include <vector>
+#include <string>
+#include <cwctype>
 
 #pragma comment(lib, "ws2_32.lib")
 #pragma comment(lib, "d3d11.lib")
@@ -92,7 +94,20 @@ static void CheckGPU() {
         if (desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE) { ad->Release(); ad = nullptr; continue; }
 
         wprintf(L"  显卡 %u: %s\n", i, desc.Description);
-        printf("         显存 %.1f GB，厂商 %04X\n", desc.DedicatedVideoMemory / 1073741824.0, desc.VendorId);
+        printf("         显存 %.1f GB，厂商 %04X", desc.DedicatedVideoMemory / 1073741824.0, desc.VendorId);
+
+        // 标出虚拟显示器适配器，这类通常不能做视频解码
+        {
+            std::wstring n(desc.Description);
+            for (auto& c : n) c = towlower(c);
+            bool virt = n.find(L"virtual") != std::wstring::npos
+                     || n.find(L"duet") != std::wstring::npos
+                     || n.find(L"gameviewer") != std::wstring::npos
+                     || n.find(L"parsec") != std::wstring::npos
+                     || n.find(L"sunlogin") != std::wstring::npos;
+            if (virt) printf("  [虚拟显示器适配器，通常无解码能力]");
+        }
+        printf("\n");
 
         D3D_FEATURE_LEVEL lv = D3D_FEATURE_LEVEL_11_0;
         ComPtr<ID3D11Device> dev;
