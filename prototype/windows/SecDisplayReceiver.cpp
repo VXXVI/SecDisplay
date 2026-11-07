@@ -358,12 +358,14 @@ bool Decoder::Init(Graphics* gfx, int width, int height) {
         // 表现为永远无输出、黑屏。
         attrs->SetUINT32(MF_TRANSFORM_ASYNC_UNLOCK, TRUE);
         attrs->SetUINT32(MF_LOW_LATENCY, TRUE);
-        attrs->SetUINT32(MF_SA_DISABLE_THINNING, TRUE);
+        // 注：原本这里想设 MF_SA_DISABLE_THINNING，但该属性在 Media Foundation
+        // 里并不存在（不在属性总表中），写进去也只是个与解码器无关的无效键。
+        // MF_LOW_LATENCY 已经能阻止硬件解码器做输出抽稀。
     }
 
     // 硬件解码：注入 D3D 管理器
     if (hardware && gfx_ && gfx_->deviceManager) {
-        hr = transform_->ProcessMessage(MFT_MESSAGE_SET_D3D11_MANAGER,
+        hr = transform_->ProcessMessage(MFT_MESSAGE_SET_D3D_MANAGER,
                                         (ULONG_PTR)gfx_->deviceManager.Get());
         if (FAILED(hr)) Log("设置 D3D11 管理器失败 %08X（将走系统内存路径）", hr);
     }
@@ -453,10 +455,10 @@ bool Decoder::DrainOutput(IMFSample** outSample) {
         if (!allocator_) {
             HRESULT ar = MFCreateVideoSampleAllocatorEx(IID_PPV_ARGS(&allocator_));
             if (FAILED(ar)) { Log("创建样本分配器失败 %08X", ar); return false; }
-            ComPtr<IMFAttributes> at;
-            allocator_->GetAttributes(&at);
-            at->SetUINT32(MF_SA_DISABLE_THINNING, TRUE);      // 预分配，避免每帧分配
-            at->SetUINT32(MF_SA_MINIMUM_OUTPUT_SAMPLE_COUNT, 4);
+            // 注：IMFVideoSampleAllocatorEx 没有 GetAttributes 方法（它只继承
+            // IMFVideoSampleAllocator，不含 IMFAttributes），所以无法在对象上设属性。
+            // 「预分配、避免每帧分配」由下面 InitializeSampleAllocatorEx 的
+            // cInitialSamples / cMaximumSamples 两个参数完成。
         }
         if (!allocatorReady_) {
             ComPtr<IMFMediaType> ot;

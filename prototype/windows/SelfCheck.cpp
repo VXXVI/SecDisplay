@@ -33,6 +33,7 @@
 #pragma comment(lib, "ws2_32.lib")
 #pragma comment(lib, "d3d11.lib")
 #pragma comment(lib, "dxgi.lib")
+#pragma comment(lib, "dxguid.lib")   // D3D11_DECODER_PROFILE_* 这些 GUID 实现在这里
 #pragma comment(lib, "mfplat.lib")
 #pragma comment(lib, "mfuuid.lib")
 #pragma comment(lib, "ole32.lib")
@@ -130,9 +131,10 @@ static void CheckGPU() {
             for (UINT k = 0; k < n; ++k) {
                 GUID g{};
                 if (SUCCEEDED(vd->GetVideoDecoderProfile(k, &g))) {
+                    // 注：D3D11_DECODER_PROFILE_H264_VLD_JPEG / _1080P 这两个名字
+                    // 在 Windows SDK 里并不存在，只有 NOFGT / FGT 是真实定义的 profile。
                     if (g == D3D11_DECODER_PROFILE_H264_VLD_NOFGT ||
-                        g == D3D11_DECODER_PROFILE_H264_VLD_JPEG ||
-                        g == D3D11_DECODER_PROFILE_H264_VLD_1080P) {
+                        g == D3D11_DECODER_PROFILE_H264_VLD_FGT) {
                         h264 = true;
                     }
                 }
