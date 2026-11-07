@@ -51,7 +51,7 @@ echo.
 set FAILED=0
 
 echo   [1/2] SelfCheck.exe
-cl /nologo /EHsc /std:c++17 /O2 SelfCheck.cpp /Fe:SelfCheck.exe
+cl /nologo /EHsc /std:c++17 /O2 /utf-8 SelfCheck.cpp /Fe:SelfCheck.exe
 if errorlevel 1 (
     echo       失败
     set FAILED=1
@@ -61,7 +61,7 @@ if errorlevel 1 (
 
 echo.
 echo   [2/2] SecDisplayReceiver.exe
-cl /nologo /EHsc /std:c++17 /O2 SecDisplayReceiver.cpp /Fe:SecDisplayReceiver.exe
+cl /nologo /EHsc /std:c++17 /O2 /utf-8 SecDisplayReceiver.cpp /Fe:SecDisplayReceiver.exe
 if errorlevel 1 (
     echo       失败
     set FAILED=1

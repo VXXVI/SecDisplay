@@ -86,11 +86,11 @@ if "!HAVE_CL!" NEQ "1" (
 )
 
 echo   正在编译 SelfCheck.cpp ...
-cl /nologo /EHsc /std:c++17 /O2 SelfCheck.cpp /Fe:SelfCheck.exe >nul 2>&1
+cl /nologo /EHsc /std:c++17 /O2 /utf-8 SelfCheck.cpp /Fe:SelfCheck.exe >nul 2>&1
 if errorlevel 1 (
     echo   [失败] 编译出错
     echo   去掉 /nologo 再跑一次能看到具体错误：
-    echo     cl /EHsc /std:c++17 /O2 SelfCheck.cpp
+    echo     cl /EHsc /std:c++17 /O2 /utf-8 SelfCheck.cpp
     goto :summary
 )
 echo   [OK] 编译成功
