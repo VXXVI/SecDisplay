@@ -108,12 +108,14 @@ static std::string ToUtf8(const wchar_t* w) {
     return out;
 }
 
-static uint64_t NowMicros() {
-    static LARGE_INTEGER freq = {};
-    if (freq.QuadPart == 0) QueryPerformanceFrequency(&freq);
-    LARGE_INTEGER c;
-    QueryPerformanceCounter(&c);
-    return (uint64_t)(c.QuadPart * 1000000ULL / freq.QuadPart);
+// Unix 纪元微秒的本地墙钟。FILETIME 是 1601-01-01 起的 100ns 单位，
+// 常量 116444736000000000 把它换算到 Unix 纪元。QPC 是开机以来的相对
+// 时间，不能与 Mac 端的 Unix 纪元时间戳相减。
+static int64_t UnixNowMicros() {
+    FILETIME ft;
+    GetSystemTimePreciseAsFileTime(&ft);
+    const int64_t t100ns = ((int64_t)ft.dwHighDateTime << 32) | (int64_t)ft.dwLowDateTime;
+    return (t100ns - 116444736000000000LL) / 10;
 }
 
 // ---------------------------------------------------------------------------
@@ -151,30 +153,31 @@ static bool RecvAll(SOCKET s, void* buf, int len) {
 //
 // 之前用首帧建立固定偏移，导致差值恒为负、被钳到 0，日志一直是 0.0 ms。
 
-static uint64_t g_winMinDeltaUs = 0;
-static uint64_t g_winStartUs = 0;
+static int64_t g_winMinDeltaUs = 0;
+static int64_t g_winStartUs = 0;
 
 static void ResetTimestampBase() {
     g_winMinDeltaUs = 0;
     g_winStartUs = 0;
 }
 
-/// 返回相对于窗口内最快帧的附加延迟（微秒）。时钟不可比时返回 -1。
+/// 返回相对于窗口内最快帧的附加延迟（微秒）。明显无效的时间戳返回 -1。
 static int64_t EstimateExtraDelayUs(uint64_t macMicros) {
-    // CFAbsoluteTime 纪元 = Unix 纪元 + 978307200 秒
-    const uint64_t macUnixUs = macMicros - 978307200ULL * 1000000ULL;
-    const uint64_t now = NowMicros();
-    if (now <= macUnixUs) return -1;             // 明显不合理，跳过
-    const uint64_t delta = now - macUnixUs;
+    // 只拦截明显无效的输入（早于 2001-01-01 的 Unix 纪元微秒），
+    // 避免无符号下溢。两端时钟未同步，delta 允许为负，靠窗口最小值归一。
+    if (macMicros < 978307200ULL * 1000000ULL) return -1;
+    const int64_t macUnixUs = (int64_t)(macMicros - 978307200ULL * 1000000ULL);
+    const int64_t now = UnixNowMicros();
+    const int64_t delta = now - macUnixUs;
 
-    const uint64_t WINDOW_US = 3'000'000ULL;     // 3 秒窗口
+    const int64_t WINDOW_US = 3'000'000;         // 3 秒窗口
     if (g_winStartUs == 0 || now - g_winStartUs > WINDOW_US) {
         g_winStartUs = now;
         g_winMinDeltaUs = delta;
     } else if (delta < g_winMinDeltaUs) {
         g_winMinDeltaUs = delta;
     }
-    if (delta >= g_winMinDeltaUs) return (int64_t)(delta - g_winMinDeltaUs);
+    if (delta >= g_winMinDeltaUs) return delta - g_winMinDeltaUs;
     return 0;
 }
 
