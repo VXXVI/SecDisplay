@@ -325,6 +325,11 @@ public:
     bool Decode(const uint8_t* avcc, size_t len, IMFSample** outSample);
     void Shutdown();
 
+    // 解码器实际给出的输出尺寸。硬解要求表面按编码尺寸对齐（1800 -> 1808），
+    // 所以它可能比请求的大，呈现端要按这个尺寸建输入视图再裁边。
+    int outWidth() const { return outWidth_ > 0 ? outWidth_ : width_; }
+    int outHeight() const { return outHeight_ > 0 ? outHeight_ : height_; }
+
 private:
     bool SetInputTypeFromParamSets(const std::vector<uint8_t>& sps,
                                    const std::vector<uint8_t>& pps);
@@ -341,6 +346,8 @@ private:
     int width_ = 0, height_ = 0;
     DWORD outId_ = 0;
     bool ready_ = false;
+    bool inputTypeSet_ = false;      // 输入类型没设就谈输出类型只会拿到 MF_E_TRANSFORM_TYPE_NOT_SET
+    int outWidth_ = 0, outHeight_ = 0;   // 解码器实际输出尺寸
     ComPtr<IMFVideoSampleAllocatorEx> allocator_;
     bool allocatorReady_ = false;
 };
@@ -474,11 +481,19 @@ bool Decoder::SetInputTypeFromParamSets(const std::vector<uint8_t>& sps,
         return false;
     }
     paramSets_ = seq;
+    inputTypeSet_ = true;
     Log("已注入 SPS(%zu) PPS(%zu)", sps.size(), pps.size());
     return true;
 }
 
 bool Decoder::SetOutputTypeD3D() {
+    // 输入类型还没设就调这里，解码器只会回 MF_E_TRANSFORM_TYPE_NOT_SET（C00D6D60）
+    if (!inputTypeSet_) {
+        static bool told = false;
+        if (!told) { told = true; Log("等 SPS/PPS 到了再协商输出类型"); }
+        return false;
+    }
+
     ComPtr<IMFMediaType> out;
     HRESULT hr = MFCreateMediaType(&out);
     if (FAILED(hr)) return false;
@@ -489,9 +504,47 @@ bool Decoder::SetOutputTypeD3D() {
 
     hr = transform_->SetOutputType(0, out.Get(), 0);
     if (FAILED(hr)) {
-        Log("SetOutputType(NV12) 失败 %08X", hr);
-        return false;
+        // 硬解要求输出表面按编码尺寸对齐：1800 不是 16 的倍数，实际得给 1808，
+        // 直接要 1800 会被判 MF_E_INVALIDMEDIATYPE（C00D36B4）。
+        // 与其猜尺寸，不如直接问解码器它接受哪些 NV12 类型。
+        Log("按 %dx%d 设输出类型失败 %08X，改向解码器查询可用类型", width_, height_, hr);
+        ComPtr<IMFMediaType> picked;
+        for (DWORD i = 0; i < 32; ++i) {
+            ComPtr<IMFMediaType> avail;
+            HRESULT ar = transform_->GetOutputAvailableType(0, i, &avail);
+            if (ar == MF_E_NO_MORE_TYPES) break;
+            if (FAILED(ar)) { Log("GetOutputAvailableType(%u) 失败 %08X", i, ar); break; }
+            GUID sub{};
+            avail->GetGUID(MF_MT_SUBTYPE, &sub);
+            UINT32 w = 0, h = 0;
+            MFGetAttributeSize(avail.Get(), MF_MT_FRAME_SIZE, &w, &h);
+            Log("  可用输出[%u] 子类型 %08X 尺寸 %ux%u", i, (unsigned)sub.Data1, w, h);
+            if (sub != MFVideoFormat_NV12) continue;
+            bool exact = (w == (UINT32)width_ && h == (UINT32)height_);
+            if (!picked || exact) picked = avail;
+            if (exact) break;
+        }
+        if (!picked) { Log("解码器没有可用的 NV12 输出类型"); return false; }
+        UINT32 w = 0, h = 0;
+        MFGetAttributeSize(picked.Get(), MF_MT_FRAME_SIZE, &w, &h);
+        hr = transform_->SetOutputType(0, picked.Get(), 0);
+        if (FAILED(hr)) { Log("按 %ux%u 设输出类型仍失败 %08X", w, h, hr); return false; }
+        if (w != (UINT32)width_ || h != (UINT32)height_) {
+            Log("解码器按 %ux%u 输出（比请求的 %dx%d 高），呈现时裁掉多余行",
+                w, h, width_, height_);
+        }
     }
+
+    // 记录实际输出尺寸，呈现端要按这个尺寸建输入视图
+    ComPtr<IMFMediaType> cur;
+    if (SUCCEEDED(transform_->GetOutputCurrentType(0, &cur)) && cur) {
+        UINT32 w = 0, h = 0;
+        if (SUCCEEDED(MFGetAttributeSize(cur.Get(), MF_MT_FRAME_SIZE, &w, &h))) {
+            outWidth_ = (int)w;
+            outHeight_ = (int)h;
+        }
+    }
+
     // 输出类型变了，样本分配器需要按新类型重建
     allocator_.Reset();
     allocatorReady_ = false;
@@ -664,14 +717,21 @@ public:
     void Shutdown();
     bool tearingSupported() const { return tearing_; }
 
+    // 解码器实际输出尺寸可能与显示尺寸不同（硬解按宏块对齐，1800 -> 1808）。
+    // 变了就重建视频处理器，并按显示尺寸裁边。
+    bool SetSourceSize(int w, int h);
+
 private:
+    bool CreateProcessor();
+
     Graphics* gfx_ = nullptr;
     ComPtr<IDXGISwapChain1> swap_;
     ComPtr<ID3D11VideoDevice> videoDevice_;
     ComPtr<ID3D11VideoContext> videoCtx_;
     ComPtr<ID3D11VideoProcessor> processor_;
     ComPtr<ID3D11VideoProcessorEnumerator> enum_;
-    int width_ = 0, height_ = 0;
+    int width_ = 0, height_ = 0;      // 显示尺寸（= 交换链尺寸）
+    int srcW_ = 0, srcH_ = 0;         // 解码器实际输出尺寸
     bool tearing_ = false;
 };
 
@@ -720,23 +780,48 @@ bool Presenter::Init(Graphics* gfx, HWND hwnd, int width, int height) {
     gfx->device.As(&videoDevice_);
     gfx->context.As(&videoCtx_);
 
+    srcW_ = width;
+    srcH_ = height;
+    if (!CreateProcessor()) return false;
+
+    Log("呈现器就绪");
+    return true;
+}
+
+bool Presenter::CreateProcessor() {
+    processor_.Reset();
+    enum_.Reset();
+
     D3D11_VIDEO_PROCESSOR_CONTENT_DESC cd{};
     cd.InputFrameFormat = D3D11_VIDEO_FRAME_FORMAT_PROGRESSIVE;
-    cd.InputWidth = width;
-    cd.InputHeight = height;
-    cd.OutputWidth = width;
-    cd.OutputHeight = height;
+    cd.InputWidth = srcW_;
+    cd.InputHeight = srcH_;
+    cd.OutputWidth = width_;
+    cd.OutputHeight = height_;
     cd.Usage = D3D11_VIDEO_USAGE_PLAYBACK_NORMAL;
 
-    hr = videoDevice_->CreateVideoProcessorEnumerator(&cd, &enum_);
-    if (FAILED(hr)) { Log("视频处理器枚举失败 %08X", hr); return false; }
+    HRESULT hr = videoDevice_->CreateVideoProcessorEnumerator(&cd, &enum_);
+    if (FAILED(hr)) { Log("视频处理器枚举失败（输入 %dx%d） %08X", srcW_, srcH_, hr); return false; }
     hr = videoDevice_->CreateVideoProcessor(enum_.Get(), 0, &processor_);
     if (FAILED(hr)) { Log("视频处理器创建失败 %08X", hr); return false; }
     videoCtx_->VideoProcessorSetStreamFrameFormat(processor_.Get(), 0,
                                                   D3D11_VIDEO_FRAME_FORMAT_PROGRESSIVE);
 
-    Log("呈现器就绪");
+    if (srcW_ != width_ || srcH_ != height_) {
+        // 硬解输出比显示区高（例如 1808 vs 1800），只取左上角可见部分，避免被纵向压缩
+        RECT src{ 0, 0, width_, height_ };
+        videoCtx_->VideoProcessorSetStreamSourceRect(processor_.Get(), 0, TRUE, &src);
+        Log("呈现器: 输入 %dx%d，只取 %dx%d", srcW_, srcH_, width_, height_);
+    }
     return true;
+}
+
+bool Presenter::SetSourceSize(int w, int h) {
+    if (w <= 0 || h <= 0) return false;
+    if (w == srcW_ && h == srcH_) return true;
+    srcW_ = w;
+    srcH_ = h;
+    return CreateProcessor();
 }
 
 void Presenter::PresentSample(IMFSample* sample) {
@@ -767,8 +852,8 @@ void Presenter::PresentSample(IMFSample* sample) {
         if (FAILED(buf.As(&twoD)) || FAILED(twoD->Lock2D(&scan0, &pitch))) return;
 
         D3D11_TEXTURE2D_DESC td{};
-        td.Width = width_;
-        td.Height = height_;
+        td.Width = srcW_;
+        td.Height = srcH_;
         td.MipLevels = 1;
         td.ArraySize = 1;
         td.Format = DXGI_FORMAT_NV12;
@@ -778,7 +863,7 @@ void Presenter::PresentSample(IMFSample* sample) {
         ComPtr<ID3D11Texture2D> tex;
         if (FAILED(gfx_->device->CreateTexture2D(&td, nullptr, &tex))) { twoD->Unlock2D(); return; }
 
-        D3D11_BOX box{ 0, 0, 0, (UINT)width_, (UINT)height_, 1 };
+        D3D11_BOX box{ 0, 0, 0, (UINT)srcW_, (UINT)srcH_, 1 };
         gfx_->context->UpdateSubresource(tex.Get(), 0, &box, scan0, (UINT)pitch, 0);
         twoD->Unlock2D();
         inputTex = tex;
@@ -972,8 +1057,11 @@ static void NetworkLoop(const RunConfig& cfg, Graphics* gfx, Presenter* presente
 
                 IMFSample* smp = nullptr;
                 if (decoder.Decode(packet.data() + HEADER_BYTES, len - HEADER_BYTES, &smp) && smp) {
-                    g_stats.decoded++;
-                    uint64_t localTs = ConvertMacTimestamp(ts);
+                g_stats.decoded++;
+                // 解码器实际输出可能比显示尺寸高（硬解按宏块对齐），
+                // 同步给呈现器，由它按显示尺寸裁边
+                presenter->SetSourceSize(decoder.outWidth(), decoder.outHeight());
+                uint64_t localTs = ConvertMacTimestamp(ts);
                     uint64_t now = NowMicros();
                     if (now > localTs) g_stats.lastLatencyUs = now - localTs;
                     presenter->PresentSample(smp);
@@ -1006,6 +1094,12 @@ static void NetworkLoop(const RunConfig& cfg, Graphics* gfx, Presenter* presente
                     uint8_t req = TYPE_KEYFRAME_REQUEST;
                     if (send(sock, (const char*)&req, 1, 0) == 1) {
                         Log("无新帧 %d 轮，重新请求关键帧（0x02）", stallRounds);
+                    }
+                    // 连续 5 轮（约 10 秒）没新帧：多半是 Mac 那边画面完全静止。
+                    // ScreenCaptureKit 是变化驱动的，静止就不出帧，请求关键帧也没用。
+                    if (stallRounds == 5) {
+                        Log("提示: 已 10 秒没有任何新帧。若 Mac 端画面静止，"
+                            "ScreenCaptureKit 不会出帧——移动窗口或鼠标即可恢复。");
                     }
                 } else {
                     stallRounds = 0;
