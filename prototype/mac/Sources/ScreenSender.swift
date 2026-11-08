@@ -227,6 +227,11 @@ final class Encoder {
         return true
     }
 
+    /// 自增帧序号，用作编码 PTS。
+    /// 采集帧和保活帧的时间基准不同，混用会让 PTS 非单调，编码器可能报错。
+    /// 真正的端到端时间戳走 captureTimeMicros，与 PTS 无关。
+    private var frameSeq: Int64 = 0
+
     func encode(_ pb: CVPixelBuffer, pts: CMTime, captureTimeMicros: UInt64) {
         guard let s = session else { return }
         // 时间戳随帧走：经 sourceFrameRefcon 传给输出回调，避免跨线程共享变量。
@@ -244,10 +249,13 @@ final class Encoder {
             ? ([kVTEncodeFrameOptionKey_ForceKeyFrame as String: true] as CFDictionary)
             : nil
 
+        frameSeq += 1
+        let monotonicPTS = CMTime(value: frameSeq, timescale: CMTimeScale(max(1, Int(60))))
+
         var flags: VTEncodeInfoFlags = []
         let status = VTCompressionSessionEncodeFrame(
-            s, imageBuffer: pb, presentationTimeStamp: pts,
-            duration: .invalid, frameProperties: props,
+            s, imageBuffer: pb, presentationTimeStamp: monotonicPTS,
+            duration: CMTime(value: 1, timescale: 60), frameProperties: props,
             sourceFrameRefcon: UnsafeMutableRawPointer(box), infoFlagsOut: &flags)
         if status != noErr { box.deallocate() }
     }
@@ -347,7 +355,35 @@ final class Capture: NSObject, SCStreamOutput, SCStreamDelegate {
     var lastFrameTime: CFAbsoluteTime = 0
     var idleFrames = 0
 
+    /// 最近一帧的像素缓冲。屏幕完全静止时 ScreenCaptureKit 可能长时间不回调，
+    /// 接收端就会断流黑屏。用它在静默期重发同一帧，保证码流不中断。
+    private var lastBuffer: CVPixelBuffer?
+    private var keepaliveTimer: Timer?
+    private let keepaliveInterval: TimeInterval = 1.0
+
     init(encoder: Encoder) { self.encoder = encoder }
+
+    /// 启动静默保活：超过 keepaliveInterval 没有新帧，就重编一次上一帧。
+    /// 内容相同，编码后是很小的 P 帧，带宽开销可忽略。
+    func startKeepalive() {
+        keepaliveTimer?.invalidate()
+        keepaliveTimer = Timer.scheduledTimer(withTimeInterval: 0.25, repeats: true) { [weak self] _ in
+            guard let self else { return }
+            let now = CFAbsoluteTimeGetCurrent()
+            guard now - self.lastFrameTime > self.keepaliveInterval else { return }
+            guard let pb = self.lastBuffer else { return }
+            self.idleFrames += 1
+            self.lastFrameTime = now
+            self.encoder.encode(pb,
+                                pts: CMTime(value: CMTimeValue(now * 1000), timescale: 1000),
+                                captureTimeMicros: UInt64(now * 1_000_000))
+        }
+    }
+
+    func stopKeepalive() {
+        keepaliveTimer?.invalidate()
+        keepaliveTimer = nil
+    }
 
     func start(displayID: CGDirectDisplayID, cfg: Config) async throws {
         let content = try await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: false)
@@ -371,7 +407,8 @@ final class Capture: NSObject, SCStreamOutput, SCStreamDelegate {
         try s.addStreamOutput(self, type: .screen, sampleHandlerQueue: DispatchQueue(label: "SecDisplay.capture"))
         try await s.startCapture()
         stream = s
-        Log.info("抓屏已启动 \(cfg.width)x\(cfg.height)@\(Int(cfg.refreshRate))")
+        startKeepalive()
+        Log.info("抓屏已启动 \(cfg.width)x\(cfg.height)@\(Int(cfg.refreshRate))，静默保活已开启")
     }
 
     func stream(_ stream: SCStream, didOutputSampleBuffer sb: CMSampleBuffer, of type: SCStreamOutputType) {
@@ -384,6 +421,7 @@ final class Capture: NSObject, SCStreamOutput, SCStreamDelegate {
 
         captured += 1
         lastFrameTime = CFAbsoluteTimeGetCurrent()
+        lastBuffer = pb
         let pts = CMSampleBufferGetPresentationTimeStamp(sb)
         let nowMicros = UInt64(CFAbsoluteTimeGetCurrent() * 1_000_000)
         encoder.encode(pb, pts: pts, captureTimeMicros: nowMicros)
@@ -398,6 +436,8 @@ final class Capture: NSObject, SCStreamOutput, SCStreamDelegate {
 
 final class Sender {
     private(set) var conn: NWConnection?
+    /// 连接代数，用于识别陈旧回调
+    private var connEpoch: Int = 0
     private let queue = DispatchQueue(label: "SecDisplay.net")
     private(set) var inFlight = 0
     private let maxInFlight = 2
@@ -426,23 +466,37 @@ final class Sender {
         listener.newConnectionHandler = { [weak self] c in
             guard let self else { return }
             Log.info("接收端已连接: \(String(describing: c.endpoint))")
-            self.conn?.cancel()
+
+            // 连接代数：只有"当前"连接的回调才能改动共享状态。
+            // 否则旧连接被 cancel 后异步回调 .cancelled，会把刚建立的新连接
+            // 误标成断开，表现为连上后一帧都发不出去。
+            self.connEpoch &+= 1
+            let epoch = self.connEpoch
+
+            let old = self.conn
             self.conn = c
             self.connected = true
-            c.stateUpdateHandler = { st in
-                if case .failed(let e) = st {
+            self.resetInFlight()          // 上一轮可能残留未完成的发送，必须清零
+            old?.cancel()
+
+            c.stateUpdateHandler = { [weak self] st in
+                guard let self, self.connEpoch == epoch else { return }   // 陈旧连接，忽略
+                switch st {
+                case .failed(let e):
                     Log.info("连接失败: \(e)")
                     self.connected = false
-                } else if case .cancelled = st {
+                case .cancelled:
                     self.connected = false
+                case .ready:
+                    Log.info("连接就绪")
+                default:
+                    break
                 }
             }
             c.start(queue: self.queue)
             // 新连接一上来就准备关键帧，不依赖对端是否及时发 0x02。
-            // 接收端也需要 SPS/PPS 才能建立解码格式，主动出一次能少一轮往返。
             self.onKeyframeRequest?()
-            // 收控制消息
-            self.receiveLoop()
+            self.receiveLoop(epoch: epoch)
         }
         listener.stateUpdateHandler = { st in
             if case .ready = st { Log.info("监听端口 \(port)，等待接收端连接") }
@@ -451,9 +505,10 @@ final class Sender {
         listener.start(queue: queue)
     }
 
-    private func receiveLoop() {
-        conn?.receive(minimumIncompleteLength: 1, maximumLength: 4096) { [weak self] data, _, done, err in
-            guard let self else { return }
+    private func receiveLoop(epoch: Int) {
+        guard connEpoch == epoch, let c = conn else { return }
+        c.receive(minimumIncompleteLength: 1, maximumLength: 4096) { [weak self] data, _, done, err in
+            guard let self, self.connEpoch == epoch else { return }
             if let data, !data.isEmpty {
                 for b in data {
                     if b == 0x02 {
@@ -464,7 +519,7 @@ final class Sender {
                 }
             }
             if done || err != nil { self.connected = false; return }
-            if self.connected { self.receiveLoop() }
+            self.receiveLoop(epoch: epoch)
         }
     }
 
@@ -472,6 +527,15 @@ final class Sender {
     var onKeyframeRequest: (() -> Void)?
 
     private let counterLock = NSLock()
+
+    /// 新连接建立时清零在途计数。
+    /// 旧连接被重置时，未完成的 send 完成回调可能不再触发，
+    /// inFlight 会永久停在 2，导致之后所有帧都被判为"拥塞"而丢弃。
+    func resetInFlight() {
+        counterLock.lock()
+        inFlight = 0
+        counterLock.unlock()
+    }
 
     func send(frame: Data, captureTimeMicros: UInt64) {
         guard connected, let c = conn else { return }
