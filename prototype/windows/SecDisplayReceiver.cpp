@@ -24,6 +24,7 @@
 
 #define WIN32_LEAN_AND_MEAN
 #define NOMINMAX
+#define _CRT_SECURE_NO_WARNINGS   // fopen/strncpy 等标准函数在 MSVC 下会被警告
 #include <windows.h>
 #include <winsock2.h>
 #include <ws2tcpip.h>
@@ -77,6 +78,7 @@ static Stats g_stats;
 // 复用预分配缓冲，避免每帧分配
 static char g_logBuf[1024];
 static std::mutex g_logLock;
+static FILE* g_logFile = nullptr;   // 可选：同时写日志文件，方便后台监控时 tail
 
 static void Log(const char* fmt, ...) {
     va_list ap;
@@ -89,6 +91,10 @@ static void Log(const char* fmt, ...) {
     g_logBuf[n] = '\n';
     fwrite(g_logBuf, 1, n + 1, stderr);
     fflush(stderr);
+    if (g_logFile) {
+        fwrite(g_logBuf, 1, n + 1, g_logFile);
+        fflush(g_logFile);          // 立即落盘，tail 时能实时看到
+    }
 }
 
 // 宽字符转 UTF-8。不要在同一输出流上混用 printf 和 wprintf，
@@ -138,19 +144,23 @@ static bool RecvAll(SOCKET s, void* buf, int len) {
 
 // Mac 端时间戳是 CFAbsoluteTime 纪元（2001-01-01）的微秒。
 // 只用于算相对延迟，这里换算成与本地 QPC 可比的相对时钟。
+static uint64_t g_tsOffsetUs = 0;
+static bool g_tsInit = false;
+
+/// 重连时复位，用新连接的第一帧重新校准时钟偏移
+static void ResetTimestampBase() {
+    g_tsInit = false;
+    g_tsOffsetUs = 0;
+}
+
 static uint64_t ConvertMacTimestamp(uint64_t macMicros) {
     // CFAbsoluteTime 纪元 = Unix 纪元 + 978307200 秒
-    static uint64_t offsetUs = 0;
-    static bool init = false;
-    if (!init) {
-        FILETIME ft;
-        GetSystemTimeAsFileTime(&ft);
-        uint64_t nowUnixUs = (((uint64_t)ft.dwHighDateTime << 32) | ft.dwLowDateTime) / 10ULL;
+    if (!g_tsInit) {
         // 用第一帧建立偏移：本地时刻 - 远端时刻
-        offsetUs = NowMicros() - (macMicros - 978307200ULL * 1000000ULL);
-        init = true;
+        g_tsOffsetUs = NowMicros() - (macMicros - 978307200ULL * 1000000ULL);
+        g_tsInit = true;
     }
-    return macMicros + offsetUs;
+    return macMicros + g_tsOffsetUs;
 }
 
 // ---------------------------------------------------------------------------
@@ -836,13 +846,215 @@ static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
 // 主流程
 // ---------------------------------------------------------------------------
 
-int main(int argc, char** argv) {
-    const char* host = argc > 1 ? argv[1] : "192.168.77.1";
-    int port = argc > 2 ? atoi(argv[2]) : 9922;
-    int width = argc > 3 ? atoi(argv[3]) : 2560;
-    int height = argc > 4 ? atoi(argv[4]) : 1600;
+// ---------------------------------------------------------------------------
+// 运行配置
+// ---------------------------------------------------------------------------
 
+struct RunConfig {
+    std::string host = "10.10.10.1";
+    int port = 9922;
+    int width = 2880;
+    int height = 1800;
+    bool fullscreen = true;   // 默认全屏铺满；--windowed 改成窗口
+    bool reconnect = true;    // 断线自动重连
+    std::string logFile;      // 非空则同时写日志文件
+};
+
+static std::atomic<bool> g_alive{ true };
+
+static void ParseArgs(int argc, char** argv, RunConfig& cfg) {
+    int positional = 0;
+    for (int i = 1; i < argc; ++i) {
+        std::string a = argv[i];
+        if (a == "--windowed" || a == "-w") {
+            cfg.fullscreen = false;
+        } else if (a == "--fullscreen" || a == "-f") {
+            cfg.fullscreen = true;
+        } else if (a == "--no-reconnect") {
+            cfg.reconnect = false;
+        } else if ((a == "--log" || a == "-l") && i + 1 < argc) {
+            cfg.logFile = argv[++i];
+        } else if (a.rfind("--", 0) == 0) {
+            // 未知选项，忽略
+        } else {
+            switch (positional++) {
+            case 0: cfg.host = a; break;
+            case 1: cfg.port = atoi(a.c_str()); break;
+            case 2: cfg.width = atoi(a.c_str()); break;
+            case 3: cfg.height = atoi(a.c_str()); break;
+            }
+        }
+    }
+    if (cfg.width <= 0) cfg.width = 2880;
+    if (cfg.height <= 0) cfg.height = 1800;
+    if (cfg.port <= 0 || cfg.port > 65535) cfg.port = 9922;
+}
+
+// ---------------------------------------------------------------------------
+// 网络主循环：连接 → 收流 → 断线重连
+//
+// 解码器每条连接重建一次：对端重启后参数集会变，沿用旧实例会解不出来。
+// ---------------------------------------------------------------------------
+
+static void NetworkLoop(const RunConfig& cfg, Graphics* gfx, Presenter* presenter) {
+    while (g_alive) {
+        SOCKET sock = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+        if (sock == INVALID_SOCKET) {
+            Log("socket 失败 %d，2 秒后重试", WSAGetLastError());
+            Sleep(2000);
+            continue;
+        }
+
+        int nodelay = 1;
+        setsockopt(sock, IPPROTO_TCP, TCP_NODELAY, (const char*)&nodelay, sizeof(nodelay));
+        int rcvbuf = 4 * 1024 * 1024;
+        setsockopt(sock, SOL_SOCKET, SO_RCVBUF, (const char*)&rcvbuf, sizeof(rcvbuf));
+
+        sockaddr_in addr{};
+        addr.sin_family = AF_INET;
+        addr.sin_port = htons((u_short)cfg.port);
+        inet_pton(AF_INET, cfg.host.c_str(), &addr.sin_addr);
+
+        Log("连接 %s:%d ...", cfg.host.c_str(), cfg.port);
+        if (connect(sock, (sockaddr*)&addr, sizeof(addr)) != 0) {
+            Log("连接失败 %d", WSAGetLastError());
+            closesocket(sock);
+            if (!cfg.reconnect) break;
+            Sleep(2000);
+            continue;
+        }
+        Log("已连接，目标 %dx%d", cfg.width, cfg.height);
+
+        // 复位统计，重连后从头计数
+        g_stats.packets = 0; g_stats.bytes = 0; g_stats.decoded = 0;
+        g_stats.presented = 0; g_stats.dropped = 0; g_stats.decodeFail = 0;
+        g_stats.lastLatencyUs = 0;
+        ResetTimestampBase();
+
+        // 立刻请求关键帧，否则解码器拿不到 SPS/PPS，黑屏
+        {
+            uint8_t req = TYPE_KEYFRAME_REQUEST;
+            if (send(sock, (const char*)&req, 1, 0) == 1) Log("已请求关键帧（0x02）");
+        }
+
+        Decoder decoder;
+        if (!decoder.Init(gfx, cfg.width, cfg.height)) {
+            Log("解码器初始化失败，断开重试");
+            closesocket(sock);
+            if (!cfg.reconnect) break;
+            Sleep(2000);
+            continue;
+        }
+
+        std::atomic<bool> connAlive{ true };
+        std::vector<uint8_t> packet;
+
+        // 收流线程
+        std::thread recv([&] {
+            while (g_alive && connAlive) {
+                uint32_t len = 0;
+                if (!RecvAll(sock, &len, 4)) break;
+                len = ntohl(len);
+                if (len < HEADER_BYTES || len > MAX_PACKET) {
+                    Log("包长度异常 %u，断开", len);
+                    break;
+                }
+                packet.resize(len);
+                if (!RecvAll(sock, packet.data(), (int)len)) break;
+
+                if (packet[0] != TYPE_VIDEO) continue;
+
+                uint64_t ts = 0;
+                for (int i = 0; i < 8; ++i) ts = (ts << 8) | packet[1 + i];
+
+                g_stats.packets++;
+                g_stats.bytes += len;
+
+                IMFSample* smp = nullptr;
+                if (decoder.Decode(packet.data() + HEADER_BYTES, len - HEADER_BYTES, &smp) && smp) {
+                    g_stats.decoded++;
+                    uint64_t localTs = ConvertMacTimestamp(ts);
+                    uint64_t now = NowMicros();
+                    if (now > localTs) g_stats.lastLatencyUs = now - localTs;
+                    presenter->PresentSample(smp);
+                    smp->Release();
+                }
+            }
+            connAlive = false;
+        });
+
+        // 监控线程：打印状态；长时间无新帧就补请求关键帧
+        std::thread watch([&] {
+            uint64_t lastBytes = 0, lastDecoded = 0;
+            int stallRounds = 0;
+            while (g_alive && connAlive) {
+                for (int i = 0; i < 20 && g_alive && connAlive; ++i) Sleep(100);
+                if (!g_alive || !connAlive) break;
+
+                uint64_t b = g_stats.bytes, d = g_stats.decoded;
+                double mbps = (b - lastBytes) * 8 / 2.0 / 1e6;
+                Log("包 %llu  解码 %llu(+%llu)  %.1f Mbps  延迟 %.1f ms  解码失败 %llu",
+                    (unsigned long long)g_stats.packets,
+                    (unsigned long long)d,
+                    (unsigned long long)(d - lastDecoded),
+                    mbps,
+                    g_stats.lastLatencyUs / 1000.0,
+                    (unsigned long long)g_stats.decodeFail);
+
+                if (d == lastDecoded) {
+                    ++stallRounds;
+                    uint8_t req = TYPE_KEYFRAME_REQUEST;
+                    if (send(sock, (const char*)&req, 1, 0) == 1) {
+                        Log("无新帧 %d 轮，重新请求关键帧（0x02）", stallRounds);
+                    }
+                } else {
+                    stallRounds = 0;
+                }
+                lastBytes = b;
+                lastDecoded = d;
+            }
+        });
+
+        recv.join();
+        connAlive = false;
+        watch.join();
+
+        decoder.Shutdown();
+        shutdown(sock, SD_BOTH);
+        closesocket(sock);
+
+        if (!g_alive) break;
+        Log("连接结束");
+        if (!cfg.reconnect) break;
+        Log("2 秒后重连");
+        Sleep(2000);
+    }
+    Log("网络循环退出");
+}
+
+// ---------------------------------------------------------------------------
+// 主流程
+// ---------------------------------------------------------------------------
+
+int main(int argc, char** argv) {
     setvbuf(stderr, nullptr, _IONBF, 0);
+
+    RunConfig cfg;
+    ParseArgs(argc, argv, cfg);
+
+    if (!cfg.logFile.empty()) {
+        // 追加模式，保留历史便于回看崩溃前的日志。
+        // 用标准 fopen 而不是 fopen_s：后者是 MSVC 扩展，MinGW 构建会不通过。
+        g_logFile = fopen(cfg.logFile.c_str(), "a");
+        if (!g_logFile) fprintf(stderr, "无法打开日志文件 %s\n", cfg.logFile.c_str());
+    }
+
+    Log("================ SecDisplay 接收端 ================");
+    Log("目标 %s:%d  分辨率 %dx%d  %s  重连 %s",
+        cfg.host.c_str(), cfg.port, cfg.width, cfg.height,
+        cfg.fullscreen ? "全屏" : "窗口",
+        cfg.reconnect ? "开" : "关");
+    if (!cfg.logFile.empty()) Log("日志文件: %s", cfg.logFile.c_str());
 
     HRESULT coInit = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
     if (FAILED(coInit) && coInit != RPC_E_CHANGED_MODE) {
@@ -855,7 +1067,7 @@ int main(int argc, char** argv) {
     }
 
     Graphics gfx;
-    if (!gfx.Init(width, height)) return 2;
+    if (!gfx.Init(cfg.width, cfg.height)) return 2;
 
     WNDCLASSA wc{};
     wc.lpfnWndProc = WndProc;
@@ -863,117 +1075,41 @@ int main(int argc, char** argv) {
     wc.lpszClassName = "SecDisplayReceiver";
     RegisterClassA(&wc);
 
-    HWND hwnd = CreateWindowExA(WS_EX_TOPMOST | WS_EX_TOOLWINDOW,
-                                "SecDisplayReceiver", "SecDisplay",
-                                WS_POPUP | WS_VISIBLE,
-                                0, 0,
-                                GetSystemMetrics(SM_CXSCREEN),
-                                GetSystemMetrics(SM_CYSCREEN),
-                                nullptr, nullptr, wc.hInstance, nullptr);
+    HWND hwnd = nullptr;
+    if (cfg.fullscreen) {
+        hwnd = CreateWindowExA(WS_EX_TOPMOST | WS_EX_TOOLWINDOW,
+                               "SecDisplayReceiver", "SecDisplay",
+                               WS_POPUP | WS_VISIBLE,
+                               0, 0,
+                               GetSystemMetrics(SM_CXSCREEN),
+                               GetSystemMetrics(SM_CYSCREEN),
+                               nullptr, nullptr, wc.hInstance, nullptr);
+    } else {
+        // 窗口模式：占屏幕中间一块，不置顶，方便远程调试时还能操作桌面
+        int sw = GetSystemMetrics(SM_CXSCREEN);
+        int sh = GetSystemMetrics(SM_CYSCREEN);
+        int ww = sw / 2;
+        int wh = (int)((double)ww * cfg.height / cfg.width);
+        if (wh > sh * 2 / 3) { wh = sh * 2 / 3; ww = (int)((double)wh * cfg.width / cfg.height); }
+        RECT rc{ 0, 0, ww, wh };
+        AdjustWindowRect(&rc, WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU, FALSE);
+        int winW = rc.right - rc.left;
+        int winH = rc.bottom - rc.top;
+        hwnd = CreateWindowExA(0, "SecDisplayReceiver", "SecDisplay - 按 Esc 退出",
+                               WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_VISIBLE,
+                               (sw - winW) / 2, (sh - winH) / 2,
+                               winW, winH,
+                               nullptr, nullptr, wc.hInstance, nullptr);
+    }
     if (!hwnd) { Log("窗口创建失败"); return 3; }
 
     Presenter presenter;
-    if (!presenter.Init(&gfx, hwnd, width, height)) return 4;
-
-    Decoder decoder;
-    if (!decoder.Init(&gfx, width, height)) return 5;
+    if (!presenter.Init(&gfx, hwnd, cfg.width, cfg.height)) return 4;
 
     WSADATA wsa;
-    if (WSAStartup(MAKEWORD(2, 2), &wsa) != 0) { Log("WSAStartup 失败"); return 6; }
+    if (WSAStartup(MAKEWORD(2, 2), &wsa) != 0) { Log("WSAStartup 失败"); return 5; }
 
-    SOCKET sock = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
-    if (sock == INVALID_SOCKET) { Log("socket 失败"); return 6; }
-
-    int nodelay = 1;
-    setsockopt(sock, IPPROTO_TCP, TCP_NODELAY, (const char*)&nodelay, sizeof(nodelay));
-    int rcvbuf = 4 * 1024 * 1024;
-    setsockopt(sock, SOL_SOCKET, SO_RCVBUF, (const char*)&rcvbuf, sizeof(rcvbuf));
-
-    sockaddr_in addr{};
-    addr.sin_family = AF_INET;
-    addr.sin_port = htons((u_short)port);
-    if (inet_pton(AF_INET, host, &addr.sin_addr) != 1) {
-        Log("IP 地址无效: %s", host);
-        return 6;
-    }
-
-    Log("连接 %s:%d ...", host, port);
-    if (connect(sock, (sockaddr*)&addr, sizeof(addr)) != 0) {
-        Log("连接失败 %d", WSAGetLastError());
-        return 7;
-    }
-    Log("已连接，目标 %dx%d", width, height);
-
-    // 连上就立刻请求一个关键帧：发送端收到 0x02 会把下一帧强行编成 IDR。
-    // 不请求的话，只能等编码器自然出关键帧，这段时间里解码器没有 SPS/PPS，黑屏。
-    {
-        uint8_t req = TYPE_KEYFRAME_REQUEST;
-        if (send(sock, (const char*)&req, 1, 0) == 1) Log("已请求关键帧（0x02）");
-    }
-
-    std::atomic<bool> running{ true };
-    std::vector<uint8_t> packet;
-
-    std::thread recvThread([&] {
-        while (running) {
-            uint32_t len = 0;
-            if (!RecvAll(sock, &len, 4)) break;
-            len = ntohl(len);
-            if (len < HEADER_BYTES || len > MAX_PACKET) {
-                Log("包长度异常 %u，断开", len);
-                break;
-            }
-
-            packet.resize(len);
-            if (!RecvAll(sock, packet.data(), (int)len)) break;
-
-            uint8_t type = packet[0];
-            if (type != TYPE_VIDEO) continue;   // 目前只收视频帧
-
-            uint64_t ts = 0;
-            for (int i = 0; i < 8; ++i) ts = (ts << 8) | packet[1 + i];
-
-            g_stats.packets++;
-            g_stats.bytes += len;
-
-            IMFSample* smp = nullptr;
-            if (decoder.Decode(packet.data() + HEADER_BYTES, len - HEADER_BYTES, &smp) && smp) {
-                g_stats.decoded++;
-                uint64_t localTs = ConvertMacTimestamp(ts);
-                uint64_t now = NowMicros();
-                if (now > localTs) g_stats.lastLatencyUs = now - localTs;
-                presenter.PresentSample(smp);
-                smp->Release();
-            }
-        }
-        running = false;
-    });
-
-    std::thread statThread([&] {
-        uint64_t lastBytes = 0, lastDecoded = 0;
-        while (running) {
-            for (int i = 0; i < 20 && running; ++i) Sleep(100);
-            if (!running) break;
-            uint64_t b = g_stats.bytes, d = g_stats.decoded;
-            double mbps = (b - lastBytes) * 8 / 2.0 / 1e6;
-            Log("包 %llu  解码 %llu(+%llu)  %.1f Mbps  延迟 %.1f ms  解码失败 %llu",
-                (unsigned long long)g_stats.packets,
-                (unsigned long long)d,
-                (unsigned long long)(d - lastDecoded),
-                mbps,
-                g_stats.lastLatencyUs / 1000.0,
-                (unsigned long long)g_stats.decodeFail);
-            // 2 秒内一帧都没解出来，说明断了或者中间丢了关键帧，重新要一次
-            if (d == lastDecoded) {
-                uint8_t req = TYPE_KEYFRAME_REQUEST;
-                if (send(sock, (const char*)&req, 1, 0) == 1) {
-                    Log("2 秒无新帧，重新请求关键帧（0x02）");
-                }
-            }
-            lastBytes = b;
-            lastDecoded = d;
-        }
-    });
+    std::thread net(NetworkLoop, cfg, &gfx, &presenter);
 
     MSG msg;
     while (GetMessage(&msg, nullptr, 0, 0)) {
@@ -981,17 +1117,15 @@ int main(int argc, char** argv) {
         DispatchMessage(&msg);
     }
 
-    running = false;
-    shutdown(sock, SD_BOTH);
-    if (recvThread.joinable()) recvThread.join();
-    if (statThread.joinable()) statThread.join();
+    g_alive = false;
+    if (net.joinable()) net.join();
 
-    closesocket(sock);
     WSACleanup();
-    decoder.Shutdown();
     presenter.Shutdown();
     gfx.Shutdown();
     MFShutdown();
     CoUninitialize();
+
+    if (g_logFile) { fclose(g_logFile); g_logFile = nullptr; }
     return 0;
 }

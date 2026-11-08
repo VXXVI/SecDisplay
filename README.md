@@ -55,6 +55,20 @@ swiftc -O Sources/RequestPermission.swift -o reqperm
 
 ### 2. Mac 端启动发送
 
+用后台脚本管理（推荐）：
+
+```bash
+cd prototype/mac
+./run.sh start      # 启动（自动编译）
+./run.sh status     # 看状态
+./run.sh log        # 实时看日志
+./run.sh stop       # 停止
+```
+
+日志写入 `prototype/mac/logs/`。
+
+也可以前台直接跑：
+
 ```bash
 cd prototype/mac
 swiftc -O Sources/ScreenSender.swift -o screensender

@@ -37,3 +37,7 @@ prototype/windows/SelfCheck.exe
 prototype/windows/SecDisplayReceiver.exe
 prototype/windows/*.obj
 prototype/windows/*.pdb
+
+# 运行日志
+prototype/mac/logs/
+prototype/windows/logs/
