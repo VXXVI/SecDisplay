@@ -143,24 +143,39 @@ static bool RecvAll(SOCKET s, void* buf, int len) {
 }
 
 // Mac 端时间戳是 CFAbsoluteTime 纪元（2001-01-01）的微秒。
-// 只用于算相对延迟，这里换算成与本地 QPC 可比的相对时钟。
-static uint64_t g_tsOffsetUs = 0;
-static bool g_tsInit = false;
+//
+// 两台机器的时钟没有同步，所以不能直接相减得到"端到端延迟"。
+// 能可靠测的是「排队延迟」：把 (本地接收时刻 - 远端发送时刻) 减去一个窗口内的
+// 最小值，得到的就是相对于最快那一帧多出来的等待时间。
+// 这个值恒 >= 0，且不随两端时钟漂移而失真（窗口每 3 秒重算一次）。
+//
+// 之前用首帧建立固定偏移，导致差值恒为负、被钳到 0，日志一直是 0.0 ms。
 
-/// 重连时复位，用新连接的第一帧重新校准时钟偏移
+static uint64_t g_winMinDeltaUs = 0;
+static uint64_t g_winStartUs = 0;
+
 static void ResetTimestampBase() {
-    g_tsInit = false;
-    g_tsOffsetUs = 0;
+    g_winMinDeltaUs = 0;
+    g_winStartUs = 0;
 }
 
-static uint64_t ConvertMacTimestamp(uint64_t macMicros) {
+/// 返回相对于窗口内最快帧的附加延迟（微秒）。时钟不可比时返回 -1。
+static int64_t EstimateExtraDelayUs(uint64_t macMicros) {
     // CFAbsoluteTime 纪元 = Unix 纪元 + 978307200 秒
-    if (!g_tsInit) {
-        // 用第一帧建立偏移：本地时刻 - 远端时刻
-        g_tsOffsetUs = NowMicros() - (macMicros - 978307200ULL * 1000000ULL);
-        g_tsInit = true;
+    const uint64_t macUnixUs = macMicros - 978307200ULL * 1000000ULL;
+    const uint64_t now = NowMicros();
+    if (now <= macUnixUs) return -1;             // 明显不合理，跳过
+    const uint64_t delta = now - macUnixUs;
+
+    const uint64_t WINDOW_US = 3'000'000ULL;     // 3 秒窗口
+    if (g_winStartUs == 0 || now - g_winStartUs > WINDOW_US) {
+        g_winStartUs = now;
+        g_winMinDeltaUs = delta;
+    } else if (delta < g_winMinDeltaUs) {
+        g_winMinDeltaUs = delta;
     }
-    return macMicros + g_tsOffsetUs;
+    if (delta >= g_winMinDeltaUs) return (int64_t)(delta - g_winMinDeltaUs);
+    return 0;
 }
 
 // ---------------------------------------------------------------------------
@@ -1061,9 +1076,8 @@ static void NetworkLoop(const RunConfig& cfg, Graphics* gfx, Presenter* presente
                 // 解码器实际输出可能比显示尺寸高（硬解按宏块对齐），
                 // 同步给呈现器，由它按显示尺寸裁边
                 presenter->SetSourceSize(decoder.outWidth(), decoder.outHeight());
-                uint64_t localTs = ConvertMacTimestamp(ts);
-                    uint64_t now = NowMicros();
-                    if (now > localTs) g_stats.lastLatencyUs = now - localTs;
+                int64_t extra = EstimateExtraDelayUs(ts);
+                    if (extra >= 0) g_stats.lastLatencyUs = (uint64_t)extra;
                     presenter->PresentSample(smp);
                     smp->Release();
                 }
@@ -1081,7 +1095,7 @@ static void NetworkLoop(const RunConfig& cfg, Graphics* gfx, Presenter* presente
 
                 uint64_t b = g_stats.bytes, d = g_stats.decoded;
                 double mbps = (b - lastBytes) * 8 / 2.0 / 1e6;
-                Log("包 %llu  解码 %llu(+%llu)  %.1f Mbps  延迟 %.1f ms  解码失败 %llu",
+                Log("包 %llu  解码 %llu(+%llu)  %.1f Mbps  附加延迟 %.1f ms  解码失败 %llu",
                     (unsigned long long)g_stats.packets,
                     (unsigned long long)d,
                     (unsigned long long)(d - lastDecoded),
