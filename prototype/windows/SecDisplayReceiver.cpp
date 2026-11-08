@@ -904,6 +904,13 @@ int main(int argc, char** argv) {
     }
     Log("已连接，目标 %dx%d", width, height);
 
+    // 连上就立刻请求一个关键帧：发送端收到 0x02 会把下一帧强行编成 IDR。
+    // 不请求的话，只能等编码器自然出关键帧，这段时间里解码器没有 SPS/PPS，黑屏。
+    {
+        uint8_t req = TYPE_KEYFRAME_REQUEST;
+        if (send(sock, (const char*)&req, 1, 0) == 1) Log("已请求关键帧（0x02）");
+    }
+
     std::atomic<bool> running{ true };
     std::vector<uint8_t> packet;
 
@@ -956,6 +963,13 @@ int main(int argc, char** argv) {
                 mbps,
                 g_stats.lastLatencyUs / 1000.0,
                 (unsigned long long)g_stats.decodeFail);
+            // 2 秒内一帧都没解出来，说明断了或者中间丢了关键帧，重新要一次
+            if (d == lastDecoded) {
+                uint8_t req = TYPE_KEYFRAME_REQUEST;
+                if (send(sock, (const char*)&req, 1, 0) == 1) {
+                    Log("2 秒无新帧，重新请求关键帧（0x02）");
+                }
+            }
             lastBytes = b;
             lastDecoded = d;
         }

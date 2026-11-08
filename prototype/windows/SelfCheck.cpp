@@ -195,27 +195,65 @@ static void CheckMF() {
 
     MFT_REGISTER_TYPE_INFO in{ MFMediaType_Video, MFVideoFormat_H264 };
 
-    // 硬件解码器
+    // 枚举全部 H.264 解码器候选。
+    // 注意：不能只用 MFT_ENUM_FLAG_HARDWARE——微软自带的 MSH264DecoderMFT 注册成
+    // 同步 MFT，会被这个标志过滤掉，于是误报「没有硬件解码器」。
     IMFActivate** acts = nullptr;
     UINT32 cnt = 0;
     HRESULT hr = MFTEnumEx(MFT_CATEGORY_VIDEO_DECODER,
+                           MFT_ENUM_FLAG_SYNCMFT | MFT_ENUM_FLAG_ASYNCMFT |
                            MFT_ENUM_FLAG_HARDWARE | MFT_ENUM_FLAG_SORTANDFILTER,
                            &in, nullptr, &acts, &cnt);
-    if (SUCCEEDED(hr) && cnt > 0) {
-        OK("找到 %u 个硬件 H.264 解码器", cnt);
-        for (UINT32 i = 0; i < cnt && i < 3; ++i) {
+    if (FAILED(hr) || cnt == 0) {
+        hr = MFTEnumEx(MFT_CATEGORY_VIDEO_DECODER, MFT_ENUM_FLAG_ALL,
+                       &in, nullptr, &acts, &cnt);
+    }
+    if (FAILED(hr) || cnt == 0) { FAIL("MFTEnumEx 失败 %08X", hr); return; }
+
+    // 判据是「谁真的接受 D3D 管理器」，而不是看 MF_SA_D3D_AWARE 声明——
+    // MSH264DecoderMFT 标称不 aware，实际接受之后内部走 DXVA。
+    ComPtr<ID3D11Device> dev;
+    ComPtr<ID3D11DeviceContext> ctx;
+    ComPtr<IMFDXGIDeviceManager> mgr;
+    bool d3dReady = false;
+    UINT resetToken = 0;
+    {
+        D3D_FEATURE_LEVEL lv{};
+        UINT flags = D3D11_CREATE_DEVICE_BGRA_SUPPORT | D3D11_CREATE_DEVICE_VIDEO_SUPPORT;
+        if (SUCCEEDED(D3D11CreateDevice(nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr, flags,
+                                        nullptr, 0, D3D11_SDK_VERSION, &dev, &lv, &ctx)) &&
+            SUCCEEDED(MFCreateDXGIDeviceManager(&resetToken, &mgr)) &&
+            SUCCEEDED(mgr->ResetDevice(dev.Get(), resetToken))) {
+            d3dReady = true;
+        }
+    }
+
+    UINT32 hwCount = 0;
+    for (UINT32 i = 0; i < cnt; ++i) {
+        ComPtr<IMFTransform> t;
+        bool accepted = false;
+        if (SUCCEEDED(acts[i]->ActivateObject(IID_PPV_ARGS(&t))) && t && d3dReady) {
+            accepted = SUCCEEDED(t->ProcessMessage(MFT_MESSAGE_SET_D3D_MANAGER,
+                                                   (ULONG_PTR)mgr.Get()));
+        }
+        if (accepted) ++hwCount;
+        if (i < 4) {
             LPWSTR name = nullptr;
             UINT32 len = 0;
             if (SUCCEEDED(acts[i]->GetAllocatedString(MFT_FRIENDLY_NAME_Attribute, &name, &len))) {
-                printf("         %s\n", ToUtf8(name).c_str());
+                printf("         [%u] %s%s\n", i, ToUtf8(name).c_str(),
+                       accepted ? "   -> 接受 D3D（走 DXVA）" : "");
                 CoTaskMemFree(name);
             }
-            acts[i]->Release();
         }
-    } else {
-        FAIL("没有硬件 H.264 解码器");
+        acts[i]->Release();
     }
-    if (acts) CoTaskMemFree(acts);
+    CoTaskMemFree(acts);
+    acts = nullptr;
+
+    if (!d3dReady) FAIL("无法创建临时 D3D11 设备，跳过硬解判定");
+    else if (hwCount > 0) OK("找到 %u 个可走 DXVA 的 H.264 解码器", hwCount);
+    else FAIL("没有可走 DXVA 的 H.264 解码器，只能软件解码");
 
     // 软件解码器
     acts = nullptr; cnt = 0;
