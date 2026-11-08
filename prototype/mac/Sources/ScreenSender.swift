@@ -353,25 +353,63 @@ final class Encoder {
 
 final class Capture: NSObject, SCStreamOutput, SCStreamDelegate {
     let encoder: Encoder
+    private let cfg: Config
+    /// 虚拟屏 id 可能变化（重建虚拟屏后），每次重建流都重新问一次
+    private let displayIDProvider: () -> CGDirectDisplayID
+
     var stream: SCStream?
     var captured = 0
     var lastFrameTime: CFAbsoluteTime = 0
     var idleFrames = 0
 
-    init(encoder: Encoder) { self.encoder = encoder }
+    // --- 自愈 ---
+    private let ctl = DispatchQueue(label: "SecDisplay.capture.ctl")
+    private var watchdog: DispatchSourceTimer?
+    private var lastSeenCount = 0
+    /// 任何类型的回调都计数，用来区分「流死了」和「画面静止」
+    private var progressCount = 0
+    private var idleFrameCount = 0
+    private var lastProgressAt = CFAbsoluteTimeGetCurrent()
+    private var needsRestart = false
+    private var restarting = false
+    private var restartCount = 0
+    /// 超过这个秒数没有新帧就认为流死了
+    private let stallTimeout: CFAbsoluteTime = 10.0   // 只作兜底，主要靠 didStopWithError
 
-    func start(displayID: CGDirectDisplayID, cfg: Config) async throws {
+    init(encoder: Encoder, cfg: Config, displayID: @escaping () -> CGDirectDisplayID) {
+        self.encoder = encoder
+        self.cfg = cfg
+        self.displayIDProvider = displayID
+        super.init()
+    }
+
+    /// 首次启动：失败会抛出，由调用方提示权限问题
+    func start() async throws {
+        try await buildStream()
+        startWatchdog()
+    }
+
+    private func buildStream() async throws {
+        let wantID = displayIDProvider()
         let content = try await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: false)
-        guard let target = content.displays.first(where: { $0.displayID == displayID }) else {
-            throw NSError(domain: "Capture", code: 1,
-                          userInfo: [NSLocalizedDescriptionKey: "找不到虚拟屏 \(displayID)"])
+
+        // 优先按 id 找；找不到就按名字找（虚拟屏重建后 id 会变）
+        var target = content.displays.first(where: { $0.displayID == wantID })
+        if target == nil {
+            target = content.displays.first(where: { $0.displayID != CGMainDisplayID() && $0.width == cfg.width })
         }
-        let filter = SCContentFilter(display: target, excludingWindows: [])
+        guard let display = target else {
+            throw NSError(domain: "Capture", code: 1, userInfo: [
+                NSLocalizedDescriptionKey: "找不到虚拟屏（期望 id=\(wantID)，可用 \(content.displays.map { $0.displayID })）"
+            ])
+        }
+
+        let filter = SCContentFilter(display: display, excludingWindows: [])
         let c = SCStreamConfiguration()
         c.width = cfg.width
         c.height = cfg.height
         c.minimumFrameInterval = CMTime(value: 1, timescale: CMTimeScale(cfg.refreshRate))
-        c.queueDepth = 3          // 队列浅，满了丢旧帧
+        c.queueDepth = 3
         c.pixelFormat = kCVPixelFormatType_32BGRA
         c.showsCursor = true
         c.scalesToFit = false
@@ -381,8 +419,68 @@ final class Capture: NSObject, SCStreamOutput, SCStreamDelegate {
         let s = SCStream(filter: filter, configuration: c, delegate: self)
         try s.addStreamOutput(self, type: .screen, sampleHandlerQueue: DispatchQueue(label: "SecDisplay.capture"))
         try await s.startCapture()
+
         stream = s
-        Log.info("抓屏已启动 \(cfg.width)x\(cfg.height)@\(Int(cfg.refreshRate))")
+        lastProgressAt = CFAbsoluteTimeGetCurrent()
+        lastSeenCount = progressCount
+        Log.info("抓屏已启动 displayID=\(display.displayID) \(cfg.width)x\(cfg.height)@\(Int(cfg.refreshRate))")
+    }
+
+    // MARK: 看门狗
+
+    private func startWatchdog() {
+        watchdog?.cancel()
+        let t = DispatchSource.makeTimerSource(queue: ctl)
+        t.schedule(deadline: .now() + 1.0, repeating: 1.0)
+        t.setEventHandler { [weak self] in self?.tick() }
+        t.resume()
+        watchdog = t
+    }
+
+    private func tick() {
+        if restarting { return }
+        let now = CFAbsoluteTimeGetCurrent()
+        if progressCount != lastSeenCount {
+            lastSeenCount = progressCount
+            lastProgressAt = now
+        }
+        let stalled = now - lastProgressAt > stallTimeout
+        guard needsRestart || stalled else { return }
+        if needsRestart {
+            Log.info("抓屏流已停止，准备重建")
+        } else {
+            Log.info("抓屏 \(Int(stallTimeout)) 秒无新帧，准备重建流")
+        }
+        needsRestart = false
+        restartStream()
+    }
+
+    /// 重建采集流。停旧的、重新取显示器、重新建流。
+    func restartStream() {
+        ctl.async { [weak self] in
+            guard let self, !self.restarting else { return }
+            self.restarting = true
+            self.restartCount += 1
+            let n = self.restartCount
+
+            let old = self.stream
+            self.stream = nil
+            Task {
+                if let old { try? await old.stopCapture() }
+                // 给系统一点时间释放对旧流的引用
+                try? await Task.sleep(nanoseconds: 300_000_000)
+                do {
+                    try await self.buildStream()
+                    Log.info("抓屏流重建成功（第 \(n) 次）")
+                } catch {
+                    Log.info("抓屏流重建失败（第 \(n) 次）: \(error)")
+                    // 下次 tick 会再试
+                    self.lastProgressAt = CFAbsoluteTimeGetCurrent()
+                    self.needsRestart = true
+                }
+                self.restarting = false
+            }
+        }
     }
 
     func stream(_ stream: SCStream, didOutputSampleBuffer sb: CMSampleBuffer, of type: SCStreamOutputType) {
@@ -390,8 +488,21 @@ final class Capture: NSObject, SCStreamOutput, SCStreamDelegate {
         guard let arr = CMSampleBufferGetSampleAttachmentsArray(sb, createIfNecessary: false) as? [[SCStreamFrameInfo: Any]],
               let info = arr.first,
               let rawStatus = info[.status] as? Int,
-              SCFrameStatus(rawValue: rawStatus) == .complete,
-              let pb = CMSampleBufferGetImageBuffer(sb) else { return }
+              let status = SCFrameStatus(rawValue: rawStatus) else { return }
+
+        // 任何回调都说明流还活着，包括画面没变化时的 idle 帧。
+        // 只把 complete 帧送去编码，避免重复编码同一画面。
+        progressCount += 1
+
+        if status == .stopped {
+            Log.info("SCK 报告流已停止，触发重建")
+            needsRestart = true
+            return
+        }
+        guard status == .complete, let pb = CMSampleBufferGetImageBuffer(sb) else {
+            idleFrameCount += 1
+            return
+        }
 
         captured += 1
         lastFrameTime = CFAbsoluteTimeGetCurrent()
@@ -402,6 +513,8 @@ final class Capture: NSObject, SCStreamOutput, SCStreamDelegate {
 
     func stream(_ stream: SCStream, didStopWithError error: Error) {
         Log.info("抓屏停止: \(error)")
+        // ScreenCaptureKit 不会自己恢复，交给看门狗重建
+        ctl.async { [weak self] in self?.needsRestart = true }
     }
 }
 
@@ -629,10 +742,11 @@ do {
 sender.onKeyframeRequest = { encoder.requestKeyframe() }
 sender.listen(port: cfg.port)
 
-let cap = Capture(encoder: encoder)
+// 传入 id 获取闭包：虚拟屏重建后 id 会变，采集侧每次重建流都重新问
+let cap = Capture(encoder: encoder, cfg: cfg, displayID: { vd.displayID })
 Task {
     do {
-        try await cap.start(displayID: vd.displayID, cfg: cfg)
+        try await cap.start()
     } catch {
         Log.info("抓屏失败: \(error)")
         Log.info("需要屏幕录制权限：系统设置 → 隐私与安全性 → 屏幕录制")
