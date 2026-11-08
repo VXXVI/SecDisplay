@@ -41,7 +41,21 @@ struct Config {
     var height = 1800
     var logicalWidth = 1440
     var logicalHeight = 900
-    var refreshRate = 90.0     // 这块屏是 90Hz
+    var refreshRate = 90.0     // 虚拟屏刷新率
+
+    /// 采集帧率上限。
+    ///
+    /// 关键参数：VideoToolbox 的 H.264 硬编在 2880x1800 上大约只能稳定 46fps。
+    /// 采集喂得更快，帧就堆在编码器内部，延迟从 25ms 一路涨到 90ms，
+    /// 表现为「越用越卡」。压到 45fps 以下后延迟稳定在 25ms 左右。
+    ///
+    /// 实测（2880x1800，M1 Pro）：
+    ///   采集 60Hz → 55fps, 中位 67ms
+    ///   采集 50Hz → 46fps, 中位 28ms
+    ///   采集 45Hz → 43fps, 中位 26ms   ← 默认
+    ///   采集 40Hz → 39fps, 中位 27ms
+    ///   采集 30Hz → 29fps, 中位 24ms
+    var captureHz = 45.0
     // 2.2K 桌面文字需要足够码率才清晰。千兆网给到 120 仍有余量。
     var bitrateMbps = 180      // 2880x1800 码率要比 2.2K 更高
     var port: UInt16 = 9922
@@ -190,7 +204,10 @@ final class Encoder {
             kVTVideoEncoderSpecification_EnableLowLatencyRateControl as String: true
         ]
         let attrs: [String: Any] = [
-            kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32BGRA,
+            // 用原生 YUV 而不是 BGRA：SCK 直接给 YUV，编码器也直接吃 YUV，
+            // 省掉两次全画面色彩转换。2880x1800 下 BGRA 每帧 20MB，
+            // YUV420 只有 7.8MB，内存带宽少 60%。
+            kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange,
             kCVPixelBufferWidthKey as String: width,
             kCVPixelBufferHeightKey as String: height,
             kCVPixelBufferIOSurfacePropertiesKey as String: [:],
@@ -219,14 +236,35 @@ final class Encoder {
         guard st == noErr, let s = session else {
             Log.info("编码器创建失败 \(st)"); return false
         }
+        let env = ProcessInfo.processInfo.environment
+        let variant = env["SECDISPLAY_ENC"] ?? "A"
+
         VTSessionSetProperty(s, key: kVTCompressionPropertyKey_RealTime, value: kCFBooleanTrue)
-        VTSessionSetProperty(s, key: kVTCompressionPropertyKey_AllowFrameReordering, value: kCFBooleanFalse)
         VTSessionSetProperty(s, key: kVTCompressionPropertyKey_ProfileLevel, value: kVTProfileLevel_H264_High_AutoLevel)
-        VTSessionSetProperty(s, key: kVTCompressionPropertyKey_AverageBitRate, value: bitrate as CFNumber)
-        VTSessionSetProperty(s, key: kVTCompressionPropertyKey_MaxKeyFrameInterval, value: 600 as CFNumber)
         VTSessionSetProperty(s, key: kVTCompressionPropertyKey_ExpectedFrameRate, value: 60 as CFNumber)
-        VTSessionSetProperty(s, key: kVTCompressionPropertyKey_MaxFrameDelayCount, value: 1 as CFNumber)
+        VTSessionSetProperty(s, key: kVTCompressionPropertyKey_MaxKeyFrameInterval, value: 600 as CFNumber)
+
+        switch variant {
+        case "B":
+            // 不设码率与帧延迟，交给低延迟 rate control
+            break
+        case "C":
+            VTSessionSetProperty(s, key: kVTCompressionPropertyKey_MaxFrameDelayCount, value: 0 as CFNumber)
+        case "D":
+            // 用 DataRateLimits 代替 AverageBitRate
+            let limits: [NSNumber] = [NSNumber(value: bitrate / 8), NSNumber(value: 1.0)]
+            VTSessionSetProperty(s, key: kVTCompressionPropertyKey_DataRateLimits, value: limits as CFArray)
+        case "E":
+            VTSessionSetProperty(s, key: kVTCompressionPropertyKey_AllowFrameReordering, value: kCFBooleanFalse)
+            VTSessionSetProperty(s, key: kVTCompressionPropertyKey_PrioritizeEncodingSpeedOverQuality, value: kCFBooleanTrue)
+        default:  // A：原样
+            VTSessionSetProperty(s, key: kVTCompressionPropertyKey_AllowFrameReordering, value: kCFBooleanFalse)
+            VTSessionSetProperty(s, key: kVTCompressionPropertyKey_AverageBitRate, value: bitrate as CFNumber)
+            VTSessionSetProperty(s, key: kVTCompressionPropertyKey_MaxFrameDelayCount, value: 1 as CFNumber)
+        }
+
         VTCompressionSessionPrepareToEncodeFrames(s)
+        Log.info("编码参数方案 \(variant)")
         return true
     }
 
@@ -307,6 +345,11 @@ final class Encoder {
         if let s = session { VTCompressionSessionCompleteFrames(s, untilPresentationTimeStamp: .invalid) }
     }
 
+    /// 编码管线延迟统计：从采集时间戳到编码输出回调
+    var encLatSum: Double = 0
+    var encLatMax: Double = 0
+    var encLatCount = 0
+
     private func emit(_ sample: CMSampleBuffer, refcon: UnsafeMutableRawPointer?) {
         // 取出并释放时间戳 box
         var captureTime: UInt64 = 0
@@ -359,6 +402,15 @@ final class Encoder {
         // 编码器输出的视频数据本身就是 AVCC，原样追加
         out.append(Data(bytes: ptr, count: length))
 
+        if captureTime > 0 {
+            let latMs = (CFAbsoluteTimeGetCurrent() - Double(captureTime) / 1_000_000) * 1000
+            if latMs >= 0 && latMs < 5000 {
+                encLatSum += latMs
+                encLatCount += 1
+                if latMs > encLatMax { encLatMax = latMs }
+            }
+        }
+
         if isKey { keyframeCount += 1 }
         encoded += 1
         bytes += out.count
@@ -386,7 +438,7 @@ final class Capture: NSObject, SCStreamOutput, SCStreamDelegate {
     private var lastSeenCount = 0
     /// 任何类型的回调都计数，用来区分「流死了」和「画面静止」
     private var progressCount = 0
-    private var idleFrameCount = 0
+    private(set) var idleFrameCount = 0
     private var lastProgressAt = CFAbsoluteTimeGetCurrent()
     private var needsRestart = false
     private var restarting = false
@@ -426,9 +478,15 @@ final class Capture: NSObject, SCStreamOutput, SCStreamDelegate {
         let c = SCStreamConfiguration()
         c.width = cfg.width
         c.height = cfg.height
-        c.minimumFrameInterval = CMTime(value: 1, timescale: CMTimeScale(cfg.refreshRate))
-        c.queueDepth = 3
-        c.pixelFormat = kCVPixelFormatType_32BGRA
+        // 采集帧率。编码器在 2880x1800 上大约只能稳定 45fps，
+        // 采集喂得更快只会在 VideoToolbox 内部堆积，延迟从 40ms 涨到 90ms。
+        // 用 SECDISPLAY_HZ 可以试不同档位。
+        let capHz = Double(ProcessInfo.processInfo.environment["SECDISPLAY_HZ"] ?? "") ?? cfg.captureHz
+        c.minimumFrameInterval = CMTime(value: 1, timescale: CMTimeScale(capHz))
+        // 队列深度直接决定 SCK 内部的缓冲帧数，也就直接决定延迟。
+        // 3 帧在 60fps 下约 50ms；越深越不容易丢帧，但延迟越高。
+        c.queueDepth = Int(ProcessInfo.processInfo.environment["SECDISPLAY_QD"] ?? "") ?? 3
+        c.pixelFormat = kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange
         c.showsCursor = true
         c.scalesToFit = false
         c.capturesAudio = false
@@ -441,7 +499,7 @@ final class Capture: NSObject, SCStreamOutput, SCStreamDelegate {
         stream = s
         lastProgressAt = CFAbsoluteTimeGetCurrent()
         lastSeenCount = progressCount
-        Log.info("抓屏已启动 displayID=\(display.displayID) \(cfg.width)x\(cfg.height)@\(Int(cfg.refreshRate))")
+        Log.info("抓屏已启动 displayID=\(display.displayID) \(cfg.width)x\(cfg.height)，采集上限 \(Int(capHz))fps")
     }
 
     // MARK: 看门狗
@@ -827,9 +885,12 @@ let rateCtl = RateController(encoder: encoder, targetMbps: cfg.bitrateMbps)
 Timer.scheduledTimer(withTimeInterval: 2.0, repeats: true) { _ in
     let mbps = Double(sender.sentBytes) * 8 / 2.0 / 1_000_000
     rateCtl.tick(dropped: sender.dropped)
-    Log.info(String(format: "采集 %d  编码 %d  关键帧 %d  发送 %d  丢弃 %d  %.1f Mbps  目标 %d  在途 %d",
-                    cap.captured, encoder.encoded, encoder.keyframeCount, sender.sent,
-                    sender.dropped, mbps, encoder.currentMbps, sender.inFlight))
+    let encAvg = encoder.encLatCount > 0 ? encoder.encLatSum / Double(encoder.encLatCount) : 0
+    Log.info(String(format: "采集 %d  空闲 %d  编码 %d  关键帧 %d  发送 %d  丢弃 %d  %.1f Mbps  目标 %d  在途 %d  编码延迟 %.1f/%.1f ms",
+                    cap.captured, cap.idleFrameCount, encoder.encoded, encoder.keyframeCount,
+                    sender.sent, sender.dropped, mbps, encoder.currentMbps, sender.inFlight,
+                    encAvg, encoder.encLatMax))
+    encoder.encLatSum = 0; encoder.encLatCount = 0; encoder.encLatMax = 0
     sender.sentBytes = 0
     sender.sent = 0
 }
