@@ -171,6 +171,8 @@ static void SendInputPacket(float vx, float vy, uint8_t buttons, int16_t wheel) 
     send(s, (const char*)pkt, 12, 0);
 }
 
+static HWND g_hwnd = nullptr;   // 主窗口句柄，ClientToVideo 与全屏切换共用
+
 /// 窗口客户区坐标 → 视频像素坐标（0..videoW, 0..videoH）
 static bool ClientToVideo(int cx, int cy, float* vx, float* vy) {
     if (!g_hwnd) return false;
@@ -826,6 +828,9 @@ private:
     ComPtr<ID3D11VideoProcessorEnumerator> enum_;
     int width_ = 0, height_ = 0;      // 显示尺寸（= 交换链尺寸）
     int srcW_ = 0, srcH_ = 0;         // 解码器实际输出尺寸
+    // 视频处理器视图按纹理指针缓存：每帧新建在 45fps 下是每秒 90 次 Create*View
+    std::unordered_map<uint64_t, ComPtr<ID3D11VideoProcessorInputView>> inViewCache_;
+    std::unordered_map<void*, ComPtr<ID3D11VideoProcessorOutputView>> outViewCache_;
     bool tearing_ = false;
     bool useVsync_ = true;
 };
@@ -1031,7 +1036,6 @@ void Presenter::Shutdown() {
 // ---------------------------------------------------------------------------
 
 // --- 全屏切换 ---
-static HWND g_hwnd = nullptr;
 static bool g_isFullscreen = false;
 static LONG_PTR g_savedStyle = 0;
 static RECT g_savedRect{};
