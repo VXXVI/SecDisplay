@@ -171,6 +171,7 @@ final class Encoder {
     var onFrame: ((Data, Bool, UInt64) -> Void)?
 
     private(set) var encoded = 0
+    private(set) var keyframeCount = 0
     private(set) var bytes = 0
     private(set) var lastKeyframeCheck = 0
 
@@ -329,6 +330,7 @@ final class Encoder {
         // 编码器输出的视频数据本身就是 AVCC，原样追加
         out.append(Data(bytes: ptr, count: length))
 
+        if isKey { keyframeCount += 1 }
         encoded += 1
         bytes += out.count
         onFrame?(out, isKey, captureTime)
@@ -436,6 +438,9 @@ final class Sender {
                 }
             }
             c.start(queue: self.queue)
+            // 新连接一上来就准备关键帧，不依赖对端是否及时发 0x02。
+            // 接收端也需要 SPS/PPS 才能建立解码格式，主动出一次能少一轮往返。
+            self.onKeyframeRequest?()
             // 收控制消息
             self.receiveLoop()
         }
@@ -452,7 +457,8 @@ final class Sender {
             if let data, !data.isEmpty {
                 for b in data {
                     if b == 0x02 {
-                        // 接收端请求关键帧（例如启动入流或丢帧后恢复）
+                        // 接收端请求关键帧（连接建立时、或丢帧后自愈）
+                        Log.info("收到关键帧请求，下一帧强制 IDR")
                         self.onKeyframeRequest?()
                     }
                 }
@@ -603,9 +609,9 @@ let rateCtl = RateController(encoder: encoder, targetMbps: cfg.bitrateMbps)
 Timer.scheduledTimer(withTimeInterval: 2.0, repeats: true) { _ in
     let mbps = Double(sender.sentBytes) * 8 / 2.0 / 1_000_000
     rateCtl.tick(dropped: sender.dropped)
-    Log.info(String(format: "采集 %d 帧  编码 %d  发送 %d  丢弃 %d  %.1f Mbps  目标 %d  在途 %d",
-                    cap.captured, encoder.encoded, sender.sent, sender.dropped, mbps,
-                    encoder.currentMbps, sender.inFlight))
+    Log.info(String(format: "采集 %d  编码 %d  关键帧 %d  发送 %d  丢弃 %d  %.1f Mbps  目标 %d  在途 %d",
+                    cap.captured, encoder.encoded, encoder.keyframeCount, sender.sent,
+                    sender.dropped, mbps, encoder.currentMbps, sender.inFlight))
     sender.sentBytes = 0
     sender.sent = 0
 }
