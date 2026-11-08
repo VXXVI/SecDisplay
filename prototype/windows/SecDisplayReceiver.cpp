@@ -374,9 +374,9 @@ bool Decoder::Init(Graphics* gfx, int width, int height) {
     transform_->GetStreamIDs(1, &inId, 1, &outId);
     outId_ = outId;
 
-    transform_->ProcessMessage(MFT_MESSAGE_COMMAND_FLUSH, 0);
-    transform_->ProcessMessage(MFT_MESSAGE_NOTIFY_BEGIN_STREAMING, 0);
-    transform_->ProcessMessage(MFT_MESSAGE_NOTIFY_START_OF_STREAM, 0);
+    // 注意：这里绝对不能发 MFT_MESSAGE_NOTIFY_BEGIN_STREAMING。
+    // 此刻输入/输出类型都还没设，msmpeg2vdec.dll 不返回错误，而是直接访问违例崩溃。
+    // 开始流消息统一挪到输出类型设好之后（见 Decode）。
 
     Log("解码器就绪 %dx%d（%s）", width, height, hardware ? "硬件" : "软件");
     return true;
@@ -522,14 +522,16 @@ bool Decoder::Decode(const uint8_t* avcc, size_t len, IMFSample** outSample) {
             if (SetInputTypeFromParamSets(sps, pps)) {
                 paramSetsCache_ = merged;
                 transform_->ProcessMessage(MFT_MESSAGE_COMMAND_FLUSH, 0);
-                transform_->ProcessMessage(MFT_MESSAGE_NOTIFY_BEGIN_STREAMING, 0);
-                transform_->ProcessMessage(MFT_MESSAGE_NOTIFY_START_OF_STREAM, 0);
                 ready_ = false;
             }
         }
     }
     if (!ready_) {
         if (!SetOutputTypeD3D()) return false;
+        // 输入类型 + 输出类型都设好之后，才能通知解码器开始流。
+        // 顺序颠倒（先 BEGIN_STREAMING 再设类型）会让 msmpeg2vdec 直接访问违例。
+        transform_->ProcessMessage(MFT_MESSAGE_NOTIFY_BEGIN_STREAMING, 0);
+        transform_->ProcessMessage(MFT_MESSAGE_NOTIFY_START_OF_STREAM, 0);
     }
 
     // AVCC -> Annex-B
