@@ -959,7 +959,43 @@ final class CursorTracker {
 
 // MARK: - 主流程
 
-let cfg = Config()
+var cfg = Config()
+
+// 预设档位：不同分辨率与采集帧率组合，用于对比流畅度与清晰度
+// 用 SECDISPLAY_PRESET 选择：sharp / balanced / smooth / fast
+if let preset = ProcessInfo.processInfo.environment["SECDISPLAY_PRESET"] {
+    switch preset {
+    case "sharp":       // 最清晰，帧率最低
+        cfg.width = 2880; cfg.height = 1800
+        cfg.logicalWidth = 1440; cfg.logicalHeight = 900
+        cfg.captureHz = 40
+    case "balanced":    // 默认
+        cfg.width = 2880; cfg.height = 1800
+        cfg.logicalWidth = 1440; cfg.logicalHeight = 900
+        cfg.captureHz = 45
+    case "smooth":      // 降分辨率换帧率
+        cfg.width = 2240; cfg.height = 1400
+        cfg.logicalWidth = 1120; cfg.logicalHeight = 700
+        cfg.captureHz = 60
+    case "fast":        // 最流畅，清晰度最差
+        cfg.width = 1920; cfg.height = 1200
+        cfg.logicalWidth = 960; cfg.logicalHeight = 600
+        cfg.captureHz = 60
+    default:
+        break
+    }
+    Log.info("使用预设档位: \(preset)")
+}
+
+// 单项覆盖，优先级高于预设
+if let w = Int(ProcessInfo.processInfo.environment["SECDISPLAY_W"] ?? ""),
+   let h = Int(ProcessInfo.processInfo.environment["SECDISPLAY_H"] ?? "") {
+    cfg.width = w; cfg.height = h
+    cfg.logicalWidth = w / 2; cfg.logicalHeight = h / 2
+}
+if let hz = Double(ProcessInfo.processInfo.environment["SECDISPLAY_HZ"] ?? "") {
+    cfg.captureHz = hz
+}
 let vd = VirtualDisplayManager()
 let encoder = Encoder(width: cfg.width, height: cfg.height, bitrateMbps: cfg.bitrateMbps)
 let sender = Sender()
