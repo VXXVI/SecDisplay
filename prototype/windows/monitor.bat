@@ -28,7 +28,7 @@ echo   SecDisplay 后台监控模式
 echo ============================================================
 echo.
 echo   Mac 地址 : %MAC_IP%:9922
-echo   窗口模式 : 否（窗口化，不占用全屏）
+echo   模式     : 全屏
 echo   自动重连 : 是
 echo   日志文件 : %LOGFILE%
 echo.
@@ -38,7 +38,7 @@ echo.
 echo   如果在远程桌面里看：窗口不会盖住桌面，可以边看日志边操作。
 echo.
 
-start "" /b cmd /c ""%~dp0SecDisplayReceiver.exe" %MAC_IP% 9922 2880 1800 --windowed --log "%LOGFILE%""
+start "" /b cmd /c ""%~dp0SecDisplayReceiver.exe" %MAC_IP% 9922 2880 1800 --fullscreen --log "%LOGFILE%""
 
 echo   已启动。实时日志：
 echo     powershell -Command "Get-Content '%LOGFILE%' -Wait -Tail 20"

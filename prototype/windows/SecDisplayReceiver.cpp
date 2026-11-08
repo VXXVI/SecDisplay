@@ -769,6 +769,7 @@ public:
     void PresentSample(IMFSample* sample);
     void Shutdown();
     bool tearingSupported() const { return tearing_; }
+    void setUseVsync(bool v) { useVsync_ = v; }
 
     // 解码器实际输出尺寸可能与显示尺寸不同（硬解按宏块对齐，1800 -> 1808）。
     // 变了就重建视频处理器，并按显示尺寸裁边。
@@ -786,6 +787,7 @@ private:
     int width_ = 0, height_ = 0;      // 显示尺寸（= 交换链尺寸）
     int srcW_ = 0, srcH_ = 0;         // 解码器实际输出尺寸
     bool tearing_ = false;
+    bool useVsync_ = true;
 };
 
 bool Presenter::Init(Graphics* gfx, HWND hwnd, int width, int height) {
@@ -811,7 +813,7 @@ bool Presenter::Init(Graphics* gfx, HWND hwnd, int width, int height) {
             }
         }
     }
-    Log("免垂直同步呈现: %s", tearing_ ? "支持" : "不支持（将按垂直同步呈现）");
+    Log("免垂直同步能力: %s", tearing_ ? "支持" : "不支持");
 
     DXGI_SWAP_CHAIN_DESC1 desc{};
     desc.Width = width;
@@ -961,12 +963,14 @@ void Presenter::PresentSample(IMFSample* sample) {
     stream.pInputSurface = inView.Get();
     if (FAILED(videoCtx_->VideoProcessorBlt(processor_.Get(), outView.Get(), 0, 1, &stream))) return;
 
-    // 关键：免垂直同步 + 允许撕裂，尽快上屏
-    UINT presentFlags = tearing_ ? DXGI_PRESENT_ALLOW_TEARING : 0;
-    HRESULT hr = swap_->Present(0, presentFlags);
-    if (FAILED(hr) && tearing_) {
-        // tearing 失败就降级
-        tearing_ = false;
+    // 呈现方式：
+    //   垂直同步（默认）—— 帧对齐到刷新周期，画面均匀。显示器 89Hz 而输出 43fps 时，
+    //     每帧占约 2 个刷新周期，节奏稳定；免同步会让这个比例在 2~3 之间跳，看起来就是卡。
+    //   免同步 —— 延迟最低，但刷新节奏不均时会有抖动的观感。
+    if (tearing_ && !useVsync_) {
+        HRESULT hr = swap_->Present(0, DXGI_PRESENT_ALLOW_TEARING);
+        if (FAILED(hr)) swap_->Present(1, 0);
+    } else {
         swap_->Present(1, 0);
     }
     g_stats.presented++;
@@ -1065,6 +1069,7 @@ struct RunConfig {
     int height = 1800;
     bool fullscreen = true;   // 默认全屏铺满；--windowed 改成窗口
     bool reconnect = true;    // 断线自动重连
+    bool vsync = true;        // true=垂直同步（画面均匀），false=免同步（延迟最低但可能抖）
     std::string logFile;      // 非空则同时写日志文件
 };
 
@@ -1080,6 +1085,10 @@ static void ParseArgs(int argc, char** argv, RunConfig& cfg) {
             cfg.fullscreen = true;
         } else if (a == "--no-reconnect") {
             cfg.reconnect = false;
+        } else if (a == "--vsync") {
+            cfg.vsync = true;
+        } else if (a == "--tearing") {
+            cfg.vsync = false;
         } else if ((a == "--log" || a == "-l") && i + 1 < argc) {
             cfg.logFile = argv[++i];
         } else if (a.rfind("--", 0) == 0) {
@@ -1347,15 +1356,30 @@ int main(int argc, char** argv) {
     if (!hwnd) { Log("窗口创建失败"); return 3; }
     g_hwnd = hwnd;
 
+    if (cfg.fullscreen) {
+        // 再强制设一次位置和尺寸。某些情况下窗口创建时给的尺寸会被系统按 DPI 修正，
+        // 这里用绝对定位兜底，确保铺满显示器。
+        RECT wr{};
+        GetWindowRect(hwnd, &wr);
+        SetWindowPos(hwnd, HWND_TOPMOST, 0, 0,
+                     wr.right - wr.left, wr.bottom - wr.top,
+                     SWP_NOACTIVATE | SWP_SHOWWINDOW | SWP_FRAMECHANGED);
+    }
+
     {
         RECT rc{};
         GetClientRect(hwnd, &rc);
-        Log("窗口客户区 %dx%d（约等于显示器物理尺寸才算全屏）",
-            rc.right - rc.left, rc.bottom - rc.top);
+        RECT wr{};
+        GetWindowRect(hwnd, &wr);
+        Log("窗口客户区 %dx%d  窗口矩形 %dx%d",
+            rc.right - rc.left, rc.bottom - rc.top,
+            wr.right - wr.left, wr.bottom - wr.top);
     }
 
     Presenter presenter;
     if (!presenter.Init(&gfx, hwnd, cfg.width, cfg.height)) return 4;
+    presenter.setUseVsync(cfg.vsync);
+    Log("呈现方式: %s", cfg.vsync ? "垂直同步（均匀）" : "免同步（低延迟）");
 
     WSADATA wsa;
     if (WSAStartup(MAKEWORD(2, 2), &wsa) != 0) { Log("WSAStartup 失败"); return 5; }
