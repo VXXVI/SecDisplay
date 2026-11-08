@@ -73,6 +73,9 @@ swiftc -O Sources/ScreenSender.swift -o screensender
 
 ### 3. Windows 端
 
+**具体步骤见 `prototype/windows/README.md`**，那份是给 Windows 机器看的操作清单，含成功判据和排障对照表。
+
+
 **双击 `prototype\windows\check.bat`** 先看环境。它不需要编译器也能跑，
 会直接显示屏幕分辨率、显卡、DPI 缩放、硬件解码能力。
 
