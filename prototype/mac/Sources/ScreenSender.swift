@@ -235,7 +235,25 @@ final class Encoder {
     /// 真正的端到端时间戳走 captureTimeMicros，与 PTS 无关。
     private var frameSeq: Int64 = 0
 
+    /// 最近一帧的输入画面。屏幕完全静止时没有新帧可编，
+    /// 收到关键帧请求需要用它临时补一个 IDR，否则接收端一直黑屏。
+    private var lastPixelBuffer: CVPixelBuffer?
+    private let lastBufferLock = NSLock()
+
     func encode(_ pb: CVPixelBuffer, pts: CMTime, captureTimeMicros: UInt64) {
+        lastBufferLock.lock()
+        lastPixelBuffer = pb
+        lastBufferLock.unlock()
+        encodeInternal(pb, captureTimeMicros: captureTimeMicros)
+    }
+
+    /// 串行化编码调用。采集线程和关键帧补发可能并发进来，
+    /// frameSeq 自增不是原子的，并发会产出重复 PTS。
+    private let encodeLock = NSLock()
+
+    private func encodeInternal(_ pb: CVPixelBuffer, captureTimeMicros: UInt64) {
+        encodeLock.lock()
+        defer { encodeLock.unlock() }
         guard let s = session else { return }
         // 时间戳随帧走：经 sourceFrameRefcon 传给输出回调，避免跨线程共享变量。
         // 堆上分配一个 box，由 emit 负责释放；即使帧被编码器丢弃也不会泄漏
