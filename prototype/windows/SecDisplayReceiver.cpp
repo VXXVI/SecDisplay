@@ -26,6 +26,7 @@
 #define NOMINMAX
 #define _CRT_SECURE_NO_WARNINGS   // fopen/strncpy 等标准函数在 MSVC 下会被警告
 #include <windows.h>
+#include <windowsx.h>
 #include <winsock2.h>
 #include <ws2tcpip.h>
 #include <d3d11.h>
@@ -143,6 +144,45 @@ static std::atomic<int> g_videoW{0};
 static std::atomic<int> g_videoH{0};
 static std::atomic<double> g_cursorX{-1};
 static std::atomic<double> g_cursorY{-1};
+
+// 输入回传：把窗口内的鼠标位置和按键状态发给 Mac，由它重放事件。
+// 不再用 SetCursorPos 搬本机光标——那会和用户自己的鼠标抢位置，
+// 表现就是「点这里，菜单出现在别处」。
+static std::atomic<SOCKET> g_sock{ INVALID_SOCKET };
+static std::atomic<uint8_t> g_buttons{ 0 };
+static std::atomic<int64_t> g_lastLocalInputMs{ 0 };
+
+static void SendInputPacket(float vx, float vy, uint8_t buttons, int16_t wheel) {
+    SOCKET s = g_sock.load();
+    if (s == INVALID_SOCKET) return;
+
+    uint8_t pkt[12];
+    pkt[0] = 0x04;
+    auto wrF = [](uint8_t* q, float f) {
+        uint32_t u; memcpy(&u, &f, 4);
+        q[0] = (uint8_t)(u >> 24); q[1] = (uint8_t)(u >> 16);
+        q[2] = (uint8_t)(u >> 8);  q[3] = (uint8_t)u;
+    };
+    wrF(pkt + 1, vx);
+    wrF(pkt + 5, vy);
+    pkt[9] = buttons;
+    pkt[10] = (uint8_t)((uint16_t)wheel >> 8);
+    pkt[11] = (uint8_t)((uint16_t)wheel & 0xFF);
+    send(s, (const char*)pkt, 12, 0);
+}
+
+/// 窗口客户区坐标 → 视频像素坐标（0..videoW, 0..videoH）
+static bool ClientToVideo(int cx, int cy, float* vx, float* vy) {
+    if (!g_hwnd) return false;
+    RECT rc{};
+    if (!GetClientRect(g_hwnd, &rc)) return false;
+    int cw = rc.right - rc.left, ch = rc.bottom - rc.top;
+    int vw = g_videoW.load(), vh = g_videoH.load();
+    if (cw <= 0 || ch <= 0 || vw <= 0 || vh <= 0) return false;
+    *vx = (float)cx / cw * vw;
+    *vy = (float)cy / ch * vh;
+    return true;
+}
 
 static void OnCursorPacket(const uint8_t* p, size_t payloadLen) {
     if (payloadLen < 9) return;
@@ -1043,6 +1083,41 @@ static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
             return 0;
         }
         return 0;
+    case WM_MOUSEMOVE: {
+        float vx, vy;
+        if (ClientToVideo(GET_X_LPARAM(l), GET_Y_LPARAM(l), &vx, &vy)) {
+            g_lastLocalInputMs = GetTickCount64();
+            SendInputPacket(vx, vy, g_buttons.load(), 0);
+        }
+        return 0;
+    }
+    case WM_LBUTTONDOWN: case WM_LBUTTONUP:
+    case WM_RBUTTONDOWN: case WM_RBUTTONUP:
+    case WM_MBUTTONDOWN: case WM_MBUTTONUP: {
+        uint8_t b = g_buttons.load();
+        bool down = (m == WM_LBUTTONDOWN || m == WM_RBUTTONDOWN || m == WM_MBUTTONDOWN);
+        uint8_t bit = (m == WM_LBUTTONDOWN || m == WM_LBUTTONUP) ? 0x1
+                    : (m == WM_RBUTTONDOWN || m == WM_RBUTTONUP) ? 0x2 : 0x4;
+        if (down) b |= bit; else b &= (uint8_t)~bit;
+        g_buttons = b;
+        g_lastLocalInputMs = GetTickCount64();
+        float vx, vy;
+        if (ClientToVideo(GET_X_LPARAM(l), GET_Y_LPARAM(l), &vx, &vy)) {
+            SendInputPacket(vx, vy, b, 0);
+        }
+        return 0;
+    }
+    case WM_MOUSEWHEEL: {
+        POINT pt{ GET_X_LPARAM(l), GET_Y_LPARAM(l) };
+        ScreenToClient(h, &pt);
+        float vx, vy;
+        if (ClientToVideo(pt.x, pt.y, &vx, &vy)) {
+            int delta = GET_WHEEL_DELTA_WPARAM(w);
+            g_lastLocalInputMs = GetTickCount64();
+            SendInputPacket(vx, vy, g_buttons.load(), (int16_t)(-delta));
+        }
+        return 0;
+    }
     case WM_SETCURSOR:
         // 保持光标可见，不要被全屏窗口自动隐藏
         SetCursor(LoadCursor(nullptr, IDC_ARROW));
@@ -1141,6 +1216,7 @@ static void NetworkLoop(const RunConfig& cfg, Graphics* gfx, Presenter* presente
             continue;
         }
         Log("已连接，目标 %dx%d", cfg.width, cfg.height);
+        g_sock = sock;
 
         // 复位统计，重连后从头计数
         g_stats.packets = 0; g_stats.bytes = 0; g_stats.decoded = 0;
@@ -1249,6 +1325,7 @@ static void NetworkLoop(const RunConfig& cfg, Graphics* gfx, Presenter* presente
         watch.join();
 
         decoder.Shutdown();
+        if (g_sock.load() == sock) g_sock = INVALID_SOCKET;
         shutdown(sock, SD_BOTH);
         closesocket(sock);
 
@@ -1393,6 +1470,10 @@ int main(int argc, char** argv) {
         POINT lastPt{ INT_MIN, INT_MIN };
         while (g_alive) {
             Sleep(4);   // ~250Hz 轮询，实际只在新位置到达时调用 SetCursorPos
+            // 本机鼠标最近 1 秒内动过，就以用户的鼠标为准，不要抢位置。
+            // 否则会出现「点这里、菜单弹在别处」。
+            if (GetTickCount64() - (uint64_t)g_lastLocalInputMs.load() < 1000) continue;
+
             double cx = g_cursorX.load(), cy = g_cursorY.load();
             if (cx < 0 || cy < 0) continue;
             int vw = g_videoW.load(), vh = g_videoH.load();

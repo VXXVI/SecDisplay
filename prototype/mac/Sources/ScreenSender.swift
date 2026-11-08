@@ -691,26 +691,58 @@ final class Sender {
         startKeepAlive()
     }
 
+    /// 控制通道缓冲。0x02 是 1 字节，0x04 输入事件是固定 12 字节，
+    /// 必须按帧解析，不能逐字节扫描——否则二进制里的 0x02 会被误判。
+    private var ctrlBuf = Data()
+
     private func receiveLoop(epoch: Int) {
         guard connEpoch == epoch, let c = conn else { return }
         c.receive(minimumIncompleteLength: 1, maximumLength: 4096) { [weak self] data, _, done, err in
             guard let self, self.connEpoch == epoch else { return }
             if let data, !data.isEmpty {
-                for b in data {
-                    if b == 0x02 {
-                        // 接收端请求关键帧（连接建立时、或丢帧后自愈）
-                        Log.info("收到关键帧请求，下一帧强制 IDR")
-                        self.onKeyframeRequest?()
-                    }
-                }
+                self.ctrlBuf.append(data)
+                self.drainControl()
             }
             if done || err != nil { self.connected = false; return }
             self.receiveLoop(epoch: epoch)
         }
     }
 
+    private func drainControl() {
+        while !ctrlBuf.isEmpty {
+            let t = ctrlBuf[ctrlBuf.startIndex]
+            if t == 0x02 {
+                Log.info("收到关键帧请求，下一帧强制 IDR")
+                onKeyframeRequest?()
+                ctrlBuf.removeFirst(1)
+            } else if t == 0x04 {
+                // [0x04][float32 x][float32 y][uint8 buttons][int16 wheel] = 12 字节
+                guard ctrlBuf.count >= 12 else { return }
+                let b = ctrlBuf
+                let o = b.startIndex
+                func rdF(_ off: Int) -> Float {
+                    var u: UInt32 = 0
+                    for i in 0..<4 { u = (u << 8) | UInt32(b[o + off + i]) }
+                    return Float(bitPattern: u)
+                }
+                let x = rdF(1)
+                let y = rdF(5)
+                let buttons = b[o + 9]
+                let wheel = Int16(bitPattern: (UInt16(b[o + 10]) << 8) | UInt16(b[o + 11]))
+                onInput?(x, y, buttons, wheel)
+                ctrlBuf.removeFirst(12)
+            } else {
+                // 未知字节，丢掉，避免卡死
+                ctrlBuf.removeFirst(1)
+            }
+            if ctrlBuf.count > 65536 { ctrlBuf.removeAll() }
+        }
+    }
+
     /// 收到对端 0x02 时回调，由外部接到编码器
     var onKeyframeRequest: (() -> Void)?
+    /// 收到对端 0x04 输入事件：(x, y, buttons, wheel)
+    var onInput: ((Float, Float, UInt8, Int16) -> Void)?
 
     private let counterLock = NSLock()
 
@@ -814,6 +846,60 @@ final class Sender {
     }
 }
 
+// MARK: - 输入回传
+//
+// 副屏要能真正操作，必须把 Windows 侧的鼠标事件回放到 Mac 上。
+// 否则用户在 Windows 屏幕上的点击对 Mac 毫无作用，或者和本机光标互相抢位置。
+//
+// 需要「辅助功能」权限：系统设置 → 隐私与安全性 → 辅助功能。
+final class InputInjector {
+    private var lastButtons: UInt8 = 0
+    private(set) var eventCount = 0
+
+    /// - Parameters:
+    ///   - x/y: 相对虚拟屏左上角的像素坐标
+    ///   - buttons: bit0 左键，bit1 右键，bit2 中键
+    ///   - wheel: 滚动量，正数向下
+    func handle(x: Float, y: Float, buttons: UInt8, wheel: Int16, bounds: CGRect) {
+        let p = CGPoint(x: bounds.minX + CGFloat(x), y: bounds.minY + CGFloat(y))
+
+        // 先移动指针，再处理按键，保证点击落在正确位置
+        if let mv = CGEvent(mouseEventSource: nil, mouseType: .mouseMoved,
+                            mouseCursorPosition: p, mouseButton: .left) {
+            mv.post(tap: .cghidEventTap)
+        }
+
+        // 按下 / 抬起
+        let pairs: [(UInt8, CGEventType, CGEventType, CGMouseButton)] = [
+            (0x1, .leftMouseDown,  .leftMouseUp,  .left),
+            (0x2, .rightMouseDown, .rightMouseUp, .right),
+            (0x4, .otherMouseDown, .otherMouseUp, .center),
+        ]
+        for (bit, downType, upType, btn) in pairs {
+            let was = (lastButtons & bit) != 0
+            let now = (buttons & bit) != 0
+            if now && !was {
+                CGEvent(mouseEventSource: nil, mouseType: downType,
+                        mouseCursorPosition: p, mouseButton: btn)?.post(tap: .cghidEventTap)
+            } else if !now && was {
+                CGEvent(mouseEventSource: nil, mouseType: upType,
+                        mouseCursorPosition: p, mouseButton: btn)?.post(tap: .cghidEventTap)
+            }
+        }
+        lastButtons = buttons
+
+        // 滚轮
+        if wheel != 0 {
+            if let e = CGEvent(scrollWheelEvent2Source: nil, units: .pixel,
+                               wheelCount: 1, wheel1: Int32(wheel), wheel2: 0, wheel3: 0) {
+                e.location = p
+                e.post(tap: .cghidEventTap)
+            }
+        }
+        eventCount += 1
+    }
+}
+
 // MARK: - 光标转发
 //
 // 视频帧只有 45fps，把指针画进画面会让它每 22ms 才动一次，观感是拖影。
@@ -911,6 +997,18 @@ do {
 sender.onKeyframeRequest = { encoder.requestKeyframe() }
 sender.listen(port: cfg.port)
 
+// 输入回传：Windows 侧的鼠标事件在 Mac 上重放
+// 需要「辅助功能」权限，没有的话事件会被系统静默丢弃
+if !AXIsProcessTrusted() {
+    Log.info("警告: 未获得辅助功能权限，副屏上的点击/滚轮无法生效")
+    Log.info("      系统设置 → 隐私与安全性 → 辅助功能，勾选运行本程序的终端")
+}
+let injector = InputInjector()
+sender.onInput = { x, y, buttons, wheel in
+    injector.handle(x: x, y: y, buttons: buttons, wheel: wheel,
+                    bounds: CGDisplayBounds(vd.displayID))
+}
+
 // 光标转发：坐标是相对虚拟屏的像素值，虚拟屏重建后 id 变了也能拿到新 bounds
 let cursor = CursorTracker(sender: sender, bounds: { CGDisplayBounds(vd.displayID) })
 cursor.start()
@@ -1007,9 +1105,9 @@ Timer.scheduledTimer(withTimeInterval: 2.0, repeats: true) { _ in
     let capAvg = cap.capLatCount > 0 ? cap.capLatSum / Double(cap.capLatCount) : 0
     let cursorDelta = cursor.sentCount - lastCursorCount
     lastCursorCount = cursor.sentCount
-    Log.info(String(format: "采集 %d  峰值 %.0ffps  空闲 %d  发送 %d  光标+%d  丢弃 %d  %.1f Mbps  在途 %d  采集延迟 %.1f  编码延迟 %.1f ms",
+    Log.info(String(format: "采集 %d  峰值 %.0ffps  空闲 %d  发送 %d  光标+%d  输入 %d  丢弃 %d  %.1f Mbps  在途 %d  采集延迟 %.1f  编码延迟 %.1f ms",
                     cap.captured, peakFps, cap.idleFrameCount, sender.sent, cursorDelta,
-                    sender.dropped, mbps, sender.inFlight, capAvg, encAvg))
+                    injector.eventCount, sender.dropped, mbps, sender.inFlight, capAvg, encAvg))
     cap.capLatSum = 0; cap.capLatCount = 0; cap.capLatMax = 0
     encoder.encLatSum = 0; encoder.encLatCount = 0; encoder.encLatMax = 0
     sender.sentBytes = 0
