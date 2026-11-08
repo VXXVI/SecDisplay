@@ -45,6 +45,9 @@ struct Config {
     // 2.2K 桌面文字需要足够码率才清晰。千兆网给到 120 仍有余量。
     var bitrateMbps = 180      // 2880x1800 码率要比 2.2K 更高
     var port: UInt16 = 9922
+    // 静止画面保活间隔（秒）。ScreenCaptureKit 画面不动就不出帧，
+    // 超过这个间隔没有新帧就重发最后一帧；设 0 关闭。
+    var keepAliveGap = 0.08
 }
 
 // MARK: - 虚拟屏
@@ -429,6 +432,12 @@ final class Sender {
             self.conn?.cancel()
             self.conn = c
             self.connected = true
+            // 丢掉上个连接的残留帧：那可能是依赖旧参考帧的 P 帧，
+            // 新接收端没有参考帧，解出来是花的。等新的 IDR。
+            self.counterLock.lock()
+            self.lastPayload = nil
+            self.lastSendAt = CFAbsoluteTimeGetCurrent()
+            self.counterLock.unlock()
             c.stateUpdateHandler = { st in
                 if case .failed(let e) = st {
                     Log.info("连接失败: \(e)")
@@ -449,6 +458,7 @@ final class Sender {
             if case .failed(let e) = st { Log.info("监听失败: \(e)") }
         }
         listener.start(queue: queue)
+        startKeepAlive()
     }
 
     private func receiveLoop() {
@@ -473,7 +483,26 @@ final class Sender {
 
     private let counterLock = NSLock()
 
+    // --- 静止画面保活 ---
+    // ScreenCaptureKit 是变化驱动的：画面不动就完全不出帧，接收端会长时间没有数据，
+    // 表现为「连上了但不动」或统计里 Mbps 掉到 0。
+    // 这里记住最后一帧的编码数据，空闲超时后重发它（重打时间戳，避免延迟统计虚高）。
+    // 同一个 access unit 重复解码是安全的，解出来还是同一张图。
+    private var lastPayload: Data?
+    private var lastSendAt: CFAbsoluteTime = 0
+    private var keepAliveTimer: DispatchSourceTimer?
+    /// 超过这么久没有新帧就补一帧；设为 0 可关闭保活
+    var keepAliveGap: CFAbsoluteTime = 0.08
+
     func send(frame: Data, captureTimeMicros: UInt64) {
+        guard connected else { return }
+        counterLock.lock()
+        lastPayload = frame
+        counterLock.unlock()
+        transmit(frame, captureTimeMicros: captureTimeMicros)
+    }
+
+    private func transmit(_ frame: Data, captureTimeMicros: UInt64) {
         guard connected, let c = conn else { return }
         // 在途帧数超限：丢这一帧，保住实时性
         counterLock.lock()
@@ -483,7 +512,9 @@ final class Sender {
             return
         }
         inFlight += 1
+        lastSendAt = CFAbsoluteTimeGetCurrent()
         counterLock.unlock()
+
         var packet = Data(capacity: frame.count + 13)
         var len = UInt32(frame.count + 9).bigEndian
         withUnsafeBytes(of: &len) { packet.append(contentsOf: $0) }
@@ -502,6 +533,26 @@ final class Sender {
             if err != nil { self.connected = false }
         })
     }
+
+    private func startKeepAlive() {
+        guard keepAliveGap > 0 else { return }
+        let timer = DispatchSource.makeTimerSource(queue: queue)
+        timer.schedule(deadline: .now() + keepAliveGap, repeating: keepAliveGap / 2)
+        timer.setEventHandler { [weak self] in
+            guard let self, self.connected else { return }
+            let now = CFAbsoluteTimeGetCurrent()
+            self.counterLock.lock()
+            let since = now - self.lastSendAt
+            let payload = self.lastPayload
+            self.counterLock.unlock()
+            guard since >= self.keepAliveGap, let payload = payload else { return }
+            // 时间戳用当前时刻：接收端按「本地时刻 - 远端时刻」算延迟，
+            // 沿用旧时间戳会让延迟越算越大。
+            self.transmit(payload, captureTimeMicros: UInt64(now * 1_000_000))
+        }
+        timer.resume()
+        keepAliveTimer = timer
+    }
 }
 
 // MARK: - 主流程
@@ -510,6 +561,7 @@ let cfg = Config()
 let vd = VirtualDisplayManager()
 let encoder = Encoder(width: cfg.width, height: cfg.height, bitrateMbps: cfg.bitrateMbps)
 let sender = Sender()
+sender.keepAliveGap = cfg.keepAliveGap
 
 guard encoder.start() else { exit(3) }
 
