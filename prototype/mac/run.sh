@@ -36,7 +36,15 @@ start)
         echo "已在运行，pid=$pid"
         exit 0
     fi
+    # 源码比二进制新就重编，避免跑到旧版本
+    need_build=0
     if [ ! -x "$BIN" ]; then
+        need_build=1
+    elif [ Sources/ScreenSender.swift -nt "$BIN" ]; then
+        need_build=1
+        echo "源码已更新，重新编译"
+    fi
+    if [ "$need_build" = "1" ]; then
         echo "编译中..."
         swiftc -O Sources/ScreenSender.swift -o screensender || exit 1
     fi
