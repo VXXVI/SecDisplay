@@ -125,9 +125,43 @@ static int64_t UnixNowMicros() {
 // ---------------------------------------------------------------------------
 
 static const uint8_t TYPE_VIDEO = 0x01;
+static const uint8_t TYPE_CURSOR = 0x03;   // 光标位置，与视频帧分离发送
 static const uint8_t TYPE_KEYFRAME_REQUEST = 0x02;
 static const size_t HEADER_BYTES = 9;   // 类型 1 + 时间戳 8
 static const size_t MAX_PACKET = 64u * 1024u * 1024u;
+
+// ---------------------------------------------------------------------------
+// 光标
+//
+// 视频只有 40fps 左右，把指针画进画面会让它每 25ms 才动一次，看起来是拖影。
+// 发送端改成不带指针出视频，指针位置用独立小包高频送来，这里直接移动系统光标。
+// Windows 的光标由硬件合成，延迟接近零。
+// ---------------------------------------------------------------------------
+
+static std::atomic<int> g_videoW{0};
+static std::atomic<int> g_videoH{0};
+static std::atomic<double> g_cursorX{-1};
+static std::atomic<double> g_cursorY{-1};
+
+static void OnCursorPacket(const uint8_t* p, size_t payloadLen) {
+    if (payloadLen < 9) return;
+    // 大端读 4 字节再按位解释成 float
+    auto rdFloat = [](const uint8_t* q) -> float {
+        uint32_t u = ((uint32_t)q[0] << 24) | ((uint32_t)q[1] << 16)
+                   | ((uint32_t)q[2] << 8) | (uint32_t)q[3];
+        float f; memcpy(&f, &u, sizeof(f)); return f;
+    };
+    float rx = rdFloat(p);
+    float ry = rdFloat(p + 4);
+    uint8_t visible = p[8];
+    if (!visible) return;
+
+    g_cursorX = rx;
+    g_cursorY = ry;
+
+    int vw = g_videoW.load(), vh = g_videoH.load();
+    if (vw <= 0 || vh <= 0) return;
+}
 
 // ---------------------------------------------------------------------------
 // 网络
@@ -933,13 +967,65 @@ void Presenter::Shutdown() {
 // 窗口
 // ---------------------------------------------------------------------------
 
+// --- 全屏切换 ---
+static HWND g_hwnd = nullptr;
+static bool g_isFullscreen = false;
+static LONG_PTR g_savedStyle = 0;
+static RECT g_savedRect{};
+
+/// 在当前所在的显示器上铺满。配合 per-monitor DPI 感知，
+/// 窗口客户区就是显示器的物理像素，交换链 1:1 不做缩放。
+static void EnterFullscreen() {
+    if (!g_hwnd || g_isFullscreen) return;
+    g_savedStyle = GetWindowLongPtr(g_hwnd, GWL_STYLE);
+    GetWindowRect(g_hwnd, &g_savedRect);
+
+    HMONITOR mon = MonitorFromWindow(g_hwnd, MONITOR_DEFAULTTONEAREST);
+    MONITORINFO mi{};
+    mi.cbSize = sizeof(mi);
+    if (!GetMonitorInfo(mon, &mi)) return;
+
+    SetWindowLongPtr(g_hwnd, GWL_STYLE, WS_POPUP | WS_VISIBLE);
+    SetWindowPos(g_hwnd, HWND_TOP,
+                 mi.rcMonitor.left, mi.rcMonitor.top,
+                 mi.rcMonitor.right - mi.rcMonitor.left,
+                 mi.rcMonitor.bottom - mi.rcMonitor.top,
+                 SWP_FRAMECHANGED | SWP_SHOWWINDOW);
+    g_isFullscreen = true;
+    Log("已切换到全屏");
+}
+
+static void ExitFullscreen() {
+    if (!g_hwnd || !g_isFullscreen) return;
+    SetWindowLongPtr(g_hwnd, GWL_STYLE, g_savedStyle);
+    SetWindowPos(g_hwnd, nullptr,
+                 g_savedRect.left, g_savedRect.top,
+                 g_savedRect.right - g_savedRect.left,
+                 g_savedRect.bottom - g_savedRect.top,
+                 SWP_FRAMECHANGED | SWP_SHOWWINDOW);
+    g_isFullscreen = false;
+    Log("已切换到窗口");
+}
+
 static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
     switch (m) {
     case WM_DESTROY:
         PostQuitMessage(0);
         return 0;
     case WM_KEYDOWN:
-        if (w == VK_ESCAPE) PostQuitMessage(0);
+        if (w == VK_ESCAPE) { PostQuitMessage(0); return 0; }
+        // F11 或 F 切换全屏，方便窗口模式下按一下变全屏
+        if (w == VK_F11 || w == 'F') {
+            if (g_isFullscreen) ExitFullscreen(); else EnterFullscreen();
+            return 0;
+        }
+        return 0;
+    case WM_SETCURSOR:
+        // 保持光标可见，不要被全屏窗口自动隐藏
+        SetCursor(LoadCursor(nullptr, IDC_ARROW));
+        return TRUE;
+    case WM_LBUTTONDBLCLK:      // 双击也切换
+        if (g_isFullscreen) ExitFullscreen(); else EnterFullscreen();
         return 0;
     }
     return DefWindowProc(h, m, w, l);
@@ -1065,6 +1151,10 @@ static void NetworkLoop(const RunConfig& cfg, Graphics* gfx, Presenter* presente
                 packet.resize(len);
                 if (!RecvAll(sock, packet.data(), (int)len)) break;
 
+                if (packet[0] == TYPE_CURSOR) {
+                    OnCursorPacket(packet.data() + HEADER_BYTES, len - HEADER_BYTES);
+                    continue;
+                }
                 if (packet[0] != TYPE_VIDEO) continue;
 
                 uint64_t ts = 0;
@@ -1150,6 +1240,15 @@ static void NetworkLoop(const RunConfig& cfg, Graphics* gfx, Presenter* presente
 int main(int argc, char** argv) {
     setvbuf(stderr, nullptr, _IONBF, 0);
 
+    // 每显示器 DPI 感知。不做这步，200% 缩放的系统里全屏窗口只有逻辑尺寸，
+    // 交换链会被系统再缩一次，画面变糊。
+    // 用动态解析避免不同 SDK / MinGW 的头文件差异。
+    if (HMODULE u32 = GetModuleHandleA("user32.dll")) {
+        typedef BOOL (WINAPI *SetCtxFn)(HANDLE);
+        auto fn = (SetCtxFn)GetProcAddress(u32, "SetProcessDpiAwarenessContext");
+        if (fn) fn((HANDLE)-4);   // DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2
+    }
+
     RunConfig cfg;
     ParseArgs(argc, argv, cfg);
 
@@ -1213,12 +1312,42 @@ int main(int argc, char** argv) {
                                nullptr, nullptr, wc.hInstance, nullptr);
     }
     if (!hwnd) { Log("窗口创建失败"); return 3; }
+    g_hwnd = hwnd;
 
     Presenter presenter;
     if (!presenter.Init(&gfx, hwnd, cfg.width, cfg.height)) return 4;
 
     WSADATA wsa;
     if (WSAStartup(MAKEWORD(2, 2), &wsa) != 0) { Log("WSAStartup 失败"); return 5; }
+
+    g_videoW = cfg.width;
+    g_videoH = cfg.height;
+
+    // 光标应用线程：把收到的归一化坐标映射到窗口客户区，直接移动系统光标。
+    // Windows 的光标由硬件合成，不受视频帧率影响，所以指针是跟手的。
+    std::thread cursorThread([] {
+        POINT lastPt{ INT_MIN, INT_MIN };
+        while (g_alive) {
+            Sleep(4);   // ~250Hz 轮询，实际只在新位置到达时调用 SetCursorPos
+            double cx = g_cursorX.load(), cy = g_cursorY.load();
+            if (cx < 0 || cy < 0) continue;
+            int vw = g_videoW.load(), vh = g_videoH.load();
+            if (vw <= 0 || vh <= 0 || !g_hwnd) continue;
+
+            RECT rc{};
+            if (!GetClientRect(g_hwnd, &rc)) continue;
+            int cw = rc.right - rc.left, ch = rc.bottom - rc.top;
+            if (cw <= 0 || ch <= 0) continue;
+
+            POINT tl{ rc.left, rc.top };
+            ClientToScreen(g_hwnd, &tl);
+            int sx = tl.x + (int)(cx / vw * cw);
+            int sy = tl.y + (int)(cy / vh * ch);
+            if (sx == lastPt.x && sy == lastPt.y) continue;
+            lastPt.x = sx; lastPt.y = sy;
+            SetCursorPos(sx, sy);
+        }
+    });
 
     std::thread net(NetworkLoop, cfg, &gfx, &presenter);
 
@@ -1230,6 +1359,7 @@ int main(int argc, char** argv) {
 
     g_alive = false;
     if (net.joinable()) net.join();
+    if (cursorThread.joinable()) cursorThread.join();
 
     WSACleanup();
     presenter.Shutdown();

@@ -28,6 +28,8 @@ final class Stats {
     var keyframes = 0
     var decodeFail = 0
     var duplicates = 0
+    var intervals: [Double] = []
+    var lastArrival: Double = 0
     func add(_ ms: Double) { lock.lock(); latencies.append(ms); frames += 1; lock.unlock() }
     func report(_ elapsed: Double) {
         lock.lock()
@@ -45,6 +47,24 @@ final class Stats {
         L.e(String(format: "最大 %.2f ms", l[n - 1]))
         L.e(String(format: "码率 %.1f Mbps  关键帧 %d  解码失败 %d  重复帧(保活) %d",
                    Double(bytes) * 8 / elapsed / 1e6, keyframes, decodeFail, duplicates))
+
+        // 帧间隔抖动：平均帧率看不出的问题，这里能看出来
+        lock.lock()
+        let iv = intervals.sorted()
+        lock.unlock()
+        if iv.count > 5 {
+            func ip(_ q: Double) -> Double { iv[min(iv.count - 1, Int(Double(iv.count) * q))] }
+            let mean = iv.reduce(0, +) / Double(iv.count)
+            L.e("")
+            L.e("===== 帧间隔（到达节奏）=====")
+            L.e(String(format: "样本 %d  平均 %.1f ms (约 %.0f fps)", iv.count, mean, 1000.0 / max(mean, 0.001)))
+            L.e(String(format: "最小 %.1f  p50 %.1f  p95 %.1f  最大 %.1f ms",
+                       iv[0], ip(0.5), ip(0.95), iv[iv.count - 1]))
+            // 超过平均间隔 2 倍视为一次卡顿
+            let stalls = iv.filter { $0 > mean * 2 && $0 > 40 }.count
+            L.e(String(format: "明显停顿(>2倍平均且>40ms) %d 次，占比 %.1f%%",
+                       stalls, Double(stalls) * 100 / Double(iv.count)))
+        }
     }
 }
 
@@ -205,7 +225,12 @@ while CFAbsoluteTimeGetCurrent() - t0 < secs {
     guard body[0] == 0x01 else { continue }
     var ts: UInt64 = 0
     for i in 0..<8 { ts = (ts << 8) | UInt64(body[1 + i]) }
-    stats.lock.lock(); stats.bytes += len; stats.lock.unlock()
+    let nowArr = CFAbsoluteTimeGetCurrent()
+    stats.lock.lock()
+    stats.bytes += len
+    if stats.lastArrival > 0 { stats.intervals.append((nowArr - stats.lastArrival) * 1000) }
+    stats.lastArrival = nowArr
+    stats.lock.unlock()
 
     let payload = Array(body[9..<len])
     let h = payload.withUnsafeBufferPointer { p -> Int in

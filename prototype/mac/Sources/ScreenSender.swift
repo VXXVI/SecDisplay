@@ -429,6 +429,10 @@ final class Capture: NSObject, SCStreamOutput, SCStreamDelegate {
 
     var stream: SCStream?
     var captured = 0
+    /// 采集段延迟：系统合成完成 → 我们拿到帧
+    var capLatSum: Double = 0
+    var capLatCount = 0
+    var capLatMax: Double = 0
     var lastFrameTime: CFAbsoluteTime = 0
     var idleFrames = 0
 
@@ -487,7 +491,9 @@ final class Capture: NSObject, SCStreamOutput, SCStreamDelegate {
         // 3 帧在 60fps 下约 50ms；越深越不容易丢帧，但延迟越高。
         c.queueDepth = Int(ProcessInfo.processInfo.environment["SECDISPLAY_QD"] ?? "") ?? 3
         c.pixelFormat = kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange
-        c.showsCursor = true
+        // 光标不画进视频：视频帧率只有 45fps，指针会把延迟放大成拖影。
+        // 指针位置改由独立的轻量消息高频发送，客户端本地绘制。
+        c.showsCursor = false
         c.scalesToFit = false
         c.capturesAudio = false
         c.preservesAspectRatio = true
@@ -582,7 +588,18 @@ final class Capture: NSObject, SCStreamOutput, SCStreamDelegate {
 
         captured += 1
         lastFrameTime = CFAbsoluteTimeGetCurrent()
+
+        // 采集段延迟：样本 PTS 与主机时钟的差值。
+        // SCK 的 PTS 走主机时钟（mach 时基），不能直接和 CFAbsoluteTime 相减。
         let pts = CMSampleBufferGetPresentationTimeStamp(sb)
+        let hostNow = CMClockGetTime(CMClockGetHostTimeClock())
+        let deltaSec = CMTimeGetSeconds(CMTimeSubtract(hostNow, pts))
+        if deltaSec.isFinite && deltaSec >= 0 && deltaSec < 2 {
+            let delayMs = deltaSec * 1000
+            capLatSum += delayMs
+            capLatCount += 1
+            if delayMs > capLatMax { capLatMax = delayMs }
+        }
         let nowMicros = UInt64(CFAbsoluteTimeGetCurrent() * 1_000_000)
         encoder.encode(pb, pts: pts, captureTimeMicros: nowMicros)
     }
@@ -717,6 +734,25 @@ final class Sender {
     /// 超过这么久没有新帧就补一帧；设为 0 可关闭保活
     var keepAliveGap: CFAbsoluteTime = 0.08
 
+    /// 光标位置。不走视频帧，独立小包，不占用在途帧配额。
+    /// 坐标是相对虚拟屏左上角的像素值。
+    func sendCursor(x: Float, y: Float, visible: Bool) {
+        guard connected, let c = conn else { return }
+        var packet = Data(capacity: 19)
+        // 长度 = 1 类型 + 8 时间戳 + 9 载荷 = 18
+        var len = UInt32(18).bigEndian
+        withUnsafeBytes(of: &len) { packet.append(contentsOf: $0) }
+        packet.append(0x03)                  // 光标类型
+        var ts = UInt64(CFAbsoluteTimeGetCurrent() * 1_000_000).bigEndian
+        withUnsafeBytes(of: &ts) { packet.append(contentsOf: $0) }
+        var fx = x.bitPattern.bigEndian
+        withUnsafeBytes(of: &fx) { packet.append(contentsOf: $0) }
+        var fy = y.bitPattern.bigEndian
+        withUnsafeBytes(of: &fy) { packet.append(contentsOf: $0) }
+        packet.append(visible ? 1 : 0)
+        c.send(content: packet, completion: .contentProcessed { _ in })
+    }
+
     func send(frame: Data, captureTimeMicros: UInt64) {
         guard connected else { return }
         counterLock.lock()
@@ -778,6 +814,63 @@ final class Sender {
     }
 }
 
+// MARK: - 光标转发
+//
+// 视频帧只有 45fps，把指针画进画面会让它每 22ms 才动一次，观感是拖影。
+// 这里把指针位置单独以高频小包发出去，客户端本地绘制，指针几乎零延迟。
+final class CursorTracker {
+    private let sender: Sender
+    private let bounds: () -> CGRect
+    private let queue = DispatchQueue(label: "SecDisplay.cursor")
+    private var timer: DispatchSourceTimer?
+    private var lastX: Float = .nan
+    private var lastY: Float = .nan
+    private var lastVisible = false
+    /// 累计发出的光标包数量，用于统计展示
+    private(set) var sentCount = 0
+
+    init(sender: Sender, bounds: @escaping () -> CGRect) {
+        self.sender = sender
+        self.bounds = bounds
+    }
+
+    func start() {
+        let t = DispatchSource.makeTimerSource(queue: queue)
+        // 120Hz 轮询。只在位置变化超过 0.5px 时才发包，
+        // 静止时几乎不产生流量。
+        t.schedule(deadline: .now(), repeating: .milliseconds(8), leeway: .milliseconds(1))
+        t.setEventHandler { [weak self] in self?.tick() }
+        t.resume()
+        timer = t
+    }
+
+    func stop() {
+        timer?.cancel()
+        timer = nil
+    }
+
+    private func tick() {
+        // 没有连接时不记录位置，否则连上之后要等指针再次移动才会发第一包
+        guard sender.connected else {
+            lastX = .nan; lastY = .nan; lastVisible = false
+            return
+        }
+        guard let ev = CGEvent(source: nil) else { return }
+        let p = ev.location                 // 全局坐标，原点在主屏左上，y 向下
+        let b = bounds()
+        let rx = Float(p.x - b.minX)
+        let ry = Float(p.y - b.minY)
+        let inside = rx >= 0 && ry >= 0 && rx < Float(b.width) && ry < Float(b.height)
+
+        let moved = !(abs(rx - lastX) < 0.5 && abs(ry - lastY) < 0.5)
+        guard moved || inside != lastVisible else { return }
+
+        lastX = rx; lastY = ry; lastVisible = inside
+        sentCount += 1
+        sender.sendCursor(x: rx, y: ry, visible: inside)
+    }
+}
+
 // MARK: - 主流程
 
 let cfg = Config()
@@ -817,6 +910,10 @@ do {
 // 接收端的 0x02 控制消息 → 让编码器下一帧强制 IDR
 sender.onKeyframeRequest = { encoder.requestKeyframe() }
 sender.listen(port: cfg.port)
+
+// 光标转发：坐标是相对虚拟屏的像素值，虚拟屏重建后 id 变了也能拿到新 bounds
+let cursor = CursorTracker(sender: sender, bounds: { CGDisplayBounds(vd.displayID) })
+cursor.start()
 
 // 传入 id 获取闭包：虚拟屏重建后 id 会变，采集侧每次重建流都重新问
 let cap = Capture(encoder: encoder, cfg: cfg, displayID: { vd.displayID })
@@ -886,10 +983,11 @@ Timer.scheduledTimer(withTimeInterval: 2.0, repeats: true) { _ in
     let mbps = Double(sender.sentBytes) * 8 / 2.0 / 1_000_000
     rateCtl.tick(dropped: sender.dropped)
     let encAvg = encoder.encLatCount > 0 ? encoder.encLatSum / Double(encoder.encLatCount) : 0
-    Log.info(String(format: "采集 %d  空闲 %d  编码 %d  关键帧 %d  发送 %d  丢弃 %d  %.1f Mbps  目标 %d  在途 %d  编码延迟 %.1f/%.1f ms",
-                    cap.captured, cap.idleFrameCount, encoder.encoded, encoder.keyframeCount,
-                    sender.sent, sender.dropped, mbps, encoder.currentMbps, sender.inFlight,
-                    encAvg, encoder.encLatMax))
+    let capAvg = cap.capLatCount > 0 ? cap.capLatSum / Double(cap.capLatCount) : 0
+    Log.info(String(format: "采集 %d  发送 %d  光标 %d  丢弃 %d  %.1f Mbps  在途 %d  采集延迟 %.1f/%.1f  编码延迟 %.1f/%.1f ms",
+                    cap.captured, sender.sent, cursor.sentCount, sender.dropped, mbps,
+                    sender.inFlight, capAvg, cap.capLatMax, encAvg, encoder.encLatMax))
+    cap.capLatSum = 0; cap.capLatCount = 0; cap.capLatMax = 0
     encoder.encLatSum = 0; encoder.encLatCount = 0; encoder.encLatMax = 0
     sender.sentBytes = 0
     sender.sent = 0
