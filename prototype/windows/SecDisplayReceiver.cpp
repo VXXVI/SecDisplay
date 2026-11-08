@@ -332,43 +332,86 @@ bool Decoder::Init(Graphics* gfx, int width, int height) {
     IMFActivate** acts = nullptr;
     UINT32 count = 0;
 
-    // 优先硬件 MFT
+    // 枚举 H.264 解码器。
+    //
+    // 关键认知：Windows 的硬解并不是注册成 "hardware MFT"。
+    // 微软自带的 MSH264DecoderMFT（msmpeg2vdec.dll）注册为同步 MFT，
+    // 只有在收到 MFT_MESSAGE_SET_D3D_MANAGER 且输入输出类型匹配时，
+    // 才在内部走 DXVA 硬件加速。
+    // 用 MFT_ENUM_FLAG_HARDWARE 单独枚举，反而会把真正能硬解的这个 MFT 过滤掉，
+    // 表现就是"找不到硬解"，白白退回慢路径。
+    //
+    // 所以这里放宽枚举范围，拿全之后再逐个判断-谁接受 D3D 管理器。
     HRESULT hr = MFTEnumEx(MFT_CATEGORY_VIDEO_DECODER,
-                           MFT_ENUM_FLAG_HARDWARE | MFT_ENUM_FLAG_SORTANDFILTER,
+                           MFT_ENUM_FLAG_SYNCMFT |
+                           MFT_ENUM_FLAG_ASYNCMFT |
+                           MFT_ENUM_FLAG_HARDWARE |
+                           MFT_ENUM_FLAG_SORTANDFILTER,
                            &inInfo, nullptr, &acts, &count);
-    bool hardware = SUCCEEDED(hr) && count > 0;
-
-    if (!hardware) {
-        Log("未找到硬件 H.264 解码器，回退软件解码");
+    if (FAILED(hr) || count == 0) {
+        // 兜底：不带 SORTANDFILTER 再试一次
         hr = MFTEnumEx(MFT_CATEGORY_VIDEO_DECODER,
-                       MFT_ENUM_FLAG_SYNCMFT | MFT_ENUM_FLAG_SORTANDFILTER,
+                       MFT_ENUM_FLAG_ALL,
                        &inInfo, nullptr, &acts, &count);
     }
     if (FAILED(hr) || count == 0) { Log("MFTEnumEx 失败 %08X", hr); return false; }
 
-    hr = acts[0]->ActivateObject(IID_PPV_ARGS(&transform_));
+    // 打印候选清单，便于排查选错的情况
+    Log("找到 %u 个 H.264 解码器候选", count);
+    for (UINT32 i = 0; i < count; ++i) {
+        LPWSTR name = nullptr;
+        UINT32 len = 0;
+        if (SUCCEEDED(acts[i]->GetAllocatedString(MFT_FRIENDLY_NAME_Attribute, &name, &len))) {
+            UINT32 d3dAware = 0;
+            acts[i]->GetUINT32(MF_SA_D3D_AWARE, &d3dAware);
+            wprintf(L"         [%u] %s%s\n", i, name, d3dAware ? L"  (支持 D3D)" : L"");
+            CoTaskMemFree(name);
+        }
+    }
+
+    // 依次尝试候选，直到找到接受 D3D 管理器的那个。
+    // 只按属性声明去猜不可靠，直接试才是准的。
+    bool hardware = false;
+    ComPtr<IMFTransform> fallback;   // 第一个能激活但拒绝 D3D 的候选，留作软件兜底
+
+    for (UINT32 i = 0; i < count && !transform_; ++i) {
+        ComPtr<IMFTransform> candidate;
+        if (FAILED(acts[i]->ActivateObject(IID_PPV_ARGS(&candidate))) || !candidate) continue;
+
+        // 低延迟：不缓冲、不解码后攒帧
+        ComPtr<IMFAttributes> a;
+        if (SUCCEEDED(candidate->GetAttributes(&a)) && a) {
+            // 异步 MFT 不解除锁定，ProcessInput/ProcessOutput 不工作，表现为永远无输出
+            a->SetUINT32(MF_TRANSFORM_ASYNC_UNLOCK, TRUE);
+            a->SetUINT32(MF_LOW_LATENCY, TRUE);
+        }
+
+        // 试着注入 D3D 管理器，成功即走 DXVA 硬解
+        bool accepted = false;
+        if (gfx_ && gfx_->deviceManager) {
+            HRESULT dr = candidate->ProcessMessage(MFT_MESSAGE_SET_D3D_MANAGER,
+                                                   (ULONG_PTR)gfx_->deviceManager.Get());
+            accepted = SUCCEEDED(dr);
+        }
+
+        if (accepted) {
+            transform_ = candidate;
+            hardware = true;
+            Log("候选 [%u] 接受 D3D 管理器，启用 DXVA 硬件解码", i);
+        } else if (!fallback) {
+            fallback = candidate;
+        }
+    }
+
+    // 没有任何候选接受 D3D，退回记录的第一个（软件解码）
+    if (!transform_ && fallback) {
+        transform_ = fallback;
+        Log("没有解码器接受 D3D 管理器，退回软件解码（性能受限）");
+    }
+
     for (UINT32 i = 0; i < count; ++i) acts[i]->Release();
     CoTaskMemFree(acts);
-    if (FAILED(hr)) { Log("激活解码器失败 %08X", hr); return false; }
-
-    // 低延迟：不缓冲、不解码后等待
-    ComPtr<IMFAttributes> attrs;
-    if (SUCCEEDED(transform_->GetAttributes(&attrs)) && attrs) {
-        // 硬件 MFT 默认是异步模式，不解除锁定的话 ProcessInput/ProcessOutput 不工作，
-        // 表现为永远无输出、黑屏。
-        attrs->SetUINT32(MF_TRANSFORM_ASYNC_UNLOCK, TRUE);
-        attrs->SetUINT32(MF_LOW_LATENCY, TRUE);
-        // 注：原本这里想设 MF_SA_DISABLE_THINNING，但该属性在 Media Foundation
-        // 里并不存在（不在属性总表中），写进去也只是个与解码器无关的无效键。
-        // MF_LOW_LATENCY 已经能阻止硬件解码器做输出抽稀。
-    }
-
-    // 硬件解码：注入 D3D 管理器
-    if (hardware && gfx_ && gfx_->deviceManager) {
-        hr = transform_->ProcessMessage(MFT_MESSAGE_SET_D3D_MANAGER,
-                                        (ULONG_PTR)gfx_->deviceManager.Get());
-        if (FAILED(hr)) Log("设置 D3D11 管理器失败 %08X（将走系统内存路径）", hr);
-    }
+    if (!transform_) { Log("没有可用的解码器"); return false; }
 
     DWORD inId = 0, outId = 0;
     transform_->GetStreamIDs(1, &inId, 1, &outId);
