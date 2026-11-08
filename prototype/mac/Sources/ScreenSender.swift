@@ -978,15 +978,38 @@ final class RateController {
 
 let rateCtl = RateController(encoder: encoder, targetMbps: cfg.bitrateMbps)
 
+// 帧率峰值跟踪：每秒采一次完整帧数，保留最近 10 秒的最大值。
+// 用户操作往往很短暂，只看 2 秒瞬时值容易错过。
+var fpsWindow: [(Double, Int)] = []
+var lastCapCount = 0
+var lastCapTime = CFAbsoluteTimeGetCurrent()
+var peakFps: Double = 0
+var lastCursorCount = 0
+
+Timer.scheduledTimer(withTimeInterval: 1.0, repeats: true) { _ in
+    let now = CFAbsoluteTimeGetCurrent()
+    let dt = now - lastCapTime
+    guard dt > 0.5 else { return }
+    let delta = cap.captured - lastCapCount
+    lastCapCount = cap.captured
+    lastCapTime = now
+    let fps = Double(delta) / dt
+    fpsWindow.append((now, delta))
+    fpsWindow.removeAll { now - $0.0 > 10 }
+    peakFps = Double(fpsWindow.map { $0.1 }.max() ?? 0)
+}
+
 // 统计
 Timer.scheduledTimer(withTimeInterval: 2.0, repeats: true) { _ in
     let mbps = Double(sender.sentBytes) * 8 / 2.0 / 1_000_000
     rateCtl.tick(dropped: sender.dropped)
     let encAvg = encoder.encLatCount > 0 ? encoder.encLatSum / Double(encoder.encLatCount) : 0
     let capAvg = cap.capLatCount > 0 ? cap.capLatSum / Double(cap.capLatCount) : 0
-    Log.info(String(format: "采集 %d  发送 %d  光标 %d  丢弃 %d  %.1f Mbps  在途 %d  采集延迟 %.1f/%.1f  编码延迟 %.1f/%.1f ms",
-                    cap.captured, sender.sent, cursor.sentCount, sender.dropped, mbps,
-                    sender.inFlight, capAvg, cap.capLatMax, encAvg, encoder.encLatMax))
+    let cursorDelta = cursor.sentCount - lastCursorCount
+    lastCursorCount = cursor.sentCount
+    Log.info(String(format: "采集 %d  峰值 %.0ffps  空闲 %d  发送 %d  光标+%d  丢弃 %d  %.1f Mbps  在途 %d  采集延迟 %.1f  编码延迟 %.1f ms",
+                    cap.captured, peakFps, cap.idleFrameCount, sender.sent, cursorDelta,
+                    sender.dropped, mbps, sender.inFlight, capAvg, encAvg))
     cap.capLatSum = 0; cap.capLatCount = 0; cap.capLatMax = 0
     encoder.encLatSum = 0; encoder.encLatCount = 0; encoder.encLatMax = 0
     sender.sentBytes = 0

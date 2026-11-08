@@ -44,6 +44,7 @@
 #include <cstring>
 #include <string>
 #include <vector>
+#include <unordered_map>
 #include <atomic>
 #include <thread>
 #include <mutex>
@@ -929,15 +930,31 @@ void Presenter::PresentSample(IMFSample* sample) {
     ivd.Texture2D.ArraySlice = subIdx;
 
     ComPtr<ID3D11VideoProcessorInputView> inView;
-    if (FAILED(videoDevice_->CreateVideoProcessorInputView(inputTex.Get(), enum_.Get(),
-                                                           &ivd, &inView))) return;
+    uint64_t inKey = ((uint64_t)(uintptr_t)inputTex.Get() << 8) | (uint64_t)(subIdx & 0xFF);
+    auto itIn = inViewCache_.find(inKey);
+    if (itIn != inViewCache_.end()) {
+        inView = itIn->second;
+    } else {
+        if (inViewCache_.size() > 32) inViewCache_.clear();
+        if (FAILED(videoDevice_->CreateVideoProcessorInputView(inputTex.Get(), enum_.Get(),
+                                                               &ivd, &inView))) return;
+        inViewCache_[inKey] = inView;
+    }
 
     D3D11_VIDEO_PROCESSOR_OUTPUT_VIEW_DESC ovd{};
     ovd.ViewDimension = D3D11_VPOV_DIMENSION_TEXTURE2D;
 
     ComPtr<ID3D11VideoProcessorOutputView> outView;
-    if (FAILED(videoDevice_->CreateVideoProcessorOutputView(backTex.Get(), enum_.Get(),
-                                                            &ovd, &outView))) return;
+    void* outKey = (void*)backTex.Get();
+    auto itOut = outViewCache_.find(outKey);
+    if (itOut != outViewCache_.end()) {
+        outView = itOut->second;
+    } else {
+        if (outViewCache_.size() > 8) outViewCache_.clear();
+        if (FAILED(videoDevice_->CreateVideoProcessorOutputView(backTex.Get(), enum_.Get(),
+                                                                &ovd, &outView))) return;
+        outViewCache_[outKey] = outView;
+    }
 
     D3D11_VIDEO_PROCESSOR_STREAM stream{};
     stream.Enable = TRUE;
@@ -956,6 +973,8 @@ void Presenter::PresentSample(IMFSample* sample) {
 }
 
 void Presenter::Shutdown() {
+    inViewCache_.clear();
+    outViewCache_.clear();
     processor_.Reset();
     enum_.Reset();
     videoCtx_.Reset();
@@ -1287,12 +1306,26 @@ int main(int argc, char** argv) {
 
     HWND hwnd = nullptr;
     if (cfg.fullscreen) {
+        // 用 EnumDisplaySettings 拿物理分辨率，而不是 GetSystemMetrics。
+        // 系统若启用了 DPI 虚拟化，SM_CXSCREEN 会返回逻辑尺寸（200% 缩放下只有一半），
+        // 窗口就盖不满屏。
+        int sw = 0, sh = 0;
+        DEVMODEW dm{};
+        dm.dmSize = sizeof(dm);
+        if (EnumDisplaySettingsW(nullptr, ENUM_CURRENT_SETTINGS, &dm) && dm.dmPelsWidth > 0) {
+            sw = (int)dm.dmPelsWidth;
+            sh = (int)dm.dmPelsHeight;
+        }
+        if (sw <= 0 || sh <= 0) {
+            sw = GetSystemMetrics(SM_CXSCREEN);
+            sh = GetSystemMetrics(SM_CYSCREEN);
+        }
+        Log("全屏目标尺寸 %dx%d（显示器物理分辨率）", sw, sh);
+
         hwnd = CreateWindowExA(WS_EX_TOPMOST | WS_EX_TOOLWINDOW,
                                "SecDisplayReceiver", "SecDisplay",
                                WS_POPUP | WS_VISIBLE,
-                               0, 0,
-                               GetSystemMetrics(SM_CXSCREEN),
-                               GetSystemMetrics(SM_CYSCREEN),
+                               0, 0, sw, sh,
                                nullptr, nullptr, wc.hInstance, nullptr);
     } else {
         // 窗口模式：占屏幕中间一块，不置顶，方便远程调试时还能操作桌面
@@ -1313,6 +1346,13 @@ int main(int argc, char** argv) {
     }
     if (!hwnd) { Log("窗口创建失败"); return 3; }
     g_hwnd = hwnd;
+
+    {
+        RECT rc{};
+        GetClientRect(hwnd, &rc);
+        Log("窗口客户区 %dx%d（约等于显示器物理尺寸才算全屏）",
+            rc.right - rc.left, rc.bottom - rc.top);
+    }
 
     Presenter presenter;
     if (!presenter.Init(&gfx, hwnd, cfg.width, cfg.height)) return 4;
