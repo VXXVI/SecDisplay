@@ -41,6 +41,16 @@
 
 using Microsoft::WRL::ComPtr;
 
+// 宽字符转 UTF-8。不要在同一流上混用 printf/wprintf，那是未定义行为。
+static std::string ToUtf8(const wchar_t* w) {
+    if (!w) return {};
+    int len = ::WideCharToMultiByte(CP_UTF8, 0, w, -1, nullptr, 0, nullptr, nullptr);
+    if (len <= 0) return {};
+    std::string out((size_t)len - 1, '\0');
+    ::WideCharToMultiByte(CP_UTF8, 0, w, -1, &out[0], len, nullptr, nullptr);
+    return out;
+}
+
 static int g_fail = 0;
 static int g_warn = 0;
 
@@ -94,7 +104,7 @@ static void CheckGPU() {
         ad->GetDesc1(&desc);
         if (desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE) { ad->Release(); ad = nullptr; continue; }
 
-        wprintf(L"  显卡 %u: %s\n", i, desc.Description);
+        printf("  显卡 %u: %s\n", i, ToUtf8(desc.Description).c_str());
         printf("         显存 %.1f GB，厂商 %04X", desc.DedicatedVideoMemory / 1073741824.0, desc.VendorId);
 
         // 标出第三方虚拟显示器适配器（远程控制、投屏软件等），这类通常不能做视频解码
@@ -197,7 +207,7 @@ static void CheckMF() {
             LPWSTR name = nullptr;
             UINT32 len = 0;
             if (SUCCEEDED(acts[i]->GetAllocatedString(MFT_FRIENDLY_NAME_Attribute, &name, &len))) {
-                wprintf(L"         %s\n", name);
+                printf("         %s\n", ToUtf8(name).c_str());
                 CoTaskMemFree(name);
             }
             acts[i]->Release();

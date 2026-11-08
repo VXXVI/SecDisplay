@@ -41,6 +41,7 @@
 #include <cstdio>
 #include <cstdint>
 #include <cstring>
+#include <string>
 #include <vector>
 #include <atomic>
 #include <thread>
@@ -88,6 +89,17 @@ static void Log(const char* fmt, ...) {
     g_logBuf[n] = '\n';
     fwrite(g_logBuf, 1, n + 1, stderr);
     fflush(stderr);
+}
+
+// 宽字符转 UTF-8。不要在同一输出流上混用 printf 和 wprintf，
+// 那是未定义行为，MSVC 上可能崩溃或输出丢失。
+static std::string ToUtf8(const wchar_t* w) {
+    if (!w) return {};
+    int len = ::WideCharToMultiByte(CP_UTF8, 0, w, -1, nullptr, 0, nullptr, nullptr);
+    if (len <= 0) return {};
+    std::string out((size_t)len - 1, '\0');
+    ::WideCharToMultiByte(CP_UTF8, 0, w, -1, &out[0], len, nullptr, nullptr);
+    return out;
 }
 
 static uint64_t NowMicros() {
@@ -233,7 +245,7 @@ bool Graphics::CreateDevice() {
                                       flags, levels, ARRAYSIZE(levels),
                                       D3D11_SDK_VERSION, &trial, nullptr, nullptr);
         if (FAILED(r)) {
-            wprintf(L"  跳过显示适配器（无法创建设备）: %s\n", nameW);
+            Log("  跳过显示适配器（无法创建设备）: %s", ToUtf8(nameW).c_str());
             continue;
         }
 
@@ -241,14 +253,14 @@ bool Graphics::CreateDevice() {
         // 必须验证它真的支持 H.264 硬解，否则选了也白选。
         ComPtr<ID3D11VideoDevice> vd;
         if (FAILED(trial.As(&vd)) || vd->GetVideoDecoderProfileCount() == 0) {
-            wprintf(L"  跳过显示适配器（无视频解码能力）: %s\n", nameW);
+            Log("  跳过显示适配器（无视频解码能力）: %s", ToUtf8(nameW).c_str());
             continue;
         }
 
         device = trial;
         trial->GetImmediateContext(&context);
-        wprintf(L"  选用显示适配器: %s（%u 个解码 profile）\n",
-                nameW, vd->GetVideoDecoderProfileCount());
+        Log("  选用显示适配器: %s（%u 个解码 profile）",
+            ToUtf8(nameW).c_str(), vd->GetVideoDecoderProfileCount());
         chosen = adapter;
         hr = S_OK;
         break;
@@ -364,7 +376,7 @@ bool Decoder::Init(Graphics* gfx, int width, int height) {
         if (SUCCEEDED(acts[i]->GetAllocatedString(MFT_FRIENDLY_NAME_Attribute, &name, &len))) {
             UINT32 d3dAware = 0;
             acts[i]->GetUINT32(MF_SA_D3D_AWARE, &d3dAware);
-            wprintf(L"         [%u] %s%s\n", i, name, d3dAware ? L"  (支持 D3D)" : L"");
+            Log("         [%u] %s%s", i, ToUtf8(name).c_str(), d3dAware ? "  (支持 D3D)" : "");
             CoTaskMemFree(name);
         }
     }
