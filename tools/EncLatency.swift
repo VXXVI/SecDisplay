@@ -18,15 +18,26 @@ let W = a.count > 1 ? Int(a[1])! : 2880
 let H = a.count > 2 ? Int(a[2])! : 1800
 let FPS = a.count > 3 ? Double(a[3])! : 55
 let SECS = a.count > 4 ? Double(a[4])! : 6
+let codecName = a.count > 5 ? a[5] : "h264"
+let codec: CMVideoCodecType = (codecName == "hevc") ? kCMVideoCodecType_HEVC : kCMVideoCodecType_H264
+let profile: CFString = (codecName == "hevc")
+    ? (kVTProfileLevel_HEVC_Main_AutoLevel as CFString)
+    : (kVTProfileLevel_H264_High_AutoLevel as CFString)
 
 final class Box { let t: UInt64; init(_ t: UInt64) { self.t = t } }
 
 var latencies: [Double] = []
 let lock = NSLock()
 
-let spec: [String: Any] = [
-    kVTVideoEncoderSpecification_EnableLowLatencyRateControl as String: true
-]
+let envv = ProcessInfo.processInfo.environment
+let mode = envv["ENC_MODE"] ?? "lowlat"
+var spec: [String: Any] = [:]
+switch mode {
+case "lowlat":
+    spec[kVTVideoEncoderSpecification_EnableLowLatencyRateControl as String] = true
+default:
+    break
+}
 let attrs: [String: Any] = [
     kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange,
     kCVPixelBufferWidthKey as String: W,
@@ -43,17 +54,21 @@ let cb: VTCompressionOutputCallback = { _, refcon, status, _, _ in
 
 var session: VTCompressionSession?
 let st = VTCompressionSessionCreate(allocator: nil, width: Int32(W), height: Int32(H),
-    codecType: kCMVideoCodecType_H264, encoderSpecification: spec as CFDictionary,
+    codecType: codec, encoderSpecification: spec as CFDictionary,
     imageBufferAttributes: attrs as CFDictionary, compressedDataAllocator: nil,
     outputCallback: cb, refcon: nil, compressionSessionOut: &session)
 guard st == noErr, let s = session else { E("创建失败 \(st)"); exit(2) }
 
 VTSessionSetProperty(s, key: kVTCompressionPropertyKey_RealTime, value: kCFBooleanTrue)
 VTSessionSetProperty(s, key: kVTCompressionPropertyKey_AllowFrameReordering, value: kCFBooleanFalse)
-VTSessionSetProperty(s, key: kVTCompressionPropertyKey_ProfileLevel, value: kVTProfileLevel_H264_High_AutoLevel)
+VTSessionSetProperty(s, key: kVTCompressionPropertyKey_ProfileLevel, value: profile)
 VTSessionSetProperty(s, key: kVTCompressionPropertyKey_ExpectedFrameRate, value: FPS as CFNumber)
 VTSessionSetProperty(s, key: kVTCompressionPropertyKey_AverageBitRate, value: 100_000_000 as CFNumber)
-VTSessionSetProperty(s, key: kVTCompressionPropertyKey_MaxFrameDelayCount, value: 1 as CFNumber)
+if (envv["ENC_DELAY"] ?? "1") == "0" {
+    VTSessionSetProperty(s, key: kVTCompressionPropertyKey_MaxFrameDelayCount, value: 0 as CFNumber)
+} else {
+    VTSessionSetProperty(s, key: kVTCompressionPropertyKey_MaxFrameDelayCount, value: 1 as CFNumber)
+}
 VTCompressionSessionPrepareToEncodeFrames(s)
 
 var p: CFTypeRef?
@@ -67,7 +82,8 @@ CVPixelBufferCreate(nil, W, H, kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange,
                     [kCVPixelBufferIOSurfacePropertiesKey as String: [:]] as CFDictionary, &pb)
 guard let pix = pb else { E("像素缓冲失败"); exit(3) }
 
-E("提交 \(Int(FPS))fps × \(Int(SECS))s  \(W)x\(H)")
+E("模式 \(mode) 帧延迟 \(envv["ENC_DELAY"] ?? "1")")
+E("提交 \(Int(FPS))fps × \(Int(SECS))s  \(W)x\(H)  \(codecName)")
 let t0 = CFAbsoluteTimeGetCurrent()
 var n = 0
 var next = t0
