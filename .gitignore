@@ -41,3 +41,4 @@ prototype/windows/*.pdb
 # 运行日志
 prototype/mac/logs/
 prototype/windows/logs/
+tools/latencyclient
