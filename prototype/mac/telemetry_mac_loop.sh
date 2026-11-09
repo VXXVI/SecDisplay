@@ -4,8 +4,10 @@
 # 设备 ID 由 push_telemetry.sh 用仓库外的随机值生成，主机名不进公开仓。
 
 set -u
-cd "$(dirname "$0")/.."          # prototype/mac
-REPO="$(cd ../.. && pwd)"
+# 脚本在 prototype/mac/ 下，logs/ 与 screensender 都在这里。
+MACDIR="$(cd "$(dirname "$0")" && pwd)"
+cd "$MACDIR"
+REPO="$(cd "$MACDIR/../.." && pwd)"
 TOOLS="$REPO/tools"
 
 LOG="$(ls -t logs/sender_*.log 2>/dev/null | head -1)"

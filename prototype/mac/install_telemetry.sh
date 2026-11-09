@@ -5,9 +5,10 @@
 #   ./install_telemetry.sh         安装
 #   ./install_telemetry.sh remove  卸载
 set -u
-cd "$(dirname "$0")/.."
-MACDIR="$(pwd)"
-REPO="$(cd ../.. && pwd)"
+# 脚本本身就在 prototype/mac/ 下，MACDIR 必须是这里（循环脚本也在此）。
+# 早期版本多 cd 了一级到 prototype/，导致 plist 指向不存在的路径、launchd 报 127。
+MACDIR="$(cd "$(dirname "$0")" && pwd)"
+REPO="$(cd "$MACDIR/../.." && pwd)"
 TOOLS="$REPO/tools"
 PLIST="$HOME/Library/LaunchAgents/com.secdisplay.telemetry.plist"
 
