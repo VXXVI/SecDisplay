@@ -31,6 +31,52 @@ import Darwin
 
 setvbuf(stdout, nil, _IONBF, 0)
 
+// MARK: - 虚拟屏身份
+//
+// 用一组独占领地的 EDID 身份号来锚定「这块屏是我们建的」。
+// CGDisplayVendorNumber/ModelNumber/SerialNumber 能原样读回这三个值（已实测）。
+// 避开系统保留号：内建屏 vendor=0x0610(Apple)，Sidecar/AirPlay 是
+// vendor=0x6161706c('aapl') / product=0x69506164('iPad')。
+// 旧值 0x2B3 来历不明，且与某些虚拟适配器可能重叠，改用自定义号。
+// CGVirtualDisplay 与 AirPlay/Sidecar 共用同一套私有 API，displayID 会随
+// Sidecar 插拔漂移或复用，只有 EDID 三元组稳定可靠。
+let kVDVendorID: UInt32  = 0xEEEE
+let kVDProductID: UInt32 = 0x5344   // 'SD'
+let kVDSerialNum: UInt32 = 0x0001
+
+// 升级前的旧身份（0x2B3/0x1000/1）。异常退出可能留下这种残留屏，
+// 仅用于残留检测与告警，绝不作为采集目标，避免把旧残留当成自己的屏抓进去。
+let kOldVDVendorID: UInt32  = 0x02B3
+let kOldVDProductID: UInt32 = 0x1000
+let kOldVDSerialNum: UInt32 = 0x0001
+
+/// 判断某块显示器是不是 SecDisplay 自己建的虚拟屏（当前身份）。
+func isOurVirtualDisplay(_ id: CGDirectDisplayID) -> Bool {
+    CGDisplayVendorNumber(id) == kVDVendorID &&
+    CGDisplayModelNumber(id) == kVDProductID &&
+    CGDisplaySerialNumber(id) == kVDSerialNum
+}
+
+/// 是否 SecDisplay 建的屏（含升级前旧身份），仅用于残留告警。
+func isAnySecDisplay(_ id: CGDirectDisplayID) -> Bool {
+    isOurVirtualDisplay(id) ||
+    (CGDisplayVendorNumber(id) == kOldVDVendorID &&
+     CGDisplayModelNumber(id) == kOldVDProductID &&
+     CGDisplaySerialNumber(id) == kOldVDSerialNum)
+}
+
+/// 枚举当前所有 SecDisplay 虚拟屏，返回 (displayID, 是否旧身份)。
+func listSecDisplays() -> [(id: CGDirectDisplayID, old: Bool)] {
+    var n: UInt32 = 0
+    CGGetOnlineDisplayList(32, nil, &n)
+    var ids = [CGDirectDisplayID](repeating: 0, count: Int(n))
+    CGGetOnlineDisplayList(n, &ids, &n)
+    return ids.prefix(Int(n)).compactMap { id -> (id: CGDirectDisplayID, old: Bool)? in
+        guard isAnySecDisplay(id) else { return nil }
+        return (id, !isOurVirtualDisplay(id))
+    }
+}
+
 // MARK: - 配置
 
 struct Config {
@@ -79,9 +125,9 @@ final class VirtualDisplayManager {
 
         let queue = DispatchQueue(label: "SecDisplay.vd")
         let d = descCls.init()
-        d.setValue(NSNumber(value: 0x2B3), forKey: "vendorID")
-        d.setValue(NSNumber(value: 0x1000), forKey: "productID")
-        d.setValue(NSNumber(value: 1), forKey: "serialNum")
+        d.setValue(NSNumber(value: kVDVendorID), forKey: "vendorID")
+        d.setValue(NSNumber(value: kVDProductID), forKey: "productID")
+        d.setValue(NSNumber(value: kVDSerialNum), forKey: "serialNum")
         d.setValue("SecDisplay", forKey: "name")
         d.setValue(NSNumber(value: cfg.width), forKey: "maxPixelsWide")
         d.setValue(NSNumber(value: cfg.height), forKey: "maxPixelsHigh")
@@ -467,14 +513,26 @@ final class Capture: NSObject, SCStreamOutput, SCStreamDelegate {
         let wantID = displayIDProvider()
         let content = try await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: false)
 
-        // 优先按 id 找；找不到就按名字找（虚拟屏重建后 id 会变）
-        var target = content.displays.first(where: { $0.displayID == wantID })
+        // 选屏只认 EDID 三元组身份，不信易变的 displayID。
+        // Sidecar 接入/断开会让系统重新分配 CGDirectDisplayID，旧 id 可能失效
+        // 或被 AirPlay 屏复用；单靠 id 或「非主屏 + 宽度相等」会抓到 iPad / 别的虚拟屏。
+        // isOurVirtualDisplay 用 vendor/product/serial 精确锚定我们自己建的屏，
+        // 内建(0x610)、Sidecar(aapl/iPad)、GameViewer、Duet 都不会误命中。
+        var target = content.displays.first(where: { isOurVirtualDisplay($0.displayID) })
+        // 兜底：极少数情况下三元组尚未就绪，再按创建时记下的 id 找一次。
         if target == nil {
-            target = content.displays.first(where: { $0.displayID != CGMainDisplayID() && $0.width == cfg.width })
+            target = content.displays.first(where: { $0.displayID == wantID })
         }
         guard let display = target else {
+            let avail = content.displays.map { d -> String in
+                String(format: "id=%u vendor=0x%x model=0x%x",
+                       d.displayID,
+                       CGDisplayVendorNumber(d.displayID),
+                       CGDisplayModelNumber(d.displayID))
+            }
             throw NSError(domain: "Capture", code: 1, userInfo: [
-                NSLocalizedDescriptionKey: "找不到虚拟屏（期望 id=\(wantID)，可用 \(content.displays.map { $0.displayID })）"
+                NSLocalizedDescriptionKey: "找不到 SecDisplay 虚拟屏（期望身份 vendor=0x\(String(kVDVendorID, radix:16))，" +
+                    "创建时 id=\(wantID)，当前可用: \(avail.joined(separator: ", "))）"
             ])
         }
 
@@ -1010,17 +1068,21 @@ encoder.onFrame = { data, isKey, ts in
 do {
     try vd.create(cfg)
 } catch VirtualDisplayManager.Err.initFailed {
-    // 系统里已有残留虚拟屏占位时，新建会被拒绝
-    var n: UInt32 = 0
-    CGGetOnlineDisplayList(32, nil, &n)
-    var ids = [CGDirectDisplayID](repeating: 0, count: Int(n))
-    CGGetOnlineDisplayList(n, &ids, &n)
+    // 用身份三元组精确判断残留。不能再用「在线显示器 > 1」：
+    // Sidecar / 外接屏在线时本来就有多块屏，会被误报成残留虚拟屏。
     Log.info("虚拟屏创建被拒绝（initWithDescriptor 返回 nil）")
-    Log.info("当前在线显示器: \(ids)")
-    if ids.count > 1 {
-        Log.info("原因：上一次运行异常退出，留下了残留虚拟屏占住了位置")
+    let ours = listSecDisplays()
+    if !ours.isEmpty {
+        let desc = ours.map { "id=\($0.id)\($0.old ? "(旧身份)" : "")" }.joined(separator: " ")
+        Log.info("检测到残留的 SecDisplay 虚拟屏: \(desc)")
+        Log.info("原因：上一次运行异常退出，留下了虚拟屏占住了位置（Sidecar 共存不受影响）")
         Log.info("处理：注销并重新登录（或重启）后再运行")
     } else {
+        var n: UInt32 = 0
+        CGGetOnlineDisplayList(32, nil, &n)
+        var ids = [CGDirectDisplayID](repeating: 0, count: Int(n))
+        CGGetOnlineDisplayList(n, &ids, &n)
+        Log.info("当前在线显示器: \(ids)（其中无 SecDisplay 残留屏）")
         Log.info("原因不明，请检查系统日志")
     }
     exit(2)
@@ -1028,6 +1090,18 @@ do {
     Log.info("虚拟屏创建失败: \(error)")
     exit(2)
 }
+
+// 打印在线显示器身份，便于现场确认选屏锚定命中正确、且 Sidecar 被正确排除
+var onN: UInt32 = 0
+CGGetOnlineDisplayList(32, nil, &onN)
+var onIDs = [CGDirectDisplayID](repeating: 0, count: Int(onN))
+CGGetOnlineDisplayList(onN, &onIDs, &onN)
+let idList = onIDs.prefix(Int(onN)).map { id -> String in
+    String(format: "id=%u:vendor=0x%x:model=0x%x%@",
+           id, CGDisplayVendorNumber(id), CGDisplayModelNumber(id),
+           isOurVirtualDisplay(id) ? "[SELF]" : "")
+}
+Log.info("在线显示器身份: \(idList.joined(separator: "  "))")
 
 // 接收端的 0x02 控制消息 → 让编码器下一帧强制 IDR
 sender.onKeyframeRequest = { encoder.requestKeyframe() }

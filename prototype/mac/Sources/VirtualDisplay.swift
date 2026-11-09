@@ -83,9 +83,12 @@ final class VirtualDisplay {
         let queue = DispatchQueue(label: "SecDisplay.vd.\(name).\(UUID().uuidString)")
 
         let desc = descCls.init()
-        desc.setValue(NSNumber(value: 0x2B3), forKey: "vendorID")
-        desc.setValue(NSNumber(value: 0x1000), forKey: "productID")
-        desc.setValue(NSNumber(value: 1), forKey: "serialNum")
+        // 专属 EDID 身份：与 ScreenSender.swift 的 kVDVendorID/ProductID/SerialNum 一致。
+        // 避开内建 0x610、Sidecar 'aapl'/'iPad'，供采集侧用三元组精确锚定本屏，
+        // 防止 Sidecar 插拔导致 displayID 漂移时抓错屏。
+        desc.setValue(NSNumber(value: UInt32(0xEEEE)), forKey: "vendorID")
+        desc.setValue(NSNumber(value: UInt32(0x5344)), forKey: "productID")
+        desc.setValue(NSNumber(value: UInt32(0x0001)), forKey: "serialNum")
         desc.setValue(name, forKey: "name")
         desc.setValue(NSNumber(value: pixelWidth), forKey: "maxPixelsWide")
         desc.setValue(NSNumber(value: pixelHeight), forKey: "maxPixelsHigh")
