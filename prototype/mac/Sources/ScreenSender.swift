@@ -767,7 +767,7 @@ final class Sender {
     var keepAliveGap: CFAbsoluteTime = 0.08
 
     /// 光标位置。不走视频帧，独立小包，不占用在途帧配额。
-    /// 坐标是相对虚拟屏左上角的像素值。
+    /// 坐标是相对虚拟屏左上角的逻辑点值（与 CGDisplayBounds / CGEvent.location 同基准）。
     func sendCursor(x: Float, y: Float, visible: Bool) {
         guard connected, let c = conn else { return }
         var packet = Data(capacity: 19)
@@ -857,7 +857,7 @@ final class InputInjector {
     private(set) var eventCount = 0
 
     /// - Parameters:
-    ///   - x/y: 相对虚拟屏左上角的像素坐标
+    ///   - x/y: 相对虚拟屏左上角的逻辑点坐标（Windows 端用逻辑尺寸换算后发来）
     ///   - buttons: bit0 左键，bit1 右键，bit2 中键
     ///   - wheel: 滚动量，正数向下
     func handle(x: Float, y: Float, buttons: UInt8, wheel: Int16, bounds: CGRect) {
@@ -1045,7 +1045,12 @@ sender.onInput = { x, y, buttons, wheel in
                     bounds: CGDisplayBounds(vd.displayID))
 }
 
-// 光标转发：坐标是相对虚拟屏的像素值，虚拟屏重建后 id 变了也能拿到新 bounds
+// 光标转发：坐标是相对虚拟屏的逻辑点值。
+// CGDisplayBounds 在 hiDPI 虚拟屏上返回点尺寸（如 1440x900），
+// CGEvent.location 也是点坐标，两者同基准，直接相减即可。
+// Windows 端坐标基准必须与之相同（见接收端 g_coordW/H）。
+let vb = CGDisplayBounds(vd.displayID)
+Log.info("坐标基准: 逻辑点 \(Int(vb.width))x\(Int(vb.height))，原点 (\(Int(vb.minX)), \(Int(vb.minY)))")
 let cursor = CursorTracker(sender: sender, bounds: { CGDisplayBounds(vd.displayID) })
 cursor.start()
 

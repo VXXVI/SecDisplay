@@ -140,8 +140,12 @@ static const size_t MAX_PACKET = 64u * 1024u * 1024u;
 // Windows 的光标由硬件合成，延迟接近零。
 // ---------------------------------------------------------------------------
 
-static std::atomic<int> g_videoW{0};
-static std::atomic<int> g_videoH{0};
+// 坐标基准 = Mac 虚拟屏的「逻辑点」尺寸（Retina 2x 下是物理像素的一半）。
+// 光标显示和输入回传都用这个：macOS 全局鼠标坐标是点坐标，CGDisplayBounds
+// 返回的也是点尺寸。用物理像素做分母会让光标显示在半程、点击放大一倍。
+// 解码/呈现/全屏窗口仍用 cfg.width/height（物理像素），两者不能混用。
+static std::atomic<int> g_coordW{0};
+static std::atomic<int> g_coordH{0};
 static std::atomic<double> g_cursorX{-1};
 static std::atomic<double> g_cursorY{-1};
 
@@ -173,13 +177,13 @@ static void SendInputPacket(float vx, float vy, uint8_t buttons, int16_t wheel) 
 
 static HWND g_hwnd = nullptr;   // 主窗口句柄，ClientToVideo 与全屏切换共用
 
-/// 窗口客户区坐标 → 视频像素坐标（0..videoW, 0..videoH）
+/// 窗口客户区坐标 → 虚拟屏逻辑点坐标（0..coordW, 0..coordH）
 static bool ClientToVideo(int cx, int cy, float* vx, float* vy) {
     if (!g_hwnd) return false;
     RECT rc{};
     if (!GetClientRect(g_hwnd, &rc)) return false;
     int cw = rc.right - rc.left, ch = rc.bottom - rc.top;
-    int vw = g_videoW.load(), vh = g_videoH.load();
+    int vw = g_coordW.load(), vh = g_coordH.load();
     if (cw <= 0 || ch <= 0 || vw <= 0 || vh <= 0) return false;
     *vx = (float)cx / cw * vw;
     *vy = (float)cy / ch * vh;
@@ -202,7 +206,7 @@ static void OnCursorPacket(const uint8_t* p, size_t payloadLen) {
     g_cursorX = rx;
     g_cursorY = ry;
 
-    int vw = g_videoW.load(), vh = g_videoH.load();
+    int vw = g_coordW.load(), vh = g_coordH.load();
     if (vw <= 0 || vh <= 0) return;
 }
 
@@ -1144,8 +1148,10 @@ static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
 struct RunConfig {
     std::string host = "10.10.10.1";
     int port = 9922;
-    int width = 2880;
+    int width = 2880;         // 物理像素：解码 / 呈现 / 全屏窗口
     int height = 1800;
+    int coordW = -1;          // 逻辑点坐标基准；<0 表示自动取物理 / 2
+    int coordH = -1;
     bool fullscreen = true;   // 默认全屏铺满；--windowed 改成窗口
     bool reconnect = true;    // 断线自动重连
     bool vsync = true;        // true=垂直同步（画面均匀），false=免同步（延迟最低但可能抖）
@@ -1170,6 +1176,11 @@ static void ParseArgs(int argc, char** argv, RunConfig& cfg) {
             cfg.vsync = false;
         } else if ((a == "--log" || a == "-l") && i + 1 < argc) {
             cfg.logFile = argv[++i];
+        } else if (a == "--coord" && i + 2 < argc) {
+            // 显式指定逻辑点坐标尺寸（如 --coord 1440 900）。
+            // 用于 CGDisplayBounds 返回值与预期不符时现场纠正，无需重编译。
+            cfg.coordW = atoi(argv[++i]);
+            cfg.coordH = atoi(argv[++i]);
         } else if (a.rfind("--", 0) == 0) {
             // 未知选项，忽略
         } else {
@@ -1465,10 +1476,17 @@ int main(int argc, char** argv) {
     WSADATA wsa;
     if (WSAStartup(MAKEWORD(2, 2), &wsa) != 0) { Log("WSAStartup 失败"); return 5; }
 
-    g_videoW = cfg.width;
-    g_videoH = cfg.height;
+    // 坐标基准用逻辑点尺寸。默认 2x Retina，逻辑 = 物理 / 2。
+    // Mac 端 CursorTracker 发的是点坐标，InputInjector 也把收到的值当点坐标，
+    // 所以这里必须用逻辑尺寸，否则光标和点击会各偏一半 / 一倍。
+    // 若 Mac 启动日志里的「坐标基准」与此不符，用 --coord W H 现场纠正。
+    g_coordW = cfg.coordW > 0 ? cfg.coordW : cfg.width / 2;
+    g_coordH = cfg.coordH > 0 ? cfg.coordH : cfg.height / 2;
+    Log("坐标基准: 逻辑 %dx%d（物理 %dx%d%s）",
+        g_coordW.load(), g_coordH.load(), cfg.width, cfg.height,
+        cfg.coordW > 0 ? "，命令行指定" : "，自动 2x");
 
-    // 光标应用线程：把收到的归一化坐标映射到窗口客户区，直接移动系统光标。
+    // 光标应用线程：把收到的逻辑点坐标按 g_coordW/H 换算到窗口客户区，直接移动系统光标。
     // Windows 的光标由硬件合成，不受视频帧率影响，所以指针是跟手的。
     std::thread cursorThread([] {
         POINT lastPt{ INT_MIN, INT_MIN };
@@ -1480,7 +1498,7 @@ int main(int argc, char** argv) {
 
             double cx = g_cursorX.load(), cy = g_cursorY.load();
             if (cx < 0 || cy < 0) continue;
-            int vw = g_videoW.load(), vh = g_videoH.load();
+            int vw = g_coordW.load(), vh = g_coordH.load();
             if (vw <= 0 || vh <= 0 || !g_hwnd) continue;
 
             RECT rc{};
