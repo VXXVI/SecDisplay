@@ -1,0 +1,70 @@
+name: SecDisplay CI
+
+# 每次 push / PR 用 GitHub 托管 runner 做两件事：
+#   1. 编译两端（macOS runner 编 Swift，windows runner 编 MSVC），
+#      这样改动 Windows 代码后不用等设备侧 build 才知道写坏了。
+#   2. 用同一份样本日志验证 Python / PowerShell 两份脱敏提取器输出一致，
+#      并把「公开仓里不含 IP / endpoint / 日志正文」当成硬检查。
+#
+# 注意：云端 runner 连不到雷电链路 10.10.10.x，也不驱动虚拟屏，
+# 所以这里只做编译与脱敏正确性检查，不测延迟和卡顿。
+
+"on":
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  build-mac:
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+      - name: 编译 Mac 发送端
+        run: |
+          cd prototype/mac
+          swiftc -O Sources/ScreenSender.swift -o screensender
+      - name: 产物检查
+        run: test -f prototype/mac/screensender && echo "Mac 编译通过"
+
+  build-windows:
+    runs-on: windows-2022
+    steps:
+      - uses: actions/checkout@v4
+      - name: 配置 MSVC 环境
+        uses: ilammy/msvc-dev-cmd@v1
+      - name: 编译 Windows 接收端
+        shell: cmd
+        run: |
+          cd prototype\windows
+          cl /nologo /EHsc /std:c++17 /O2 /utf-8 SecDisplayReceiver.cpp /Fe:SecDisplayReceiver.exe
+      - name: 产物检查
+        shell: cmd
+        run: if not exist prototype\windows\SecDisplayReceiver.exe exit /b 1
+
+  telemetry-consistency:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: 生成样本日志（含内网 IP，用于验证脱敏）
+        run: python3 tools/make_fixtures.py
+      - name: Python 提取器
+        run: |
+          python3 tools/extract_telemetry.py --platform mac --log /tmp/fx/mac.log --out /tmp/fx/mac.json --commit deadbeef
+          python3 tools/extract_telemetry.py --platform win --log /tmp/fx/win.log --out /tmp/fx/win.json --commit deadbeef
+      - name: PowerShell 后备提取器（验证正则不漂移）
+        shell: pwsh
+        run: |
+          pwsh tools/extract_telemetry.ps1 -Log /tmp/fx/win.log -Out /tmp/fx/win.pwsh.json -Commit deadbeef
+      - name: 脱敏与一致性校验
+        run: python3 tools/check_telemetry.py --mac /tmp/fx/mac.json --win /tmp/fx/win.json --win-ps1 /tmp/fx/win.pwsh.json --log /tmp/fx/mac.log
+      - name: 汇总工具冒烟
+        run: |
+          mkdir -p /tmp/fx/telemetry/mac /tmp/fx/telemetry/win
+          cp /tmp/fx/mac.json /tmp/fx/telemetry/mac/ci.json
+          cp /tmp/fx/win.json /tmp/fx/telemetry/win/ci.json
+          python3 tools/summarize_telemetry.py --dir /tmp/fx/telemetry --strict

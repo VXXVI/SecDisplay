@@ -55,6 +55,19 @@ if exist "logs\diag.log" (
 )
 echo.
 echo ============================================================
-echo   把上面从"SecDisplay 接收端"开始的内容整段复制发出来
+echo   自动上传脱敏指标（不用你复制日志）
 echo ============================================================
+set "REPO=%~dp0..\.."
+for %%i in ("%REPO%") do set "REPO=%%~fi"
+del /q "%TEMP%\secdisplay-diag-win.json" 2>nul
+powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0..\..\tools\extract_telemetry.ps1" ^
+    -Log "%~dp0logs\diag.log" -Out "%TEMP%\secdisplay-diag-win.json" -Commit "unknown" 2>nul
+if exist "%TEMP%\secdisplay-diag-win.json" (
+    powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0..\..\tools\push_telemetry.ps1" ^
+        -Json "%TEMP%\secdisplay-diag-win.json" -Platform win -RepoRoot "%REPO%" 2>nul
+    echo   指标已提交到 telemetry/win/（只含数值，无 IP / 无原始日志 / 无主机名）
+) else (
+    echo   未生成指标文件，跳过上传
+)
+echo.
 pause
