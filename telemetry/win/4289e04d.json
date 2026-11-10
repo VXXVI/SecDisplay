@@ -1,53 +1,55 @@
 {
-  "schema": 1,
-  "platform": "win",
-  "generated_utc": "2026-11-10T08:10:23Z",
-  "commit": "603fd29",
-  "coord": {
-    "logical_w": 2880,
-    "logical_h": 1800,
-    "physical_w": 2880,
-    "physical_h": 1800,
-    "source": null
-  },
-  "status": {
-    "present_mode": "vsync",
-    "decoder_hw": true,
-    "client_w": 2880,
-    "client_h": 1800,
-    "fullscreen": true
-  },
-  "samples": 133,
-  "metrics": {
-    "packets_last": 4370.0,
-    "decoded_last": 4368.0,
-    "decoded_per_sample": {
-      "min": 4.0,
-      "median": 27.0,
-      "p95": 65.0,
-      "max": 91.0
-    },
-    "decode_fail_last": 0.0,
-    "mbps": {
-      "min": 0.2,
-      "median": 0.6,
-      "p95": 1.9,
-      "max": 3.9
-    },
-    "extra_latency_ms": {
-      "min": 0.0,
-      "median": 0.0,
-      "p95": 0.0,
-      "max": 0.0
-    },
-    "peak_fps": {
-      "min": 8.0,
-      "median": 22.0,
-      "p95": 39.5,
-      "max": 45.5
-    },
-    "cursor_pkts_total": 6414,
-    "input_pkts_last": 13123.0
-  },
-  "warnings": []
+    "schema":  1,
+    "platform":  "win",
+    "generated_utc":  "2026-11-10T08:12:54Z",
+    "commit":  "94d9bb2",
+    "coord":  {
+                  "logical_w":  1440,
+                  "logical_h":  900,
+                  "physical_w":  2880,
+                  "physical_h":  1800,
+                  "source":  "auto2x"
+              },
+    "status":  {
+                   "present_mode":  "vsync",
+                   "decoder_hw":  true,
+                   "client_w":  1440,
+                   "client_h":  900,
+                   "fullscreen":  false
+               },
+    "samples":  4,
+    "metrics":  {
+                    "packets_last":  0,
+                    "decoded_last":  0,
+                    "decoded_per_sample":  {
+                                               "min":  0,
+                                               "median":  0,
+                                               "p95":  0,
+                                               "max":  0
+                                           },
+                    "decode_fail_last":  0,
+                    "mbps":  {
+                                 "min":  0,
+                                 "median":  0,
+                                 "p95":  0,
+                                 "max":  0
+                             },
+                    "extra_latency_ms":  {
+                                             "min":  0,
+                                             "median":  0,
+                                             "p95":  0,
+                                             "max":  0
+                                         },
+                    "peak_fps":  {
+                                     "min":  0,
+                                     "median":  0,
+                                     "p95":  0,
+                                     "max":  0
+                                 },
+                    "cursor_pkts_total":  0,
+                    "input_pkts_last":  0
+                },
+    "warnings":  [
+
+                 ]
 }
