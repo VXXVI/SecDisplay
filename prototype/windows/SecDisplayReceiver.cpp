@@ -238,7 +238,9 @@ static const UINT WM_TRAY      = WM_USER + 1;   // Shell_NotifyIcon 回调消息
 static const UINT ID_TRAY_EXIT = 1001;
 static const UINT ID_TRAY_TOGGLE = 1002;
 static const UINT ID_TRAY_ABOUT  = 1003;
+static const UINT ID_TRAY_MINIMIZE = 1004;
 static const int  HOTKEY_QUIT_ID = 1;
+static const int  HOTKEY_HIDE_ID = 2;   // Ctrl+Alt+H：最小化让位/还原，不退出
 // 用 W 版托盘结构与宽字符提示：A 版在 CP936 下会把 UTF-8 中文按 GBK 解码，
 // 托盘悬浮提示会变乱码。窗口类本身仍是 A 版注册（类名纯 ASCII），不受影响。
 static NOTIFYICONDATAW g_nid{};
@@ -249,6 +251,20 @@ static void RequestQuit() {
     // 该变量在文件后段才定义，提前引用会编译失败。
     // WM_CLOSE -> WndProc 的 PostQuitMessage 会让 GetMessage 返回 0，正常收尾。
     if (g_hwnd) PostMessageA(g_hwnd, WM_CLOSE, 0, 0);
+}
+
+// 一键让位：把窗口最小化/还原，用户随时能回到 Windows 桌面而不必退出程序。
+// 不碰 g_alive、不 PostQuitMessage，网络与解码线程照常运行，回来即恢复画面。
+static void ToggleMinimize() {
+    if (!g_hwnd) return;
+    if (IsIconic(g_hwnd)) {
+        ShowWindow(g_hwnd, SW_RESTORE);
+        SetForegroundWindow(g_hwnd);
+        Log("已从托盘还原窗口");
+    } else {
+        ShowWindow(g_hwnd, SW_MINIMIZE);
+        Log("已最小化让位，按 Ctrl+Alt+H 或点托盘还原");
+    }
 }
 
 static void TrayCreate(HWND hwnd) {
@@ -283,6 +299,7 @@ static void TrayShowMenu(HWND hwnd) {
     if (!menu) return;
     // W 版菜单 + 宽字符：绕开 CP936 对 UTF-8 中文的 GBK 误解码
     AppendMenuW(menu, MF_STRING, ID_TRAY_TOGGLE, L"切换全屏 / 窗口  (F11)");
+    AppendMenuW(menu, MF_STRING, ID_TRAY_MINIMIZE, L"最小化让位 / 还原  (Ctrl+Alt+H)");
     AppendMenuW(menu, MF_STRING, ID_TRAY_ABOUT,  L"关于 SecDisplay");
     AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
     AppendMenuW(menu, MF_STRING | MF_DEFAULT, ID_TRAY_EXIT, L"退出 SecDisplay");
@@ -1211,8 +1228,9 @@ void Presenter::Shutdown() {
 // ---------------------------------------------------------------------------
 
 // --- 全屏切换 ---
-static bool g_isFullscreen = false;
+static bool g_isFullscreen = false;      // 由 main 按 cfg.fullscreen 同步
 static LONG_PTR g_savedStyle = 0;
+static LONG_PTR g_savedExStyle = 0;
 static RECT g_savedRect{};
 
 /// 在当前所在的显示器上铺满。配合 per-monitor DPI 感知，
@@ -1220,6 +1238,7 @@ static RECT g_savedRect{};
 static void EnterFullscreen() {
     if (!g_hwnd || g_isFullscreen) return;
     g_savedStyle = GetWindowLongPtr(g_hwnd, GWL_STYLE);
+    g_savedExStyle = GetWindowLongPtr(g_hwnd, GWL_EXSTYLE);
     GetWindowRect(g_hwnd, &g_savedRect);
 
     HMONITOR mon = MonitorFromWindow(g_hwnd, MONITOR_DEFAULTTONEAREST);
@@ -1227,8 +1246,11 @@ static void EnterFullscreen() {
     mi.cbSize = sizeof(mi);
     if (!GetMonitorInfo(mon, &mi)) return;
 
-    SetWindowLongPtr(g_hwnd, GWL_STYLE, WS_POPUP | WS_VISIBLE);
-    SetWindowPos(g_hwnd, HWND_TOP,
+    // 切换后仍是普通应用窗口：保留 WS_MINIMIZEBOX/WS_SYSMENU，EXSTYLE 保持
+    // WS_EX_APPWINDOW（进任务栏、可 Alt-Tab），不设 TOPMOST/TOOLWINDOW。
+    SetWindowLongPtr(g_hwnd, GWL_STYLE,
+                     WS_POPUP | WS_SYSMENU | WS_MINIMIZEBOX | WS_VISIBLE);
+    SetWindowPos(g_hwnd, HWND_NOTOPMOST,
                  mi.rcMonitor.left, mi.rcMonitor.top,
                  mi.rcMonitor.right - mi.rcMonitor.left,
                  mi.rcMonitor.bottom - mi.rcMonitor.top,
@@ -1240,7 +1262,8 @@ static void EnterFullscreen() {
 static void ExitFullscreen() {
     if (!g_hwnd || !g_isFullscreen) return;
     SetWindowLongPtr(g_hwnd, GWL_STYLE, g_savedStyle);
-    SetWindowPos(g_hwnd, nullptr,
+    SetWindowLongPtr(g_hwnd, GWL_EXSTYLE, g_savedExStyle);
+    SetWindowPos(g_hwnd, HWND_NOTOPMOST,
                  g_savedRect.left, g_savedRect.top,
                  g_savedRect.right - g_savedRect.left,
                  g_savedRect.bottom - g_savedRect.top,
@@ -1330,10 +1353,12 @@ static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
         case ID_TRAY_TOGGLE:
             if (g_isFullscreen) ExitFullscreen(); else EnterFullscreen();
             return 0;
+        case ID_TRAY_MINIMIZE: ToggleMinimize(); return 0;
         case ID_TRAY_ABOUT:
             MessageBoxW(h,
                 L"SecDisplay\n"
                 L"左键托盘图标 或 Ctrl+Alt+Q 退出\n"
+                L"Ctrl+Alt+H 最小化让位 / 还原（不退出）\n"
                 L"F11 切换全屏 / 窗口\n"
                 L"Esc 也可退出",
                 L"关于 SecDisplay", MB_OK | MB_ICONINFORMATION);
@@ -1342,6 +1367,7 @@ static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
         return 0;
     case WM_HOTKEY:
         if (w == HOTKEY_QUIT_ID) RequestQuit();
+        else if (w == HOTKEY_HIDE_ID) ToggleMinimize();
         return 0;
     case WM_KEYDOWN:
         if (w == VK_ESCAPE) { RequestQuit(); return 0; }
@@ -1412,7 +1438,8 @@ struct RunConfig {
     int height = 1800;
     int coordW = -1;          // 坐标基准尺寸；<0 表示默认取物理尺寸（与 Mac CGDisplayBounds 对齐）
     int coordH = -1;
-    bool fullscreen = true;   // 默认全屏铺满；--windowed 改成窗口
+    bool fullscreen = false;  // 默认窗口化：开启软件后桌面仍可正常使用，不盖屏、可 Alt-Tab、可最小化。
+                              // 需要铺满时用 --fullscreen 或 F11，且全屏也不置顶、不进不了任务栏。
     bool reconnect = true;    // 断线自动重连
     bool vsync = true;        // true=垂直同步（画面均匀），false=免同步（延迟最低但可能抖）
     std::string logFile;      // 非空则同时写日志文件
@@ -1721,9 +1748,14 @@ int main(int argc, char** argv) {
         }
         Log("全屏目标尺寸 %dx%d（显示器物理分辨率）", sw, sh);
 
-        hwnd = CreateWindowExA(WS_EX_TOPMOST | WS_EX_TOOLWINDOW,
+        // 不盖屏约束：不用 WS_EX_TOPMOST（否则压住任务栏与所有窗口），
+        // 不用 WS_EX_TOOLWINDOW（否则被 pin 到所有虚拟桌面、不进任务栏/Alt-Tab，
+        // 用户 Win+Tab 新建桌面也会被盖住）。改 WS_EX_APPWINDOW 让窗口正常进任务栏，
+        // 补 WS_SYSMENU|WS_MINIMIZEBOX 让最小化按钮与 Win+M 可用。
+        // 客户区仍是整屏物理分辨率，投屏 1:1 不变。
+        hwnd = CreateWindowExA(WS_EX_APPWINDOW,
                                "SecDisplayReceiver", "SecDisplay",
-                               WS_POPUP | WS_VISIBLE,
+                               WS_POPUP | WS_SYSMENU | WS_MINIMIZEBOX | WS_VISIBLE,
                                0, 0, sw, sh,
                                nullptr, nullptr, wc.hInstance, nullptr);
     } else {
@@ -1737,14 +1769,15 @@ int main(int argc, char** argv) {
         AdjustWindowRect(&rc, WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU, FALSE);
         int winW = rc.right - rc.left;
         int winH = rc.bottom - rc.top;
-        hwnd = CreateWindowExA(0, "SecDisplayReceiver", "SecDisplay",
-                               WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_VISIBLE,
+        hwnd = CreateWindowExA(WS_EX_APPWINDOW, "SecDisplayReceiver", "SecDisplay",
+                               WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX | WS_VISIBLE,
                                (sw - winW) / 2, (sh - winH) / 2,
                                winW, winH,
                                nullptr, nullptr, wc.hInstance, nullptr);
     }
     if (!hwnd) { Log("窗口创建失败"); return 3; }
     g_hwnd = hwnd;
+    g_isFullscreen = cfg.fullscreen;   // 与启动模式对齐，F11 首次切换才正确
 
     // 窗口模式标题含中文，用 W 版单独设，绕开 A 版在 CP936 下的 GBK 误解码。
     // 全屏标题 "SecDisplay" 是纯 ASCII，保持 CreateWindowExA 传入的值即可。
@@ -1752,20 +1785,25 @@ int main(int argc, char** argv) {
         SetWindowTextW(hwnd, L"SecDisplay - 按 Esc 退出");
     }
 
-    // 系统托盘小图标 + 全局退出热键：保证任何时候都能退出全屏
+    // 系统托盘小图标 + 全局热键
     TrayCreate(hwnd);
     // Ctrl+Alt+Q 兜底强退；注册失败也不影响托盘和 Esc
     if (!RegisterHotKey(hwnd, HOTKEY_QUIT_ID, MOD_CONTROL | MOD_ALT, 'Q')) {
         Log("全局热键 Ctrl+Alt+Q 注册失败（可能已被占用）");
     }
+    // Ctrl+Alt+H 一键最小化让位/还原，焦点无关，随时能回 Windows 桌面且不退出程序
+    if (!RegisterHotKey(hwnd, HOTKEY_HIDE_ID, MOD_CONTROL | MOD_ALT, 'H')) {
+        Log("全局热键 Ctrl+Alt+H 注册失败（可能已被占用）");
+    }
     Log("退出方式: Esc / 左键托盘图标 / 右键菜单 / Ctrl+Alt+Q");
+    Log("让位方式: Ctrl+Alt+H 最小化/还原，或托盘菜单；窗口可 Alt-Tab、可 Win+M 最小化");
 
     if (cfg.fullscreen) {
-        // 再强制设一次位置和尺寸。某些情况下窗口创建时给的尺寸会被系统按 DPI 修正，
-        // 这里用绝对定位兜底，确保铺满显示器。
+        // 绝对定位兜底，确保铺满显示器；不再置顶（HWND_NOTOPMOST），
+        // 让任务栏与其它窗口能正常显示在它之上，用户可随时切回桌面。
         RECT wr{};
         GetWindowRect(hwnd, &wr);
-        SetWindowPos(hwnd, HWND_TOPMOST, 0, 0,
+        SetWindowPos(hwnd, HWND_NOTOPMOST, 0, 0,
                      wr.right - wr.left, wr.bottom - wr.top,
                      SWP_NOACTIVATE | SWP_SHOWWINDOW | SWP_FRAMECHANGED);
     }
@@ -1843,6 +1881,7 @@ int main(int argc, char** argv) {
     // 退出清理：托盘图标和热键必须在进程结束前移除，否则托盘会留残影
     TrayRemove();
     UnregisterHotKey(hwnd, HOTKEY_QUIT_ID);
+    UnregisterHotKey(hwnd, HOTKEY_HIDE_ID);
     if (g_customCursor) { DestroyCursor(g_customCursor); g_customCursor = nullptr; }
     g_alive = false;
     // 关键：先掐断 socket，让阻塞在 recv 的收流线程立即返回。
