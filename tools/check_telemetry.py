@@ -46,7 +46,7 @@ def check_doc(raw, doc, tag):
     # 结构性脱敏：所有叶子字符串必须落在固定枚举白名单里。
     # 这样即使日志将来冒出新的敏感串，被正则带出来也会在这里被拦下。
     STR_ENUM = {
-        "mac", "win", "unknown", "auto2x", "explicit",
+        "mac", "win", "unknown", "auto2x", "explicit", "default_physical",
         "sharp", "balanced", "smooth", "fast", "A", "B", "C",
         "vsync", "tearing", "硬件", "软件",
         "ax_not_trusted", "screen_recording_missing", "vdisplay_create_failed",
@@ -103,13 +103,13 @@ def main():
             fail("PowerShell 提取器与 Python 版输出不一致")
         print("OK: PowerShell 后备提取器与 Python 版字段级一致")
 
-    # 坐标基准必须抽出来且是 1440x900
-    if (m["coord"].get("logical_w"), m["coord"].get("logical_h")) != (1440, 900):
-        fail("mac 坐标基准解析错误: %s" % m["coord"])
-    if (w["coord"].get("logical_w"), w["coord"].get("logical_h")) != (1440, 900):
-        fail("win 坐标基准解析错误: %s" % w["coord"])
-    if w["coord"].get("source") != "auto2x":
-        fail("win 坐标来源解析错误")
+    # 坐标基准两端必须一致，且等于 e153f2c 之后的实测值 2880x1800。
+    # 旧校验写死 1440x900/auto2x，对新版真实输出必然 FAIL（CI 校验失效）。
+    for tag, d in (("mac", m), ("win", w)):
+        if (d["coord"].get("logical_w"), d["coord"].get("logical_h")) != (2880, 1800):
+            fail("%s 坐标基准解析错误: %s" % (tag, d["coord"]))
+    if w["coord"].get("source") not in ("default_physical", "auto2x", "explicit"):
+        fail("win 坐标来源解析错误: %s" % w["coord"].get("source"))
 
     # 数值字段必须真的抽到了（不是全 None）
     if m["samples"] < 3:

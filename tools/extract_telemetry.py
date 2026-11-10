@@ -172,7 +172,11 @@ def parse_win(text):
         pw, ph = int(m.group(3)), int(m.group(4))
     if "命令行指定" in text:
         coord_source = "explicit"
+    elif "默认对齐物理" in text:
+        # e153f2c 起默认取物理尺寸，与 Mac CGDisplayBounds 对齐
+        coord_source = "default_physical"
     elif "自动 2x" in text:
+        # 旧版(e153f2c 之前)日志
         coord_source = "auto2x"
 
     present_mode = None

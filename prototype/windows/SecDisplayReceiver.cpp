@@ -352,12 +352,17 @@ static void ResetTimestampBase() {
 
 /// 返回相对于窗口内最快帧的附加延迟（微秒）。明显无效的时间戳返回 -1。
 static int64_t EstimateExtraDelayUs(uint64_t macMicros) {
-    // 只拦截明显无效的输入（早于 2001-01-01 的 Unix 纪元微秒），
-    // 避免无符号下溢。两端时钟未同步，delta 允许为负，靠窗口最小值归一。
-    if (macMicros < 978307200ULL * 1000000ULL) return -1;
-    const int64_t macUnixUs = (int64_t)(macMicros - 978307200ULL * 1000000ULL);
-    const int64_t now = UnixNowMicros();
-    const int64_t delta = now - macUnixUs;
+    // Mac 发的是 CFAbsoluteTime 纪元(2001-01-01)微秒，不是 Unix 纪元。
+    // 旧代码把 macMicros 当 Unix 微秒、又减去 978307200e6，导致守卫
+    // (macMicros < 9.78e14) 对当前约 8.15e14 的值恒成立，直接 return -1，
+    // 日志「附加延迟」永远是 0.0 ms。
+    // 这里把本地 now 也换算到 CFAbsoluteTime 基准，两边同基准直接相减。
+    const int64_t kAppleEpochOffsetUs = 978307200LL * 1000000LL;
+    // 只拦截明显无效的输入（为 0 或量级异常），避免无符号下溢
+    if (macMicros < 1000000ULL) return -1;
+    const int64_t macAppleUs = (int64_t)macMicros;
+    const int64_t now = UnixNowMicros() - kAppleEpochOffsetUs;
+    const int64_t delta = now - macAppleUs;
 
     const int64_t WINDOW_US = 3'000'000;         // 3 秒窗口
     if (g_winStartUs == 0 || now - g_winStartUs > WINDOW_US) {

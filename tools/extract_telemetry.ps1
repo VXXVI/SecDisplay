@@ -83,6 +83,7 @@ if ($m.Success) {
 }
 $coordSource = $null
 if ($text -match "命令行指定") { $coordSource = "explicit" }
+elseif ($text -match "默认对齐物理") { $coordSource = "default_physical" }
 elseif ($text -match "自动 2x") { $coordSource = "auto2x" }
 
 $presentMode = $null

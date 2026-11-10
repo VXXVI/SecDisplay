@@ -14,7 +14,8 @@ import json
 import os
 import sys
 
-COORD_OK = (1440, 900)
+# e153f2c 起坐标基准默认对齐物理，与 Mac CGDisplayBounds 实测一致
+COORD_OK = (2880, 1800)
 
 
 def load_all(root):

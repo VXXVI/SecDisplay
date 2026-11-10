@@ -874,12 +874,20 @@ final class Sender {
 
         sent += 1
         sentBytes += packet.count
+        // 捕获发起时的连接代数。重连时新连接先把 connected 置 true，
+        // 旧连接上未完成的 send 随后会以错误回调；若不区分代数，这个迟到的
+        // 错误会把新连接的 connected 打回 false，之后所有帧被 guard 静默丢弃，
+        // 表现为「连着却永久黑屏、且不会自愈重连」。
+        let epoch = connEpoch
         c.send(content: packet, completion: .contentProcessed { [weak self] err in
             guard let self else { return }
             self.counterLock.lock()
-            self.inFlight = max(0, self.inFlight - 1)
+            // 陈旧连接的回调不计入新连接的在途数（新连接已 resetInFlight）
+            if self.connEpoch == epoch {
+                self.inFlight = max(0, self.inFlight - 1)
+            }
             self.counterLock.unlock()
-            if err != nil { self.connected = false }
+            if err != nil && self.connEpoch == epoch { self.connected = false }
         })
     }
 
