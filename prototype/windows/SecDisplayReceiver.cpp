@@ -27,6 +27,7 @@
 #define _CRT_SECURE_NO_WARNINGS   // fopen/strncpy 等标准函数在 MSVC 下会被警告
 #include <windows.h>
 #include <windowsx.h>
+#include <shellapi.h>      // 系统托盘 Shell_NotifyIcon
 #include <winsock2.h>
 #include <ws2tcpip.h>
 #include <d3d11.h>
@@ -58,6 +59,7 @@
 #pragma comment(lib, "mfuuid.lib")
 #pragma comment(lib, "ole32.lib")
 #pragma comment(lib, "user32.lib")
+#pragma comment(lib, "shell32.lib")
 
 using Microsoft::WRL::ComPtr;
 
@@ -179,6 +181,68 @@ static void SendInputPacket(float vx, float vy, uint8_t buttons, int16_t wheel) 
 }
 
 static HWND g_hwnd = nullptr;   // 主窗口句柄，ClientToVideo 与全屏切换共用
+
+// ---------------------------------------------------------------------------
+// 系统托盘：全屏置顶无边框窗口没有关闭按钮，唯一退出口是 Esc。
+// 加一个托盘小图标，让「退出」永远点得到，不用盲敲命令。
+//   - 左键单击托盘图标 = 直接退出
+//   - 右键 = 菜单（退出 / 全屏·窗口切换 / 关于）
+//   - 全局热键 Ctrl+Alt+Q = 兜底强退（连托盘都被盖住时）
+// ---------------------------------------------------------------------------
+static const UINT WM_TRAY      = WM_USER + 1;   // Shell_NotifyIcon 回调消息
+static const UINT ID_TRAY_EXIT = 1001;
+static const UINT ID_TRAY_TOGGLE = 1002;
+static const UINT ID_TRAY_ABOUT  = 1003;
+static const int  HOTKEY_QUIT_ID = 1;
+static NOTIFYICONDATAA g_nid{};
+static bool g_trayAdded = false;
+
+static void RequestQuit() {
+    // g_alive 由主循环收尾时统一置 false（见消息循环后），这里不碰它：
+    // 该变量在文件后段才定义，提前引用会编译失败。
+    // WM_CLOSE -> WndProc 的 PostQuitMessage 会让 GetMessage 返回 0，正常收尾。
+    if (g_hwnd) PostMessageA(g_hwnd, WM_CLOSE, 0, 0);
+}
+
+static void TrayCreate(HWND hwnd) {
+    g_nid.cbSize = sizeof(g_nid);
+    g_nid.hWnd = hwnd;
+    g_nid.uID = 1;
+    g_nid.uFlags = NIF_ICON | NIF_MESSAGE | NIF_TIP;
+    g_nid.uCallbackMessage = WM_TRAY;
+    // 用系统自带的应用图标，省去资源文件；IDI_APPLICATION 稳定可用
+    g_nid.hIcon = LoadIconA(nullptr, IDI_APPLICATION);
+    // 用 strncpy 而非 strcpy_s，兼容 MinGW（build-mingw.bat 也在用）
+    strncpy(g_nid.szTip,
+            "SecDisplay - 左键退出 / 右键菜单 / Ctrl+Alt+Q 强退",
+            sizeof(g_nid.szTip) - 1);
+    g_nid.szTip[sizeof(g_nid.szTip) - 1] = '\0';
+    g_trayAdded = Shell_NotifyIconA(NIM_ADD, &g_nid) == TRUE;
+    if (!g_trayAdded) Log("托盘图标添加失败（不影响 Esc / 热键退出）");
+}
+
+static void TrayRemove() {
+    if (g_trayAdded) {
+        Shell_NotifyIconA(NIM_DELETE, &g_nid);
+        g_trayAdded = false;
+    }
+}
+
+static void TrayShowMenu(HWND hwnd) {
+    POINT pt{};
+    GetCursorPos(&pt);
+    HMENU menu = CreatePopupMenu();
+    if (!menu) return;
+    AppendMenuA(menu, MF_STRING, ID_TRAY_TOGGLE, "切换全屏 / 窗口  (F11)");
+    AppendMenuA(menu, MF_STRING, ID_TRAY_ABOUT,  "关于 SecDisplay");
+    AppendMenuA(menu, MF_SEPARATOR, 0, nullptr);
+    AppendMenuA(menu, MF_STRING | MF_DEFAULT, ID_TRAY_EXIT, "退出 SecDisplay");
+    // 前置，否则菜单可能被置顶窗口盖住
+    SetForegroundWindow(hwnd);
+    TrackPopupMenu(menu, TPM_RIGHTBUTTON | TPM_BOTTOMALIGN,
+                   pt.x, pt.y, 0, hwnd, nullptr);
+    DestroyMenu(menu);
+}
 
 /// 窗口客户区坐标 → 虚拟屏逻辑点坐标（0..coordW, 0..coordH）
 static bool ClientToVideo(int cx, int cy, float* vx, float* vy) {
@@ -1083,11 +1147,44 @@ static void ExitFullscreen() {
 
 static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
     switch (m) {
-    case WM_DESTROY:
+    case WM_CLOSE:
+        // Esc / 托盘「退出」/ 全局热键都汇到这里
+        TrayRemove();
         PostQuitMessage(0);
         return 0;
+    case WM_DESTROY:
+        TrayRemove();
+        PostQuitMessage(0);
+        return 0;
+    case WM_TRAY:
+        // 托盘图标的鼠标事件（lParam = 具体消息）
+        if (LOWORD(l) == WM_LBUTTONUP) {
+            RequestQuit();                 // 左键：直接退出
+        } else if (LOWORD(l) == WM_RBUTTONUP) {
+            TrayShowMenu(h);               // 右键：菜单
+        }
+        return 0;
+    case WM_COMMAND:
+        switch (LOWORD(w)) {
+        case ID_TRAY_EXIT:   RequestQuit(); return 0;
+        case ID_TRAY_TOGGLE:
+            if (g_isFullscreen) ExitFullscreen(); else EnterFullscreen();
+            return 0;
+        case ID_TRAY_ABOUT:
+            MessageBoxA(h,
+                "SecDisplay\n"
+                "左键托盘图标 或 Ctrl+Alt+Q 退出\n"
+                "F11 切换全屏 / 窗口\n"
+                "Esc 也可退出",
+                "关于 SecDisplay", MB_OK | MB_ICONINFORMATION);
+            return 0;
+        }
+        return 0;
+    case WM_HOTKEY:
+        if (w == HOTKEY_QUIT_ID) RequestQuit();
+        return 0;
     case WM_KEYDOWN:
-        if (w == VK_ESCAPE) { PostQuitMessage(0); return 0; }
+        if (w == VK_ESCAPE) { RequestQuit(); return 0; }
         // F11 或 F 切换全屏，方便窗口模式下按一下变全屏
         if (w == VK_F11 || w == 'F') {
             if (g_isFullscreen) ExitFullscreen(); else EnterFullscreen();
@@ -1468,6 +1565,14 @@ int main(int argc, char** argv) {
     if (!hwnd) { Log("窗口创建失败"); return 3; }
     g_hwnd = hwnd;
 
+    // 系统托盘小图标 + 全局退出热键：保证任何时候都能退出全屏
+    TrayCreate(hwnd);
+    // Ctrl+Alt+Q 兜底强退；注册失败也不影响托盘和 Esc
+    if (!RegisterHotKey(hwnd, HOTKEY_QUIT_ID, MOD_CONTROL | MOD_ALT, 'Q')) {
+        Log("全局热键 Ctrl+Alt+Q 注册失败（可能已被占用）");
+    }
+    Log("退出方式: Esc / 左键托盘图标 / 右键菜单 / Ctrl+Alt+Q");
+
     if (cfg.fullscreen) {
         // 再强制设一次位置和尺寸。某些情况下窗口创建时给的尺寸会被系统按 DPI 修正，
         // 这里用绝对定位兜底，确保铺满显示器。
@@ -1548,6 +1653,9 @@ int main(int argc, char** argv) {
         DispatchMessage(&msg);
     }
 
+    // 退出清理：托盘图标和热键必须在进程结束前移除，否则托盘会留残影
+    TrayRemove();
+    UnregisterHotKey(hwnd, HOTKEY_QUIT_ID);
     g_alive = false;
     if (net.joinable()) net.join();
     if (cursorThread.joinable()) cursorThread.join();
