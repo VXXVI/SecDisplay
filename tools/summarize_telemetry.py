@@ -71,7 +71,10 @@ def show(path, d):
             fmt_agg(m.get("decoded_per_sample"))))
         print("  附加延迟ms:  " + fmt_agg(m.get("extra_latency_ms")))
         print("  码率Mbps:    " + fmt_agg(m.get("mbps")))
-        print("  解码失败:    %s" % m.get("decode_fail_last"))
+        print("  峰值帧率:    " + fmt_agg(m.get("peak_fps")))
+        print("  光标包 %s  输入包 %s  解码失败 %s" % (
+            m.get("cursor_pkts_total"), m.get("input_pkts_last"),
+            m.get("decode_fail_last")))
     w = d.get("warnings", []) or []
     print("  告警: " + (", ".join(w) if w else "无"))
 

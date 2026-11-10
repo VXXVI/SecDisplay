@@ -160,6 +160,10 @@ def parse_win(text):
     mbps = floats(r"([\d.]+)\s*Mbps", blob)
     extra = floats(r"附加延迟\s+([\d.]+)\s*ms", blob)
     fails = ints(r"解码失败\s+(\d+)", blob)
+    # 356f99d 起统计行新增三字段；旧日志没有这些字段时结果为空，agg 返回 None，向后兼容
+    peak_fps = floats(r"峰值\s+([\d.]+)\s*fps", blob)
+    cursor_inc = ints(r"光标\+\s*(\d+)", blob)
+    input_total = ints(r"输入\s+(\d+)", blob)
 
     lw = lh = pw = ph = coord_source = None
     m = re.search(r"坐标基准:\s*逻辑\s*(\d+)x(\d+)（物理\s*(\d+)x(\d+)", text)
@@ -219,6 +223,9 @@ def parse_win(text):
             "decode_fail_last": last(fails),
             "mbps": agg(mbps),
             "extra_latency_ms": agg(extra),
+            "peak_fps": agg(peak_fps),
+            "cursor_pkts_total": total(cursor_inc),
+            "input_pkts_last": last(input_total),
         },
         "warnings": warnings,
     }

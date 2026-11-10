@@ -70,6 +70,10 @@ $decInc   = Collect-Doubles $blobLines "解码\s+\d+\(\+(\d+)\)"
 $mbps     = Collect-Doubles $blobLines "([\d.]+)\s*Mbps"
 $extra    = Collect-Doubles $blobLines "附加延迟\s+([\d.]+)\s*ms"
 $fails    = Collect-Doubles $blobLines "解码失败\s+(\d+)"
+# 356f99d 起统计行新增三字段；旧日志无这些字段时数组为空，Get-Agg/Last-Val 返回 null
+$peakFps  = Collect-Doubles $blobLines "峰值\s+([\d.]+)\s*fps"
+$cursorInc= Collect-Doubles $blobLines "光标\+\s*(\d+)"
+$inputLast= Collect-Doubles $blobLines "输入\s+(\d+)"
 
 $lw = $lh = $pw = $ph = $null
 $m = [regex]::Match($text, "坐标基准:\s*逻辑\s*(\d+)x(\d+)（物理\s*(\d+)x(\d+)")
@@ -120,12 +124,15 @@ $doc = [ordered]@{
     }
     samples       = $stat.Length
     metrics       = [ordered]@{
-        packets_last      = Last-Val $packets
-        decoded_last      = Last-Val $decoded
+        packets_last       = Last-Val $packets
+        decoded_last       = Last-Val $decoded
         decoded_per_sample = Get-Agg $decInc
-        decode_fail_last  = Last-Val $fails
-        mbps              = Get-Agg $mbps
-        extra_latency_ms  = Get-Agg $extra
+        decode_fail_last   = Last-Val $fails
+        mbps               = Get-Agg $mbps
+        extra_latency_ms   = Get-Agg $extra
+        peak_fps           = Get-Agg $peakFps
+        cursor_pkts_total  = if ($cursorInc.Length -gt 0) { [int64](($cursorInc | Measure-Object -Sum).Sum) } else { 0 }
+        input_pkts_last    = Last-Val $inputLast
     }
     warnings      = @($warnings.ToArray())
 }

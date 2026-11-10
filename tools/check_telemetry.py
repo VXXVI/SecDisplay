@@ -61,6 +61,7 @@ def check_doc(raw, doc, tag):
         "p95", "max", "cursor_pkts_total", "input_pkts_total", "dropped_total",
         "inflight_max", "idle_last", "packets_last", "decoded_last",
         "decoded_per_sample", "decode_fail_last", "extra_latency_ms",
+        "peak_fps", "cursor_pkts_total", "input_pkts_last",
     }
     def walk(v, path=""):
         if isinstance(v, str):
@@ -121,6 +122,13 @@ def main():
         fail("win 状态行不足")
     if not w["metrics"]["decoded_per_sample"]:
         fail("win 解码计数解析错误")
+    # 356f99d 起 Windows 统计行新增三字段，必须真的被采到
+    if not w["metrics"]["peak_fps"] or w["metrics"]["peak_fps"]["max"] < 20:
+        fail("win 峰值帧率解析错误")
+    if w["metrics"]["cursor_pkts_total"] != 20:
+        fail("win 光标包解析错误")
+    if w["metrics"]["input_pkts_last"] != 9:
+        fail("win 输入计数解析错误")
     if w["status"]["present_mode"] != "vsync":
         fail("win 呈现方式解析错误")
     if not m["warnings"] or "ax_not_trusted" not in m["warnings"]:
