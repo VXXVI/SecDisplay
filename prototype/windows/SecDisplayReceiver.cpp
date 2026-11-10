@@ -44,6 +44,7 @@
 #include <cstdio>
 #include <cstdint>
 #include <cstring>
+#include <clocale>
 #include <string>
 #include <vector>
 #include <unordered_map>
@@ -86,6 +87,16 @@ static char g_logBuf[1024];
 static std::mutex g_logLock;
 static FILE* g_logFile = nullptr;   // 可选：同时写日志文件，方便后台监控时 tail
 
+// UTF-8 转宽字符。Log() 用它把日志经 WriteConsoleW 直写控制台，绕开代码页。
+static std::wstring ToWide(const char* utf8, int bytes) {
+    if (!utf8 || bytes <= 0) return {};
+    int len = ::MultiByteToWideChar(CP_UTF8, 0, utf8, bytes, nullptr, 0);
+    if (len <= 0) return {};
+    std::wstring out((size_t)len, L'\0');
+    ::MultiByteToWideChar(CP_UTF8, 0, utf8, bytes, &out[0], len);
+    return out;
+}
+
 static void Log(const char* fmt, ...) {
     va_list ap;
     va_start(ap, fmt);
@@ -95,8 +106,25 @@ static void Log(const char* fmt, ...) {
     if (n < 0) return;
     if (n > (int)sizeof(g_logBuf) - 2) n = (int)sizeof(g_logBuf) - 2;
     g_logBuf[n] = '\n';
-    fwrite(g_logBuf, 1, n + 1, stderr);
-    fflush(stderr);
+
+    // 控制台：用 WriteConsoleW 直写宽字符，绕开 CP936/UTF-8 代码页问题。
+    // 中文 Windows 默认控制台是 GBK，直接 fwrite UTF-8 字节会显示成乱码。
+    // 句柄不是真控制台（重定向到文件/管道）时回退到 fwrite。
+    HANDLE hErr = GetStdHandle(STD_ERROR_HANDLE);
+    DWORD mode = 0;
+    bool wroteConsole = false;
+    if (hErr && hErr != INVALID_HANDLE_VALUE && GetConsoleMode(hErr, &mode)) {
+        std::wstring w = ToWide(g_logBuf, n + 1);
+        DWORD written = 0;
+        if (!w.empty() && WriteConsoleW(hErr, w.c_str(), (DWORD)w.size(), &written, nullptr))
+            wroteConsole = true;
+    }
+    if (!wroteConsole) {
+        fwrite(g_logBuf, 1, n + 1, stderr);
+        fflush(stderr);
+    }
+
+    // 日志文件：始终原样写 UTF-8，遥测提取器按 UTF-8 读取，不受控制台改动影响
     if (g_logFile) {
         fwrite(g_logBuf, 1, n + 1, g_logFile);
         fflush(g_logFile);          // 立即落盘，tail 时能实时看到
@@ -1495,6 +1523,16 @@ static void NetworkLoop(const RunConfig& cfg, Graphics* gfx, Presenter* presente
 
 int main(int argc, char** argv) {
     setvbuf(stderr, nullptr, _IONBF, 0);
+
+    // 控制台输出用 UTF-8。Log() 把 UTF-8 字节直接 fwrite 到 stderr，
+    // 而中文 Windows 控制台默认是 CP936(GBK)，UTF-8 字节被当 GBK 显示，
+    // 就是截图里「附加延迟」变「闃勫姩浠樻儏縺」那种乱码。
+    // 设成 CP_UTF8 后控制台按 UTF-8 解释这些字节。
+    // 只影响控制台显示；写日志文件仍保持 UTF-8 原样，遥测提取器不受影响。
+    SetConsoleOutputCP(CP_UTF8);
+    SetConsoleCP(CP_UTF8);
+    // 用 UTF-8 locale，保证 CRT 不做多余的窄字符转换
+    setlocale(LC_ALL, ".UTF-8");
 
     // 每显示器 DPI 感知。不做这步，200% 缩放的系统里全屏窗口只有逻辑尺寸，
     // 交换链会被系统再缩一次，画面变糊。
