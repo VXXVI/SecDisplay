@@ -68,3 +68,22 @@ ToggleMinimize 只动窗口显示状态，不碰 g_alive、不 PostQuitMessage�
 ## 7. 下一步（三项归属，指向文件 2）
 
 延迟算法 / 传输协议 / 驱动优化的开发需求对齐、归属划分与「请 Mac 侧确认」清单，统一写在 research/SYNC-dev-needs-2026-11-10.md，本文件不重复展开。本端可独立推进的归 Windows，需 Mac 配合的归两端协同，Mac 侧 VT/SCK 相关归 Mac。按 research/PROTOCOL-autonomous-collab.md:14-23 的 SOP 回报，保持动态联系。
+
+## 8. 0x04 输入回传节流（2026-11-11 凌晨，提交 a0cefa1）
+
+`research/SYNC-dev-needs-2026-11-10.md` Top 4 指出 0x04 回传过密（遥测 input_pkts_total 328 万级、单次统计「输入 4376」）。两端代码确认：
+- Windows 端每个 `WM_MOUSEMOVE` 都 `SendInputPacket` 一次（原 SecDisplayReceiver.cpp:1380-1386）。
+- Mac 端 `receiveLoop`→`drainControl` 逐包处理，每个 0x04 无条件 post 一个 `CGEvent.mouseMoved`（ScreenSender.swift:758-800、969-1013），无合并、无节流、无阈值。鼠标快速移动时 Mac 侧 CGEvent 队列堆积，是「鼠标延迟极高」的真实来源之一。
+
+改法（本端独立，不动协议）：
+- UI 线程 `WM_MOUSEMOVE` 只更新最新位置与 dirty 标记，不直接发。
+- 新增独立 `inputThread`，每 4ms 轮询：鼠标移动按 8ms 间隔合并发送（约 120Hz，与 Mac 侧 0x03 采样同频）；按键/滚轮置 `eventPending`，下一轮约 4ms 内立即发。
+- 单线程发送，避免 UI 线程与发送线程并发 send 同一 socket。
+- 曾先试 `WM_TIMER` 方案，实测行为不稳：消息堆积时合并成 1 个（过少），消息稀疏时几乎每条都发（过多），因为 WM_TIMER 低优先级、触发取决于消息队列状态。改独立线程后稳定。
+
+实机验证（本地假服务端统计 0x04 包）：
+- 鼠标移动：精确 1ms 间隔投递 200 个消息（359ms），实收 24 个 0x04 包，约 8.3:1 压缩、稳定间隔，符合 120Hz 预期。
+- 按键：模拟左键按下+抬起，实收 `buttons=0x01` 与 `buttons=0x00` 两个包，立即发出，点击不丢。
+- MSVC + MinGW 两套工具链均编译通过。
+
+边界：这是发送端节流，Mac 侧接收处理未改。若 Mac 侧也想在接收端合并，需另议，避免两端重复。端到端手感改善需 Mac 发送端在线做真机联调确认。
