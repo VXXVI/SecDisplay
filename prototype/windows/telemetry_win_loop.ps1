@@ -13,9 +13,11 @@ if (-not $RepoRoot) {
 $winDir = Split-Path -Parent $PSCommandPath
 $tools = Join-Path $RepoRoot "tools"
 
-# 只挑含状态行的日志（--log 输出），避免选中无「附加延迟」的其它日志
+# 只挑含状态行的日志（--log 输出），避免选中无「附加延迟」的其它日志。
+# 日志是 UTF-8 无 BOM，必须显式 -Encoding UTF8；否则脚本宿主按 ANSI 读，中文判据变乱码匹配不上，
+# 导致选不中任何日志而直接 exit 0（计划任务静默不上传）。Mbps/fps 作为 ASCII 兜底。
 $log = Get-ChildItem -LiteralPath (Join-Path $winDir "logs") -Filter "*.log" -File -ErrorAction SilentlyContinue |
-       Where-Object { (Get-Content -LiteralPath $_.FullName -Tail 40 -ErrorAction SilentlyContinue) -match "附加延迟|SecDisplay 接收端" } |
+       Where-Object { (Get-Content -LiteralPath $_.FullName -Tail 40 -Encoding UTF8 -ErrorAction SilentlyContinue) -match "附加延迟|SecDisplay 接收端|Mbps|fps" } |
        Sort-Object LastWriteTime -Descending | Select-Object -First 1
 if (-not $log) { exit 0 }
 
