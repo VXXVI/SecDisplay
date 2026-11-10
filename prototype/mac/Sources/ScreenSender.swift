@@ -179,6 +179,10 @@ final class VirtualDisplayManager {
     }
 
     /// 正确销毁：取出 CGVirtualDisplay 内部的 _client 指针，交给 CDVirtualDisplayDestroy。
+    ///
+    /// 实测（2026-11-11）：曾尝试「复用残留屏」方案——同身份残留屏能被 CG 枚举到、
+    /// SCK 也报「抓屏已启动」，但采集 0 帧、空闲 0。孤儿屏的 owner 进程已死，
+    /// WindowServer 不再向它合成新内容，SCK 拿不到帧。故 adopt 方案不可行，已放弃。
     /// 传对象本身会触发 CoreDisplay 内部断言；只释放引用屏不会消失。
     func destroy() {
         guard let obj = object else { return }
@@ -1394,33 +1398,36 @@ func vdStillOnline() -> Bool {
     }
 }
 
-/// 有序退出：先停采集并断开连接，再销毁虚拟屏，并**确认它真的从在线列表消失**。
-/// 采集流还连着显示器时调 CDVirtualDisplayDestroy，WindowServer 会静默拒绝、
-/// 留下残影（日志却打印「已销毁」），下次启动创建被拒。所以要轮询确认 + 重试。
+/// 有序退出：先停采集并断开连接，再销毁虚拟屏。
+///
+/// 关键教训：destroy 只能调一次、且只在主线程调。旧代码在 Task 线程和主线程各调
+/// 一次，而 destroy 第一次就把 object 置 nil，第二次及所有「重试」都变成空操作，
+/// 实际根本没重试；一旦首次 destroy 被 WindowServer 拒绝（采集未完全停），就留残影。
+///
+/// 现在改为：Task 只负责停采集/断连；主线程等采集停稳 + 额外缓冲后再 destroy 一次，
+/// 给 WindowServer 足够时间异步移除，最后只做「检查并报告」，不做危险的重复销毁。
 func shutdown(signal sig: Int32) -> Never {
     Log.info("收到信号 \(sig)，开始清理")
-    var finished = false
+    var stopped = false
     Task {
         try? await cap.stream?.stopCapture()
         sender.conn?.cancel()
-        // 给系统一点时间释放采集管线
-        try? await Task.sleep(nanoseconds: 400_000_000)
-        vd.destroy()
-        finished = true
+        stopped = true
     }
     // 等采集停止，最多 3 秒
     let stopDeadline = Date().addingTimeInterval(3.0)
-    while !finished && Date() < stopDeadline {
+    while !stopped && Date() < stopDeadline {
         RunLoop.current.run(mode: .default, before: Date().addingTimeInterval(0.05))
     }
-    // 销毁并确认虚拟屏真的消失；最多重试 10 次、每次等 200ms。
-    // 只有确认消失才算清理完成，否则残留会挡住下次启动。
+    // 采集停稳后再多等 800ms，让 WindowServer 释放该虚拟屏的采集关联。
+    // 这步是必须的：采集还挂着时 CDVirtualDisplayDestroy 会被静默拒绝。
+    RunLoop.current.run(mode: .default, before: Date().addingTimeInterval(0.8))
     vd.destroy()
+    // 等 WindowServer 完成异步移除（不重复 destroy，避免对同一 client 二次释放）。
     var waited = 0.0
     while vdStillOnline() && waited < 2.0 {
         RunLoop.current.run(mode: .default, before: Date().addingTimeInterval(0.1))
         usleep(100_000); waited += 0.1
-        if waited > 0.4 { vd.destroy() }   // 再次尝试
     }
     if vdStillOnline() {
         Log.info("警告: 虚拟屏疑似未清理干净，下次启动可能被拒；可注销重登清除")
