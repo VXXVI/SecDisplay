@@ -1,13 +1,13 @@
 {
   "schema": 1,
   "platform": "win",
-  "generated_utc": "2026-11-10T02:21:57Z",
-  "commit": "cc49fd1",
+  "generated_utc": "2026-11-10T08:10:23Z",
+  "commit": "603fd29",
   "coord": {
-    "logical_w": null,
-    "logical_h": null,
-    "physical_w": null,
-    "physical_h": null,
+    "logical_w": 2880,
+    "logical_h": 1800,
+    "physical_w": 2880,
+    "physical_h": 1800,
     "source": null
   },
   "status": {
@@ -17,29 +17,37 @@
     "client_h": 1800,
     "fullscreen": true
   },
-  "samples": 11,
+  "samples": 133,
   "metrics": {
-    "packets_last": 271.0,
-    "decoded_last": 269.0,
+    "packets_last": 4370.0,
+    "decoded_last": 4368.0,
     "decoded_per_sample": {
-      "min": 22.0,
-      "median": 25.0,
-      "p95": 26.0,
-      "max": 26.0
+      "min": 4.0,
+      "median": 27.0,
+      "p95": 65.0,
+      "max": 91.0
     },
     "decode_fail_last": 0.0,
     "mbps": {
-      "min": 0.5,
+      "min": 0.2,
       "median": 0.6,
-      "p95": 0.6,
-      "max": 3.5
+      "p95": 1.9,
+      "max": 3.9
     },
     "extra_latency_ms": {
       "min": 0.0,
       "median": 0.0,
       "p95": 0.0,
       "max": 0.0
-    }
+    },
+    "peak_fps": {
+      "min": 8.0,
+      "median": 22.0,
+      "p95": 39.5,
+      "max": 45.5
+    },
+    "cursor_pkts_total": 6414,
+    "input_pkts_last": 13123.0
   },
   "warnings": []
 }
