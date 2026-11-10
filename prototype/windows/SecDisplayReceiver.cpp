@@ -1069,11 +1069,24 @@ bool Presenter::CreateProcessor() {
     videoCtx_->VideoProcessorSetStreamFrameFormat(processor_.Get(), 0,
                                                   D3D11_VIDEO_FRAME_FORMAT_PROGRESSIVE);
 
+    // 裁边/缩放：VideoProcessorBlt 默认把整个输入表面映射到输出，
+    // 这里只在需要时覆盖 StreamSourceRect，且右下角绝不越出输入纹理。
+    //   src >= dst：硬解按宏块对齐多出几行(如 1808 vs 1800)，取 dst 大小裁掉多余行。
+    //   src <  dst：Mac 切到低分辨率档位(如 smooth 2240x1408 对命令行 2880x1800)，
+    //               取整个 src，让 VideoProcessor 缩放到输出，不能按 dst 取(会越界)。
+    //   src == dst：不设，走默认整面映射。
     if (srcW_ != width_ || srcH_ != height_) {
-        // 硬解输出比显示区高（例如 1808 vs 1800），只取左上角可见部分，避免被纵向压缩
-        RECT src{ 0, 0, width_, height_ };
+        RECT src{};
+        if (srcW_ >= width_ && srcH_ >= height_) {
+            src = RECT{ 0, 0, width_, height_ };          // 裁掉对齐多出的行/列
+            Log("呈现器: 输入 %dx%d，裁到 %dx%d（去掉宏块对齐余量）",
+                srcW_, srcH_, width_, height_);
+        } else {
+            src = RECT{ 0, 0, srcW_, srcH_ };             // 取整个源，缩放到输出
+            Log("呈现器: 输入 %dx%d，小于显示 %dx%d，缩放铺满（不裁边）",
+                srcW_, srcH_, width_, height_);
+        }
         videoCtx_->VideoProcessorSetStreamSourceRect(processor_.Get(), 0, TRUE, &src);
-        Log("呈现器: 输入 %dx%d，只取 %dx%d", srcW_, srcH_, width_, height_);
     }
     return true;
 }
