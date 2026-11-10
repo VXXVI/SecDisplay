@@ -16,9 +16,18 @@ name: SecDisplay CI
     branches: [main]
   workflow_dispatch:
 
+# 遥测脚本会定时 push，密集时避免把上一轮还在跑的 CI 取消。
+# 同一分支只保留最新一次运行，但 PR 的构建不互相取消。
+concurrency:
+  group: secdisplay-ci-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   build-mac:
-    runs-on: macos-14
+    # macos-14 已于 2026-11-02 被 GitHub 退役，该标签会立即 cancelled（分配不到机器）。
+    # 用 macos-15（arm64，官方推荐迁移目标，稳定不随 -latest 漂移）。
+    # 本项目用 ScreenCaptureKit / CGVirtualDisplay / Apple Silicon，本就适合 arm64 runner。
+    runs-on: macos-15
     steps:
       - uses: actions/checkout@v4
       - name: 编译 Mac 发送端
