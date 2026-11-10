@@ -65,7 +65,7 @@ Mac 侧 2026-11-11 凌晨做了真实端到端实测（`tools/latencyclient` + `
 
 ## 四、Mac 侧已就绪的配合
 
-- Mac 发送端当前**已停**、且有一块残留虚拟屏 id=10 待用户注销/重启清除（
+- Mac 发送端当前**已停**、且有一块残留虚拟屏 id=11 待用户注销/重启清除（
   `NIGHTLY-2026-11-10.md` 续节已记录，是我的实验副作用）。Windows 侧联调前需 Mac 先恢复。
 - 恢复后 Mac 命令：`cd prototype/mac && ./run.sh start`（smooth、9922 监听）。
 - 降延迟组合开关（Mac 侧已实现，供 A/B）：`SECDISPLAY_QD=1`（队列深度，默认3）、
