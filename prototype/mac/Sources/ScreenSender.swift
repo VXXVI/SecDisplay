@@ -675,8 +675,6 @@ final class Sender {
     private(set) var conn: NWConnection?
     /// 连接代数，用于识别陈旧回调
     private var connEpoch: Int = 0
-    /// 只读暴露给 CursorImageTracker，用于连接重建时强制重发光标图像
-    var currentEpoch: Int { queue.sync { connEpoch } }
     private let queue = DispatchQueue(label: "SecDisplay.net")
     private(set) var inFlight = 0
     private let maxInFlight = 2
@@ -842,31 +840,6 @@ final class Sender {
         var fy = y.bitPattern.bigEndian
         withUnsafeBytes(of: &fy) { packet.append(contentsOf: $0) }
         packet.append(visible ? 1 : 0)
-        c.send(content: packet, completion: .contentProcessed { _ in })
-    }
-
-    /// 发送真实系统光标图像。独立类型 0x05，不动 0x03 位置链路，
-    /// 这样两端版本错配时最多是没有自定义光标，位置转发仍正常。
-    /// 载荷(全大端): [u16 w][u16 h][u16 hotX][u16 hotY][u32 nBytes][BGRA 像素...]
-    /// BGRA 是 Windows DIB(32bpp BI_RGB) 直接可用的排布。
-    func sendCursorImage(width: Int, height: Int,
-                         hotX: Int, hotY: Int, bgra: Data) {
-        guard connected, let c = conn else { return }
-        let headerBytes = 12
-        let payloadLen = headerBytes + bgra.count
-        let total = 1 + 8 + payloadLen          // type + ts + payload
-        var packet = Data(capacity: 4 + total)
-        var len = UInt32(total).bigEndian
-        withUnsafeBytes(of: &len) { packet.append(contentsOf: $0) }
-        packet.append(0x05)
-        var ts = UInt64(CFAbsoluteTimeGetCurrent() * 1_000_000).bigEndian
-        withUnsafeBytes(of: &ts) { packet.append(contentsOf: $0) }
-        func put16(_ v: UInt16) { var x = v.bigEndian; withUnsafeBytes(of: &x) { packet.append(contentsOf: $0) } }
-        func put32(_ v: UInt32) { var x = v.bigEndian; withUnsafeBytes(of: &x) { packet.append(contentsOf: $0) } }
-        put16(UInt16(width)); put16(UInt16(height))
-        put16(UInt16(hotX));  put16(UInt16(hotY))
-        put32(UInt32(bgra.count))
-        packet.append(bgra)
         c.send(content: packet, completion: .contentProcessed { _ in })
     }
 
@@ -1071,83 +1044,6 @@ final class CursorTracker {
     }
 }
 
-/// 真实系统光标图像转发。
-///
-/// 用 NSCursor.currentSystem(本 SDK 名称，旧名 currentSystemCursor) 拿到当前
-/// 系统光标的位图与热点，转成 BGRA 后走 0x05 发给 Windows，由它本地绘制，
-/// 让副屏显示 Mac 的真实光标（I 型、手型等），不再是固定 Windows 箭头。
-/// 只在「形状变化」或「连接刚建立」时发，正常移动不发，流量可忽略。
-final class CursorImageTracker {
-    private let sender: Sender
-    private let queue = DispatchQueue(label: "SecDisplay.cursorImage")
-    private var timer: DispatchSourceTimer?
-    /// 上次发送的图像指纹，用于检测形状变化
-    private var lastFingerprint: UInt64 = 0
-    /// 上次观察到的连接代数，用于连接重建时强制重发
-    private var lastEpoch = -1
-    private let maxDim = 128       // 光标不会超过 128 像素，超出则截断保护
-
-    init(sender: Sender) { self.sender = sender }
-
-    func start() {
-        let t = DispatchSource.makeTimerSource(queue: queue)
-        // 100ms 轮询足够跟上光标形状切换(箭头<->I型<->手型)，又不浪费 CPU
-        t.schedule(deadline: .now(), repeating: .milliseconds(100), leeway: .milliseconds(20))
-        t.setEventHandler { [weak self] in self?.tick() }
-        t.resume()
-        timer = t
-    }
-
-    func stop() { timer?.cancel(); timer = nil }
-
-    private func tick() {
-        guard sender.connected else {
-            // 断开时清指纹，下次连上强制重发（新接收端没有旧光标）
-            lastFingerprint = 0
-            return
-        }
-        guard let cur = NSCursor.currentSystem,
-              let cg = cur.image.cgImage(forProposedRect: nil, context: nil, hints: nil)
-        else { return }
-
-        let w = min(cg.width, maxDim), h = min(cg.height, maxDim)
-        guard w > 0, h > 0 else { return }
-        let hotX = Int(cur.hotSpot.x), hotY = Int(cur.hotSpot.y)
-
-        // 绘制到 BGRA 缓冲。用 kCGBitmapByteOrder32Little + premultipliedFirst
-        // 在 little-endian 上得到 BGRA 排布，正是 Windows DIB 需要的。
-        var bgra = [UInt8](repeating: 0, count: w * h * 4)
-        let cs = CGColorSpaceCreateDeviceRGB()
-        let bitmapInfo = CGImageAlphaInfo.premultipliedFirst.rawValue
-            | CGBitmapInfo.byteOrder32Little.rawValue
-        guard let ctx = CGContext(data: &bgra, width: w, height: h,
-                                  bitsPerComponent: 8, bytesPerRow: w * 4,
-                                  space: cs, bitmapInfo: bitmapInfo) else { return }
-        ctx.draw(cg, in: CGRect(x: 0, y: 0, width: w, height: h))
-
-        // 指纹：尺寸 + 热点 + 抽样像素，足以区分不同光标形状
-        var fp = UInt64(w) << 48 | UInt64(h) << 32
-            | UInt64(hotX & 0xff) << 24 | UInt64(hotY & 0xff) << 16
-        var hash: UInt64 = 1469598103934665603
-        let step = max(1, bgra.count / 256)
-        var i = 0
-        while i < bgra.count {
-            hash = (hash ^ UInt64(bgra[i])) &* 1099511628211
-            i += step
-        }
-        fp ^= hash & 0xffff
-
-        // 连接代数变化(重连)也要重发
-        let epoch = sender.currentEpoch
-        let force = epoch != lastEpoch
-        lastEpoch = epoch
-        guard force || fp != lastFingerprint else { return }
-        lastFingerprint = fp
-
-        sender.sendCursorImage(width: w, height: h, hotX: hotX, hotY: hotY,
-                               bgra: Data(bgra))
-    }
-}
 
 // MARK: - 主流程
 
@@ -1260,9 +1156,6 @@ let vb = CGDisplayBounds(vd.displayID)
 Log.info("坐标基准: 逻辑点 \(Int(vb.width))x\(Int(vb.height))，原点 (\(Int(vb.minX)), \(Int(vb.minY)))")
 let cursor = CursorTracker(sender: sender, bounds: { CGDisplayBounds(vd.displayID) })
 cursor.start()
-// 真实光标图像：形状变化时才发，让副屏显示 Mac 的光标而非固定 Windows 箭头
-let cursorImage = CursorImageTracker(sender: sender)
-cursorImage.start()
 
 // 传入 id 获取闭包：虚拟屏重建后 id 会变，采集侧每次重建流都重新问
 let cap = Capture(encoder: encoder, cfg: cfg, displayID: { vd.displayID })
