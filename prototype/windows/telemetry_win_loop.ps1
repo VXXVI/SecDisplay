@@ -1,4 +1,4 @@
-# telemetry_win_loop.ps1
+﻿# telemetry_win_loop.ps1
 # Windows 端无人值守遥测循环：定时从运行中的接收端日志提取脱敏指标并 push。
 # 由「任务计划程序」每 5 分钟调用一次；单次运行，不常驻、不抢全屏、不动光标。
 # 设备 ID 由 push_telemetry.ps1 用仓库外的随机值生成，主机名不进公开仓。

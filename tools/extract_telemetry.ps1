@@ -1,4 +1,4 @@
-# extract_telemetry.ps1
+﻿# extract_telemetry.ps1
 # Windows 端（无 Python 时）从 diag / fullscreen 日志提取脱敏指标 JSON。
 # 输出 schema 与 tools/extract_telemetry.py 的 --platform win 完全一致，
 # CI 会用同一份样本日志对比两者，防止两份正则漂移。

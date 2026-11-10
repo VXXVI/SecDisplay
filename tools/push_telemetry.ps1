@@ -1,4 +1,4 @@
-# push_telemetry.ps1
+﻿# push_telemetry.ps1
 # 把一份 JSON 指标文件提交并推送到当前仓库的 telemetry/ 目录。
 # 与 tools/push_telemetry.sh 行为一致：只 add 目标文件、先 pull --rebase、
 # 设备 ID 用仓库外的稳定随机值、忽略时间戳比较避免空提交洪水、
