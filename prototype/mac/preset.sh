@@ -1,6 +1,10 @@
 #!/bin/zsh
 # 切换画质/流畅度档位
 # 用法: ./preset.sh sharp|balanced|smooth|fast|status
+#
+# 切档只写 .preset 并调用 run.sh restart，由 run.sh 统一负责：
+# 重编(若源码更新)、重签稳定身份、干净停虚拟屏、按 .preset 设置
+# SECDISPLAY_PRESET 再启动。旧版本用 pkill 裸启，曾撞「残留虚拟屏占位置」。
 set -u
 cd "$(dirname "$0")"
 P="${1:-status}"
@@ -13,17 +17,13 @@ status)
         tail -2 "$(ls -t logs/*.log 2>/dev/null | head -1)" 2>/dev/null
     else
         echo "未运行"
+        echo "当前档位: $(cat .preset 2>/dev/null || echo balanced)"
     fi
     ;;
 sharp|balanced|smooth|fast)
-    pkill -TERM -f screensender 2>/dev/null
-    sleep 2
     echo "$P" > .preset
-    mkdir -p logs
-    SECDISPLAY_PRESET="$P" nohup ./screensender > "logs/sender_$(date +%Y%m%d_%H%M%S)_$P.log" 2>&1 &
-    sleep 3
-    echo "已切换到 $P"
-    grep -E "预设档位|虚拟屏就绪|抓屏已启动" "$(ls -t logs/*.log|head -1)"
+    echo "已写入档位 $P，重启发送端以应用..."
+    ./run.sh restart
     ;;
 *)
     echo "用法: $0 sharp|balanced|smooth|fast|status"

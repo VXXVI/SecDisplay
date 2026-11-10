@@ -102,6 +102,16 @@ start)
         sign_binary || exit 1
         echo "已补稳定身份: $SIGN_ID"
     fi
+    # 从 .preset 读档位（由 preset.sh 写入），让 start/restart 自动应用。
+    # 旧 preset.sh 用 pkill 裸启，绕过了本脚本的重签/虚拟屏清理，已改为
+    # 写文件后调用 run.sh restart，统一走这条路径。
+    if [ -f .preset ]; then
+        _preset="$(cat .preset 2>/dev/null | tr -cd 'a-z')"
+        case "$_preset" in
+            sharp|balanced|smooth|fast) export SECDISPLAY_PRESET="$_preset"
+                echo "应用预设档位: $_preset" ;;
+        esac
+    fi
     log="$LOGDIR/sender_$(date +%Y%m%d_%H%M%S).log"
     echo "启动，日志: $log"
     nohup "$BIN" > "$log" 2>&1 &
