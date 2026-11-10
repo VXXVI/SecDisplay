@@ -69,6 +69,25 @@ Mac 侧客观数据（telemetry/mac/d87b16db.json，14:19Z）：
 Mac 当前 smooth。若仍觉卡，报告「有连接时 Windows 遥测的 peak_fps / decoded_per_sample /
 extra_latency_ms」，Mac 侧据此决定是否降到 fast 或调呈现节奏。
 
+## windowsagent 实机回传（78b0016 / RESULT-PRESET-2026-11-10.md，Mac 侧已读）
+
+windowsagent 用 `--windowed 2880 1800`（旧参数）跑了一次端到端，独立确认：
+- 解码器**能自适应 SPS**：日志 `可用输出[0] 尺寸 2240x1408`、`解码失败 0`、
+  包数稳定涨约 14~15fps、`附加延迟` 真实波动。即 smooth(2240x1400) 码流在
+  2880x1800 命令行下也能解能显。
+- 它修了呈现器 `src<dst` 越界（CreateProcessor 的 source rect 方向分支），
+  这是真实改进，Mac 侧不碰 Windows 端代码，避免冲突。
+- 它同样定性「两端分辨率/坐标基准对不上」，建议 A 路两端统一档位。
+
+**重要不一致，需 windowsagent 复现**：那次是 `--windowed 2880 1800` 且解码失败 0，
+而用户实机报「解码失败」。两者参数不同。请用**最新脚本**（abe8e29 起默认
+`2240 1400 --fullscreen`，`git pull` 后 `start.bat`）再跑一次，回传：
+- `解码失败 N` 到底是 0 还是在涨
+- 若仍失败，附 `logs\fullscreen.log` 尾部 40 行（尤其 `解码器就绪`、`可用输出`、
+  `呈现器`、`解码失败` 几行）
+这样能区分「尺寸不符导致」还是「旧 exe / 0x05 光标包 / 连接重置」等其它因素，
+避免双方基于不同参数各说各话。Mac 侧不臆断解码失败的唯一根因。
+
 ## 子代理静态核查结论（2026-11-10 深夜，Mac 侧派 review 子代理产出）
 
 对 HEAD(cef09d7) 逐行核查坐标闭环，结论：**纸面自洽，未发现代码里的 2x/缩放 bug**。
