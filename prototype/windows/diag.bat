@@ -14,6 +14,10 @@ if not exist "SecDisplayReceiver.exe" (
 set "MAC_IP=%~1"
 if "%MAC_IP%"=="" set "MAC_IP=10.10.10.1"
 
+rem 分辨率须等于 Mac 当前预设档位物理像素，默认 smooth 2240x1400。
+if not defined SECDISPLAY_W set "SECDISPLAY_W=2240"
+if not defined SECDISPLAY_H set "SECDISPLAY_H=1400"
+
 if not exist "logs" mkdir "logs"
 del /q "logs\diag.log" 2>nul
 
@@ -31,7 +35,7 @@ echo ============================================================
 echo.
 pause
 
-start "" /b cmd /c ""%~dp0SecDisplayReceiver.exe" %MAC_IP% 9922 2880 1800 --fullscreen --log "%~dp0logs\diag.log""
+start "" /b cmd /c ""%~dp0SecDisplayReceiver.exe" %MAC_IP% 9922 %SECDISPLAY_W% %SECDISPLAY_H% --fullscreen --log "%~dp0logs\diag.log""
 
 echo   倒计时：
 for /l %%i in (20,-1,1) do (

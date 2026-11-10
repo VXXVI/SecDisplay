@@ -16,6 +16,11 @@ if not exist "SecDisplayReceiver.exe" (
 set "MAC_IP=%~1"
 if "%MAC_IP%"=="" set "MAC_IP=10.10.10.1"
 
+rem 分辨率须等于 Mac 当前预设档位物理像素，默认 smooth 2240x1400。
+rem 切档时启动前设 SECDISPLAY_W / SECDISPLAY_H 覆盖，避免解码失败。
+if not defined SECDISPLAY_W set "SECDISPLAY_W=2240"
+if not defined SECDISPLAY_H set "SECDISPLAY_H=1400"
+
 set "LOGDIR=%~dp0logs"
 if not exist "%LOGDIR%" mkdir "%LOGDIR%"
 for /f "tokens=2 delims==" %%I in ('wmic os get localdatetime /value ^| find "="') do set "TS=%%I"
@@ -38,7 +43,7 @@ echo.
 echo   如果在远程桌面里看：窗口不会盖住桌面，可以边看日志边操作。
 echo.
 
-start "" /b cmd /c ""%~dp0SecDisplayReceiver.exe" %MAC_IP% 9922 2880 1800 --fullscreen --log "%LOGFILE%""
+start "" /b cmd /c ""%~dp0SecDisplayReceiver.exe" %MAC_IP% 9922 %SECDISPLAY_W% %SECDISPLAY_H% --fullscreen --log "%LOGFILE%""
 
 echo   已启动。实时日志：
 echo     powershell -Command "Get-Content '%LOGFILE%' -Wait -Tail 20"
