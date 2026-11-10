@@ -160,6 +160,7 @@ static int64_t UnixNowMicros() {
 
 static const uint8_t TYPE_VIDEO = 0x01;
 static const uint8_t TYPE_CURSOR = 0x03;   // 光标位置，与视频帧分离发送
+static const uint8_t TYPE_CURSOR_IMAGE = 0x05;  // 真实光标图像 + 热点（BGRA）
 static const uint8_t TYPE_KEYFRAME_REQUEST = 0x02;
 static const size_t HEADER_BYTES = 9;   // 类型 1 + 时间戳 8
 static const size_t MAX_PACKET = 64u * 1024u * 1024u;
@@ -172,14 +173,25 @@ static const size_t MAX_PACKET = 64u * 1024u * 1024u;
 // Windows 的光标由硬件合成，延迟接近零。
 // ---------------------------------------------------------------------------
 
-// 坐标基准 = Mac 虚拟屏的「逻辑点」尺寸（Retina 2x 下是物理像素的一半）。
-// 光标显示和输入回传都用这个：macOS 全局鼠标坐标是点坐标，CGDisplayBounds
-// 返回的也是点尺寸。用物理像素做分母会让光标显示在半程、点击放大一倍。
-// 解码/呈现/全屏窗口仍用 cfg.width/height（物理像素），两者不能混用。
+// 坐标基准 = Mac 虚拟屏 CGDisplayBounds 的尺寸（e153f2c 起默认对齐物理，
+// 随档位变化，如 2880x1800 / 2240x1400）。光标显示和输入回传都以它为准。
+// 解码/呈现/全屏窗口用 cfg.width/height（物理像素），两者一致时不冲突。
 static std::atomic<int> g_coordW{0};
 static std::atomic<int> g_coordH{0};
 static std::atomic<double> g_cursorX{-1};
 static std::atomic<double> g_cursorY{-1};
+
+// 真实 Mac 光标图像（0x05）。网络线程只把收到的 BGRA 存进缓冲并 post 消息，
+// HCURSOR 的创建/替换/销毁统一在 UI 线程做，避免跨线程句柄竞态。
+static const UINT WM_APPLY_CURSOR = WM_APP + 2;
+struct CursorImageBuf {
+    std::mutex mtx;
+    std::vector<uint8_t> bgra;
+    int w = 0, h = 0, hotX = 0, hotY = 0;
+    bool pending = false;
+};
+static CursorImageBuf g_cursorImage;
+static HCURSOR g_customCursor = nullptr;   // 仅 UI 线程访问
 
 // 输入回传：把窗口内的鼠标位置和按键状态发给 Mac，由它重放事件。
 // 不再用 SetCursorPos 搬本机光标——那会和用户自己的鼠标抢位置，
@@ -311,6 +323,34 @@ static void OnCursorPacket(const uint8_t* p, size_t payloadLen) {
 
     int vw = g_coordW.load(), vh = g_coordH.load();
     if (vw <= 0 || vh <= 0) return;
+}
+
+// 0x05 真实光标图像。载荷(全大端):
+//   [u16 w][u16 h][u16 hotX][u16 hotY][u32 nBytes][BGRA 像素...]
+// 网络线程只存缓冲并 post 消息，HCURSOR 创建在 UI 线程做，避免句柄竞态。
+static void OnCursorImagePacket(const uint8_t* p, size_t payloadLen) {
+    if (payloadLen < 12) return;
+    auto rd16 = [](const uint8_t* q) -> uint16_t {
+        return (uint16_t)((q[0] << 8) | q[1]);
+    };
+    auto rd32 = [](const uint8_t* q) -> uint32_t {
+        return ((uint32_t)q[0] << 24) | ((uint32_t)q[1] << 16)
+             | ((uint32_t)q[2] << 8) | (uint32_t)q[3];
+    };
+    int w = rd16(p), h = rd16(p + 2);
+    int hotX = rd16(p + 4), hotY = rd16(p + 6);
+    uint32_t nBytes = rd32(p + 8);
+    if (w <= 0 || h <= 0 || w > 128 || h > 128) return;
+    if (nBytes != (uint32_t)(w * h * 4) || payloadLen < 12 + nBytes) return;
+
+    {
+        std::lock_guard<std::mutex> lk(g_cursorImage.mtx);
+        g_cursorImage.w = w; g_cursorImage.h = h;
+        g_cursorImage.hotX = hotX; g_cursorImage.hotY = hotY;
+        g_cursorImage.bgra.assign(p + 12, p + 12 + nBytes);
+        g_cursorImage.pending = true;
+    }
+    if (g_hwnd) PostMessageA(g_hwnd, WM_APPLY_CURSOR, 0, 0);
 }
 
 // ---------------------------------------------------------------------------
@@ -1195,6 +1235,58 @@ static void ExitFullscreen() {
     Log("已切换到窗口");
 }
 
+// 用收到的 BGRA 像素造一个 32bpp 带 alpha 的 HCURSOR。
+// 仅在 UI 线程(WM_APPLY_CURSOR)调用；旧 cursor 在此销毁，无跨线程句柄竞态。
+static void ApplyCursorImage() {
+    // 只拷需要的字段；CursorImageBuf 含 mutex，不可整体值拷贝。
+    std::vector<uint8_t> bgra;
+    int w, h, hotX, hotY;
+    {
+        std::lock_guard<std::mutex> lk(g_cursorImage.mtx);
+        if (!g_cursorImage.pending) return;
+        w = g_cursorImage.w; h = g_cursorImage.h;
+        hotX = g_cursorImage.hotX; hotY = g_cursorImage.hotY;
+        bgra = g_cursorImage.bgra;
+        g_cursorImage.pending = false;
+    }
+    if (w <= 0 || h <= 0 || (int)bgra.size() < w * h * 4) return;
+
+    // color DIB：自底向上，32bpp BGRA
+    BITMAPV5HEADER bi{};
+    bi.bV5Size = sizeof(bi);
+    bi.bV5Width = w;
+    bi.bV5Height = -h;                  // 负值 = 自顶向下，匹配 Mac 送来的行序
+    bi.bV5Planes = 1;
+    bi.bV5BitCount = 32;
+    bi.bV5Compression = BI_RGB;
+    void* bits = nullptr;
+    HDC hdc = GetDC(nullptr);
+    HBITMAP color = CreateDIBSection(hdc, (BITMAPINFO*)&bi, DIB_RGB_COLORS,
+                                     &bits, nullptr, 0);
+    if (hdc) ReleaseDC(nullptr, hdc);
+    if (!color || !bits) { if (color) DeleteObject(color); return; }
+    memcpy(bits, bgra.data(), (size_t)w * h * 4);
+
+    // mask：全 0（32bpp alpha 光标不需要 1bpp AND 掩码，但 ICONINFO 要求提供）
+    HBITMAP mask = CreateBitmap(w, h, 1, 1, nullptr);
+    if (!mask) { DeleteObject(color); return; }
+
+    ICONINFO ii{};
+    ii.fIcon = FALSE;
+    ii.xHotspot = (DWORD)hotX;
+    ii.yHotspot = (DWORD)hotY;
+    ii.hbmColor = color;
+    ii.hbmMask = mask;
+    HCURSOR cur = CreateIconIndirect(&ii);
+    DeleteObject(color);
+    DeleteObject(mask);
+    if (!cur) return;
+
+    if (g_customCursor) DestroyCursor(g_customCursor);
+    g_customCursor = cur;
+    SetCursor(cur);
+}
+
 static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
     switch (m) {
     case WM_CLOSE:
@@ -1205,6 +1297,10 @@ static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
     case WM_DESTROY:
         TrayRemove();
         PostQuitMessage(0);
+        return 0;
+    case WM_APPLY_CURSOR:
+        // 网络线程收到 0x05 后 post 到这里，HCURSOR 创建/销毁统一在 UI 线程
+        ApplyCursorImage();
         return 0;
     case WM_TRAY:
         // 托盘图标的鼠标事件（lParam = 具体消息）
@@ -1277,8 +1373,8 @@ static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
         return 0;
     }
     case WM_SETCURSOR:
-        // 保持光标可见，不要被全屏窗口自动隐藏
-        SetCursor(LoadCursor(nullptr, IDC_ARROW));
+        // 有 Mac 真实光标就用它，否则退回标准箭头
+        SetCursor(g_customCursor ? g_customCursor : LoadCursor(nullptr, IDC_ARROW));
         return TRUE;
     case WM_LBUTTONDBLCLK:      // 双击也切换
         if (g_isFullscreen) ExitFullscreen(); else EnterFullscreen();
@@ -1431,6 +1527,11 @@ static void NetworkLoop(const RunConfig& cfg, Graphics* gfx, Presenter* presente
                     OnCursorPacket(packet.data() + HEADER_BYTES, len - HEADER_BYTES);
                     continue;
                 }
+                if (packet[0] == TYPE_CURSOR_IMAGE) {
+                    OnCursorImagePacket(packet.data() + HEADER_BYTES, len - HEADER_BYTES);
+                    continue;
+                }
+                // 0x06 心跳 / 其它未知类型：忽略即可，TCP 已有数据流动
                 if (packet[0] != TYPE_VIDEO) continue;
 
                 uint64_t ts = 0;
@@ -1728,6 +1829,7 @@ int main(int argc, char** argv) {
     // 退出清理：托盘图标和热键必须在进程结束前移除，否则托盘会留残影
     TrayRemove();
     UnregisterHotKey(hwnd, HOTKEY_QUIT_ID);
+    if (g_customCursor) { DestroyCursor(g_customCursor); g_customCursor = nullptr; }
     g_alive = false;
     // 关键：先掐断 socket，让阻塞在 recv 的收流线程立即返回。
     // 否则「已连上 Mac 正常收流」时按退出，net.join() 会一直等那个
