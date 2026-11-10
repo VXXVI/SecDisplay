@@ -182,6 +182,10 @@ static void SendInputPacket(float vx, float vy, uint8_t buttons, int16_t wheel) 
 
 static HWND g_hwnd = nullptr;   // 主窗口句柄，ClientToVideo 与全屏切换共用
 
+// 全局存活标志。放在靠前位置，因为 RecvAll 等底层函数也要读它来判断退出。
+// false 时所有后台线程（收流/光标/监控）应尽快结束。
+static std::atomic<bool> g_alive{ true };
+
 // ---------------------------------------------------------------------------
 // 系统托盘：全屏置顶无边框窗口没有关闭按钮，唯一退出口是 Esc。
 // 加一个托盘小图标，让「退出」永远点得到，不用盲敲命令。
@@ -285,9 +289,18 @@ static bool RecvAll(SOCKET s, void* buf, int len) {
     char* p = (char*)buf;
     while (len > 0) {
         int n = recv(s, p, len, 0);
-        if (n <= 0) return false;
-        p += n;
-        len -= n;
+        if (n > 0) { p += n; len -= n; continue; }
+        if (n == 0) return false;               // 对端关闭
+        // n < 0：区分「超时」与「真错误」。SO_RCVTIMEO 让 recv 每 500ms
+        // 醒一次，超时时若 g_alive 仍为 true 就继续等（保活间隔约 80ms，
+        // 正常收流不会真的超时）；g_alive=false 时立刻返回，让线程退出。
+        int err = WSAGetLastError();
+        if (err == WSAETIMEDOUT) {
+            if (!g_alive.load()) return false; // 退出信号：结束收流
+            continue;                          // 只是超时，继续等下一批数据
+        }
+        if (err == WSAEINTR) continue;
+        return false;                          // 其它错误：连接断了
     }
     return true;
 }
@@ -1258,7 +1271,7 @@ struct RunConfig {
     std::string logFile;      // 非空则同时写日志文件
 };
 
-static std::atomic<bool> g_alive{ true };
+// g_alive 已前移到文件顶部全局区（供 RecvAll 等底层函数使用）。
 
 static void ParseArgs(int argc, char** argv, RunConfig& cfg) {
     int positional = 0;
@@ -1332,6 +1345,12 @@ static void NetworkLoop(const RunConfig& cfg, Graphics* gfx, Presenter* presente
         }
         Log("已连接，目标 %dx%d", cfg.width, cfg.height);
         g_sock = sock;
+
+        // 给 recv 设超时，退出时即便漏了 shutdown，阻塞的 recv 也会在
+        // 500ms 内返回，让收流线程能轮询 g_alive 后退出（避免 net.join 卡死）。
+        DWORD recvTimeoutMs = 500;
+        setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO,
+                   (const char*)&recvTimeoutMs, sizeof(recvTimeoutMs));
 
         // 复位统计，重连后从头计数
         g_stats.packets = 0; g_stats.bytes = 0; g_stats.decoded = 0;
@@ -1657,6 +1676,14 @@ int main(int argc, char** argv) {
     TrayRemove();
     UnregisterHotKey(hwnd, HOTKEY_QUIT_ID);
     g_alive = false;
+    // 关键：先掐断 socket，让阻塞在 recv 的收流线程立即返回。
+    // 否则「已连上 Mac 正常收流」时按退出，net.join() 会一直等那个
+    // 无超时的 recv，进程卡在退出途中，看起来像「点了退出没反应」。
+    // 配合 RecvAll 的 SO_RCVTIMEO(500ms) 双保险。
+    {
+        SOCKET s = g_sock.load();
+        if (s != INVALID_SOCKET) shutdown(s, SD_BOTH);
+    }
     if (net.joinable()) net.join();
     if (cursorThread.joinable()) cursorThread.join();
 
