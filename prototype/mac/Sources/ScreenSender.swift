@@ -246,9 +246,18 @@ final class Encoder {
     }
 
     func start() -> Bool {
-        let spec: [String: Any] = [
-            kVTVideoEncoderSpecification_EnableLowLatencyRateControl as String: true
-        ]
+        // EnableLowLatencyRateControl 并非恒优。实测（tools/EncLatency.swift，M1 Pro）：
+        //   2240x1400@60  开=34~37ms 关=21~23ms（关更好）
+        //   2880x1800@45  开=44~50ms 关=35~36ms（关更好）
+        //   1920x1200@60  开=9ms     关=14ms   （开更好）
+        // 规律：分辨率接近编码器吞吐上限时该开关反而拖慢（同 Sunshine #5814）。
+        // 默认保持开启（低分辨率/未知场景收益确定）；高分辨率档可用
+        // SECDISPLAY_NOLOWLAT=1 关闭，供真机 A/B。
+        var spec: [String: Any] = [:]
+        let noLowLat = ProcessInfo.processInfo.environment["SECDISPLAY_NOLOWLAT"] == "1"
+        if !noLowLat {
+            spec[kVTVideoEncoderSpecification_EnableLowLatencyRateControl as String] = true
+        }
         let attrs: [String: Any] = [
             // 用原生 YUV 而不是 BGRA：SCK 直接给 YUV，编码器也直接吃 YUV，
             // 省掉两次全画面色彩转换。2880x1800 下 BGRA 每帧 20MB，

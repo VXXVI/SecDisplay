@@ -42,6 +42,8 @@ prototype/windows/*.pdb
 prototype/mac/logs/
 prototype/windows/logs/
 tools/latencyclient
+tools/motionloader
+tools/enclatency
 
 # 本地运行状态（当前档位），不进仓库
 prototype/mac/.preset

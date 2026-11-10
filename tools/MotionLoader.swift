@@ -18,9 +18,13 @@ var n: UInt32 = 0
 CGGetOnlineDisplayList(16, nil, &n)
 var ids = [CGDirectDisplayID](repeating: 0, count: Int(n))
 CGGetOnlineDisplayList(n, &ids, &n)
-let main = CGMainDisplayID()
-guard let vdID = ids.first(where: { $0 != main && $0 != 6 }) else {
-    FileHandle.standardError.write("找不到虚拟屏，先启动发送端\n".data(using: .utf8)!)
+// 用与主程序一致的 EDID 身份识别 SecDisplay 虚拟屏，
+// 不要用「非主屏/fixed id」判断：在线可能还有 Sidecar、外接屏，会选错。
+func isSecDisplay(_ id: CGDirectDisplayID) -> Bool {
+    CGDisplayVendorNumber(id) == 0xEEEE && CGDisplayModelNumber(id) == 0x5344
+}
+guard let vdID = ids.first(where: { isSecDisplay($0) }) else {
+    FileHandle.standardError.write("找不到 SecDisplay 虚拟屏，先启动发送端\n".data(using: .utf8)!)
     exit(2)
 }
 FileHandle.standardError.write("目标虚拟屏 \(vdID)\n".data(using: .utf8)!)
