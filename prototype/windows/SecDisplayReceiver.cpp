@@ -201,6 +201,19 @@ static std::atomic<SOCKET> g_sock{ INVALID_SOCKET };
 static std::atomic<uint8_t> g_buttons{ 0 };
 static std::atomic<int64_t> g_lastLocalInputMs{ 0 };
 
+// 鼠标移动节流：WM_MOUSEMOVE 频率可达每秒数百上千次，逐包发给 Mac 会让
+// 对端 CGEvent.mouseMoved 队列堆积，体感「鼠标延迟极高」。UI 线程只记最新位置，
+// 由独立 inputThread 每 8ms（约 120Hz，与 Mac 侧 0x03 采样同频）合并发送。
+// 按键/滚轮标记 eventPending，inputThread 下一轮（约 4ms 内）立即发，保证点击及时。
+// 用独立线程而非 WM_TIMER：WM_TIMER 是低优先级，消息队列不空时长期不触发，节奏不稳。
+static std::atomic<bool> g_moveDirty{ false };
+static std::atomic<float> g_moveX{ 0.0f };
+static std::atomic<float> g_moveY{ 0.0f };
+static std::atomic<bool> g_eventPending{ false };
+static std::atomic<int16_t> g_pendingWheel{ 0 };
+static const uint64_t INPUT_MOVE_INTERVAL_MS = 8;   // 约 120Hz
+static const uint64_t INPUT_TICK_MS           = 4;   // 线程轮询粒度
+
 static void SendInputPacket(float vx, float vy, uint8_t buttons, int16_t wheel) {
     SOCKET s = g_sock.load();
     if (s == INVALID_SOCKET) return;
@@ -1381,7 +1394,10 @@ static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
         float vx, vy;
         if (ClientToVideo(GET_X_LPARAM(l), GET_Y_LPARAM(l), &vx, &vy)) {
             g_lastLocalInputMs = GetTickCount64();
-            SendInputPacket(vx, vy, g_buttons.load(), 0);
+            // 只记最新位置，由 inputThread 8ms 合并发送，避免逐消息刷包
+            g_moveX = vx;
+            g_moveY = vy;
+            g_moveDirty = true;
         }
         return 0;
     }
@@ -1397,7 +1413,10 @@ static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
         g_lastLocalInputMs = GetTickCount64();
         float vx, vy;
         if (ClientToVideo(GET_X_LPARAM(l), GET_Y_LPARAM(l), &vx, &vy)) {
-            SendInputPacket(vx, vy, b, 0);
+            // 更新位置并标记事件，inputThread 下一轮（约 4ms 内）立即发，保证点击落点准
+            g_moveX = vx;
+            g_moveY = vy;
+            g_eventPending = true;
         }
         return 0;
     }
@@ -1408,7 +1427,10 @@ static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
         if (ClientToVideo(pt.x, pt.y, &vx, &vy)) {
             int delta = GET_WHEEL_DELTA_WPARAM(w);
             g_lastLocalInputMs = GetTickCount64();
-            SendInputPacket(vx, vy, g_buttons.load(), (int16_t)(-delta));
+            g_moveX = vx;
+            g_moveY = vy;
+            g_pendingWheel = (int16_t)(-delta);
+            g_eventPending = true;   // 滚轮事件由 inputThread 立即发
         }
         return 0;
     }
@@ -1797,6 +1819,7 @@ int main(int argc, char** argv) {
     }
     Log("退出方式: Esc / 左键托盘图标 / 右键菜单 / Ctrl+Alt+Q");
     Log("让位方式: Ctrl+Alt+H 最小化/还原，或托盘菜单；窗口可 Alt-Tab、可 Win+M 最小化");
+    Log("输入回传: 鼠标移动约 120Hz 合并发送，按键/滚轮即时");
 
     if (cfg.fullscreen) {
         // 绝对定位兜底，确保铺满显示器；不再置顶（HWND_NOTOPMOST），
@@ -1870,6 +1893,33 @@ int main(int argc, char** argv) {
         }
     });
 
+    // 输入回传线程：每 4ms 轮询，鼠标移动按 8ms 合并发（约 120Hz），
+    // 按键/滚轮事件在下一轮立即发。单线程发送，避免与 UI 线程并发 send 同一 socket。
+    std::thread inputThread([] {
+        uint64_t lastMoveMs = 0;
+        while (g_alive) {
+            Sleep((DWORD)INPUT_TICK_MS);
+            if (!g_alive) break;
+            if (g_sock.load() == INVALID_SOCKET) continue;
+            if (g_eventPending.exchange(false)) {
+                SendInputPacket(g_moveX.load(), g_moveY.load(), g_buttons.load(),
+                                g_pendingWheel.exchange(0));
+                lastMoveMs = GetTickCount64();
+                g_moveDirty = false;   // 事件包已带最新位置
+                continue;
+            }
+            if (g_moveDirty.load()) {
+                uint64_t now = GetTickCount64();
+                if (now - lastMoveMs >= INPUT_MOVE_INTERVAL_MS) {
+                    if (g_moveDirty.exchange(false)) {
+                        SendInputPacket(g_moveX.load(), g_moveY.load(), g_buttons.load(), 0);
+                    }
+                    lastMoveMs = now;
+                }
+            }
+        }
+    });
+
     std::thread net(NetworkLoop, cfg, &gfx, &presenter);
 
     MSG msg;
@@ -1894,6 +1944,7 @@ int main(int argc, char** argv) {
     }
     if (net.joinable()) net.join();
     if (cursorThread.joinable()) cursorThread.join();
+    if (inputThread.joinable()) inputThread.join();
 
     WSACleanup();
     presenter.Shutdown();
