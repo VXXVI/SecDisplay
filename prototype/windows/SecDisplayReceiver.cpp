@@ -226,7 +226,9 @@ static const UINT ID_TRAY_EXIT = 1001;
 static const UINT ID_TRAY_TOGGLE = 1002;
 static const UINT ID_TRAY_ABOUT  = 1003;
 static const int  HOTKEY_QUIT_ID = 1;
-static NOTIFYICONDATAA g_nid{};
+// 用 W 版托盘结构与宽字符提示：A 版在 CP936 下会把 UTF-8 中文按 GBK 解码，
+// 托盘悬浮提示会变乱码。窗口类本身仍是 A 版注册（类名纯 ASCII），不受影响。
+static NOTIFYICONDATAW g_nid{};
 static bool g_trayAdded = false;
 
 static void RequestQuit() {
@@ -242,20 +244,21 @@ static void TrayCreate(HWND hwnd) {
     g_nid.uID = 1;
     g_nid.uFlags = NIF_ICON | NIF_MESSAGE | NIF_TIP;
     g_nid.uCallbackMessage = WM_TRAY;
-    // 用系统自带的应用图标，省去资源文件；IDI_APPLICATION 稳定可用
+    // 系统自带应用图标，省去资源文件。图标是数字资源 ID，A/W 版等价、无文本编码问题
     g_nid.hIcon = LoadIconA(nullptr, IDI_APPLICATION);
-    // 用 strncpy 而非 strcpy_s，兼容 MinGW（build-mingw.bat 也在用）
-    strncpy(g_nid.szTip,
-            "SecDisplay - 左键退出 / 右键菜单 / Ctrl+Alt+Q 强退",
-            sizeof(g_nid.szTip) - 1);
-    g_nid.szTip[sizeof(g_nid.szTip) - 1] = '\0';
-    g_trayAdded = Shell_NotifyIconA(NIM_ADD, &g_nid) == TRUE;
+    // 宽字符悬浮提示：A 版在 CP936 下会把 UTF-8 中文按 GBK 解码成乱码。
+    // lstrcpynW 来自 windows.h，保证按缓冲区截断并以 L'\0' 结尾，
+    // MinGW / MSVC 都可用，不用 strcpy_s 这类 MSVC 扩展。
+    lstrcpynW(g_nid.szTip,
+              L"SecDisplay - 左键退出 / 右键菜单 / Ctrl+Alt+Q 强退",
+              (int)(sizeof(g_nid.szTip) / sizeof(g_nid.szTip[0])));
+    g_trayAdded = Shell_NotifyIconW(NIM_ADD, &g_nid) == TRUE;
     if (!g_trayAdded) Log("托盘图标添加失败（不影响 Esc / 热键退出）");
 }
 
 static void TrayRemove() {
     if (g_trayAdded) {
-        Shell_NotifyIconA(NIM_DELETE, &g_nid);
+        Shell_NotifyIconW(NIM_DELETE, &g_nid);
         g_trayAdded = false;
     }
 }
@@ -265,10 +268,11 @@ static void TrayShowMenu(HWND hwnd) {
     GetCursorPos(&pt);
     HMENU menu = CreatePopupMenu();
     if (!menu) return;
-    AppendMenuA(menu, MF_STRING, ID_TRAY_TOGGLE, "切换全屏 / 窗口  (F11)");
-    AppendMenuA(menu, MF_STRING, ID_TRAY_ABOUT,  "关于 SecDisplay");
-    AppendMenuA(menu, MF_SEPARATOR, 0, nullptr);
-    AppendMenuA(menu, MF_STRING | MF_DEFAULT, ID_TRAY_EXIT, "退出 SecDisplay");
+    // W 版菜单 + 宽字符：绕开 CP936 对 UTF-8 中文的 GBK 误解码
+    AppendMenuW(menu, MF_STRING, ID_TRAY_TOGGLE, L"切换全屏 / 窗口  (F11)");
+    AppendMenuW(menu, MF_STRING, ID_TRAY_ABOUT,  L"关于 SecDisplay");
+    AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
+    AppendMenuW(menu, MF_STRING | MF_DEFAULT, ID_TRAY_EXIT, L"退出 SecDisplay");
     // 前置，否则菜单可能被置顶窗口盖住
     SetForegroundWindow(hwnd);
     TrackPopupMenu(menu, TPM_RIGHTBUTTON | TPM_BOTTOMALIGN,
@@ -1217,12 +1221,12 @@ static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
             if (g_isFullscreen) ExitFullscreen(); else EnterFullscreen();
             return 0;
         case ID_TRAY_ABOUT:
-            MessageBoxA(h,
-                "SecDisplay\n"
-                "左键托盘图标 或 Ctrl+Alt+Q 退出\n"
-                "F11 切换全屏 / 窗口\n"
-                "Esc 也可退出",
-                "关于 SecDisplay", MB_OK | MB_ICONINFORMATION);
+            MessageBoxW(h,
+                L"SecDisplay\n"
+                L"左键托盘图标 或 Ctrl+Alt+Q 退出\n"
+                L"F11 切换全屏 / 窗口\n"
+                L"Esc 也可退出",
+                L"关于 SecDisplay", MB_OK | MB_ICONINFORMATION);
             return 0;
         }
         return 0;
@@ -1618,7 +1622,7 @@ int main(int argc, char** argv) {
         AdjustWindowRect(&rc, WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU, FALSE);
         int winW = rc.right - rc.left;
         int winH = rc.bottom - rc.top;
-        hwnd = CreateWindowExA(0, "SecDisplayReceiver", "SecDisplay - 按 Esc 退出",
+        hwnd = CreateWindowExA(0, "SecDisplayReceiver", "SecDisplay",
                                WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_VISIBLE,
                                (sw - winW) / 2, (sh - winH) / 2,
                                winW, winH,
@@ -1626,6 +1630,12 @@ int main(int argc, char** argv) {
     }
     if (!hwnd) { Log("窗口创建失败"); return 3; }
     g_hwnd = hwnd;
+
+    // 窗口模式标题含中文，用 W 版单独设，绕开 A 版在 CP936 下的 GBK 误解码。
+    // 全屏标题 "SecDisplay" 是纯 ASCII，保持 CreateWindowExA 传入的值即可。
+    if (!cfg.fullscreen) {
+        SetWindowTextW(hwnd, L"SecDisplay - 按 Esc 退出");
+    }
 
     // 系统托盘小图标 + 全局退出热键：保证任何时候都能退出全屏
     TrayCreate(hwnd);
