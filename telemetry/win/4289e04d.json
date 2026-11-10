@@ -1,0 +1,45 @@
+{
+  "schema": 1,
+  "platform": "win",
+  "generated_utc": "2026-11-10T02:21:57Z",
+  "commit": "cc49fd1",
+  "coord": {
+    "logical_w": null,
+    "logical_h": null,
+    "physical_w": null,
+    "physical_h": null,
+    "source": null
+  },
+  "status": {
+    "present_mode": "vsync",
+    "decoder_hw": true,
+    "client_w": 2880,
+    "client_h": 1800,
+    "fullscreen": true
+  },
+  "samples": 11,
+  "metrics": {
+    "packets_last": 271.0,
+    "decoded_last": 269.0,
+    "decoded_per_sample": {
+      "min": 22.0,
+      "median": 25.0,
+      "p95": 26.0,
+      "max": 26.0
+    },
+    "decode_fail_last": 0.0,
+    "mbps": {
+      "min": 0.5,
+      "median": 0.6,
+      "p95": 0.6,
+      "max": 3.5
+    },
+    "extra_latency_ms": {
+      "min": 0.0,
+      "median": 0.0,
+      "p95": 0.0,
+      "max": 0.0
+    }
+  },
+  "warnings": []
+}
