@@ -21,7 +21,7 @@ rem cc1plus.exe 在 libexec 下，PATH 里没有 ucrt64\bin 时它会加载 DLL 
 set "PATH=%MSYS%\ucrt64\bin;%PATH%"
 
 set "CXXFLAGS=-std=c++17 -O2 -DNDEBUG -static"
-set "LIBS=-lws2_32 -ld3d11 -ldxgi -ldxguid -lmfplat -lmfreadwrite -lmfuuid -lole32 -luser32"
+set "LIBS=-lws2_32 -ld3d11 -ldxgi -ldxguid -lmfplat -lmfreadwrite -lmfuuid -lole32 -luser32 -lgdi32"
 
 echo.
 echo ============================================================
