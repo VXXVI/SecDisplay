@@ -1188,6 +1188,12 @@ if let w = Int(ProcessInfo.processInfo.environment["SECDISPLAY_W"] ?? ""),
 if let hz = Double(ProcessInfo.processInfo.environment["SECDISPLAY_HZ"] ?? "") {
     cfg.captureHz = hz
 }
+// 码率覆盖。默认 180Mbps 对 2240x1400@60 偏富余（静止时实测仅 0.3Mbps），
+// 留出环境变量便于按链路/内容 A/B，无需改代码重编。
+if let mbps = Int(ProcessInfo.processInfo.environment["SECDISPLAY_MBPS"] ?? ""),
+   mbps >= 10, mbps <= 1000 {
+    cfg.bitrateMbps = mbps
+}
 let vd = VirtualDisplayManager()
 let encoder = Encoder(width: cfg.width, height: cfg.height, bitrateMbps: cfg.bitrateMbps)
 let sender = Sender()
