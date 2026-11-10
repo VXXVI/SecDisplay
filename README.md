@@ -138,38 +138,48 @@ ping -c 5 192.168.77.2
 
 ## 参数配置
 
-在 `prototype/mac/Sources/ScreenSender.swift` 顶部：
+默认值按 Lenovo 82NC 实测（2880x1800 @ 89Hz，200% 缩放）。在 `prototype/mac/Sources/ScreenSender.swift` 顶部：
 
 ```swift
 struct Config {
-    var width = 2240          // 虚拟屏背板宽度 = Windows 屏物理宽度
-    var height = 1400
-    var logicalWidth = 2240   // 逻辑宽度
-    var logicalHeight = 1400
-    var refreshRate = 60.0
-    var bitrateMbps = 120
+    var width = 2880          // 虚拟屏背板 = Windows 屏物理像素
+    var height = 1800
+    var logicalWidth = 1440   // 逻辑点（2x Retina，文字最锐利）
+    var logicalHeight = 900
+    var refreshRate = 90.0
+    var captureHz = 45.0      // 采集上限；M1 Pro 在此分辨率稳定约 43fps
+    var bitrateMbps = 180
     var port: UInt16 = 9922
 }
 ```
 
-默认值按 Lenovo 82NC（2240x1400）预设。其他机器改这四行即可。
+**width/height 必须等于 Windows 屏物理像素，否则缩放后文字会糊。** logical 是物理的一半，Windows 端坐标基准也用逻辑尺寸，两端一致光标和点击才对得上。
 
-### 尺寸怎么配
+### 快速切档（不用改代码）
 
-| Windows 屏 | width/height | logical | 效果 |
+用 `preset.sh` 或环境变量选四档，清晰度和流畅度互换：
+
+```bash
+cd prototype/mac
+./preset.sh status            # 看当前档位
+./preset.sh smooth            # 切档并重启发送端
+```
+
+| 档位 | 分辨率 | 采集上限 | 适用 |
 |---|---|---|---|
-| 2240x1400 | 2240x1400 | 2240x1400 | 1:1，UI 正常 |
-| 2880x1800 | 2880x1800 | 1440x900 | Retina，UI 大一号 |
-| 1920x1080 | 1920x1080 | 1920x1080 | 1:1 |
+| `sharp` | 2880x1800 | 40Hz | 文字最清晰 |
+| `balanced` | 2880x1800 | 45Hz | 默认，均衡 |
+| `smooth` | 2240x1400 | 60Hz | 要更跟手 |
+| `fast` | 1920x1200 | 60Hz | 最流畅，清晰度最差 |
 
-**width/height 必须等于 Windows 屏物理像素，否则缩放后文字会糊。**
+也能用 `SECDISPLAY_W` / `SECDISPLAY_H` / `SECDISPLAY_HZ` 单独覆盖。`./run.sh restart` 检测到源码更新会自动重编。
 
 ### 码率建议
 
 | 内容 | 码率 |
 |---|---|
 | 纯文字 | 40~80 Mbps |
-| 混合办公 | 100~150 Mbps |
+| 混合办公 | 100~180 Mbps |
 | 有视频 | 200~300 Mbps |
 
 ---
