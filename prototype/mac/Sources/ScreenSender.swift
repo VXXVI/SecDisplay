@@ -1383,8 +1383,20 @@ Timer.scheduledTimer(withTimeInterval: 2.0, repeats: true) { _ in
 // 信号处理只置标志位，实际清理在主循环里做
 VirtualDisplayGuard.install()
 
-/// 有序退出：先停采集并断开连接，再销毁虚拟屏。
-/// 采集流还连着显示器时直接销毁，系统会拒绝移除，留下残影。
+/// 虚拟屏是否仍在线（按 EDID 三元组识别，不误伤 Sidecar）。
+func vdStillOnline() -> Bool {
+    var n: UInt32 = 0
+    CGGetOnlineDisplayList(32, nil, &n)
+    var ids = [CGDirectDisplayID](repeating: 0, count: Int(n))
+    CGGetOnlineDisplayList(n, &ids, &n)
+    return ids.prefix(Int(n)).contains {
+        CGDisplayVendorNumber($0) == kVDVendorID && CGDisplayModelNumber($0) == kVDProductID
+    }
+}
+
+/// 有序退出：先停采集并断开连接，再销毁虚拟屏，并**确认它真的从在线列表消失**。
+/// 采集流还连着显示器时调 CDVirtualDisplayDestroy，WindowServer 会静默拒绝、
+/// 留下残影（日志却打印「已销毁」），下次启动创建被拒。所以要轮询确认 + 重试。
 func shutdown(signal sig: Int32) -> Never {
     Log.info("收到信号 \(sig)，开始清理")
     var finished = false
@@ -1392,15 +1404,27 @@ func shutdown(signal sig: Int32) -> Never {
         try? await cap.stream?.stopCapture()
         sender.conn?.cancel()
         // 给系统一点时间释放采集管线
-        try? await Task.sleep(nanoseconds: 300_000_000)
+        try? await Task.sleep(nanoseconds: 400_000_000)
         vd.destroy()
         finished = true
     }
-    let deadline = Date().addingTimeInterval(2.0)
-    while !finished && Date() < deadline {
+    // 等采集停止，最多 3 秒
+    let stopDeadline = Date().addingTimeInterval(3.0)
+    while !finished && Date() < stopDeadline {
         RunLoop.current.run(mode: .default, before: Date().addingTimeInterval(0.05))
     }
-    vd.destroy()   // 幂等，兜底
+    // 销毁并确认虚拟屏真的消失；最多重试 10 次、每次等 200ms。
+    // 只有确认消失才算清理完成，否则残留会挡住下次启动。
+    vd.destroy()
+    var waited = 0.0
+    while vdStillOnline() && waited < 2.0 {
+        RunLoop.current.run(mode: .default, before: Date().addingTimeInterval(0.1))
+        usleep(100_000); waited += 0.1
+        if waited > 0.4 { vd.destroy() }   // 再次尝试
+    }
+    if vdStillOnline() {
+        Log.info("警告: 虚拟屏疑似未清理干净，下次启动可能被拒；可注销重登清除")
+    }
     exit(128 + sig)
 }
 
