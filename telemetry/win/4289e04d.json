@@ -1,14 +1,14 @@
 {
     "schema":  1,
     "platform":  "win",
-    "generated_utc":  "2026-11-10T08:12:54Z",
-    "commit":  "94d9bb2",
+    "generated_utc":  "2026-11-10T10:22:06Z",
+    "commit":  "deb3be0",
     "coord":  {
-                  "logical_w":  1440,
-                  "logical_h":  900,
+                  "logical_w":  2880,
+                  "logical_h":  1800,
                   "physical_w":  2880,
                   "physical_h":  1800,
-                  "source":  "auto2x"
+                  "source":  null
               },
     "status":  {
                    "present_mode":  "vsync",
@@ -17,22 +17,22 @@
                    "client_h":  900,
                    "fullscreen":  false
                },
-    "samples":  4,
+    "samples":  1014,
     "metrics":  {
-                    "packets_last":  0,
-                    "decoded_last":  0,
+                    "packets_last":  15606,
+                    "decoded_last":  15605,
                     "decoded_per_sample":  {
-                                               "min":  0,
-                                               "median":  0,
-                                               "p95":  0,
-                                               "max":  0
+                                               "min":  5,
+                                               "median":  24,
+                                               "p95":  46,
+                                               "max":  95
                                            },
                     "decode_fail_last":  0,
                     "mbps":  {
-                                 "min":  0,
-                                 "median":  0,
-                                 "p95":  0,
-                                 "max":  0
+                                 "min":  0.1,
+                                 "median":  0.5,
+                                 "p95":  1.9,
+                                 "max":  60.6
                              },
                     "extra_latency_ms":  {
                                              "min":  0,
@@ -41,13 +41,13 @@
                                              "max":  0
                                          },
                     "peak_fps":  {
-                                     "min":  0,
-                                     "median":  0,
-                                     "p95":  0,
-                                     "max":  0
+                                     "min":  11,
+                                     "median":  13.5,
+                                     "p95":  40.5,
+                                     "max":  47.5
                                  },
-                    "cursor_pkts_total":  0,
-                    "input_pkts_last":  0
+                    "cursor_pkts_total":  4392,
+                    "input_pkts_last":  1171
                 },
     "warnings":  [
 
