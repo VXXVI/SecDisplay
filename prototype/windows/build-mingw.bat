@@ -1,4 +1,4 @@
-﻿@echo off
+@echo off
 chcp 65001 >nul 2>&1
 title SecDisplay 编译 (MSYS2 MinGW-w64)
 setlocal
