@@ -1,4 +1,4 @@
-﻿@echo off
+@echo off
 chcp 65001 >nul 2>&1
 title SecDisplay 一键诊断
 cd /d "%~dp0"
@@ -36,12 +36,12 @@ start "" /b cmd /c ""%~dp0SecDisplayReceiver.exe" %MAC_IP% 9922 2880 1800 --full
 echo   倒计时：
 for /l %%i in (20,-1,1) do (
     <nul set /p "=%%i "
-    timeout /t 1 >nul
+    ping -n 2 127.0.0.1 >nul
 )
 echo.
 
 taskkill /f /im SecDisplayReceiver.exe >nul 2>&1
-timeout /t 1 >nul
+ping -n 2 127.0.0.1 >nul
 
 echo.
 echo ============================================================

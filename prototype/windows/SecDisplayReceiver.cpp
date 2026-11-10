@@ -73,6 +73,8 @@ struct Stats {
     std::atomic<uint64_t> dropped{0};
     std::atomic<uint64_t> decodeFail{0};
     std::atomic<uint64_t> lastLatencyUs{0};
+    std::atomic<uint64_t> cursor{0};      // 收到的 0x03 光标包
+    std::atomic<uint64_t> inputSent{0};   // 发出的 0x04 输入事件
 };
 
 static Stats g_stats;
@@ -173,6 +175,7 @@ static void SendInputPacket(float vx, float vy, uint8_t buttons, int16_t wheel) 
     pkt[10] = (uint8_t)((uint16_t)wheel >> 8);
     pkt[11] = (uint8_t)((uint16_t)wheel & 0xFF);
     send(s, (const char*)pkt, 12, 0);
+    g_stats.inputSent++;
 }
 
 static HWND g_hwnd = nullptr;   // 主窗口句柄，ClientToVideo 与全屏切换共用
@@ -1271,6 +1274,7 @@ static void NetworkLoop(const RunConfig& cfg, Graphics* gfx, Presenter* presente
                 if (!RecvAll(sock, packet.data(), (int)len)) break;
 
                 if (packet[0] == TYPE_CURSOR) {
+                    g_stats.cursor++;
                     OnCursorPacket(packet.data() + HEADER_BYTES, len - HEADER_BYTES);
                     continue;
                 }
@@ -1299,7 +1303,9 @@ static void NetworkLoop(const RunConfig& cfg, Graphics* gfx, Presenter* presente
 
         // 监控线程：打印状态；长时间无新帧就补请求关键帧
         std::thread watch([&] {
-            uint64_t lastBytes = 0, lastDecoded = 0;
+            uint64_t lastBytes = 0, lastDecoded = 0, lastCursor = 0;
+            double recentFps[5] = { 0, 0, 0, 0, 0 };   // 近 10 秒的每秒解码帧数
+            int fpsIdx = 0;
             int stallRounds = 0;
             while (g_alive && connAlive) {
                 for (int i = 0; i < 20 && g_alive && connAlive; ++i) Sleep(100);
@@ -1307,13 +1313,27 @@ static void NetworkLoop(const RunConfig& cfg, Graphics* gfx, Presenter* presente
 
                 uint64_t b = g_stats.bytes, d = g_stats.decoded;
                 double mbps = (b - lastBytes) * 8 / 2.0 / 1e6;
-                Log("包 %llu  解码 %llu(+%llu)  %.1f Mbps  附加延迟 %.1f ms  解码失败 %llu",
+
+                // 峰值帧率取近 5 个采样窗口（约 10 秒）的最大值：
+                // 平均值会被静止画面拉低，看不出卡顿；峰值能反映「有动静时能跑多快」
+                recentFps[fpsIdx] = (double)(d - lastDecoded) / 2.0;
+                fpsIdx = (fpsIdx + 1) % 5;
+                double peakFps = 0;
+                for (double v : recentFps) if (v > peakFps) peakFps = v;
+
+                uint64_t curPkts = g_stats.cursor.load();
+                Log("包 %llu  解码 %llu(+%llu)  %.1f Mbps  附加延迟 %.1f ms  解码失败 %llu"
+                    "  峰值 %.1f fps  光标+%llu  输入 %llu",
                     (unsigned long long)g_stats.packets,
                     (unsigned long long)d,
                     (unsigned long long)(d - lastDecoded),
                     mbps,
                     g_stats.lastLatencyUs / 1000.0,
-                    (unsigned long long)g_stats.decodeFail);
+                    (unsigned long long)g_stats.decodeFail,
+                    peakFps,
+                    (unsigned long long)(curPkts - lastCursor),
+                    (unsigned long long)g_stats.inputSent.load());
+                lastCursor = curPkts;
 
                 if (d == lastDecoded) {
                     ++stallRounds;
