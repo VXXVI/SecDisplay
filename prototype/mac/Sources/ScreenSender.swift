@@ -1299,6 +1299,17 @@ if let w = Int(ProcessInfo.processInfo.environment["SECDISPLAY_W"] ?? ""),
    let h = Int(ProcessInfo.processInfo.environment["SECDISPLAY_H"] ?? "") {
     cfg.width = w; cfg.height = h
     cfg.logicalWidth = w / 2; cfg.logicalHeight = h / 2
+    // 显式指定逻辑分辨率，绕开「逻辑 = 物理 / 2」的固定 2x 假设。
+    //
+    // 背景：macOS 27 上 CGVirtualDisplay 的 hiDPI 对虚拟屏不生效，
+    // 实测 NSScreen 与 CGDisplayMode 报的都是「逻辑 = 物理」，也就是 1x，
+    // 于是 2240x1400 的桌面元素偏小。把 LOGICAL 设成与 W/H 相同，
+    // 得到干净的 1x：物理 1600x1000、逻辑 1600x1000，元素随之变大。
+    if let lw = Int(ProcessInfo.processInfo.environment["SECDISPLAY_LOGICAL_W"] ?? ""),
+       let lh = Int(ProcessInfo.processInfo.environment["SECDISPLAY_LOGICAL_H"] ?? ""),
+       lw > 0, lh > 0 {
+        cfg.logicalWidth = lw; cfg.logicalHeight = lh
+    }
 }
 if let hz = Double(ProcessInfo.processInfo.environment["SECDISPLAY_HZ"] ?? "") {
     cfg.captureHz = hz
