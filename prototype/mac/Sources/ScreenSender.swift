@@ -762,6 +762,7 @@ final class Sender {
                     Log.info("连接失败: \(e)")
                     self.connected = false
                 case .cancelled:
+                    Log.info("连接已取消（cancelled）")
                     self.connected = false
                 case .ready:
                     Log.info("连接就绪")
@@ -794,7 +795,15 @@ final class Sender {
                 self.ctrlBuf.append(data)
                 self.drainControl()
             }
-            if done || err != nil { self.connected = false; return }
+            if done || err != nil {
+                // 注意：这里不能把 connected 置 false。
+                // 接收侧 EOF/出错只代表「对端不再发数据」（可能是半关闭），
+                // 发送方向仍可能可用。之前一置 false 就彻底停止发视频，
+                // 表现为「画面冻结、发送 0、直到对端重连」。
+                // 真正的断开交给发送完成回调（transmit 里 err）来判定。
+                Log.info("接收循环结束: done=\(done) err=\(String(describing: err))；继续尝试发送")
+                return
+            }
             self.receiveLoop(epoch: epoch)
         }
     }
@@ -961,7 +970,10 @@ final class Sender {
                 self.inFlight = max(0, self.inFlight - 1)
             }
             self.counterLock.unlock()
-            if err != nil && self.connEpoch == epoch { self.connected = false }
+            if err != nil && self.connEpoch == epoch {
+                Log.info("发送失败，判定断开: \(err!)")
+                self.connected = false
+            }
         })
     }
 
