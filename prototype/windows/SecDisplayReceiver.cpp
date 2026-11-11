@@ -51,6 +51,7 @@
 #include <atomic>
 #include <thread>
 #include <mutex>
+#include <condition_variable>
 
 #pragma comment(lib, "ws2_32.lib")
 #pragma comment(lib, "d3d11.lib")
@@ -1443,6 +1444,14 @@ static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
         // 有 Mac 真实光标就用它，否则退回标准箭头
         SetCursor(g_customCursor ? g_customCursor : LoadCursor(nullptr, IDC_ARROW));
         return TRUE;
+    case WM_SYSCOMMAND:
+        // 窗口模式的「最大化」按钮 / Win+↑ 都接到整屏放大（EnterFullscreen），
+        // 走的是改窗口样式与位置，不动交换链尺寸，避免 ResizeBuffers 引发的黑屏风险。
+        if ((w & 0xFFF0) == SC_MAXIMIZE) {
+            if (!g_isFullscreen) EnterFullscreen();
+            return 0;
+        }
+        break;
     case WM_LBUTTONDBLCLK:      // 双击也切换
         if (g_isFullscreen) ExitFullscreen(); else EnterFullscreen();
         return 0;
@@ -1577,7 +1586,16 @@ static void NetworkLoop(const RunConfig& cfg, Graphics* gfx, Presenter* presente
         std::atomic<bool> connAlive{ true };
         std::vector<uint8_t> packet;
 
-        // 收流线程
+        // 解码只保留最新一帧：收流线程持续解码以维持 H.264 参考链（直接丢编码包会花屏），
+        // 呈现线程只取最新帧上屏。这样呈现被垂直同步阻塞时，旧帧不会在队列里堆积，
+        // 操作延迟被压到「解码 + 一次呈现」的量级。
+        struct LatestFrame { IMFSample* smp = nullptr; int srcW = 0; int srcH = 0; };
+        std::mutex latestMtx;
+        std::condition_variable latestCv;
+        LatestFrame latest;
+        bool hasLatest = false;
+
+        // 收流 + 解码线程
         std::thread recv([&] {
             while (g_alive && connAlive) {
                 uint32_t len = 0;
@@ -1610,17 +1628,48 @@ static void NetworkLoop(const RunConfig& cfg, Graphics* gfx, Presenter* presente
 
                 IMFSample* smp = nullptr;
                 if (decoder.Decode(packet.data() + HEADER_BYTES, len - HEADER_BYTES, &smp) && smp) {
-                g_stats.decoded++;
-                // 解码器实际输出可能比显示尺寸高（硬解按宏块对齐），
-                // 同步给呈现器，由它按显示尺寸裁边
-                presenter->SetSourceSize(decoder.outWidth(), decoder.outHeight());
-                int64_t extra = EstimateExtraDelayUs(ts);
+                    g_stats.decoded++;
+                    int64_t extra = EstimateExtraDelayUs(ts);
                     if (extra >= 0) g_stats.lastLatencyUs = (uint64_t)extra;
-                    presenter->PresentSample(smp);
-                    smp->Release();
+                    // 解码器实际输出可能比显示尺寸高（硬解按宏块对齐），随帧带给呈现器裁边。
+                    int ow = decoder.outWidth(), oh = decoder.outHeight();
+                    IMFSample* old = nullptr;
+                    {
+                        std::lock_guard<std::mutex> lk(latestMtx);
+                        old = latest.smp;
+                        latest.smp = smp; latest.srcW = ow; latest.srcH = oh;
+                        hasLatest = true;
+                    }
+                    if (old) old->Release();   // 旧帧还没上屏就被新帧取代，直接丢
+                    latestCv.notify_one();
                 }
             }
             connAlive = false;
+            latestCv.notify_all();
+        });
+
+        // 呈现线程：只上屏最新帧。慢于解码时中间帧被丢，不影响解码参考链。
+        std::thread present([&] {
+            while (g_alive && connAlive) {
+                IMFSample* smp = nullptr; int ow = 0, oh = 0;
+                {
+                    std::unique_lock<std::mutex> lk(latestMtx);
+                    latestCv.wait(lk, [&] { return hasLatest || !connAlive || !g_alive; });
+                    if (!hasLatest) break;
+                    smp = latest.smp; ow = latest.srcW; oh = latest.srcH;
+                    latest.smp = nullptr; hasLatest = false;
+                }
+                presenter->SetSourceSize(ow, oh);
+                presenter->PresentSample(smp);
+                smp->Release();
+            }
+            // 清掉退出前最后一帧未呈现的样本
+            IMFSample* rest = nullptr;
+            {
+                std::lock_guard<std::mutex> lk(latestMtx);
+                rest = latest.smp; latest.smp = nullptr; hasLatest = false;
+            }
+            if (rest) rest->Release();
         });
 
         // 监控线程：打印状态；长时间无新帧就补请求关键帧
@@ -1679,6 +1728,8 @@ static void NetworkLoop(const RunConfig& cfg, Graphics* gfx, Presenter* presente
 
         recv.join();
         connAlive = false;
+        latestCv.notify_all();
+        present.join();
         watch.join();
 
         decoder.Shutdown();
@@ -1793,11 +1844,11 @@ int main(int argc, char** argv) {
         int wh = (int)((double)ww * cfg.height / cfg.width);
         if (wh > sh * 2 / 3) { wh = sh * 2 / 3; ww = (int)((double)wh * cfg.width / cfg.height); }
         RECT rc{ 0, 0, ww, wh };
-        AdjustWindowRect(&rc, WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU, FALSE);
+        AdjustWindowRect(&rc, WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX | WS_MAXIMIZEBOX, FALSE);
         int winW = rc.right - rc.left;
         int winH = rc.bottom - rc.top;
         hwnd = CreateWindowExA(WS_EX_APPWINDOW, "SecDisplayReceiver", "SecDisplay",
-                               WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX | WS_VISIBLE,
+                               WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX | WS_MAXIMIZEBOX | WS_VISIBLE,
                                (sw - winW) / 2, (sh - winH) / 2,
                                winW, winH,
                                nullptr, nullptr, wc.hInstance, nullptr);
@@ -1809,7 +1860,7 @@ int main(int argc, char** argv) {
     // 窗口模式标题含中文，用 W 版单独设，绕开 A 版在 CP936 下的 GBK 误解码。
     // 全屏标题 "SecDisplay" 是纯 ASCII，保持 CreateWindowExA 传入的值即可。
     if (!cfg.fullscreen) {
-        SetWindowTextW(hwnd, L"SecDisplay - 按 Esc 退出");
+        SetWindowTextW(hwnd, L"SecDisplay - 按标题栏最大化或 F11 全屏放大 / Ctrl+Alt+H 让位 / Esc 退出");
     }
 
     // 系统托盘小图标 + 全局热键
@@ -1824,6 +1875,7 @@ int main(int argc, char** argv) {
     }
     Log("退出方式: Esc / 左键托盘图标 / 右键菜单 / Ctrl+Alt+Q");
     Log("让位方式: Ctrl+Alt+H 最小化/还原，或托盘菜单；窗口可 Alt-Tab、可 Win+M 最小化");
+    Log("放大方式: 点标题栏最大化按钮 / F11 / Win+向上键，均切换整屏放大；不置顶、可随时让位");
     Log("输入回传: 鼠标移动约 120Hz 合并发送，按键/滚轮即时");
 
     if (cfg.fullscreen) {

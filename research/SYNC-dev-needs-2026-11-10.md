@@ -70,6 +70,7 @@ Top 5 全部有结论。
 - 跨机时钟校准方案选一次性偏移还是同源参考。
 - 切档联动的默认值：当前 smooth 2240x1400@60、bitrate 180、QD 3（ScreenSender.swift:106、:1168-1171、:550）。
 - 0x04 回传密度是否影响点击错位，节流阈值两端如何定。
+- 帧率确认：Windows 端联调解码峰值长期约 10-12 fps，即使有画面变化也不高。请确认当前 Mac 发送端实际生效的 preset 与 `minimumFrameInterval`/`queueDepth`，排除采集帧间隔或预设过低导致的体感延迟。
 - 辅助功能授权根治（.app bundle，ISSUES-2026-11-10.md:136-137）排期。
 
 明确不做、别重复派活：光标跨屏 leave/released（FIX-05 设计稿）、SPS 自适应分辨率、89Hz 跳变之外的呈现节奏大改、辅助功能授权、Mac 握手带 CGDisplayBounds 尺寸。以上或已列下轮独立，或需两端协同多轮实测。
