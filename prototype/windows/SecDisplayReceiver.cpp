@@ -254,10 +254,15 @@ static std::atomic<int> g_coordW{0};
 static std::atomic<int> g_coordH{0};
 static std::atomic<double> g_cursorX{-1};
 static std::atomic<double> g_cursorY{-1};
+// 程序自己调用 SetCursorPos 会引起 WM_MOUSEMOVE；用时间戳把它和用户真实
+// 输入区分开，否则每次跟随都会被当成「用户动了」，导致门控反复自锁。
+static std::atomic<int64_t> g_lastRemoteCursorMoveMs{ 0 };
 
 // 真实 Mac 光标图像（0x05）。网络线程只把收到的 BGRA 存进缓冲并 post 消息，
 // HCURSOR 的创建/替换/销毁统一在 UI 线程做，避免跨线程句柄竞态。
 static const UINT WM_APPLY_CURSOR = WM_APP + 2;
+// 0x03 远程光标位置：网络线程 post，UI 线程做门控与 SetCursorPos
+static const UINT WM_APP_REMOTE_CURSOR = WM_APP + 3;
 struct CursorImageBuf {
     std::mutex mtx;
     std::vector<uint8_t> bgra;
@@ -420,13 +425,21 @@ static void OnCursorPacket(const uint8_t* p, size_t payloadLen) {
     float rx = rdFloat(p);
     float ry = rdFloat(p + 4);
     uint8_t visible = p[8];
-    if (!visible) return;
+    if (!visible) {
+        // 光标离开副屏：清空坐标。留着旧值会让 UI 线程把系统光标拽回
+        // 上一次的位置，这正是「鼠标被反复重置」的来源。
+        g_cursorX = -1;
+        g_cursorY = -1;
+        return;
+    }
 
+    double oldX = g_cursorX.load(), oldY = g_cursorY.load();
     g_cursorX = rx;
     g_cursorY = ry;
-
-    int vw = g_coordW.load(), vh = g_coordH.load();
-    if (vw <= 0 || vh <= 0) return;
+    // 只在位置真的变化时通知 UI。Mac 端静止不发包，这里再挡一层，
+    // 避免重复 SetCursorPos。
+    if (rx == oldX && ry == oldY) return;
+    if (g_hwnd) PostMessageA(g_hwnd, WM_APP_REMOTE_CURSOR, 0, 0);
 }
 
 // 0x05 真实光标图像。载荷(全大端):
@@ -1519,6 +1532,29 @@ static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
         // 网络线程收到 0x05 后 post 到这里，HCURSOR 创建/销毁统一在 UI 线程
         ApplyCursorImage();
         return 0;
+    case WM_APP_REMOTE_CURSOR: {
+        // 事件驱动：只有收到新的远程位置才搬一次光标，不再 4ms 轮询。
+        // Mac 端静止时本来就不发包，所以不会出现「停下 1 秒就被拽回」。
+        // 两个门控都通过才动：
+        //   1. 副屏窗口在前台，用户在别的程序里操作时不抢
+        //   2. 本机鼠标最近 250ms 没动，本地输入优先
+        if (GetForegroundWindow() != g_hwnd) return 0;
+        if (GetTickCount64() - (uint64_t)g_lastLocalInputMs.load() < 250) return 0;
+        double cx = g_cursorX.load(), cy = g_cursorY.load();
+        if (cx < 0 || cy < 0) return 0;
+        int vw = g_coordW.load(), vh = g_coordH.load();
+        if (vw <= 0 || vh <= 0) return 0;
+        RECT rc{};
+        if (!GetClientRect(g_hwnd, &rc)) return 0;
+        int cw = rc.right - rc.left, ch = rc.bottom - rc.top;
+        if (cw <= 0 || ch <= 0) return 0;
+        POINT tl{ rc.left, rc.top };
+        ClientToScreen(g_hwnd, &tl);
+        // 标记这次移动是程序发起的，随后的 WM_MOUSEMOVE 不要污染本地输入时间戳
+        g_lastRemoteCursorMoveMs = GetTickCount64();
+        SetCursorPos(tl.x + (int)(cx / vw * cw), tl.y + (int)(cy / vh * ch));
+        return 0;
+    }
     case WM_TRAY:
         // 托盘图标的鼠标事件（lParam = 具体消息）
         if (LOWORD(l) == WM_LBUTTONUP) {
@@ -1563,6 +1599,9 @@ static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
         }
         return 0;
     case WM_MOUSEMOVE: {
+        // 程序自己 SetCursorPos 引起的移动不算用户输入，否则远程跟随
+        // 每动一次就把本地时间戳刷新，门控随即自锁，光标一顿一顿。
+        if (GetTickCount64() - (uint64_t)g_lastRemoteCursorMoveMs.load() < 50) return 0;
         float vx, vy;
         if (ClientToVideo(GET_X_LPARAM(l), GET_Y_LPARAM(l), &vx, &vy)) {
             g_lastLocalInputMs = GetTickCount64();
