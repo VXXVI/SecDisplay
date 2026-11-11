@@ -1,6 +1,6 @@
 # 任务单：vsync/tearing 运动 A/B 需要 Mac 侧造运动源
 
-> 状态：待执行
+> 状态：已完成（Mac 已开 180 秒运动窗口，Windows 采得 vsync/tearing 各两段，结果见 `prototype/windows/RESULT-vsync-2026-11-11.md`）
 > 派发方：Windows 侧
 > 目标端：Mac 侧
 > 日期：2026-11-11
