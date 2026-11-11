@@ -155,3 +155,14 @@ ToggleMinimize 只动窗口显示状态，不碰 g_alive、不 PostQuitMessage�
 现版本：全屏与窗口都是普通应用窗口 `WS_EX_APPWINDOW`，不设 `WS_EX_TOPMOST`、不设 `WS_EX_TOOLWINDOW`。普通窗口只存在于创建它的那个虚拟桌面，切走后不跟随；它进任务栏、可 Alt-Tab、可 Win+M 最小化；另有 `Ctrl+Alt+H` 一键最小化让位。探针实测 exstyle 仅 `WS_EX_APPWINDOW`。
 
 待确认（Mac 侧）：Windows 端解码峰值长期约 10-12 fps，请确认 Mac 发送端当前档位/帧率配置，排除采集帧间隔或预设过低导致的体感延迟。
+
+### 10.5 Esc 不再误退出，全屏加返回提示
+
+用户反馈：放大后想缩小，没看到提示直接按 Esc，结果把程序关了。
+
+改法：
+- 全屏时按 Esc 先退回窗口；窗口模式再按 Esc 才退出程序。退出仍可走托盘、右键菜单、Ctrl+Alt+Q。
+- 进入全屏时在左上角短暂显示提示条：「F11 或 Esc 返回窗口 / Ctrl+Alt+H 最小化让位 / 再按一次 Esc 退出」，5 秒后自动隐藏。
+- 提示条用独立的分层弹出窗（WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_NOACTIVATE），鼠标穿透、不抢焦点。原因是 FLIP 交换链会盖住子窗口，子控件画不到视频上，首版子控件方案截图验证不可见，已弃用。
+
+验证（截图 + 探针）：全屏后提示条浮在视频左上可见，5 秒自动消失；全屏按 Esc 后窗口样式恢复（MAXBOX=1、POPUP=0）且进程存活；窗口模式再按 Esc 进程正常退出。

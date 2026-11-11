@@ -1252,6 +1252,74 @@ static LONG_PTR g_savedStyle = 0;
 static LONG_PTR g_savedExStyle = 0;
 static RECT g_savedRect{};
 
+// --- 全屏提示 ---
+// 进入全屏时短暂显示「怎么返回」，避免用户找不到出口把程序直接关掉。
+// 用独立的分层弹出窗：FLIP 交换链会盖住子窗口，子控件画在视频上不可见。
+static HWND    g_hintHwnd = nullptr;
+static HBRUSH  g_hintBrush = nullptr;
+static HFONT   g_hintFont = nullptr;
+static const wchar_t* g_hintText =
+    L"F11 或 Esc 返回窗口      Ctrl+Alt+H 最小化让位      再按一次 Esc 退出";
+static const UINT     WM_APP_HIDE_HINT = WM_APP + 1;
+static const UINT_PTR TIMER_HINT_HIDE  = 3;
+
+static LRESULT CALLBACK HintWndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
+    if (m == WM_PAINT) {
+        PAINTSTRUCT ps; HDC dc = BeginPaint(h, &ps);
+        RECT rc; GetClientRect(h, &rc);
+        FillRect(dc, &rc, g_hintBrush ? g_hintBrush : (HBRUSH)GetStockObject(BLACK_BRUSH));
+        SetBkMode(dc, TRANSPARENT);
+        SetTextColor(dc, RGB(255, 255, 255));
+        HFONT old = (HFONT)SelectObject(dc, g_hintFont ? g_hintFont : GetStockObject(DEFAULT_GUI_FONT));
+        RECT tr = rc; tr.left += 18; tr.right -= 18;
+        DrawTextW(dc, g_hintText, -1, &tr, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
+        SelectObject(dc, old);
+        EndPaint(h, &ps);
+        return 0;
+    }
+    if (m == WM_ERASEBKGND) return 1;
+    return DefWindowProcW(h, m, w, l);
+}
+
+static void HideFullscreenHint() {
+    if (g_hintHwnd) ShowWindow(g_hintHwnd, SW_HIDE);
+}
+
+static void ShowFullscreenHint() {
+    if (!g_hwnd) return;
+    if (!g_hintHwnd) {
+        g_hintBrush = CreateSolidBrush(RGB(18, 18, 18));
+        g_hintFont = CreateFontW(-26, 0, 0, 0, FW_SEMIBOLD, FALSE, FALSE, FALSE,
+            DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
+            CLEARTYPE_QUALITY, DEFAULT_PITCH, L"Microsoft YaHei");
+        static bool clsReg = false;
+        if (!clsReg) {
+            WNDCLASSEXW wc{}; wc.cbSize = sizeof(wc);
+            wc.lpfnWndProc = HintWndProc;
+            wc.hInstance = (HINSTANCE)GetWindowLongPtrW(g_hwnd, GWLP_HINSTANCE);
+            wc.hCursor = LoadCursor(nullptr, IDC_ARROW);
+            wc.lpszClassName = L"SecDisplayHint";
+            RegisterClassExW(&wc);
+            clsReg = true;
+        }
+        HINSTANCE inst = (HINSTANCE)GetWindowLongPtrW(g_hwnd, GWLP_HINSTANCE);
+        g_hintHwnd = CreateWindowExW(
+            WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_NOACTIVATE,
+            L"SecDisplayHint", L"",
+            WS_POPUP,
+            0, 0, 920, 60, g_hwnd, nullptr, inst, nullptr);
+        if (g_hintHwnd)
+            SetLayeredWindowAttributes(g_hintHwnd, 0, 235, LWA_ALPHA);
+    }
+    if (!g_hintHwnd) return;
+    HMONITOR mon = MonitorFromWindow(g_hwnd, MONITOR_DEFAULTTONEAREST);
+    MONITORINFO mi{}; mi.cbSize = sizeof(mi);
+    int px = 16, py = 16;
+    if (GetMonitorInfoW(mon, &mi)) { px = mi.rcMonitor.left + 16; py = mi.rcMonitor.top + 16; }
+    SetWindowPos(g_hintHwnd, HWND_TOP, px, py, 920, 60, SWP_SHOWWINDOW | SWP_NOACTIVATE);
+    SetTimer(g_hwnd, TIMER_HINT_HIDE, 5000, nullptr);   // 5 秒后自动隐藏
+}
+
 /// 在当前所在的显示器上铺满。配合 per-monitor DPI 感知，
 /// 窗口客户区就是显示器的物理像素，交换链 1:1 不做缩放。
 static void EnterFullscreen() {
@@ -1276,6 +1344,7 @@ static void EnterFullscreen() {
                  SWP_FRAMECHANGED | SWP_SHOWWINDOW);
     g_isFullscreen = true;
     Log("已切换到全屏");
+    ShowFullscreenHint();
 }
 
 static void ExitFullscreen() {
@@ -1289,6 +1358,8 @@ static void ExitFullscreen() {
                  SWP_FRAMECHANGED | SWP_SHOWWINDOW);
     g_isFullscreen = false;
     Log("已切换到窗口");
+    KillTimer(g_hwnd, TIMER_HINT_HIDE);
+    HideFullscreenHint();
 }
 
 // 用收到的 BGRA 像素造一个 32bpp 带 alpha 的 HCURSOR。
@@ -1354,6 +1425,16 @@ static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
         TrayRemove();
         PostQuitMessage(0);
         return 0;
+    case WM_TIMER:
+        if (w == TIMER_HINT_HIDE) {
+            KillTimer(g_hwnd, TIMER_HINT_HIDE);
+            HideFullscreenHint();
+            return 0;
+        }
+        break;
+    case WM_APP_HIDE_HINT:
+        HideFullscreenHint();
+        return 0;
     case WM_APPLY_CURSOR:
         // 网络线程收到 0x05 后 post 到这里，HCURSOR 创建/销毁统一在 UI 线程
         ApplyCursorImage();
@@ -1389,7 +1470,12 @@ static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
         else if (w == HOTKEY_HIDE_ID) ToggleMinimize();
         return 0;
     case WM_KEYDOWN:
-        if (w == VK_ESCAPE) { RequestQuit(); return 0; }
+        if (w == VK_ESCAPE) {
+            // 全屏时 Esc 先回到窗口，避免想退出放大却直接把程序关掉；
+            // 已经在窗口模式时 Esc 才退出程序。
+            if (g_isFullscreen) ExitFullscreen(); else RequestQuit();
+            return 0;
+        }
         // F11 或 F 切换全屏，方便窗口模式下按一下变全屏
         if (w == VK_F11 || w == 'F') {
             if (g_isFullscreen) ExitFullscreen(); else EnterFullscreen();
@@ -1873,7 +1959,7 @@ int main(int argc, char** argv) {
     if (!RegisterHotKey(hwnd, HOTKEY_HIDE_ID, MOD_CONTROL | MOD_ALT, 'H')) {
         Log("全局热键 Ctrl+Alt+H 注册失败（可能已被占用）");
     }
-    Log("退出方式: Esc / 左键托盘图标 / 右键菜单 / Ctrl+Alt+Q");
+    Log("退出方式: 窗口模式按 Esc / 左键托盘图标 / 右键菜单 / Ctrl+Alt+Q；全屏时 Esc 先回窗口");
     Log("让位方式: Ctrl+Alt+H 最小化/还原，或托盘菜单；窗口可 Alt-Tab、可 Win+M 最小化");
     Log("放大方式: 点标题栏最大化按钮 / F11 / Win+向上键，均切换整屏放大；不置顶、可随时让位");
     Log("输入回传: 鼠标移动约 120Hz 合并发送，按键/滚轮即时");
@@ -1990,6 +2076,9 @@ int main(int argc, char** argv) {
     UnregisterHotKey(hwnd, HOTKEY_QUIT_ID);
     UnregisterHotKey(hwnd, HOTKEY_HIDE_ID);
     if (g_customCursor) { DestroyCursor(g_customCursor); g_customCursor = nullptr; }
+    if (g_hintFont)  { DeleteObject(g_hintFont);  g_hintFont = nullptr; }
+    if (g_hintBrush) { DeleteObject(g_hintBrush); g_hintBrush = nullptr; }
+    if (g_hintHwnd)  { DestroyWindow(g_hintHwnd); g_hintHwnd = nullptr; }
     g_alive = false;
     // 关键：先掐断 socket，让阻塞在 recv 的收流线程立即返回。
     // 否则「已连上 Mac 正常收流」时按退出，net.join() 会一直等那个
