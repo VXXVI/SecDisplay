@@ -89,30 +89,39 @@ static Stats g_stats;
 // qsvc 下 89Hz 屏 + 53fps 源会落在 11/22ms 两档；免同步则贴近源间隔。
 static std::mutex g_presentMtx;
 static const int PRESENT_RING = 512;
-static uint64_t g_presentIntervals[PRESENT_RING];
+static double g_presentIntervals[PRESENT_RING];
 static int g_presentRingCount = 0;
+
+// 亚毫秒时钟：GetTickCount64 在 Windows 上约 15.6ms 粒度，
+// 会把 11/22ms 的 vsync 量化抹成 16/31ms，必须用 QPC。
+static double QpcNowMs() {
+    static LARGE_INTEGER freq{};
+    if (!freq.QuadPart) QueryPerformanceFrequency(&freq);
+    LARGE_INTEGER c; QueryPerformanceCounter(&c);
+    return (double)c.QuadPart * 1000.0 / (double)freq.QuadPart;
+}
 
 static void ResetPresentRing() {
     std::lock_guard<std::mutex> lk(g_presentMtx);
     g_presentRingCount = 0;
 }
 
-static void PushPresentInterval(uint64_t ms) {
+static void PushPresentInterval(double ms) {
     std::lock_guard<std::mutex> lk(g_presentMtx);
     if (g_presentRingCount < PRESENT_RING) g_presentIntervals[g_presentRingCount++] = ms;
 }
 
-static void TakePresentIntervals(std::vector<uint64_t>& out) {
+static void TakePresentIntervals(std::vector<double>& out) {
     std::lock_guard<std::mutex> lk(g_presentMtx);
     out.assign(g_presentIntervals, g_presentIntervals + g_presentRingCount);
     g_presentRingCount = 0;
 }
 
-static double PercentileMs(std::vector<uint64_t>& v, double p) {
+static double PercentileMs(std::vector<double>& v, double p) {
     if (v.empty()) return 0.0;
     size_t k = (size_t)(p * (double)(v.size() - 1));
     std::nth_element(v.begin(), v.begin() + k, v.end());
-    return (double)v[k];
+    return v[k];
 }
 
 // 复用预分配缓冲，避免每帧分配
@@ -1262,9 +1271,9 @@ void Presenter::PresentSample(IMFSample* sample) {
     }
     // 记录两次上屏的间隔：vsync 会把节奏拉成刷新周期的整数倍，
     // 免同步则贴近源帧间隔。统计行打印 p50/p95 便于客观判断。
-    static uint64_t s_lastPresentMs = 0;   // 仅呈现线程调用
-    uint64_t nowMs = GetTickCount64();
-    if (s_lastPresentMs) PushPresentInterval(nowMs - s_lastPresentMs);
+    static double s_lastPresentMs = 0.0;   // 仅呈现线程调用
+    double nowMs = QpcNowMs();
+    if (s_lastPresentMs > 0.0) PushPresentInterval(nowMs - s_lastPresentMs);
     s_lastPresentMs = nowMs;
     g_stats.presented++;
 }
@@ -1803,7 +1812,7 @@ static void NetworkLoop(const RunConfig& cfg, Graphics* gfx, Presenter* presente
             double recentFps[5] = { 0, 0, 0, 0, 0 };   // 近 10 秒的每秒解码帧数
             int fpsIdx = 0;
             int stallRounds = 0;
-            std::vector<uint64_t> ivs;
+            std::vector<double> ivs;
             while (g_alive && connAlive) {
                 for (int i = 0; i < 20 && g_alive && connAlive; ++i) Sleep(100);
                 if (!g_alive || !connAlive) break;
@@ -1995,6 +2004,23 @@ int main(int argc, char** argv) {
     if (!hwnd) { Log("窗口创建失败"); return 3; }
     g_hwnd = hwnd;
     g_isFullscreen = cfg.fullscreen;   // 与启动模式对齐，F11 首次切换才正确
+
+    // 记录显示器刷新率：判断源帧率与刷新率是否成整数比，是 vsync 顿挫的前提。
+    {
+        int hz = 0;
+        MONITORINFOEXW mi{}; mi.cbSize = sizeof(mi);
+        DEVMODEW dmr{}; dmr.dmSize = sizeof(dmr);
+        if (GetMonitorInfoW(MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST), &mi) &&
+            EnumDisplaySettingsW(mi.szDevice, ENUM_CURRENT_SETTINGS, &dmr)) {
+            hz = (int)dmr.dmDisplayFrequency;
+        }
+        if (hz <= 0) {
+            DEVMODEW dm2{}; dm2.dmSize = sizeof(dm2);
+            if (EnumDisplaySettingsW(nullptr, ENUM_CURRENT_SETTINGS, &dm2))
+                hz = (int)dm2.dmDisplayFrequency;
+        }
+        if (hz > 0) Log("显示器刷新率 %d Hz", hz);
+    }
 
     // 窗口模式标题含中文，用 W 版单独设，绕开 A 版在 CP936 下的 GBK 误解码。
     // 全屏标题 "SecDisplay" 是纯 ASCII，保持 CreateWindowExA 传入的值即可。
