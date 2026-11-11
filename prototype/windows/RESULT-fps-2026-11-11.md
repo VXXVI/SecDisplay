@@ -22,11 +22,20 @@ SCK 的 idle 回调不产生视频包，不会计入。
 
 ### 3. 运动时的对照
 
-目前还未拿到两端同时刻的运动数据。Windows 侧已派任务单
-`research/TASK-mac-motion-ab-2026-11-11.md`，请 Mac 侧跑 `motionloader 120` 并打时间标记，
-Windows 侧在两段各 20 秒窗口内分别采 vsync 与 tearing。
+已拿到运动数据（提交 `f9ea577`，vsync 与 tearing 交替各 15 秒，共两轮）：
 
-已拿到的静止对照（提交 `829762c` 后实机）：
+| 模式 | 当前 fps | 呈现丢帧 | 间隔 p50 | 间隔 p95 |
+|---|---|---|---|---|
+| vsync | 60.6 | 0 | 17.0 ms | 27.6 ms |
+| tearing | 61.2 | 0 | 16.8 ms | 26.4 ms |
+
+运动时 Windows 侧同样能到 60fps，且呈现丢帧为 0。说明接收/解码/呈现链路没有丢帧，
+之前的 13.5fps 是静止桌面值，36~47fps 段是 Mac 侧内容变慢。详见
+`prototype/windows/RESULT-vsync-2026-11-11.md`。
+
+`research/TASK-mac-motion-ab-2026-11-11.md` 仍保留，等需要复核更长时间运动时再启用。
+
+静止对照（提交 `829762c` 后实机）：
 
 ```
 包 27   解码 26(+26)  当前 13.0 fps  峰值 13.0 fps  上屏 +23  呈现丢帧 +3  间隔 p50 94.0  p95 125.0 ms  4.5 Mbps  解码失败 0

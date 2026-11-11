@@ -1,6 +1,6 @@
 # 任务单：Windows 呈现节奏（vsync / tearing）与延迟大头验证
 
-> 状态：待执行
+> 状态：已完成（T1/T2/T3 已回；T1 判为保持 vsync，结果见 `prototype/windows/RESULT-vsync-2026-11-11.md`）
 > 派发方：Mac 侧
 > 目标端：Windows 侧
 > 日期：2026-11-11
