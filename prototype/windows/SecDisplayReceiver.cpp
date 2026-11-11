@@ -1929,27 +1929,38 @@ static void NetworkLoop(const RunConfig& cfg, Graphics* gfx, Presenter* presente
                 double peakFps = 0;
                 for (double v : recentFps) if (v > peakFps) peakFps = v;
 
-                // 节拍目标吸附到刷新周期整数倍，避免垂直同步再量化一次。
-                // 只在源帧率明显低于刷新率（<60%）时启用；高帧率内容保持即时上屏。
-                if (g_paceEnabled.load()) {
-                    double targetMs = 0.0;
-                    if (g_refreshHz > 0 && curFps > 1.0 && curFps < g_refreshHz * 0.6) {
-                        double vs = 1000.0 / (double)g_refreshHz;
-                        double meanMs = 1000.0 / curFps;
-                        double n = std::ceil(meanMs / vs - 0.02);
-                        if (n < 1.0) n = 1.0;
-                        if (n > 8.0) n = 8.0;
-                        targetMs = n * vs;
-                    }
-                    g_paceTargetMs.store(targetMs);
-                }
-
                 TakePresentIntervals(ivs);
                 double p50 = PercentileMs(ivs, 0.50);
                 double p95 = PercentileMs(ivs, 0.95);
                 TakeDecodeIntervals(divs);
                 double d50 = PercentileMs(divs, 0.50);
                 double d95 = PercentileMs(divs, 0.95);
+
+                // 节拍目标吸附到刷新周期整数倍，避免垂直同步再量化一次。
+                // 只在源帧率稳定落在刷新率 25%~60% 区间时启用；
+                // 低帧率、静止、或帧率大幅波动时自动关闭，退回即时上屏。
+                if (g_paceEnabled.load()) {
+                    double targetMs = 0.0;
+                    bool inRange = g_refreshHz > 0 &&
+                                   curFps >= g_refreshHz * 0.30 &&
+                                   curFps <  g_refreshHz * 0.60;
+                    if (inRange) {
+                        double mn = curFps, mx = curFps;
+                        for (double v : recentFps) {
+                            if (v > 0.0) { if (v < mn) mn = v; if (v > mx) mx = v; }
+                        }
+                        bool stable = (mx <= 0.0) || ((mx - mn) <= mx * 0.5);
+                        if (stable && d50 > 0.0 && d50 < 80.0) {
+                            double vs = 1000.0 / (double)g_refreshHz;
+                            double meanMs = 1000.0 / curFps;
+                            double n = std::ceil(meanMs / vs - 0.02);
+                            if (n < 1.0) n = 1.0;
+                            if (n > 6.0) n = 6.0;
+                            targetMs = n * vs;
+                        }
+                    }
+                    g_paceTargetMs.store(targetMs);
+                }
 
                 uint64_t curPkts = g_stats.cursor.load();
                 Log("包 %llu  解码 %llu(+%llu)  当前 %.1f fps  峰值 %.1f fps"
