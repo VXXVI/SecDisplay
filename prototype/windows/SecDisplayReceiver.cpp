@@ -47,11 +47,13 @@
 #include <clocale>
 #include <string>
 #include <vector>
+#include <deque>
 #include <algorithm>
 #include <unordered_map>
 #include <atomic>
 #include <thread>
 #include <mutex>
+#include <chrono>
 #include <condition_variable>
 
 #pragma comment(lib, "ws2_32.lib")
@@ -77,6 +79,7 @@ struct Stats {
     std::atomic<uint64_t> decoded{0};
     std::atomic<uint64_t> presented{0};
     std::atomic<uint64_t> dropped{0};
+    std::atomic<uint64_t> paced{0};       // --pace 队列溢出时主动丢掉的旧帧
     std::atomic<uint64_t> decodeFail{0};
     std::atomic<uint64_t> lastLatencyUs{0};
     std::atomic<uint64_t> cursor{0};      // 收到的 0x03 光标包
@@ -84,6 +87,12 @@ struct Stats {
 };
 
 static Stats g_stats;
+
+// 可选抖动缓冲：默认关闭。--pace 打开后，呈现线程用一个小队列按自适应节拍上屏，
+// 吸收源端偶发的双倍帧间隔；代价是增加约一帧延迟。
+static std::atomic<bool>   g_paceEnabled{false};
+static std::atomic<double> g_paceTargetMs{0.0};
+static int g_refreshHz = 0;   // 当前显示器刷新率，用于把节拍吸附到刷新周期整数倍
 
 // 呈现间隔采样（毫秒）：用来区分「垂直同步量化」与「跟随源帧率」。
 // qsvc 下 89Hz 屏 + 53fps 源会落在 11/22ms 两档；免同步则贴近源间隔。
@@ -1486,10 +1495,12 @@ static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
     switch (m) {
     case WM_CLOSE:
         // Esc / 托盘「退出」/ 全局热键都汇到这里
+        Log("收到 WM_CLOSE，准备退出");
         TrayRemove();
         PostQuitMessage(0);
         return 0;
     case WM_DESTROY:
+        Log("收到 WM_DESTROY");
         TrayRemove();
         PostQuitMessage(0);
         return 0;
@@ -1632,6 +1643,7 @@ struct RunConfig {
                               // 需要铺满时用 --fullscreen 或 F11，且全屏也不置顶、不进不了任务栏。
     bool reconnect = true;    // 断线自动重连
     bool vsync = true;        // true=垂直同步（画面均匀），false=免同步（延迟最低但可能抖）
+    bool pace = false;        // --pace：一帧抖动缓冲，按自适应节拍上屏，抹平源端小抖动
     std::string logFile;      // 非空则同时写日志文件
 };
 
@@ -1651,6 +1663,8 @@ static void ParseArgs(int argc, char** argv, RunConfig& cfg) {
             cfg.vsync = true;
         } else if (a == "--tearing") {
             cfg.vsync = false;
+        } else if (a == "--pace") {
+            cfg.pace = true;
         } else if ((a == "--log" || a == "-l") && i + 1 < argc) {
             cfg.logFile = argv[++i];
         } else if (a == "--coord" && i + 2 < argc) {
@@ -1718,7 +1732,7 @@ static void NetworkLoop(const RunConfig& cfg, Graphics* gfx, Presenter* presente
 
         // 复位统计，重连后从头计数
         g_stats.packets = 0; g_stats.bytes = 0; g_stats.decoded = 0;
-        g_stats.presented = 0; g_stats.dropped = 0; g_stats.decodeFail = 0;
+        g_stats.presented = 0; g_stats.dropped = 0; g_stats.paced = 0; g_stats.decodeFail = 0;
         ResetPresentRing();
         ResetDecodeRing();
         g_lastDecodeMs = 0.0;
@@ -1808,22 +1822,80 @@ static void NetworkLoop(const RunConfig& cfg, Graphics* gfx, Presenter* presente
             latestCv.notify_all();
         });
 
-        // 呈现线程：只上屏最新帧。慢于解码时中间帧被丢，不影响解码参考链。
+        // 呈现线程：默认只上屏最新帧。慢于解码时中间帧被丢，不影响解码参考链。
+        // --pace 时改为「一帧缓冲 + 自适应节拍」：先预填一帧，再按源端平均帧间隔
+        // 定期上屏，把偶发的双倍间隔吸收掉。代价是增加约一帧延迟。
         std::thread present([&] {
+            struct PendingFrame { IMFSample* smp; int w; int h; };
+            std::deque<PendingFrame> pending;
+            double lastPresentMs = 0.0;
+            bool primed = false;
+
+            auto dropOldest = [&] {
+                if (!pending.empty()) {
+                    pending.front().smp->Release();
+                    pending.pop_front();
+                    g_stats.paced++;
+                }
+            };
+
             while (g_alive && connAlive) {
-                IMFSample* smp = nullptr; int ow = 0, oh = 0;
+                double target = g_paceTargetMs.load();
+                const bool pace = g_paceEnabled.load() && target > 1.0;
+
+                // 节拍模式下等到下一个上屏点；否则有新帧就上。
+                bool timed = false;
+                double waitMs = 0.0;
+                if (pace && primed && lastPresentMs > 0.0) {
+                    double due = lastPresentMs + target;
+                    double now = QpcNowMs();
+                    if (now + 0.5 < due) { timed = true; waitMs = due - now; }
+                }
+
                 {
                     std::unique_lock<std::mutex> lk(latestMtx);
-                    latestCv.wait(lk, [&] { return hasLatest || !connAlive || !g_alive; });
-                    if (!hasLatest) break;
-                    smp = latest.smp; ow = latest.srcW; oh = latest.srcH;
-                    latest.smp = nullptr; hasLatest = false;
+                    if (!hasLatest) {
+                        if (timed) {
+                            latestCv.wait_for(lk, std::chrono::duration<double, std::milli>(waitMs),
+                                              [&] { return hasLatest || !connAlive || !g_alive; });
+                        } else {
+                            latestCv.wait(lk, [&] { return hasLatest || !connAlive || !g_alive; });
+                        }
+                    }
+                    if (hasLatest) {
+                        pending.push_back({ latest.smp, latest.srcW, latest.srcH });
+                        latest.smp = nullptr; hasLatest = false;
+                    }
                 }
-                presenter->SetSourceSize(ow, oh);
-                presenter->PresentSample(smp);
-                smp->Release();
+                if (!g_alive || !connAlive) break;
+
+                // 源快于节拍时丢最旧保实时，队列最多留 3 帧
+                while (pending.size() > 3) dropOldest();
+
+                if (pace) {
+                    if (!primed) {
+                        if (pending.size() < 2) continue;   // 预填一帧，避免起步就空
+                        primed = true;
+                        lastPresentMs = 0.0;
+                    }
+                    if (lastPresentMs > 0.0) {
+                        double due = lastPresentMs + target;
+                        if (QpcNowMs() + 0.5 < due) continue;   // 还没到上屏点
+                    }
+                }
+
+                if (pending.empty()) continue;
+                PendingFrame f = pending.front();
+                pending.pop_front();
+                presenter->SetSourceSize(f.w, f.h);
+                lastPresentMs = QpcNowMs();   // 以本次上屏开始时刻为节拍基准，避免把 Present 阻塞时长叠加进节拍
+                presenter->PresentSample(f.smp);
+                f.smp->Release();
             }
-            // 清掉退出前最后一帧未呈现的样本
+
+            // 清理退出前尚未上屏的样本
+            for (auto& f : pending) f.smp->Release();
+            pending.clear();
             IMFSample* rest = nullptr;
             {
                 std::lock_guard<std::mutex> lk(latestMtx);
@@ -1835,7 +1907,7 @@ static void NetworkLoop(const RunConfig& cfg, Graphics* gfx, Presenter* presente
         // 监控线程：打印状态；长时间无新帧就补请求关键帧
         std::thread watch([&] {
             uint64_t lastBytes = 0, lastDecoded = 0, lastCursor = 0;
-            uint64_t lastPresented = 0, lastDropped = 0;
+            uint64_t lastPresented = 0, lastDropped = 0, lastPaced = 0;
             double recentFps[5] = { 0, 0, 0, 0, 0 };   // 近 10 秒的每秒解码帧数
             int fpsIdx = 0;
             int stallRounds = 0;
@@ -1846,6 +1918,7 @@ static void NetworkLoop(const RunConfig& cfg, Graphics* gfx, Presenter* presente
 
                 uint64_t b = g_stats.bytes, d = g_stats.decoded;
                 uint64_t p = g_stats.presented, dr = g_stats.dropped;
+                uint64_t pc = g_stats.paced;
                 double mbps = (b - lastBytes) * 8 / 2.0 / 1e6;
 
                 // 当前帧率 = 本 2 秒窗口的实时解码速率；峰值 = 近 5 个窗口（约 10 秒）最大值。
@@ -1855,6 +1928,21 @@ static void NetworkLoop(const RunConfig& cfg, Graphics* gfx, Presenter* presente
                 fpsIdx = (fpsIdx + 1) % 5;
                 double peakFps = 0;
                 for (double v : recentFps) if (v > peakFps) peakFps = v;
+
+                // 节拍目标吸附到刷新周期整数倍，避免垂直同步再量化一次。
+                // 只在源帧率明显低于刷新率（<60%）时启用；高帧率内容保持即时上屏。
+                if (g_paceEnabled.load()) {
+                    double targetMs = 0.0;
+                    if (g_refreshHz > 0 && curFps > 1.0 && curFps < g_refreshHz * 0.6) {
+                        double vs = 1000.0 / (double)g_refreshHz;
+                        double meanMs = 1000.0 / curFps;
+                        double n = std::ceil(meanMs / vs - 0.02);
+                        if (n < 1.0) n = 1.0;
+                        if (n > 8.0) n = 8.0;
+                        targetMs = n * vs;
+                    }
+                    g_paceTargetMs.store(targetMs);
+                }
 
                 TakePresentIntervals(ivs);
                 double p50 = PercentileMs(ivs, 0.50);
@@ -1866,7 +1954,7 @@ static void NetworkLoop(const RunConfig& cfg, Graphics* gfx, Presenter* presente
                 uint64_t curPkts = g_stats.cursor.load();
                 Log("包 %llu  解码 %llu(+%llu)  当前 %.1f fps  峰值 %.1f fps"
                     "  上屏 +%llu  呈现丢帧 +%llu  源间隔 p50 %.1f p95 %.1f ms"
-                    "  上屏间隔 p50 %.1f p95 %.1f ms"
+                    "  上屏间隔 p50 %.1f p95 %.1f ms  节拍 %.1f ms  节拍丢帧 +%llu"
                     "  %.1f Mbps  附加延迟 %.1f ms  解码失败 %llu  光标+%llu  输入 %llu",
                     (unsigned long long)g_stats.packets,
                     (unsigned long long)d,
@@ -1877,6 +1965,8 @@ static void NetworkLoop(const RunConfig& cfg, Graphics* gfx, Presenter* presente
                     (unsigned long long)(dr - lastDropped),
                     d50, d95,
                     p50, p95,
+                    g_paceTargetMs.load(),
+                    (unsigned long long)(pc - lastPaced),
                     mbps,
                     g_stats.lastLatencyUs / 1000.0,
                     (unsigned long long)g_stats.decodeFail,
@@ -1885,6 +1975,7 @@ static void NetworkLoop(const RunConfig& cfg, Graphics* gfx, Presenter* presente
                 lastCursor = curPkts;
                 lastPresented = p;
                 lastDropped = dr;
+                lastPaced = pc;
 
                 if (d == lastDecoded) {
                     ++stallRounds;
@@ -2051,7 +2142,7 @@ int main(int argc, char** argv) {
             if (EnumDisplaySettingsW(nullptr, ENUM_CURRENT_SETTINGS, &dm2))
                 hz = (int)dm2.dmDisplayFrequency;
         }
-        if (hz > 0) Log("显示器刷新率 %d Hz", hz);
+        if (hz > 0) { g_refreshHz = hz; Log("显示器刷新率 %d Hz", hz); }
     }
 
     // 窗口模式标题含中文，用 W 版单独设，绕开 A 版在 CP936 下的 GBK 误解码。
@@ -2075,7 +2166,8 @@ int main(int argc, char** argv) {
     Log("放大方式: 点标题栏最大化按钮 / F11 / Win+向上键，均切换整屏放大；不置顶、可随时让位");
     Log("输入回传: 鼠标移动约 120Hz 合并发送，按键/滚轮即时");
     Log("遥测口径: 当前=本2秒解码帧率 峰值=近10秒最大 源间隔=相邻解码帧到达间隔"
-        " 上屏间隔=相邻Present间隔 呈现丢帧=上屏前被新帧取代");
+        " 上屏间隔=相邻Present间隔 呈现丢帧=上屏前被新帧取代"
+        " 节拍=目标上屏间隔 节拍丢帧=缓冲队列溢出主动丢弃");
 
     if (cfg.fullscreen) {
         // 绝对定位兜底，确保铺满显示器；不再置顶（HWND_NOTOPMOST），
@@ -2101,6 +2193,8 @@ int main(int argc, char** argv) {
     if (!presenter.Init(&gfx, hwnd, cfg.width, cfg.height)) return 4;
     presenter.setUseVsync(cfg.vsync);
     Log("呈现方式: %s", cfg.vsync ? "垂直同步（均匀）" : "免同步（低延迟）");
+    g_paceEnabled = cfg.pace;
+    Log("抖动缓冲: %s", cfg.pace ? "开（一帧缓冲，自适应节拍，增加约一帧延迟）" : "关（即时上屏，延迟最低）");
 
     WSADATA wsa;
     if (WSAStartup(MAKEWORD(2, 2), &wsa) != 0) { Log("WSAStartup 失败"); return 5; }
