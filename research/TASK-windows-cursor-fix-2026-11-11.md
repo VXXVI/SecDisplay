@@ -1,6 +1,6 @@
 # 任务单：停用抢光标后，Windows 侧编译与验收（2026-11-11）
 
-> 状态：待 Windows 侧编译验证
+> 状态：进行中（W1/W2 通过，W3 外观/点击待用户目视确认；结果见 `prototype/windows/RESULT-cursor-fix-2026-11-11.md`）
 > 派发方：Mac 侧
 > 目标端：Windows 侧
 > 日期：2026-11-11
