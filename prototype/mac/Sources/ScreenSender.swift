@@ -1423,50 +1423,77 @@ Task {
 // 原则：宁可降码率保流畅。画面糊一点还能办公，卡住没法用。
 //   - 连续丢帧 → 码率下调（检测到拥塞）
 //   - 长时间无丢帧 → 缓慢上调（回到目标值，但不超上限）
+/// 码率控制信号。Phase 1 只用 Mac 本地可见的量，不依赖 Windows 反馈。
+/// `encodeMs` 目前用均值代替设计稿里的 p95，先跑通控制律，p95 留到 Phase 2。
+struct RateSignals {
+    var droppedDelta: Int     // 本轮在途丢帧增量
+    var inFlight: Int         // 本轮观察到的在途帧数
+    var encodeMs: Double      // 本轮平均编码耗时
+    var sentMbps: Double      // 本轮实际发送码率
+    var captureFps: Double    // 本轮采集帧率
+}
+
+/// 健康度驱动的码率控制。健康度取「编码负载 / 在途负载 / 丢帧」三者最大值：
+/// 超过 1.0 连续两轮降码率，低于 0.7 连续三轮缓慢回升，中间区间不动。
+/// 目标是压住编码与队列积压，不是盲目降带宽。
 final class RateController {
     let encoder: Encoder
     let targetMbps: Int
+    let captureHz: Double
     private var current: Int
-    private var lastDropped = 0
-    private var cleanRounds = 0
+    private var highRounds = 0
+    private var lowRounds = 0
 
-    init(encoder: Encoder, targetMbps: Int) {
+    init(encoder: Encoder, targetMbps: Int, captureHz: Double) {
         self.encoder = encoder
         self.targetMbps = targetMbps
+        self.captureHz = max(1, captureHz)
         self.current = targetMbps
     }
 
-    /// 每 2 秒调用一次，参数是本轮丢帧数
-    func tick(dropped: Int) {
-        let delta = dropped - lastDropped
-        lastDropped = dropped
+    /// 每 2 秒调用一次
+    func tick(_ s: RateSignals) {
+        // 静态桌面不发帧，帧率类判断都不可靠，直接跳过并清空连续计数
+        if s.captureFps < 10 {
+            highRounds = 0
+            lowRounds = 0
+            return
+        }
+        let budgetMs = 1000.0 / captureHz
+        let encodeLoad = s.encodeMs / budgetMs
+        let inflightLoad = Double(s.inFlight) / 2.0      // maxInFlight = 2
+        let dropLoad = s.droppedDelta > 0 ? 1.5 : 0.0
+        let health = max(encodeLoad, max(inflightLoad, dropLoad))
 
-        if delta > 0 {
-            // 有丢帧说明拥塞：一次下调 20%，最少 15 Mbps
-            cleanRounds = 0
-            let next = max(15, Int(Double(current) * 0.8))
-            if next != current {
-                current = next
-                encoder.setBitrate(current)
-                Log.info("网络拥塞，码率下调至 \(current) Mbps")
-            }
-        } else if current < targetMbps {
-            // 连续 3 轮（约 6 秒）无丢帧才回升，避免来回抖
-            cleanRounds += 1
-            if cleanRounds >= 3 {
-                cleanRounds = 0
-                let next = min(targetMbps, Int(Double(current) * 1.15) + 1)
-                if next != current {
-                    current = next
-                    encoder.setBitrate(current)
-                    Log.info("网络良好，码率回升至 \(current) Mbps")
-                }
-            }
+        if health > 1.0 {
+            highRounds += 1
+            lowRounds = 0
+            guard highRounds >= 2 else { return }
+            highRounds = 0
+            let next = max(15, Int(Double(current) * 0.80))
+            guard abs(next - current) >= max(2, Int(Double(current) * 0.05)) else { return }
+            current = next
+            encoder.setBitrate(current)
+            Log.info(String(format: "健康度 %.2f（编码 %.0f%% 在途 %.0f%%），码率下调至 %d Mbps",
+                            health, encodeLoad * 100, inflightLoad * 100, current))
+        } else if health < 0.70 {
+            lowRounds += 1
+            highRounds = 0
+            guard lowRounds >= 3, current < targetMbps else { return }
+            lowRounds = 0
+            let next = min(targetMbps, Int(Double(current) * 1.10) + 1)
+            guard abs(next - current) >= max(2, Int(Double(current) * 0.05)) else { return }
+            current = next
+            encoder.setBitrate(current)
+            Log.info(String(format: "健康度 %.2f，码率回升至 %d Mbps", health, current))
+        } else {
+            highRounds = 0
+            lowRounds = 0
         }
     }
 }
 
-let rateCtl = RateController(encoder: encoder, targetMbps: cfg.bitrateMbps)
+let rateCtl = RateController(encoder: encoder, targetMbps: cfg.bitrateMbps, captureHz: cfg.captureHz)
 
 // 帧率峰值跟踪：每秒采一次完整帧数，保留最近 10 秒的最大值。
 // 用户操作往往很短暂，只看 2 秒瞬时值容易错过。
@@ -1491,11 +1518,21 @@ Timer.scheduledTimer(withTimeInterval: 1.0, repeats: true) { _ in
 }
 
 // 统计
+var lastDroppedCount = 0
+var lastCapturedCount = 0
 Timer.scheduledTimer(withTimeInterval: 2.0, repeats: true) { _ in
     let mbps = Double(sender.sentBytes) * 8 / 2.0 / 1_000_000
-    rateCtl.tick(dropped: sender.dropped)
     let encAvg = encoder.encLatCount > 0 ? encoder.encLatSum / Double(encoder.encLatCount) : 0
     let capAvg = cap.capLatCount > 0 ? cap.capLatSum / Double(cap.capLatCount) : 0
+    let droppedDelta = sender.dropped - lastDroppedCount
+    lastDroppedCount = sender.dropped
+    let capturedDelta = cap.captured - lastCapturedCount
+    lastCapturedCount = cap.captured
+    rateCtl.tick(RateSignals(droppedDelta: droppedDelta,
+                             inFlight: sender.inFlight,
+                             encodeMs: encAvg,
+                             sentMbps: mbps,
+                             captureFps: Double(capturedDelta) / 2.0))
     let cursorDelta = cursor.sentCount - lastCursorCount
     lastCursorCount = cursor.sentCount
     let imgDelta = cursorImage.sentCount - lastCursorImageCount
