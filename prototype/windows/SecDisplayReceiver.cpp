@@ -106,6 +106,28 @@ static void ResetPresentRing() {
     g_presentRingCount = 0;
 }
 
+// 解码到达间隔：与上屏间隔并排，用来判断抖动是源端带来的还是呈现侧引入的。
+static std::mutex g_decodeMtx;
+static double g_decodeIntervals[PRESENT_RING];
+static int g_decodeRingCount = 0;
+static double g_lastDecodeMs = 0.0;   // 仅收流线程访问
+
+static void ResetDecodeRing() {
+    std::lock_guard<std::mutex> lk(g_decodeMtx);
+    g_decodeRingCount = 0;
+}
+
+static void PushDecodeInterval(double ms) {
+    std::lock_guard<std::mutex> lk(g_decodeMtx);
+    if (g_decodeRingCount < PRESENT_RING) g_decodeIntervals[g_decodeRingCount++] = ms;
+}
+
+static void TakeDecodeIntervals(std::vector<double>& out) {
+    std::lock_guard<std::mutex> lk(g_decodeMtx);
+    out.assign(g_decodeIntervals, g_decodeIntervals + g_decodeRingCount);
+    g_decodeRingCount = 0;
+}
+
 static void PushPresentInterval(double ms) {
     std::lock_guard<std::mutex> lk(g_presentMtx);
     if (g_presentRingCount < PRESENT_RING) g_presentIntervals[g_presentRingCount++] = ms;
@@ -1698,6 +1720,8 @@ static void NetworkLoop(const RunConfig& cfg, Graphics* gfx, Presenter* presente
         g_stats.packets = 0; g_stats.bytes = 0; g_stats.decoded = 0;
         g_stats.presented = 0; g_stats.dropped = 0; g_stats.decodeFail = 0;
         ResetPresentRing();
+        ResetDecodeRing();
+        g_lastDecodeMs = 0.0;
         g_stats.lastLatencyUs = 0;
         ResetTimestampBase();
 
@@ -1762,6 +1786,9 @@ static void NetworkLoop(const RunConfig& cfg, Graphics* gfx, Presenter* presente
                 IMFSample* smp = nullptr;
                 if (decoder.Decode(packet.data() + HEADER_BYTES, len - HEADER_BYTES, &smp) && smp) {
                     g_stats.decoded++;
+                    double dn = QpcNowMs();
+                    if (g_lastDecodeMs > 0.0) PushDecodeInterval(dn - g_lastDecodeMs);
+                    g_lastDecodeMs = dn;
                     int64_t extra = EstimateExtraDelayUs(ts);
                     if (extra >= 0) g_stats.lastLatencyUs = (uint64_t)extra;
                     // 解码器实际输出可能比显示尺寸高（硬解按宏块对齐），随帧带给呈现器裁边。
@@ -1812,7 +1839,7 @@ static void NetworkLoop(const RunConfig& cfg, Graphics* gfx, Presenter* presente
             double recentFps[5] = { 0, 0, 0, 0, 0 };   // 近 10 秒的每秒解码帧数
             int fpsIdx = 0;
             int stallRounds = 0;
-            std::vector<double> ivs;
+            std::vector<double> ivs, divs;
             while (g_alive && connAlive) {
                 for (int i = 0; i < 20 && g_alive && connAlive; ++i) Sleep(100);
                 if (!g_alive || !connAlive) break;
@@ -1832,10 +1859,14 @@ static void NetworkLoop(const RunConfig& cfg, Graphics* gfx, Presenter* presente
                 TakePresentIntervals(ivs);
                 double p50 = PercentileMs(ivs, 0.50);
                 double p95 = PercentileMs(ivs, 0.95);
+                TakeDecodeIntervals(divs);
+                double d50 = PercentileMs(divs, 0.50);
+                double d95 = PercentileMs(divs, 0.95);
 
                 uint64_t curPkts = g_stats.cursor.load();
                 Log("包 %llu  解码 %llu(+%llu)  当前 %.1f fps  峰值 %.1f fps"
-                    "  上屏 +%llu  呈现丢帧 +%llu  间隔 p50 %.1f p95 %.1f ms"
+                    "  上屏 +%llu  呈现丢帧 +%llu  源间隔 p50 %.1f p95 %.1f ms"
+                    "  上屏间隔 p50 %.1f p95 %.1f ms"
                     "  %.1f Mbps  附加延迟 %.1f ms  解码失败 %llu  光标+%llu  输入 %llu",
                     (unsigned long long)g_stats.packets,
                     (unsigned long long)d,
@@ -1844,6 +1875,7 @@ static void NetworkLoop(const RunConfig& cfg, Graphics* gfx, Presenter* presente
                     peakFps,
                     (unsigned long long)(p - lastPresented),
                     (unsigned long long)(dr - lastDropped),
+                    d50, d95,
                     p50, p95,
                     mbps,
                     g_stats.lastLatencyUs / 1000.0,
