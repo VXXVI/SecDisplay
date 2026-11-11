@@ -172,7 +172,22 @@ cd prototype/mac
 | `smooth` | 2240x1400 | 60Hz | 要更跟手 |
 | `fast` | 1920x1200 | 60Hz | 最流畅，清晰度最差 |
 
-也能用 `SECDISPLAY_W` / `SECDISPLAY_H` / `SECDISPLAY_HZ` 单独覆盖。`./run.sh restart` 检测到源码更新会自动重编。
+也能用环境变量单独覆盖（`./run.sh restart` 检测到源码更新会自动重编）：
+
+| 变量 | 作用 | 默认 |
+|---|---|---|
+| `SECDISPLAY_W` / `SECDISPLAY_H` | 虚拟屏物理分辨率 | 随档位 |
+| `SECDISPLAY_HZ` | 采集帧率上限 | 随档位 |
+| `SECDISPLAY_MBPS` | 码率（10~1000） | 180 |
+| `SECDISPLAY_QD` | SCK 队列深度（官方最小 3，范围 3~8） | 3 |
+| `SECDISPLAY_ENC` | 编码参数方案 A~E（E=禁帧重排+速度优先） | A |
+| `SECDISPLAY_NOLOWLAT=1` | 关 `EnableLowLatencyRateControl` | 开 |
+
+`SECDISPLAY_NOLOWLAT` 只作实验开关：隔离测试里关掉更快，但**真实端到端实测开着更优**
+（19.7ms vs 31~69ms），日常保持默认开，详见 `research/BENCH-05-lowlat-ratecontrol.md`。
+
+**切档必须两端同步**：Mac 切档后，Windows 端启动前要设相同的 `SECDISPLAY_W`/`SECDISPLAY_H`，
+否则分辨率/坐标基准不一致会解码失败、点击错位。
 
 ### 码率建议
 
@@ -181,6 +196,8 @@ cd prototype/mac
 | 纯文字 | 40~80 Mbps |
 | 混合办公 | 100~180 Mbps |
 | 有视频 | 200~300 Mbps |
+
+码率可用 `SECDISPLAY_MBPS` 覆盖，无需改代码。
 
 ---
 
@@ -199,9 +216,17 @@ cd prototype/mac
 
 ### 残留虚拟屏清理
 
-程序异常退出可能留下虚拟屏，占住位置导致新建失败。现象是 `initWithDescriptor` 返回 nil。
+程序异常退出可能留下虚拟屏，占住位置导致新建失败。现象是 `initWithDescriptor` 返回 nil，
+启动日志会打印「检测到残留的 SecDisplay 虚拟屏: id=N」。
 
-清理方式：**注销并重新登录**，或重启。
+清理方式：**注销并重新登录**，或重启。这是唯一可靠的办法。
+
+已知边界（2026-11-11 实测）：
+- `shutdown` 已改为停采集 → 等 800ms → destroy 一次 → 观察 2 秒，减少残留概率；
+  但 `CDVirtualDisplayDestroy` 在 macOS 27.2 上并非 100% 可靠，仍可能残留。少做高频 restart。
+- 「复用残留屏」方案**行不通**：孤儿屏 owner 进程已死，SCK 虽报「抓屏已启动」但采集 0 帧。
+- 探测 CoreGraphics/CoreDisplay 无按 displayID 移除的导出符号，`pmset` 关屏、显示器重配置
+  都无法回收。只能注销/重启。
 
 ---
 
