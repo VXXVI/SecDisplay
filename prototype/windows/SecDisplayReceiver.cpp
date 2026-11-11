@@ -292,6 +292,38 @@ static std::atomic<int16_t> g_pendingWheel{ 0 };
 static const uint64_t INPUT_MOVE_INTERVAL_MS = 8;   // 约 120Hz
 static const uint64_t INPUT_TICK_MS           = 4;   // 线程轮询粒度
 
+// 控制包发送锁：0x04 输入、0x07 反馈、0x02 关键帧请求共用同一 socket，
+// 必须串行写，避免不同线程的 send 交错导致对端解析错位。
+static std::mutex g_sendMtx;
+
+// 可选反馈包 0x07：--feedback 打开后，监控线程每 2 秒把接收端健康度回传给 Mac，
+// 供 Mac 侧自适应码率环使用。默认关闭，旧 Mac 会把未知字节逐个丢弃，不会误解析。
+static std::atomic<bool>     g_feedbackEnabled{ false };
+static std::atomic<bool>     g_feedbackPending{ false };
+static std::atomic<uint16_t> g_fbPresentP95{ 0 };
+static std::atomic<uint16_t> g_fbSourceP95{ 0 };
+static std::atomic<uint16_t> g_fbDecodeFps10{ 0 };
+static std::atomic<uint16_t> g_fbPresentDrop{ 0 };
+static std::atomic<uint16_t> g_fbPacedDrop{ 0 };
+
+static void SendFeedbackPacket() {
+    SOCKET s = g_sock.load();
+    if (s == INVALID_SOCKET) return;
+    uint8_t pkt[13];
+    pkt[0] = 0x07;
+    auto wr16 = [](uint8_t* q, uint16_t v) {
+        q[0] = (uint8_t)(v >> 8); q[1] = (uint8_t)v;
+    };
+    wr16(pkt + 1,  g_fbPresentP95.load());
+    wr16(pkt + 3,  g_fbSourceP95.load());
+    wr16(pkt + 5,  g_fbDecodeFps10.load());
+    wr16(pkt + 7,  g_fbPresentDrop.load());
+    wr16(pkt + 9,  g_fbPacedDrop.load());
+    wr16(pkt + 11, 0);
+    std::lock_guard<std::mutex> lk(g_sendMtx);
+    send(s, (const char*)pkt, sizeof(pkt), 0);
+}
+
 static void SendInputPacket(float vx, float vy, uint8_t buttons, int16_t wheel) {
     SOCKET s = g_sock.load();
     if (s == INVALID_SOCKET) return;
@@ -308,7 +340,10 @@ static void SendInputPacket(float vx, float vy, uint8_t buttons, int16_t wheel) 
     pkt[9] = buttons;
     pkt[10] = (uint8_t)((uint16_t)wheel >> 8);
     pkt[11] = (uint8_t)((uint16_t)wheel & 0xFF);
-    send(s, (const char*)pkt, 12, 0);
+    {
+        std::lock_guard<std::mutex> lk(g_sendMtx);
+        send(s, (const char*)pkt, 12, 0);
+    }
     g_stats.inputSent++;
 }
 
@@ -1684,6 +1719,7 @@ struct RunConfig {
     bool reconnect = true;    // 断线自动重连
     bool vsync = true;        // true=垂直同步（画面均匀），false=免同步（延迟最低但可能抖）
     bool pace = false;        // --pace：一帧抖动缓冲，按自适应节拍上屏，抹平源端小抖动
+    bool feedback = false;    // --feedback：每 2 秒向 Mac 回传 0x07 健康度，供自适应码率环使用
     std::string logFile;      // 非空则同时写日志文件
 };
 
@@ -1705,6 +1741,8 @@ static void ParseArgs(int argc, char** argv, RunConfig& cfg) {
             cfg.vsync = false;
         } else if (a == "--pace") {
             cfg.pace = true;
+        } else if (a == "--feedback") {
+            cfg.feedback = true;
         } else if ((a == "--log" || a == "-l") && i + 1 < argc) {
             cfg.logFile = argv[++i];
         } else if (a == "--coord" && i + 2 < argc) {
@@ -1782,7 +1820,12 @@ static void NetworkLoop(const RunConfig& cfg, Graphics* gfx, Presenter* presente
         // 立刻请求关键帧，否则解码器拿不到 SPS/PPS，黑屏
         {
             uint8_t req = TYPE_KEYFRAME_REQUEST;
-            if (send(sock, (const char*)&req, 1, 0) == 1) Log("已请求关键帧（0x02）");
+            int sent = 0;
+            {
+                std::lock_guard<std::mutex> lk(g_sendMtx);
+                sent = send(sock, (const char*)&req, 1, 0);
+            }
+            if (sent == 1) Log("已请求关键帧（0x02）");
         }
 
         Decoder decoder;
@@ -1959,6 +2002,8 @@ static void NetworkLoop(const RunConfig& cfg, Graphics* gfx, Presenter* presente
                 uint64_t b = g_stats.bytes, d = g_stats.decoded;
                 uint64_t p = g_stats.presented, dr = g_stats.dropped;
                 uint64_t pc = g_stats.paced;
+                uint64_t dropDelta = dr - lastDropped;
+                uint64_t pacedDelta = pc - lastPaced;
                 double mbps = (b - lastBytes) * 8 / 2.0 / 1e6;
 
                 // 当前帧率 = 本 2 秒窗口的实时解码速率；峰值 = 近 5 个窗口（约 10 秒）最大值。
@@ -2013,11 +2058,11 @@ static void NetworkLoop(const RunConfig& cfg, Graphics* gfx, Presenter* presente
                     curFps,
                     peakFps,
                     (unsigned long long)(p - lastPresented),
-                    (unsigned long long)(dr - lastDropped),
+                    (unsigned long long)dropDelta,
                     d50, d95,
                     p50, p95,
                     g_paceTargetMs.load(),
-                    (unsigned long long)(pc - lastPaced),
+                    (unsigned long long)pacedDelta,
                     mbps,
                     g_stats.lastLatencyUs / 1000.0,
                     (unsigned long long)g_stats.decodeFail,
@@ -2028,10 +2073,34 @@ static void NetworkLoop(const RunConfig& cfg, Graphics* gfx, Presenter* presente
                 lastDropped = dr;
                 lastPaced = pc;
 
+                // 可选：把接收端健康度回传给 Mac，供自适应码率环使用。
+                // 只回传本窗口的统计，不做判断；由 Mac 侧决定是否调码率。
+                if (g_feedbackEnabled.load()) {
+                    auto clamp16 = [](double v) -> uint16_t {
+                        if (v < 0.0) v = 0.0;
+                        if (v > 65535.0) v = 65535.0;
+                        return (uint16_t)(v + 0.5);
+                    };
+                    auto clamp16u = [](uint64_t v) -> uint16_t {
+                        return (uint16_t)(v > 65535 ? 65535 : v);
+                    };
+                    g_fbPresentP95.store(clamp16(p95));
+                    g_fbSourceP95.store(clamp16(d95));
+                    g_fbDecodeFps10.store(clamp16(curFps * 10.0));
+                    g_fbPresentDrop.store(clamp16u(dropDelta));
+                    g_fbPacedDrop.store(clamp16u(pacedDelta));
+                    g_feedbackPending.store(true);
+                }
+
                 if (d == lastDecoded) {
                     ++stallRounds;
                     uint8_t req = TYPE_KEYFRAME_REQUEST;
-                    if (send(sock, (const char*)&req, 1, 0) == 1) {
+                    int sent = 0;
+                    {
+                        std::lock_guard<std::mutex> lk(g_sendMtx);
+                        sent = send(sock, (const char*)&req, 1, 0);
+                    }
+                    if (sent == 1) {
                         Log("无新帧 %d 轮，重新请求关键帧（0x02）", stallRounds);
                     }
                     // 连续 5 轮（约 10 秒）没新帧：多半是 Mac 那边画面完全静止。
@@ -2246,6 +2315,8 @@ int main(int argc, char** argv) {
     Log("呈现方式: %s", cfg.vsync ? "垂直同步（均匀）" : "免同步（低延迟）");
     g_paceEnabled = cfg.pace;
     Log("抖动缓冲: %s", cfg.pace ? "开（一帧缓冲，自适应节拍，增加约一帧延迟）" : "关（即时上屏，延迟最低）");
+    g_feedbackEnabled = cfg.feedback;
+    Log("反馈包: %s", cfg.feedback ? "开（0x07 健康度，每 2 秒，供 Mac 自适应码率）" : "关");
 
     WSADATA wsa;
     if (WSAStartup(MAKEWORD(2, 2), &wsa) != 0) { Log("WSAStartup 失败"); return 5; }
@@ -2285,6 +2356,9 @@ int main(int argc, char** argv) {
             Sleep((DWORD)INPUT_TICK_MS);
             if (!g_alive) break;
             if (g_sock.load() == INVALID_SOCKET) continue;
+            if (g_feedbackEnabled.load() && g_feedbackPending.exchange(false)) {
+                SendFeedbackPacket();
+            }
             if (g_eventPending.exchange(false)) {
                 SendInputPacket(g_moveX.load(), g_moveY.load(), g_buttons.load(),
                                 g_pendingWheel.exchange(0));
