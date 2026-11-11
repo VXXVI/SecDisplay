@@ -61,3 +61,14 @@ Windows 侧新增「源间隔」与「上屏间隔」并排统计，运动时实
 
 两组逐项吻合，差值 ≤0.2ms，可确认抖动在进入 Windows 前已存在。
 p50 34ms 配平均 36fps，说明源端是「多数 34ms、少量 17ms」的 2:1 节奏。
+
+## 七、代码位置提示（只读定位，不必先改逻辑）
+
+- SCK 采集回调：`prototype/mac/Sources/ScreenSender.swift:657-694`。
+  `status == .complete` 才送编码，idle 帧被跳过（`:673-676`），所以 2:1 不是 idle 帧造成。
+- 编码输出：`:430 emit(...)`，VT 回调里直接组包并 `sender.send`。
+- 发送与在途：`:937-978 transmit(...)`，`maxInFlight = 2`（`:713`），
+  超限直接 `dropped += 1` 返回（`:941-945`）。
+- 建议在 `emit` 入口、`transmit` 入口、`send` 完成回调三处各记一个
+  `CFAbsoluteTimeGetCurrent()`，每 2 秒打印三段相邻间隔的 p50/p95 与 >1.5×p50 占比。
+  对照 SCK 样本的 PTS 差值，就能看出 2:1 是在采集、编码输出还是发送完成阶段形成的。
