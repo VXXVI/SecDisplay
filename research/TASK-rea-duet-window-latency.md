@@ -1,6 +1,6 @@
 # 任务单：REA 逆向 Duet 的窗口模型与延迟/输入链路
 
-> 状态：待 REA 执行（静态部分已完成，动态双端运行阻塞）。本文件是 Windows 端派给 Mac 侧 REA 的任务单，仅列待办与取证，不含实现内容。
+> 状态：已拆分（本单不再单独执行）。Mac 侧见 `research/TASK-mac-duet-analysis-2026-11-11.md`，Windows 侧见 `research/TASK-windows-duet-analysis-2026-11-11.md`，总计划见 `research/PLAN-duet-analysis-2026-11-11.md`。
 > 派发方：Windows 端。日期：2026-11-10 晚。取证提交：54e21d9。
 
 ## Mac 侧回执（2026-11-10 深夜，被唤起时按协作协议 SOP 处理）

@@ -1,6 +1,6 @@
 # Duet Display 原理分析：任务拆分与分发（2026-11-11）
 
-> 状态：待确认
+> 状态：已派发（Mac 侧 `research/TASK-mac-duet-analysis-2026-11-11.md`，Windows 侧 `research/TASK-windows-duet-analysis-2026-11-11.md`；旧 REA 单已拆分）
 > 发起：用户要求 macOS 侧分析 Duet Display 原理，Windows 侧负责拆分与分发
 > 现有基线：`research/REVERSE-DUET-4.0.526.md`、`research/TASK-rea-duet-window-latency.md`
 > 目标：不是复刻 Duet，而是提取能落到 SecDisplay 的设计原则，回答四个问题：
