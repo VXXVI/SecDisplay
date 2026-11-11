@@ -42,7 +42,10 @@
 
 专用队列（观察）：`com.duet.cgDisplayStreamCaptureQueue`
 
-**结论（推断）**：主力仍是 `CGDisplayStream`，ScreenCaptureKit 作为新系统上的可选后备。切换条件由运行时能力探测决定，具体判据在反汇编里，本次未取到，标为**未知**。
+**结论（已由 `RESULT-duet-mac-encode-deep.md` 的反汇编更正）**：运行时优先用
+ScreenCaptureKit，`CGDisplayStream` 是旧系统回退。判据在 `GetInstance` 里：
+macOS ≥ 14.3 且 `SCStream` 类可用时走 SCK，否则回退 CGDisplayStream。
+弱链接只说明部署目标是旧系统，不代表运行时优先用它。
 
 ### 1.2 队列与帧间隔（观察）
 
@@ -192,7 +195,7 @@ protobuf 描述符直接嵌在二进制里（`google/protobuf/descriptor.proto`�
 
 | 项 | Duet 4.0.526 | SecDisplay 现状 | 差距 |
 |---|---|---|---|
-| 采集 API | CGDisplayStream 为主，SCK 弱链接后备 | ScreenCaptureKit | 路线相反，但都能用 |
+| 采集 API | SCK 优先（macOS ≥14.3），CGDisplayStream 回退 | ScreenCaptureKit | 路线一致 |
 | 队列控制 | 有 QueueDepth / MinimumFrameTime setter | 有 captureHz，队列深度未显式控制 | 可能需要补浅队列 |
 | 编码 | RealTime + 禁重排 + GOP + 速度优先 + 硬编 + 码率上下限 | 基本对齐 | 差距不大 |
 | 自适应码率 | 延迟反馈 + 发送码率统计 | 固定码率 | 明显缺口 |

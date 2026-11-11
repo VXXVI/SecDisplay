@@ -24,11 +24,14 @@ REA `inspect_macho` 依赖表（arm64 slice，SHA256 `8c2786ba…`）：
 | CoreMedia / CoreVideo | 强 | CMSampleBuffer / CVPixelBuffer |
 | IOSurface / Metal / QuartzCore / Accelerate | 强 | 零拷贝帧传递、图像缩放 |
 | IOKit / IOBluetooth | 强 | USB/蓝牙设备发现 |
-| **ScreenCaptureKit** | **弱（LC_LOAD_WEAK_DYLIB）** | 可选后备采集 |
+| **ScreenCaptureKit** | **弱（LC_LOAD_WEAK_DYLIB）** | 运行时优先采集（macOS ≥14.3） |
 | libavcodec.61 / libavformat.61 / libswscale.8 | 自带 | 软件编解码/缩放后备 |
 | QtWebSockets / QtNetwork | 自带 | 传输 |
 
-关键判断：**采集主力是 `CGDisplayStream`（CoreGraphics 旧 API），不是 ScreenCaptureKit**。REA 导入符号表里明确有 `CGDisplayStreamCreateWithDispatchQueue` / `Start` / `Stop`、`CGDisplayStreamShowCursor` 属性键，而 `SCContentFilter` / `SCShareableContent` 是 `weak:true` 的弱符号。ScreenCaptureKit 只是新系统上的可选后备。
+> **2026-11-11 更正**：下面这段「采集主力是 CGDisplayStream」的判断已被反汇编推翻。
+> `GetInstance` 里 macOS ≥ 14.3 且 `SCStream` 类可用时**优先走 ScreenCaptureKit**，
+> `CGDisplayStream` 只是旧系统回退。弱链接只反映部署目标，不代表运行时优先级。
+> 依据见 `research/RESULT-duet-mac-encode-deep.md`。
 
 Windows 端（从 exe 内嵌文件名和 CAB 解包，观察）：
 - 接收端：`duet.exe`、`DuetDisplaySL.exe`、`DuetLaunch.exe`
