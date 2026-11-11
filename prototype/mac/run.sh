@@ -22,12 +22,36 @@ SIGN_ID=com.secdisplay.screensender
 
 mkdir -p "$LOGDIR"
 
-# 用固定 designated requirement 重签二进制。
+# 优先用本机 Apple Development 证书重签二进制。
+#
 # 背景：swiftc 默认产出 ad-hoc 签名，DR=cdhash，每次重编 cdhash 都变，
 # TCC(辅助功能)把授权绑在 DR 上，于是每次重编都要重新授权。
-# 改成 identifier 型 DR 后，TCC 存的是固定的 identifier，与代码内容无关，
-# 重编多少次授权都保持有效。不需要 Apple 开发者证书，纯本地可用。
+# 早期做法是改成 identifier 型 DR，但 macOS 15+ 的 TCC 对 ad-hoc 签名的
+# identifier-only 要求匹配不稳定：开关打开、auth_value=2，AXIsProcessTrusted
+# 仍返回 false（实测）。换成本机 Apple Development 证书后，csreq 会带上
+# anchor apple generic 与证书 CN，授权才稳定生效。
+# 没有开发者证书时退回 ad-hoc，doctor 会提示授权可能失效。
+# 允许用环境变量 SECDISPLAY_SIGN_CERT 指定证书名。
+pick_sign_cert() {
+    local cert="${SECDISPLAY_SIGN_CERT:-}"
+    if [ -n "$cert" ]; then
+        printf '%s\n' "$cert"
+        return 0
+    fi
+    security find-identity -v -p codesigning 2>/dev/null \
+        | sed -n 's/.*"\(Apple Development: [^"]*\)"/\1/p' | head -1
+}
+
 sign_binary() {
+    local cert
+    cert="$(pick_sign_cert)"
+    if [ -n "$cert" ]; then
+        codesign --force --sign "$cert" --identifier "$SIGN_ID" "$BIN" >/dev/null 2>&1 || {
+            echo "签名失败，辅助功能授权会在重编后失效" >&2
+            return 1
+        }
+        return 0
+    fi
     codesign --force --sign - \
         --identifier "$SIGN_ID" \
         -r="designated => identifier \"$SIGN_ID\"" \
@@ -194,8 +218,11 @@ doctor)
     # 直接读 TCC 数据库里这个身份的授权记录，最可靠。
     # 数据库受 SIP 保护，读不到时退回看最近启动日志有无告警。
     tccdb="/Library/Application Support/com.apple.TCC/TCC.db"
+    # TCC 按「文件路径」记命令行工具的授权，只有 App 才按 bundle id 记。
+    # 旧代码只查 identifier，永远查不到，误报「未授权」。
+    bin_path="$(cd "$(dirname "$0")" && pwd)/screensender"
     granted=$(sqlite3 "$tccdb" \
-        "select auth_value from access where service='kTCCServiceAccessibility' and client='$SIGN_ID' limit 1;" 2>/dev/null)
+        "select auth_value from access where service='kTCCServiceAccessibility' and (client='$bin_path' or client='$SIGN_ID') order by last_modified desc limit 1;" 2>/dev/null)
     logwarn=$(ls -t "$LOGDIR"/sender_*.log 2>/dev/null | head -1 | xargs grep -l "未获得辅助功能权限" 2>/dev/null)
     if [ "$granted" = "2" ]; then
         echo "  已授权（副屏点击/滚轮可用）"
@@ -211,7 +238,7 @@ doctor)
     echo "       $(cd "$(dirname "$0")" && pwd)/screensender"
     echo "    3. 打开并确认开关为开"
     echo "    4. 完全重启服务：./run.sh restart"
-    echo "  命令行重置授权：tccutil reset Accessibility $SIGN_ID"
+    echo "  重置授权：系统设置里删掉本条再重新添加即可"
     ;;
 restart)
     "$0" stop
