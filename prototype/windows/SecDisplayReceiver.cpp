@@ -47,6 +47,7 @@
 #include <clocale>
 #include <string>
 #include <vector>
+#include <algorithm>
 #include <unordered_map>
 #include <atomic>
 #include <thread>
@@ -83,6 +84,36 @@ struct Stats {
 };
 
 static Stats g_stats;
+
+// 呈现间隔采样（毫秒）：用来区分「垂直同步量化」与「跟随源帧率」。
+// qsvc 下 89Hz 屏 + 53fps 源会落在 11/22ms 两档；免同步则贴近源间隔。
+static std::mutex g_presentMtx;
+static const int PRESENT_RING = 512;
+static uint64_t g_presentIntervals[PRESENT_RING];
+static int g_presentRingCount = 0;
+
+static void ResetPresentRing() {
+    std::lock_guard<std::mutex> lk(g_presentMtx);
+    g_presentRingCount = 0;
+}
+
+static void PushPresentInterval(uint64_t ms) {
+    std::lock_guard<std::mutex> lk(g_presentMtx);
+    if (g_presentRingCount < PRESENT_RING) g_presentIntervals[g_presentRingCount++] = ms;
+}
+
+static void TakePresentIntervals(std::vector<uint64_t>& out) {
+    std::lock_guard<std::mutex> lk(g_presentMtx);
+    out.assign(g_presentIntervals, g_presentIntervals + g_presentRingCount);
+    g_presentRingCount = 0;
+}
+
+static double PercentileMs(std::vector<uint64_t>& v, double p) {
+    if (v.empty()) return 0.0;
+    size_t k = (size_t)(p * (double)(v.size() - 1));
+    std::nth_element(v.begin(), v.begin() + k, v.end());
+    return (double)v[k];
+}
 
 // 复用预分配缓冲，避免每帧分配
 static char g_logBuf[1024];
@@ -1229,6 +1260,12 @@ void Presenter::PresentSample(IMFSample* sample) {
     } else {
         swap_->Present(1, 0);
     }
+    // 记录两次上屏的间隔：vsync 会把节奏拉成刷新周期的整数倍，
+    // 免同步则贴近源帧间隔。统计行打印 p50/p95 便于客观判断。
+    static uint64_t s_lastPresentMs = 0;   // 仅呈现线程调用
+    uint64_t nowMs = GetTickCount64();
+    if (s_lastPresentMs) PushPresentInterval(nowMs - s_lastPresentMs);
+    s_lastPresentMs = nowMs;
     g_stats.presented++;
 }
 
@@ -1651,6 +1688,7 @@ static void NetworkLoop(const RunConfig& cfg, Graphics* gfx, Presenter* presente
         // 复位统计，重连后从头计数
         g_stats.packets = 0; g_stats.bytes = 0; g_stats.decoded = 0;
         g_stats.presented = 0; g_stats.dropped = 0; g_stats.decodeFail = 0;
+        ResetPresentRing();
         g_stats.lastLatencyUs = 0;
         ResetTimestampBase();
 
@@ -1726,7 +1764,7 @@ static void NetworkLoop(const RunConfig& cfg, Graphics* gfx, Presenter* presente
                         latest.smp = smp; latest.srcW = ow; latest.srcH = oh;
                         hasLatest = true;
                     }
-                    if (old) old->Release();   // 旧帧还没上屏就被新帧取代，直接丢
+                    if (old) { g_stats.dropped++; old->Release(); }   // 旧帧还没上屏就被新帧取代，记一次呈现丢帧
                     latestCv.notify_one();
                 }
             }
@@ -1761,36 +1799,51 @@ static void NetworkLoop(const RunConfig& cfg, Graphics* gfx, Presenter* presente
         // 监控线程：打印状态；长时间无新帧就补请求关键帧
         std::thread watch([&] {
             uint64_t lastBytes = 0, lastDecoded = 0, lastCursor = 0;
+            uint64_t lastPresented = 0, lastDropped = 0;
             double recentFps[5] = { 0, 0, 0, 0, 0 };   // 近 10 秒的每秒解码帧数
             int fpsIdx = 0;
             int stallRounds = 0;
+            std::vector<uint64_t> ivs;
             while (g_alive && connAlive) {
                 for (int i = 0; i < 20 && g_alive && connAlive; ++i) Sleep(100);
                 if (!g_alive || !connAlive) break;
 
                 uint64_t b = g_stats.bytes, d = g_stats.decoded;
+                uint64_t p = g_stats.presented, dr = g_stats.dropped;
                 double mbps = (b - lastBytes) * 8 / 2.0 / 1e6;
 
-                // 峰值帧率取近 5 个采样窗口（约 10 秒）的最大值：
-                // 平均值会被静止画面拉低，看不出卡顿；峰值能反映「有动静时能跑多快」
-                recentFps[fpsIdx] = (double)(d - lastDecoded) / 2.0;
+                // 当前帧率 = 本 2 秒窗口的实时解码速率；峰值 = 近 5 个窗口（约 10 秒）最大值。
+                // 静止桌面 SCK 变化驱动，当前值本来就低；峰值用来判断「有动静时能跑多快」。
+                double curFps = (double)(d - lastDecoded) / 2.0;
+                recentFps[fpsIdx] = curFps;
                 fpsIdx = (fpsIdx + 1) % 5;
                 double peakFps = 0;
                 for (double v : recentFps) if (v > peakFps) peakFps = v;
 
+                TakePresentIntervals(ivs);
+                double p50 = PercentileMs(ivs, 0.50);
+                double p95 = PercentileMs(ivs, 0.95);
+
                 uint64_t curPkts = g_stats.cursor.load();
-                Log("包 %llu  解码 %llu(+%llu)  %.1f Mbps  附加延迟 %.1f ms  解码失败 %llu"
-                    "  峰值 %.1f fps  光标+%llu  输入 %llu",
+                Log("包 %llu  解码 %llu(+%llu)  当前 %.1f fps  峰值 %.1f fps"
+                    "  上屏 +%llu  呈现丢帧 +%llu  间隔 p50 %.1f p95 %.1f ms"
+                    "  %.1f Mbps  附加延迟 %.1f ms  解码失败 %llu  光标+%llu  输入 %llu",
                     (unsigned long long)g_stats.packets,
                     (unsigned long long)d,
                     (unsigned long long)(d - lastDecoded),
+                    curFps,
+                    peakFps,
+                    (unsigned long long)(p - lastPresented),
+                    (unsigned long long)(dr - lastDropped),
+                    p50, p95,
                     mbps,
                     g_stats.lastLatencyUs / 1000.0,
                     (unsigned long long)g_stats.decodeFail,
-                    peakFps,
                     (unsigned long long)(curPkts - lastCursor),
                     (unsigned long long)g_stats.inputSent.load());
                 lastCursor = curPkts;
+                lastPresented = p;
+                lastDropped = dr;
 
                 if (d == lastDecoded) {
                     ++stallRounds;
