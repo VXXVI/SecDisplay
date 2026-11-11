@@ -1,0 +1,84 @@
+name: Windows Ops
+
+# 通过 self-hosted runner 操作那台 Windows 机器（C:\SecDisplay）。
+#
+# 为什么不用 windows-latest：云端 runner 是一次性虚拟机，连不到雷电链路
+# 10.10.10.x，也碰不到本地代码。只有装了 self-hosted runner，这个 workflow
+# 才能真正落到目标机器上执行。
+#
+# 安装步骤见 prototype/windows/RUNNER.md。
+#
+# 注意：inputs.command 会在目标机以 runner 身份执行任意 PowerShell 命令，
+# 因此只有对仓库有写权限的人才能触发。不要把 runner 加到公开仓库上。
+
+on:
+  workflow_dispatch:
+    inputs:
+      work_dir:
+        description: "Windows 部署目录"
+        required: true
+        default: 'C:\SecDisplay'
+      sync:
+        description: "先拉取 origin/main 最新代码（reset --hard，会丢弃本地未提交改动）"
+        type: boolean
+        default: true
+      rebuild:
+        description: "同步后重新编译接收端（build.bat）"
+        type: boolean
+        default: false
+      command:
+        description: "额外执行的 PowerShell 命令（留空则只同步/编译）"
+        required: false
+        default: ""
+
+permissions:
+  contents: read
+
+concurrency:
+  group: windows-ops
+  cancel-in-progress: false
+
+jobs:
+  ops:
+    runs-on: [self-hosted, windows]
+    timeout-minutes: 30
+    steps:
+      - name: 同步最新代码
+        if: ${{ inputs.sync }}
+        shell: powershell
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $dir = "${{ inputs.work_dir }}"
+          if (-not (Test-Path $dir)) { throw "部署目录不存在：$dir" }
+          git -C $dir fetch origin main
+          git -C $dir reset --hard origin/main
+          Write-Host "当前提交：" (git -C $dir log -1 --oneline)
+
+      - name: 重新编译
+        if: ${{ inputs.rebuild }}
+        shell: cmd
+        run: |
+          cd /d "${{ inputs.work_dir }}\prototype\windows"
+          call build.bat < nul
+          if errorlevel 1 exit /b 1
+
+      - name: 执行命令
+        if: ${{ inputs.command != '' }}
+        shell: powershell
+        working-directory: ${{ inputs.work_dir }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          ${{ inputs.command }}
+
+      - name: 汇总
+        shell: powershell
+        run: |
+          Write-Host "机器：" $env:COMPUTERNAME
+          Write-Host "目录：" "${{ inputs.work_dir }}"
+          $exe = Join-Path "${{ inputs.work_dir }}" "prototype\windows\SecDisplayReceiver.exe"
+          if (Test-Path $exe) {
+            $f = Get-Item $exe
+            Write-Host ("接收端：{0}  修改时间 {1}" -f $f.Length, $f.LastWriteTime)
+          } else {
+            Write-Host "接收端：尚未编译"
+          }
