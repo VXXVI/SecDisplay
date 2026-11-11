@@ -1,6 +1,6 @@
 # 任务单：Duet Display 原理分析（Mac 侧）
 
-> 状态：待执行（P1；静态部分不依赖 9922，可先做）
+> 状态：已完成（A-Mac-1/2/3 静态；D-1/2/3 动态阻塞，结果见 `research/RESULT-duet-mac-static.md`）
 > 派发方：Windows 侧（按用户要求拆分）
 > 目标端：Mac 侧
 > 日期：2026-11-11
