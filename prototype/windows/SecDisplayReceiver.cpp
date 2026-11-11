@@ -44,6 +44,7 @@
 #include <cstdio>
 #include <cstdint>
 #include <cstring>
+#include <cmath>
 #include <clocale>
 #include <string>
 #include <vector>
