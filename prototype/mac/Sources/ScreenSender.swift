@@ -344,6 +344,24 @@ final class Encoder {
         encodeInternal(pb, captureTimeMicros: captureTimeMicros)
     }
 
+    /// 用最后一帧强制补一个 IDR。
+    ///
+    /// 屏幕静止时 ScreenCaptureKit 不出帧，接收端新连上会拿不到任何首帧
+    ///（旧实现只置 wantKeyframe 标志，但要等下一帧采集才生效，静止时永远等不到），
+    /// 表现为接收端黑屏 / 报解码失败。这里直接用 lastPixelBuffer 编一帧发出去。
+    /// 若连最后一帧都还没有（刚启动、尚未采集到），就只置标志，等首帧到来再补。
+    func forceEncodeLastFrame() {
+        lastBufferLock.lock()
+        let pb = lastPixelBuffer
+        lastBufferLock.unlock()
+        guard let pb else {
+            requestKeyframe()
+            return
+        }
+        requestKeyframe()   // 让 encodeInternal 把这一帧编成 IDR
+        encodeInternal(pb, captureTimeMicros: UInt64(CFAbsoluteTimeGetCurrent() * 1_000_000))
+    }
+
     /// 串行化编码调用。采集线程和关键帧补发可能并发进来，
     /// frameSeq 自增不是原子的，并发会产出重复 PTS。
     private let encodeLock = NSLock()
@@ -1257,7 +1275,9 @@ let idList = onIDs.prefix(Int(onN)).map { id -> String in
 Log.info("在线显示器身份: \(idList.joined(separator: "  "))")
 
 // 接收端的 0x02 控制消息 → 让编码器下一帧强制 IDR
-sender.onKeyframeRequest = { encoder.requestKeyframe() }
+// 接收端连上 / 请求关键帧时，用最后一帧强制补 IDR。
+// 不能只 requestKeyframe：静止画面没有下一帧，标志永远消费不掉，接收端一直黑屏。
+sender.onKeyframeRequest = { encoder.forceEncodeLastFrame() }
 sender.listen(port: cfg.port)
 
 // 输入回传：Windows 侧的鼠标事件在 Mac 上重放
