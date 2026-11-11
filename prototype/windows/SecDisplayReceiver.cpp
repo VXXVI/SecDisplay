@@ -572,11 +572,16 @@ bool Graphics::CreateDevice() {
     }
     if (FAILED(hr) || !device) { Log("D3D11CreateDevice 失败 %08X", hr); return false; }
 
-    // 多线程保护：解码线程与呈现线程共享同一台设备
+    // 多线程保护：解码线程与呈现线程共享同一台设备。
+    // 注意 SetMultithreadProtected 返回的是「调用前是否已开启」，FALSE 只表示之前没开、
+    // 本次已成功开启，不能当失败。真实状态要用 GetMultithreadProtected() 回读。
     ComPtr<ID3D11Multithread> mt;
     if (SUCCEEDED(device.As(&mt)) && mt) {
-        if (!mt->SetMultithreadProtected(TRUE)) {
-            Log("警告: 多线程保护未启用，共享设备可能有竞争");
+        mt->SetMultithreadProtected(TRUE);
+        if (!mt->GetMultithreadProtected()) {
+            Log("警告: 多线程保护未能启用，共享设备可能有竞争");
+        } else {
+            Log("多线程保护已启用");
         }
     }
     return true;

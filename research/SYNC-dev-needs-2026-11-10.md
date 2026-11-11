@@ -55,6 +55,14 @@
 4. 0x04 回传节流：WM_MOUSEMOVE 合并/降频（SecDisplayReceiver.cpp:1380-1384）。
 5. 窗口样式与让位路径回归：Ctrl+Alt+H / F11 / 双击不破坏出画（f7b01e6，RESULT-WINDOW-2026-11-10.md 第 3 节）。
 
+状态（2026-11-11 更新，详见 RESULT-WINDOW-2026-11-10.md 第 8、9 节）：
+- 第 1 项：复核结论现状即较优，需 89Hz 真机 A/B，本轮不改。
+- 第 2 项：原警告是误报（SetMultithreadProtected 返回值语义理解反了），已改为 GetMultithreadProtected 回读并实机确认「已启用」。
+- 第 3 项：复核无缺陷（key 持引用、规模有界），不改。
+- 第 4 项：已完成，鼠标移动合并到约 120Hz、按键滚轮即时。
+- 第 5 项：已完成。
+Top 5 全部有结论。
+
 ## 6. 请 Mac 侧确认
 
 - RateController 现状与 REVERSE-DUET:65-68 旧结论是否一致，以哪份为准。

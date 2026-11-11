@@ -87,3 +87,34 @@ ToggleMinimize 只动窗口显示状态，不碰 g_alive、不 PostQuitMessage�
 - MSVC + MinGW 两套工具链均编译通过。
 
 边界：这是发送端节流，Mac 侧接收处理未改。若 Mac 侧也想在接收端合并，需另议，避免两端重复。端到端手感改善需 Mac 发送端在线做真机联调确认。
+
+## 9. 本端可独立项收尾（2026-11-11，提交见下）
+
+按 research/SYNC-dev-needs-2026-11-10.md 第 5 节 Top 5 逐项处理，本轮把剩下三项定性：修 1 项、复核 2 项。
+
+### 9.1 Top 2 多线程保护警告：误报，已修
+
+原代码 `if (!mt->SetMultithreadProtected(TRUE)) Log("警告: 多线程保护未启用")` 把返回值当成功标志，判断反了。查 Windows SDK 头文件 `d3d11_4.h:1958` 与官方文档：`SetMultithreadProtected` 返回「调用前是否已开启」，FALSE 只表示之前没开、本次已成功开启。真实状态要用同接口的 `GetMultithreadProtected()` 回读（`d3d11_4.h:1962`）。
+
+改成：调用 `SetMultithreadProtected(TRUE)` 后用 `GetMultithreadProtected()` 回读，为真打「多线程保护已启用」，仍为假才打「未能启用」。实机运行日志已确认输出「多线程保护已启用」，此前的假警告消失。MSVC + MinGW 均编译通过。
+
+### 9.2 Top 1 呈现节奏 89Hz 配 43fps：复核结论为现状即较优，需真机验证，本轮不改
+
+现状 SecDisplayReceiver.cpp:1216-1226：默认 `Present(1,0)` 垂直同步，免同步仅在 `tearing_ && !useVsync_` 时走 `DXGI_PRESENT_ALLOW_TEARING`。89/43≈2.07 个刷新周期每帧，vsync 下表现为「2,2,2,3…」周期性多等一个周期，属刷新率与帧率非整数比的结构性跳动。
+
+判断：改判定阈值或强行 tearing 都会改变观感，且必须在该分辨率/刷新率的真实显示器上看效果，当前环境无 89Hz 屏，改动无法验证。按不盲改原则，本轮只记录结论，留待真机联调时 A/B（vsync 与 tearing 各跑一段），再决定是否引入「帧率接近刷新率整数分频时才启用 tearing」的启发式。归属 Windows 独立，但依赖真机。
+
+### 9.3 Top 3 视图缓存上限与清理策略：复核无缺陷，本轮不改
+
+现状 SecDisplayReceiver.cpp:1184-1209：输入视图按 `(纹理指针<<8)|子索引` 缓存、上限 32，超出整体 clear；输出视图按后备缓冲指针缓存、上限 8，超出整体 clear。
+
+复核要点：
+- 缓存 key 用裸纹理指针不会误命中：`CreateVideoProcessorInputView` 会持有资源引用，旧纹理在被缓存视图引用期间不会被释放，指针不会复用，且 key 带子索引。
+- 规模有界：输入 key 数量受解码输出纹理池 × 子索引限制，输出 key 受交换链后备缓冲数限制，实际远小于 32/8，clear 分支基本不触发，不存在周期性抖动风险。
+- 整体 clear 即使触发也是一次性重建，不影响正确性。
+
+结论：无缺陷，不改。若日后解码纹理池增大到接近上限，再考虑换 LRU 或惰性淘汰。
+
+### 9.4 Top 4 / Top 5 已完成
+
+0x04 节流见第 8 节；窗口样式与让位路径回归见第 3 节。Top 5 至此全部有结论。
