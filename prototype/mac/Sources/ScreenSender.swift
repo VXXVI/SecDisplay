@@ -709,6 +709,13 @@ final class Sender {
     /// 只读暴露给 CursorImageTracker，用于连接重建时强制重发光标图像
     var currentEpoch: Int { queue.sync { connEpoch } }
     private let queue = DispatchQueue(label: "SecDisplay.net")
+    /// 监听器必须由 Sender 强引用持有。之前是 listen(port:) 里的局部变量，
+    /// 启动后可能被运行时释放，端口随之消失，但进程、采集、编码都还活着，
+    /// Windows 侧看到的就是「主机能 ping 通、9922 却 WSAECONNREFUSED」。
+    private var listener: NWListener?
+    private var listenPort: UInt16 = 0
+    private var listenerWatchdog: DispatchSourceTimer?
+    private var listenerRestartScheduled = false
     private(set) var inFlight = 0
     private let maxInFlight = 2
     var dropped = 0
@@ -717,6 +724,7 @@ final class Sender {
     var connected = false
 
     func listen(port: UInt16) {
+        listenPort = port
         let params = NWParameters.tcp
         params.allowLocalEndpointReuse = true
         // 关闭 Nagle
@@ -731,8 +739,15 @@ final class Sender {
             listener = try NWListener(using: params, on: NWEndpoint.Port(rawValue: port)!)
         } catch {
             Log.info("端口 \(port) 监听失败（可能被占用）: \(error)")
+            // 自愈路径里不要直接退出进程：端口还被上一次监听占着是暂时的，
+            // 交给看门狗重试。只有首次启动失败才退出。
+            if listenerRestartScheduled || self.listener != nil {
+                scheduleListenerRestart("创建监听器失败")
+                return
+            }
             exit(6)
         }
+        self.listener = listener
         listener.newConnectionHandler = { [weak self] c in
             guard let self else { return }
             Log.info("接收端已连接: \(String(describing: c.endpoint))")
@@ -775,12 +790,57 @@ final class Sender {
             self.onKeyframeRequest?()
             self.receiveLoop(epoch: epoch)
         }
-        listener.stateUpdateHandler = { st in
-            if case .ready = st { Log.info("监听端口 \(port)，等待接收端连接") }
-            if case .failed(let e) = st { Log.info("监听失败: \(e)") }
+        listener.stateUpdateHandler = { [weak self, weak listener] st in
+            // 旧 listener 的回调可能晚到，只认当前持有的那个
+            guard let self, let l = listener, self.listener === l else { return }
+            switch st {
+            case .ready:
+                Log.info("监听端口 \(port)，等待接收端连接")
+                self.listenerRestartScheduled = false
+            case .failed(let e):
+                Log.info("监听失败: \(e)")
+                self.scheduleListenerRestart("failed")
+            case .cancelled:
+                Log.info("监听已取消")
+                self.scheduleListenerRestart("cancelled")
+            default:
+                break
+            }
         }
         listener.start(queue: queue)
         startKeepAlive()
+        startListenerWatchdog()
+    }
+
+    /// 监听器重建：先 cancel 旧实例，1 秒后重新 listen。
+    /// 不动 connEpoch、编码器和现有连接，避免重建监听把正在传输的链路打断。
+    private func scheduleListenerRestart(_ reason: String) {
+        guard !listenerRestartScheduled else { return }
+        listenerRestartScheduled = true
+        Log.info("监听自愈：\(reason)，1 秒后重建端口 \(listenPort)")
+        listener?.cancel()
+        listener = nil
+        queue.asyncAfter(deadline: .now() + 1) { [weak self] in
+            guard let self else { return }
+            self.listenerRestartScheduled = false
+            self.listen(port: self.listenPort)
+        }
+    }
+
+    /// 看门狗：stateUpdateHandler 在对象被释放等场景下可能漏报，
+    /// 每 5 秒自己查一次状态，不在 ready 就重建。
+    private func startListenerWatchdog() {
+        guard listenerWatchdog == nil else { return }
+        let timer = DispatchSource.makeTimerSource(queue: queue)
+        timer.schedule(deadline: .now() + 5, repeating: 5)
+        timer.setEventHandler { [weak self] in
+            guard let self else { return }
+            if self.listener?.state != .ready {
+                self.scheduleListenerRestart("看门狗检测到监听不在 ready")
+            }
+        }
+        timer.resume()
+        listenerWatchdog = timer
     }
 
     /// 控制通道缓冲。0x02 是 1 字节，0x04 输入事件是固定 12 字节，
@@ -979,6 +1039,8 @@ final class Sender {
 
     private func startKeepAlive() {
         guard keepAliveGap > 0 else { return }
+        // 监听自愈会重新调用本函数，先取消旧定时器，避免重复保活与泄漏
+        keepAliveTimer?.cancel()
         let timer = DispatchSource.makeTimerSource(queue: queue)
         timer.schedule(deadline: .now() + keepAliveGap, repeating: keepAliveGap / 2)
         timer.setEventHandler { [weak self] in
@@ -1129,6 +1191,12 @@ final class CursorImageTracker {
     /// 上次观察到的连接代数，用于连接重建时强制重发
     private var lastEpoch = -1
     private let maxDim = 128       // 光标不会超过 128 像素，超出则截断保护
+    /// 上次实际发送时刻，用于限流：光标形状在移动中可能在箭头/I型/手型间频繁切换，
+    /// 每切一次就让接收端重建一次 HCURSOR，会造成光标卡顿。限制最小间隔。
+    private var lastSendAt: CFAbsoluteTime = 0
+    private let minSendGap: CFAbsoluteTime = 0.25
+    /// 累计发送次数，供统计展示，便于判断是否在频繁重发
+    private(set) var sentCount = 0
 
     init(sender: Sender) { self.sender = sender }
 
@@ -1185,7 +1253,11 @@ final class CursorImageTracker {
         let force = epoch != lastEpoch
         lastEpoch = epoch
         guard force || fp != lastFingerprint else { return }
+        // 非强制（仅形状变化）时限流，避免移动中形状频繁切换导致接收端反复重建光标
+        if !force, CFAbsoluteTimeGetCurrent() - lastSendAt < minSendGap { return }
+        lastSendAt = CFAbsoluteTimeGetCurrent()
         lastFingerprint = fp
+        sentCount += 1
 
         sender.sendCursorImage(width: w, height: h, hotX: hotX, hotY: hotY,
                                bgra: Data(bgra))
@@ -1312,8 +1384,15 @@ Log.info("坐标基准: 逻辑点 \(Int(vb.width))x\(Int(vb.height))，原点 (\
 let cursor = CursorTracker(sender: sender, bounds: { CGDisplayBounds(vd.displayID) })
 cursor.start()
 // 真实光标图像：形状变化时才发，让副屏显示 Mac 的光标而非固定 Windows 箭头
+// 真实光标图像（0x05）。SECDISPLAY_NOCURSORIMG=1 可整体关闭，
+// 用于 A/B 判断「光标卡顿是否由接收端反复重建光标引起」——关掉后回退 Windows 标准箭头。
 let cursorImage = CursorImageTracker(sender: sender)
-cursorImage.start()
+let disableCursorImage = ProcessInfo.processInfo.environment["SECDISPLAY_NOCURSORIMG"] == "1"
+if disableCursorImage {
+    Log.info("已关闭真实光标图像(0x05)，使用接收端标准箭头（SECDISPLAY_NOCURSORIMG=1）")
+} else {
+    cursorImage.start()
+}
 
 // 传入 id 获取闭包：虚拟屏重建后 id 会变，采集侧每次重建流都重新问
 let cap = Capture(encoder: encoder, cfg: cfg, displayID: { vd.displayID })
@@ -1385,6 +1464,7 @@ var lastCapCount = 0
 var lastCapTime = CFAbsoluteTimeGetCurrent()
 var peakFps: Double = 0
 var lastCursorCount = 0
+var lastCursorImageCount = 0
 
 Timer.scheduledTimer(withTimeInterval: 1.0, repeats: true) { _ in
     let now = CFAbsoluteTimeGetCurrent()
@@ -1407,8 +1487,10 @@ Timer.scheduledTimer(withTimeInterval: 2.0, repeats: true) { _ in
     let capAvg = cap.capLatCount > 0 ? cap.capLatSum / Double(cap.capLatCount) : 0
     let cursorDelta = cursor.sentCount - lastCursorCount
     lastCursorCount = cursor.sentCount
-    Log.info(String(format: "采集 %d  峰值 %.0ffps  空闲 %d  发送 %d  光标+%d  输入 %d  丢弃 %d  %.1f Mbps  在途 %d  采集延迟 %.1f  编码延迟 %.1f ms",
-                    cap.captured, peakFps, cap.idleFrameCount, sender.sent, cursorDelta,
+    let imgDelta = cursorImage.sentCount - lastCursorImageCount
+    lastCursorImageCount = cursorImage.sentCount
+    Log.info(String(format: "采集 %d  峰值 %.0ffps  空闲 %d  发送 %d  光标+%d  图像+%d  输入 %d  丢弃 %d  %.1f Mbps  在途 %d  采集延迟 %.1f  编码延迟 %.1f ms",
+                    cap.captured, peakFps, cap.idleFrameCount, sender.sent, cursorDelta, imgDelta,
                     injector.eventCount, sender.dropped, mbps, sender.inFlight, capAvg, encAvg))
     cap.capLatSum = 0; cap.capLatCount = 0; cap.capLatMax = 0
     encoder.encLatSum = 0; encoder.encLatCount = 0; encoder.encLatMax = 0
