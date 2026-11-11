@@ -76,3 +76,14 @@ Mac 侧 2026-11-11 凌晨做了真实端到端实测（`tools/latencyclient` + `
 
 按 `research/PROTOCOL-autonomous-collab.md` 约定，在 RESULT 文件头写明：
 对应任务单路径、执行提交号、逐条判据结果、遗留项、阻塞项。
+
+---
+
+## Windows 侧进展（2026-11-11，提交 829762c）
+
+- 已加呈现埋点：当前/峰值 fps、上屏数、呈现丢帧、上屏间隔 p50/p95。
+- 静止实测：当前 10~13 fps、呈现丢帧 0、间隔 p50 94~109 ms，与源帧间隔一致。
+- T2 已有可加埋点的位置与口径：间隔 即两次 Present 的毫秒间隔，可直接判断 vsync 量化。
+- T1 仍缺运动源：已派 esearch/TASK-mac-motion-ab-2026-11-11.md，等 Mac 侧跑 motionloader 并打时间标记。
+- T3 全屏尺寸与点击错位此前已实测关闭，见 prototype/windows/RESULT-WINDOW-2026-11-10.md 第 8~10 节。
+
