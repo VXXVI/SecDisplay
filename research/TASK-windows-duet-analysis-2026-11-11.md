@@ -1,6 +1,6 @@
 # 任务单：Duet Display 原理分析（Windows 侧）
 
-> 状态：进行中（Windows 侧自领，先做 A-Win-1）
+> 状态：进行中（P1/P2；A-Win-1 初查已完成，下一步 A-Win-2 呈现采样）
 > 派发方：Windows 侧（按用户要求拆分）
 > 目标端：Windows 侧
 > 日期：2026-11-11
