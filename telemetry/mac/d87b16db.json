@@ -1,8 +1,8 @@
 {
   "schema": 1,
   "platform": "mac",
-  "generated_utc": "2026-11-11T14:40:42Z",
-  "commit": "870266f",
+  "generated_utc": "2026-11-11T14:45:54Z",
+  "commit": "986a51c",
   "coord": {
     "logical_w": 1600,
     "logical_h": 1000
@@ -14,34 +14,34 @@
     "preset": "smooth",
     "encoder_variant": "A"
   },
-  "samples": 335,
+  "samples": 491,
   "metrics": {
     "peak_fps": {
-      "min": 30.0,
-      "median": 31.0,
+      "min": 0.0,
+      "median": 30.0,
       "p95": 31.0,
       "max": 43.0
     },
     "capture_ms": {
-      "min": 3.2,
-      "median": 5.2,
-      "p95": 7.4,
+      "min": 0.0,
+      "median": 5.1,
+      "p95": 7.3,
       "max": 19.4
     },
     "encode_ms": {
-      "min": 14.2,
-      "median": 19.6,
+      "min": 0.0,
+      "median": 19.5,
       "p95": 22.3,
       "max": 39.2
     },
     "mbps": {
-      "min": 6.6,
-      "median": 7.5,
-      "p95": 14.1,
+      "min": 0.5,
+      "median": 7.4,
+      "p95": 7.7,
       "max": 51.8
     },
     "sent_per_sample": {
-      "min": 14.0,
+      "min": 3.0,
       "median": 60.0,
       "p95": 61.0,
       "max": 62.0
@@ -50,8 +50,12 @@
     "input_pkts_total": 0,
     "dropped_total": 0,
     "inflight_max": 1,
-    "idle_last": 16133.0
+    "idle_last": 20955.0
   },
-  "warnings": [],
-  "warning_counts": {}
+  "warnings": [
+    "stream_rebuild"
+  ],
+  "warning_counts": {
+    "stream_rebuild": 226
+  }
 }
