@@ -2225,35 +2225,18 @@ int main(int argc, char** argv) {
         g_coordW.load(), g_coordH.load(), cfg.width, cfg.height,
         cfg.coordW > 0 ? "，命令行指定" : "，默认对齐物理");
 
-    // 光标应用线程：把收到的逻辑点坐标按 g_coordW/H 换算到窗口客户区，直接移动系统光标。
-    // Windows 的光标由硬件合成，不受视频帧率影响，所以指针是跟手的。
-    std::thread cursorThread([] {
-        POINT lastPt{ INT_MIN, INT_MIN };
-        while (g_alive) {
-            Sleep(4);   // ~250Hz 轮询，实际只在新位置到达时调用 SetCursorPos
-            // 本机鼠标最近 1 秒内动过，就以用户的鼠标为准，不要抢位置。
-            // 否则会出现「点这里、菜单弹在别处」。
-            if (GetTickCount64() - (uint64_t)g_lastLocalInputMs.load() < 1000) continue;
-
-            double cx = g_cursorX.load(), cy = g_cursorY.load();
-            if (cx < 0 || cy < 0) continue;
-            int vw = g_coordW.load(), vh = g_coordH.load();
-            if (vw <= 0 || vh <= 0 || !g_hwnd) continue;
-
-            RECT rc{};
-            if (!GetClientRect(g_hwnd, &rc)) continue;
-            int cw = rc.right - rc.left, ch = rc.bottom - rc.top;
-            if (cw <= 0 || ch <= 0) continue;
-
-            POINT tl{ rc.left, rc.top };
-            ClientToScreen(g_hwnd, &tl);
-            int sx = tl.x + (int)(cx / vw * cw);
-            int sy = tl.y + (int)(cy / vh * ch);
-            if (sx == lastPt.x && sy == lastPt.y) continue;
-            lastPt.x = sx; lastPt.y = sy;
-            SetCursorPos(sx, sy);
-        }
-    });
+    // 光标跟随已停用（止血）。
+    //
+    // 旧实现在这里起了一个 4ms 轮询的线程，把 0x03 收到的远程坐标换算到
+    // 窗口客户区后 SetCursorPos，直接搬系统光标。问题是 g_lastLocalInputMs
+    // 只在鼠标位于副屏客户区内时才刷新（WM_MOUSEMOVE + ClientToVideo 成功），
+    // 用户把鼠标移回主屏后时间戳不再更新，满 1 秒就被判定「本机没动」，
+    // 光标被拽回副屏旧坐标；SetCursorPos 又触发一次 WM_MOUSEMOVE 刷新时间戳，
+    // 于是形成每 1 秒一次的周期性抢光标。
+    //
+    // 现在窗口光标由 0x05 图像 + ApplyCursorImage + WM_SETCURSOR 本地绘制，
+    // 位置完全交给系统光标，两边互不抢占。若将来要做「远程驱动副屏光标」，
+    // 应改为在视频画面上绘制，而不是 SetCursorPos 搬系统光标。
 
     // 输入回传线程：每 4ms 轮询，鼠标移动按 8ms 合并发（约 120Hz），
     // 按键/滚轮事件在下一轮立即发。单线程发送，避免与 UI 线程并发 send 同一 socket。
@@ -2308,7 +2291,7 @@ int main(int argc, char** argv) {
         if (s != INVALID_SOCKET) shutdown(s, SD_BOTH);
     }
     if (net.joinable()) net.join();
-    if (cursorThread.joinable()) cursorThread.join();
+    // cursorThread 已随「停用 SetCursorPos 抢光标」一起移除，勿再 join。
     if (inputThread.joinable()) inputThread.join();
 
     WSACleanup();
