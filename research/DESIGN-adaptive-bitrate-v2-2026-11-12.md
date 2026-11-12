@@ -81,9 +81,10 @@ if health > 1.15 连续 2 轮:
     应用新码率
     进入「观察期」
 
-观察期（降档后 2 轮，约 4 秒）：
-    if health < probe.beforeHealth * 0.90:
-        认为降档有效，清除 probe
+观察期（8 秒窗口，给队列排空留时间）：
+    窗口内记录最低健康度 probe.minHealth
+    if probe.minHealth < probe.beforeHealth * 0.90:
+        认为降档有效，保留新码率
     else:
         回退到 probe.beforeMbps
         设置 60 秒不再下调（floor 保持）

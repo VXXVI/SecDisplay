@@ -120,21 +120,26 @@ let health = max(max(winQueueLoad, dropLoad), max(inflightLoad, encodeGuard))
 试探与回退：
 
 ```swift
-// 观察期：降档后 2 轮
-if let pm = probeMbps, now - probeAt < 4 {
-    if health < probeHealth * 0.90 {
-        probeMbps = nil          // 降档有效
-    } else {
-        // 降档无效，回退
+// 观察期：8 秒窗口，取窗口内最低健康度
+if let pm = probeMbps {
+    if now - probeAt < 8 {
+        if health < probeHealth * 0.90 {
+            probeMbps = nil          // 降档有效，提前结束观察
+        } else {
+            probeMinHealth = min(probeMinHealth, health)
+        }
+        return
+    }
+    let improved = probeMinHealth < probeHealth * 0.90
+    probeMbps = nil
+    if !improved {
         current = pm
         encoder.setBitrate(current)
-        probeMbps = nil
         revertCooldownUntil = now + 60
         Log.info("降档无效，回退至 \(current) Mbps")
     }
     return
 }
-probeMbps = nil
 ```
 
 下调：
@@ -179,7 +184,7 @@ func setBitrate(_ mbps: Int) {
 
 1. 静止 5 分钟：码率不下降，静止回升生效。
 2. 稳定 30~40fps 运动：`winQueueMs` 接近 0，码率不频繁调整。
-3. 人为制造队列：降 10% 后观察 2 轮，无改善则回退，60 秒内不再降。
+3. 人为制造队列：降 10% 后观察 8 秒，无改善则回退，60 秒内不再降。
 4. 同时开 `--feedback` 与 `--pace`：`pacedDrop` 不计入 `dropLoad`。
 5. 旧 Mac 不开 `--feedback`：行为与 Phase 1 一致，不误解析。
 

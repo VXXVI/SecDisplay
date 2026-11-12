@@ -40,7 +40,7 @@ health = max(max(winQueueLoad, dropLoad), max(inflightLoad, encodeGuard))
 
 ### 1.4 降档试探与回退
 
-降档后 4 秒内观察健康度：
+降档后 8 秒观察窗口，取窗口内最低健康度：
 
 - 改善 ≥10%：认为降档有效，保留。
 - 没有改善：回退到降档前码率，并 60 秒内不再下调。

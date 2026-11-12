@@ -1513,6 +1513,7 @@ final class RateController {
     /// 避免 Phase 1 实测里 180Mbps 一路滑到 17Mbps 的情况。
     private var probeMbps: Int? = nil
     private var probeHealth: Double = 0
+    private var probeMinHealth: Double = 0
     private var probeAt: CFAbsoluteTime = 0
     private var revertCooldownUntil: CFAbsoluteTime = 0
 
@@ -1565,22 +1566,26 @@ final class RateController {
         let encodeGuard = encodeLoad > 1.5 ? encodeLoad : 0.0
         let health = max(max(winQueueLoad, dropLoad), max(inflightLoad, encodeGuard))
 
-        // 降档观察期：降档后约 4 秒内看健康度是否真的改善
+        // 降档观察期：队列排空需要时间，给 8 秒；窗口内取最低健康度判断。
         if let pm = probeMbps {
-            if now - probeAt < 4.0 {
+            if now - probeAt < 8.0 {
                 if health < probeHealth * 0.90 {
-                    probeMbps = nil          // 降档有效
+                    probeMbps = nil          // 降档有效，提前结束观察
                 } else {
-                    current = pm
-                    encoder.setBitrate(current)
-                    probeMbps = nil
-                    revertCooldownUntil = now + 60
-                    Log.info(String(format: "降档无效，回退至 %d Mbps（health %.2f -> %.2f）",
-                                    current, probeHealth, health))
+                    probeMinHealth = min(probeMinHealth, health)
                 }
                 return
             }
+            let improved = probeMinHealth < probeHealth * 0.90
             probeMbps = nil
+            if !improved {
+                current = pm
+                encoder.setBitrate(current)
+                revertCooldownUntil = now + 60
+                Log.info(String(format: "降档无效，回退至 %d Mbps（health %.2f -> %.2f）",
+                                current, probeHealth, probeMinHealth))
+            }
+            return
         }
 
         if health > 1.15, now >= revertCooldownUntil {
@@ -1596,6 +1601,7 @@ final class RateController {
             let prev = current
             probeMbps = prev
             probeHealth = health
+            probeMinHealth = health
             probeAt = now
             current = next
             encoder.setBitrate(current)
