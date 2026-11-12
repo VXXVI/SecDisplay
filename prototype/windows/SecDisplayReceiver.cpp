@@ -1555,6 +1555,31 @@ static void ApplyCursorImage() {
     SetCursor(cur);
 }
 
+// 查询窗口所在显示器的当前刷新率。启动、显示模式变化、窗口跨屏移动时都用它。
+static int QueryRefreshHz(HWND hwnd) {
+    int hz = 0;
+    MONITORINFOEXW mi{}; mi.cbSize = sizeof(mi);
+    DEVMODEW dmr{}; dmr.dmSize = sizeof(dmr);
+    if (GetMonitorInfoW(MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST), &mi) &&
+        EnumDisplaySettingsW(mi.szDevice, ENUM_CURRENT_SETTINGS, &dmr)) {
+        hz = (int)dmr.dmDisplayFrequency;
+    }
+    if (hz <= 0) {
+        DEVMODEW dm2{}; dm2.dmSize = sizeof(dm2);
+        if (EnumDisplaySettingsW(nullptr, ENUM_CURRENT_SETTINGS, &dm2))
+            hz = (int)dm2.dmDisplayFrequency;
+    }
+    return hz;
+}
+
+static void UpdateRefreshHz() {
+    int hz = QueryRefreshHz(g_hwnd);
+    if (hz > 0 && hz != g_refreshHz) {
+        g_refreshHz = hz;
+        Log("显示器刷新率变化，更新为 %d Hz", hz);
+    }
+}
+
 static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
     switch (m) {
     case WM_CLOSE:
@@ -1581,6 +1606,11 @@ static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
     case WM_APPLY_CURSOR:
         // 网络线程收到 0x05 后 post 到这里，HCURSOR 创建/销毁统一在 UI 线程
         ApplyCursorImage();
+        return 0;
+    case WM_DISPLAYCHANGE:
+    case WM_EXITSIZEMOVE:
+        // 显示模式变化或窗口跨屏移动后，刷新率可能变了，--pace 的节拍要跟着更新
+        UpdateRefreshHz();
         return 0;
     case WM_APP_REMOTE_CURSOR: {
         // 事件驱动：只有收到新的远程位置才搬一次光标，不再 4ms 轮询。
@@ -2295,18 +2325,7 @@ int main(int argc, char** argv) {
 
     // 记录显示器刷新率：判断源帧率与刷新率是否成整数比，是 vsync 顿挫的前提。
     {
-        int hz = 0;
-        MONITORINFOEXW mi{}; mi.cbSize = sizeof(mi);
-        DEVMODEW dmr{}; dmr.dmSize = sizeof(dmr);
-        if (GetMonitorInfoW(MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST), &mi) &&
-            EnumDisplaySettingsW(mi.szDevice, ENUM_CURRENT_SETTINGS, &dmr)) {
-            hz = (int)dmr.dmDisplayFrequency;
-        }
-        if (hz <= 0) {
-            DEVMODEW dm2{}; dm2.dmSize = sizeof(dm2);
-            if (EnumDisplaySettingsW(nullptr, ENUM_CURRENT_SETTINGS, &dm2))
-                hz = (int)dm2.dmDisplayFrequency;
-        }
+        int hz = QueryRefreshHz(hwnd);
         if (hz > 0) { g_refreshHz = hz; Log("显示器刷新率 %d Hz", hz); }
     }
 
