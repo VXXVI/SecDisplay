@@ -1362,6 +1362,14 @@ if let w = Int(ProcessInfo.processInfo.environment["SECDISPLAY_W"] ?? ""),
 if let hz = Double(ProcessInfo.processInfo.environment["SECDISPLAY_HZ"] ?? "") {
     cfg.captureHz = hz
 }
+// 虚拟屏刷新率默认跟随采集上限，默认 60。
+// 内建屏 120Hz 与 90Hz 虚拟屏同时在线时，WindowServer 要给两套不整除的
+// 节拍排帧，合成开销和光标抖动都会放大。显式指定用 SECDISPLAY_REFRESH。
+if let r = Double(ProcessInfo.processInfo.environment["SECDISPLAY_REFRESH"] ?? ""), r >= 24 {
+    cfg.refreshRate = r
+} else {
+    cfg.refreshRate = cfg.captureHz
+}
 // 码率：默认按像素率估算，约 0.35 bit/pixel/frame。
 // 1600x1000@60 约 34 Mbps，2240x1400@60 约 66 Mbps，2880x1800@45 约 82 Mbps。
 // 原先固定 180 Mbps 对多数档位都偏富余，除了压编码器，也会让自适应码率的
