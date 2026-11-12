@@ -1314,11 +1314,16 @@ if let w = Int(ProcessInfo.processInfo.environment["SECDISPLAY_W"] ?? ""),
 if let hz = Double(ProcessInfo.processInfo.environment["SECDISPLAY_HZ"] ?? "") {
     cfg.captureHz = hz
 }
-// 码率覆盖。默认 180Mbps 对 2240x1400@60 偏富余（静止时实测仅 0.3Mbps），
-// 留出环境变量便于按链路/内容 A/B，无需改代码重编。
+// 码率：默认按像素率估算，约 0.35 bit/pixel/frame。
+// 1600x1000@60 约 34 Mbps，2240x1400@60 约 66 Mbps，2880x1800@45 约 82 Mbps。
+// 原先固定 180 Mbps 对多数档位都偏富余，除了压编码器，也会让自适应码率的
+// 下调幅度显得突兀（一降就是几十 Mbps）。需要更高画质时用 SECDISPLAY_MBPS 覆盖。
 if let mbps = Int(ProcessInfo.processInfo.environment["SECDISPLAY_MBPS"] ?? ""),
    mbps >= 10, mbps <= 1000 {
     cfg.bitrateMbps = mbps
+} else {
+    let pixelsPerSec = Double(cfg.width * cfg.height) * cfg.captureHz
+    cfg.bitrateMbps = max(20, min(200, Int(pixelsPerSec * 0.35 / 1_000_000)))
 }
 let vd = VirtualDisplayManager()
 let encoder = Encoder(width: cfg.width, height: cfg.height, bitrateMbps: cfg.bitrateMbps)
@@ -1443,6 +1448,10 @@ final class RateController {
     private var current: Int
     private var highRounds = 0
     private var lowRounds = 0
+    private var idleRounds = 0
+    private var lastDownAt: CFAbsoluteTime = 0
+    /// 降档冷却：Duet 的做法是 10 秒防抖，避免一次负载抖动就连环下调
+    private let downCooldown: CFAbsoluteTime = 10
 
     init(encoder: Encoder, targetMbps: Int, captureHz: Double) {
         self.encoder = encoder
@@ -1453,24 +1462,39 @@ final class RateController {
 
     /// 每 2 秒调用一次
     func tick(_ s: RateSignals) {
-        // 静态桌面不发帧，帧率类判断都不可靠，直接跳过并清空连续计数
+        let now = CFAbsoluteTimeGetCurrent()
+
+        // 静态桌面不发帧，健康度不可信。但也不能一直停在低码率，
+        // 静止恰恰说明带宽充裕，允许每 3 轮（约 6 秒）小幅回升。
         if s.captureFps < 10 {
             highRounds = 0
             lowRounds = 0
+            idleRounds += 1
+            guard idleRounds >= 3, current < targetMbps else { return }
+            idleRounds = 0
+            let next = min(targetMbps, Int(Double(current) * 1.10) + 1)
+            guard abs(next - current) >= max(2, Int(Double(current) * 0.05)) else { return }
+            current = next
+            encoder.setBitrate(current)
+            Log.info("静止回升，码率上调至 \(current) Mbps")
             return
         }
+        idleRounds = 0
+
         let budgetMs = 1000.0 / captureHz
         let encodeLoad = s.encodeMs / budgetMs
         let inflightLoad = Double(s.inFlight) / 2.0      // maxInFlight = 2
         let dropLoad = s.droppedDelta > 0 ? 1.5 : 0.0
         let health = max(encodeLoad, max(inflightLoad, dropLoad))
 
-        if health > 1.0 {
+        if health > 1.15 {
             highRounds += 1
             lowRounds = 0
-            guard highRounds >= 2 else { return }
+            // 连续两轮确认，且距上次下调超过冷却时间才动手
+            guard highRounds >= 2, now - lastDownAt >= downCooldown else { return }
             highRounds = 0
-            let next = max(15, Int(Double(current) * 0.80))
+            lastDownAt = now
+            let next = max(15, Int(Double(current) * 0.90))
             guard abs(next - current) >= max(2, Int(Double(current) * 0.05)) else { return }
             current = next
             encoder.setBitrate(current)
