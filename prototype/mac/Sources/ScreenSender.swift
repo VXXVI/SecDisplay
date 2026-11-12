@@ -1600,18 +1600,19 @@ func shutdown(signal sig: Int32) -> Never {
         sender.conn?.cancel()
         stopped = true
     }
-    // 等采集停止，最多 3 秒
-    let stopDeadline = Date().addingTimeInterval(3.0)
+    // 等采集停止，最多 5 秒（SCK 重建失败时 stopCapture 偶尔会很慢）
+    let stopDeadline = Date().addingTimeInterval(5.0)
     while !stopped && Date() < stopDeadline {
         RunLoop.current.run(mode: .default, before: Date().addingTimeInterval(0.05))
     }
-    // 采集停稳后再多等 800ms，让 WindowServer 释放该虚拟屏的采集关联。
+    // 采集停稳后再多等 1.2 秒，让 WindowServer 释放该虚拟屏的采集关联。
     // 这步是必须的：采集还挂着时 CDVirtualDisplayDestroy 会被静默拒绝。
-    RunLoop.current.run(mode: .default, before: Date().addingTimeInterval(0.8))
+    RunLoop.current.run(mode: .default, before: Date().addingTimeInterval(1.2))
     vd.destroy()
     // 等 WindowServer 完成异步移除（不重复 destroy，避免对同一 client 二次释放）。
+    // 这里给足 5 秒：只等 2 秒时实测会误判「已清理」，随后留下孤儿屏。
     var waited = 0.0
-    while vdStillOnline() && waited < 2.0 {
+    while vdStillOnline() && waited < 5.0 {
         RunLoop.current.run(mode: .default, before: Date().addingTimeInterval(0.1))
         usleep(100_000); waited += 0.1
     }
