@@ -83,3 +83,15 @@ telemetry-consistency  success
 - 0x07 与 0x04 的字节边界必须严格，`removeFirst(13)` 不能少。
 - `DataRateLimits` 在方案 B 下可能不生效，日志会打印设置失败。
 - 本轮没有改协议视频包，也没有改 Windows 侧代码。
+
+## 六、控制律模拟（2026-11-12）
+
+用 	ools/sim_rate_controller.py 复刻控制律验证：
+
+- 45fps 编码重载只降一次就回退，不会滑到 15Mbps。
+- 真实队列拥塞保留降档，队列排空后回升。
+- 单帧丢帧不触发降档。
+- 静止每 6 秒回升约 10%。
+
+模拟发现 4 秒观察窗口会把真实拥塞误判为无效并回退，已改为 8 秒窗口 +
+窗口内最低健康度。详见 esearch/RESULT-rate-controller-sim-2026-11-12.md。
