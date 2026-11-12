@@ -935,6 +935,9 @@ final class Sender {
                 feedbackLock.lock()
                 feedback = fb
                 feedbackLock.unlock()
+                // 每 2 秒至多一条（Windows 发送节奏），用于确认反馈链路活着与字段值
+                Log.info(String(format: "0x07 反馈: presentP95 %.0fms  sourceP95 %.0fms  decodeFps %.1f  presentDrop %d  pacedDrop %d",
+                                fb.presentP95, fb.sourceP95, fb.decodeFps, fb.presentDrop, fb.pacedDrop))
                 ctrlBuf.removeFirst(13)
             } else {
                 // 未知字节，丢掉，避免卡死
@@ -1493,6 +1496,7 @@ struct RateSignals {
     var winQueueMs: Double = 0  // Windows 侧额外排队：presentP95 - sourceP95
     var presentDrop: Int = 0    // 非节拍丢帧
     var pacedDrop: Int = 0      // 节拍主动丢帧，不参与判断
+    var clientFps: Double = 0   // Windows 解码呈现 fps（0x07 decodeFps/10），仅观测
 }
 
 /// 健康度驱动的码率控制。健康度取「编码负载 / 在途负载 / 丢帧」三者最大值：
@@ -1669,7 +1673,8 @@ Timer.scheduledTimer(withTimeInterval: 2.0, repeats: true) { _ in
                              captureFps: Double(capturedDelta) / 2.0,
                              winQueueMs: winQueueMs,
                              presentDrop: fb.presentDrop,
-                             pacedDrop: fb.pacedDrop))
+                             pacedDrop: fb.pacedDrop,
+                             clientFps: fb.decodeFps))
     let cursorDelta = cursor.sentCount - lastCursorCount
     lastCursorCount = cursor.sentCount
     let imgDelta = cursorImage.sentCount - lastCursorImageCount
