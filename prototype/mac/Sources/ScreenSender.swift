@@ -403,6 +403,14 @@ final class Encoder {
         let clamped = max(8, min(mbps, 300))
         VTSessionSetProperty(s, key: kVTCompressionPropertyKey_AverageBitRate,
                              value: (clamped * 1_000_000) as CFNumber)
+        // 同步硬上限：只改 AverageBitRate 时，DataRateLimits 可能仍停在初始化值，
+        // 导致「码率降了但编码延迟没降」。方案 B 若不接受这两个属性，失败只记日志。
+        let limits: [NSNumber] = [NSNumber(value: clamped * 1_000_000 / 8), NSNumber(value: 1.0)]
+        let st = VTSessionSetProperty(s, key: kVTCompressionPropertyKey_DataRateLimits,
+                                      value: limits as CFArray)
+        if st != noErr {
+            Log.info("DataRateLimits 设置失败: \(st)")
+        }
         currentMbps = clamped
     }
 
@@ -723,6 +731,16 @@ final class Sender {
     var sentBytes = 0
     var connected = false
 
+    // 0x07 反馈快照。drainControl 在 net queue 写，Timer 在 main queue 读。
+    private let feedbackLock = NSLock()
+    private var feedback = FeedbackSignals()
+
+    func latestFeedback() -> FeedbackSignals {
+        feedbackLock.lock()
+        defer { feedbackLock.unlock() }
+        return feedback
+    }
+
     func listen(port: UInt16) {
         listenPort = port
         let params = NWParameters.tcp
@@ -891,6 +909,26 @@ final class Sender {
                 let wheel = Int16(bitPattern: (UInt16(b[o + 10]) << 8) | UInt16(b[o + 11]))
                 onInput?(x, y, buttons, wheel)
                 ctrlBuf.removeFirst(12)
+            } else if t == 0x07 {
+                // [0x07][presentP95 u16][sourceP95 u16][decodeFps*10 u16]
+                // [presentDrop u16][pacedDrop u16][reserved u16] = 13 字节，全大端
+                guard ctrlBuf.count >= 13 else { return }
+                let b = ctrlBuf
+                let o = b.startIndex
+                func rd16(_ off: Int) -> UInt16 {
+                    (UInt16(b[o + off]) << 8) | UInt16(b[o + off + 1])
+                }
+                let fb = FeedbackSignals(
+                    presentP95: Double(rd16(1)),
+                    sourceP95: Double(rd16(3)),
+                    decodeFps: Double(rd16(5)) / 10.0,
+                    presentDrop: Int(rd16(7)),
+                    pacedDrop: Int(rd16(9))
+                )
+                feedbackLock.lock()
+                feedback = fb
+                feedbackLock.unlock()
+                ctrlBuf.removeFirst(13)
             } else {
                 // 未知字节，丢掉，避免卡死
                 ctrlBuf.removeFirst(1)
@@ -1428,14 +1466,26 @@ Task {
 // 原则：宁可降码率保流畅。画面糊一点还能办公，卡住没法用。
 //   - 连续丢帧 → 码率下调（检测到拥塞）
 //   - 长时间无丢帧 → 缓慢上调（回到目标值，但不超上限）
-/// 码率控制信号。Phase 1 只用 Mac 本地可见的量，不依赖 Windows 反馈。
-/// `encodeMs` 目前用均值代替设计稿里的 p95，先跑通控制律，p95 留到 Phase 2。
+/// 接收端 0x07 反馈快照。没有收到反馈时各字段为 0，控制律退回本地判断。
+struct FeedbackSignals {
+    var presentP95: Double = 0
+    var sourceP95: Double = 0
+    var decodeFps: Double = 0
+    var presentDrop: Int = 0
+    var pacedDrop: Int = 0
+}
+
+/// 码率控制信号。Phase 1 用 Mac 本地可见的量，Phase 2 加入 Windows 0x07 反馈。
+/// `encodeMs` 仍用均值，p95 留到后续。
 struct RateSignals {
     var droppedDelta: Int     // 本轮在途丢帧增量
     var inFlight: Int         // 本轮观察到的在途帧数
     var encodeMs: Double      // 本轮平均编码耗时
     var sentMbps: Double      // 本轮实际发送码率
     var captureFps: Double    // 本轮采集帧率
+    var winQueueMs: Double = 0  // Windows 侧额外排队：presentP95 - sourceP95
+    var presentDrop: Int = 0    // 非节拍丢帧
+    var pacedDrop: Int = 0      // 节拍主动丢帧，不参与判断
 }
 
 /// 健康度驱动的码率控制。健康度取「编码负载 / 在途负载 / 丢帧」三者最大值：
@@ -1452,6 +1502,12 @@ final class RateController {
     private var lastDownAt: CFAbsoluteTime = 0
     /// 降档冷却：Duet 的做法是 10 秒防抖，避免一次负载抖动就连环下调
     private let downCooldown: CFAbsoluteTime = 10
+    /// 试探回退：降档后观察两轮，健康度没有改善 10% 就回退并冷却 60 秒，
+    /// 避免 Phase 1 实测里 180Mbps 一路滑到 17Mbps 的情况。
+    private var probeMbps: Int? = nil
+    private var probeHealth: Double = 0
+    private var probeAt: CFAbsoluteTime = 0
+    private var revertCooldownUntil: CFAbsoluteTime = 0
 
     init(encoder: Encoder, targetMbps: Int, captureHz: Double) {
         self.encoder = encoder
@@ -1484,22 +1540,49 @@ final class RateController {
         let budgetMs = 1000.0 / captureHz
         let encodeLoad = s.encodeMs / budgetMs
         let inflightLoad = Double(s.inFlight) / 2.0      // maxInFlight = 2
-        let dropLoad = s.droppedDelta > 0 ? 1.5 : 0.0
-        let health = max(encodeLoad, max(inflightLoad, dropLoad))
+        let winQueueLoad = s.winQueueMs / 15.0           // Windows 侧额外排队，15ms 警戒
+        let dropLoad = (s.presentDrop > 0 || s.droppedDelta > 0) ? 1.5 : 0.0
+        // 编码延迟只在明显超标时参与，避免 1.1 这种噪声反复触发
+        let encodeGuard = encodeLoad > 1.5 ? encodeLoad : 0.0
+        let health = max(max(winQueueLoad, dropLoad), max(inflightLoad, encodeGuard))
 
-        if health > 1.15 {
+        // 降档观察期：降档后约 4 秒内看健康度是否真的改善
+        if let pm = probeMbps {
+            if now - probeAt < 4.0 {
+                if health < probeHealth * 0.90 {
+                    probeMbps = nil          // 降档有效
+                } else {
+                    current = pm
+                    encoder.setBitrate(current)
+                    probeMbps = nil
+                    revertCooldownUntil = now + 60
+                    Log.info(String(format: "降档无效，回退至 %d Mbps（health %.2f -> %.2f）",
+                                    current, probeHealth, health))
+                }
+                return
+            }
+            probeMbps = nil
+        }
+
+        if health > 1.15, now >= revertCooldownUntil {
             highRounds += 1
             lowRounds = 0
             // 连续两轮确认，且距上次下调超过冷却时间才动手
             guard highRounds >= 2, now - lastDownAt >= downCooldown else { return }
             highRounds = 0
             lastDownAt = now
-            let next = max(15, Int(Double(current) * 0.90))
+            let floor = max(15, targetMbps / 3)
+            let next = max(floor, Int(Double(current) * 0.90))
             guard abs(next - current) >= max(2, Int(Double(current) * 0.05)) else { return }
+            let prev = current
+            probeMbps = prev
+            probeHealth = health
+            probeAt = now
             current = next
             encoder.setBitrate(current)
-            Log.info(String(format: "健康度 %.2f（编码 %.0f%% 在途 %.0f%%），码率下调至 %d Mbps",
-                            health, encodeLoad * 100, inflightLoad * 100, current))
+            Log.info(String(format: "码率 %d -> %d Mbps  health %.2f（winQ %.0fms presentDrop %d 编码 %.0f%% 在途 %.0f%%）",
+                            prev, current, health, s.winQueueMs, s.presentDrop,
+                            encodeLoad * 100, inflightLoad * 100))
         } else if health < 0.70 {
             lowRounds += 1
             highRounds = 0
@@ -1552,11 +1635,16 @@ Timer.scheduledTimer(withTimeInterval: 2.0, repeats: true) { _ in
     lastDroppedCount = sender.dropped
     let capturedDelta = cap.captured - lastCapturedCount
     lastCapturedCount = cap.captured
+    let fb = sender.latestFeedback()
+    let winQueueMs = max(0, fb.presentP95 - fb.sourceP95)
     rateCtl.tick(RateSignals(droppedDelta: droppedDelta,
                              inFlight: sender.inFlight,
                              encodeMs: encAvg,
                              sentMbps: mbps,
-                             captureFps: Double(capturedDelta) / 2.0))
+                             captureFps: Double(capturedDelta) / 2.0,
+                             winQueueMs: winQueueMs,
+                             presentDrop: fb.presentDrop,
+                             pacedDrop: fb.pacedDrop))
     let cursorDelta = cursor.sentCount - lastCursorCount
     lastCursorCount = cursor.sentCount
     let imgDelta = cursorImage.sentCount - lastCursorImageCount
