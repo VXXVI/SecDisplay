@@ -45,6 +45,8 @@
 #include <cstdint>
 #include <cstring>
 #include <cmath>
+#include <cstdlib>
+#include <exception>
 #include <clocale>
 #include <string>
 #include <vector>
@@ -1582,6 +1584,12 @@ static void UpdateRefreshHz() {
 
 static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
     switch (m) {
+    case WM_QUERYENDSESSION:
+        Log("收到 WM_QUERYENDSESSION（系统注销/关机）");
+        return TRUE;
+    case WM_ENDSESSION:
+        Log("收到 WM_ENDSESSION（会话结束）");
+        return 0;
     case WM_CLOSE:
         // Esc / 托盘「退出」/ 全局热键都汇到这里
         Log("收到 WM_CLOSE，准备退出");
@@ -2216,6 +2224,17 @@ static void NetworkLoop(const RunConfig& cfg, Graphics* gfx, Presenter* presente
 // 主流程
 // ---------------------------------------------------------------------------
 
+// 未处理异常/terminate 时尽量留一行日志，便于区分崩溃与外部终止。
+static LONG WINAPI CrashFilter(EXCEPTION_POINTERS* ep) {
+    if (ep && ep->ExceptionRecord) {
+        Log("未处理异常: code=%08X addr=%p",
+            ep->ExceptionRecord->ExceptionCode, ep->ExceptionRecord->ExceptionAddress);
+    } else {
+        Log("未处理异常: 无异常记录");
+    }
+    return EXCEPTION_EXECUTE_HANDLER;
+}
+
 int main(int argc, char** argv) {
     setvbuf(stderr, nullptr, _IONBF, 0);
 
@@ -2254,6 +2273,12 @@ int main(int argc, char** argv) {
         cfg.fullscreen ? "全屏" : "窗口",
         cfg.reconnect ? "开" : "关");
     if (!cfg.logFile.empty()) Log("日志文件: %s", cfg.logFile.c_str());
+
+    SetUnhandledExceptionFilter(CrashFilter);
+    std::set_terminate([] {
+        Log("std::terminate 被调用");
+        std::abort();
+    });
 
     HRESULT coInit = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
     if (FAILED(coInit) && coInit != RPC_E_CHANGED_MODE) {
@@ -2475,6 +2500,7 @@ int main(int argc, char** argv) {
     MFShutdown();
     CoUninitialize();
 
+    Log("主循环退出，进程结束");
     if (g_logFile) { fclose(g_logFile); g_logFile = nullptr; }
     return 0;
 }
