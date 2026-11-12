@@ -47,3 +47,7 @@ tools/enclatency
 
 # 本地运行状态（当前档位），不进仓库
 prototype/mac/.preset
+
+# 运行日志与本地编译产物
+logs/
+prototype/mac/cleanup_orphan_vdisplay
