@@ -1174,7 +1174,10 @@ final class InputInjector {
 final class CursorTracker {
     private let sender: Sender
     private let bounds: () -> CGRect
-    private let queue = DispatchQueue(label: "SecDisplay.cursor")
+    // userInteractive：光标轮询是延迟敏感路径，默认 QoS 在系统负载高时
+    // 会被调度器推迟，实测 8ms 定时器在 CPU 争用下会掉到 20ms 以上，
+    // 光标包速率从 120/s 跌到 40/s，鼠标看起来就是一跳一跳的。
+    private let queue = DispatchQueue(label: "SecDisplay.cursor", qos: .userInteractive)
     private var timer: DispatchSourceTimer?
     private var lastX: Float = .nan
     private var lastY: Float = .nan
@@ -1191,7 +1194,7 @@ final class CursorTracker {
         let t = DispatchSource.makeTimerSource(queue: queue)
         // 120Hz 轮询。只在位置变化超过 0.5px 时才发包，
         // 静止时几乎不产生流量。
-        t.schedule(deadline: .now(), repeating: .milliseconds(8), leeway: .milliseconds(1))
+        t.schedule(deadline: .now(), repeating: .milliseconds(8), leeway: .microseconds(500))
         t.setEventHandler { [weak self] in self?.tick() }
         t.resume()
         timer = t
