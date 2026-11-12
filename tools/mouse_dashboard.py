@@ -100,11 +100,13 @@ class LogTail:
 
 
 class Probe:
-    def __init__(self, binary, simulate, seconds, speed):
+    def __init__(self, binary, simulate, seconds, speed, post=False):
         self.lines = deque(maxlen=2000)
         cmd = [binary]
         if simulate != "none":
             cmd += ["--simulate", simulate, "--seconds", str(seconds), "--speed", str(speed)]
+        if post:
+            cmd += ["--post"]
         self.proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
                                      text=True, bufsize=1)
         self.thread = threading.Thread(target=self._read, daemon=True)
@@ -161,6 +163,8 @@ def main():
     ap.add_argument("--simulate", default="none")
     ap.add_argument("--seconds", type=float, default=0)
     ap.add_argument("--speed", type=float, default=600)
+    ap.add_argument("--post", action="store_true",
+                    help="用真实 mouseMoved 事件模拟，能触发发送端事件驱动路径")
     ap.add_argument("--csv", default=None)
     ap.add_argument("--no-clear", action="store_true")
     args = ap.parse_args()
@@ -175,7 +179,7 @@ def main():
 
     log_path = args.log or latest_sender_log()
     log = LogTail(log_path)
-    probe = Probe(probe_bin, args.simulate, args.seconds, args.speed)
+    probe = Probe(probe_bin, args.simulate, args.seconds, args.speed, args.post)
 
     csv_f = None
     csv_w = None
