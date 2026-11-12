@@ -1,6 +1,6 @@
 # 任务单：Mac 侧自适应码率 Phase 1（扩展 RateController）
 
-> 状态：待执行（P1）
+> 状态：代码已完成（v2，提交 `6bed9a1`，CI `build-mac` 通过），待 Mac 重建/重启后真机验证
 > 派发方：Windows 侧
 > 目标端：Mac 侧
 > 日期：2026-11-11
