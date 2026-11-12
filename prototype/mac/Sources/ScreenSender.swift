@@ -1743,5 +1743,65 @@ Timer.scheduledTimer(withTimeInterval: 0.1, repeats: true) { _ in
     shutdown(signal: sig)
 }
 
-Log.info("SecDisplay 服务已启动，Ctrl-C 退出")
-RunLoop.main.run()
+// MARK: - 菜单栏图标
+//
+// 命令行程序没有 bundle，也没有窗口，退出只能靠 Ctrl-C 或 kill。
+// 这里挂一个 NSStatusItem，给出可视入口：实时状态 + 一键退出。
+// 退出仍走 shutdown(signal:)，保证虚拟屏按正常时序销毁。
+
+final class StatusMenuTarget: NSObject {
+    @objc func quit() {
+        Log.info("菜单栏请求退出")
+        shutdown(signal: SIGTERM)
+    }
+}
+
+let statusMenuTarget = StatusMenuTarget()
+var statusItem: NSStatusItem?
+var statusInfoItem: NSMenuItem?
+
+func setupStatusBar() -> NSApplication {
+    let app = NSApplication.shared
+    app.setActivationPolicy(.accessory)
+
+    let item = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
+    if let button = item.button {
+        button.image = NSImage(systemSymbolName: "display", accessibilityDescription: "SecDisplay")
+        button.image?.isTemplate = true
+        button.toolTip = "SecDisplay 发送端"
+    }
+
+    let menu = NSMenu()
+    let info = NSMenuItem(title: "正在启动…", action: nil, keyEquivalent: "")
+    info.isEnabled = false
+    menu.addItem(info)
+    menu.addItem(.separator())
+
+    let quit = NSMenuItem(title: "退出 SecDisplay", action: #selector(StatusMenuTarget.quit), keyEquivalent: "q")
+    quit.target = statusMenuTarget
+    menu.addItem(quit)
+
+    item.menu = menu
+    statusItem = item
+    statusInfoItem = info
+    if item.button != nil {
+        Log.info("菜单栏图标已创建（右侧菜单栏，可点开退出）")
+    } else {
+        Log.info("警告: 菜单栏按钮创建失败，退出仍需 Ctrl-C")
+    }
+    return app
+}
+
+let statusApp = setupStatusBar()
+
+// 每秒刷新菜单栏文字：连接状态、帧率、编码延迟、在途
+Timer.scheduledTimer(withTimeInterval: 1.0, repeats: true) { _ in
+    guard let info = statusInfoItem else { return }
+    let enc = encoder.encLatCount > 0 ? encoder.encLatSum / Double(encoder.encLatCount) : 0
+    let conn = sender.connected ? "已连接" : "等待连接"
+    info.title = String(format: "%@ · %.0f fps · 编码 %.0f ms · %d 在途",
+                        conn, peakFps, enc, sender.inFlight)
+}
+
+Log.info("SecDisplay 服务已启动，菜单栏可退出")
+statusApp.run()
