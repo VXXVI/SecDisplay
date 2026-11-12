@@ -90,7 +90,7 @@ struct Stats {
 static Stats g_stats;
 
 // 可选抖动缓冲：默认关闭。--pace 打开后，呈现线程用一个小队列按自适应节拍上屏，
-// 吸收源端偶发的双倍帧间隔；代价是增加约一帧延迟。
+// 吸收源端偶发的双倍帧间隔；代价是增加约 1~3 帧延迟（队列上限 3）。
 static std::atomic<bool>   g_paceEnabled{false};
 static std::atomic<double> g_paceTargetMs{0.0};
 static int g_refreshHz = 0;   // 当前显示器刷新率，用于把节拍吸附到刷新周期整数倍
@@ -111,9 +111,12 @@ static double QpcNowMs() {
     return (double)c.QuadPart * 1000.0 / (double)freq.QuadPart;
 }
 
+static double g_lastPresentMs = 0.0;   // 仅呈现线程写；重连时复位，避免断线时长污染 p95
+
 static void ResetPresentRing() {
     std::lock_guard<std::mutex> lk(g_presentMtx);
     g_presentRingCount = 0;
+    g_lastPresentMs = 0.0;
 }
 
 // 解码到达间隔：与上屏间隔并排，用来判断抖动是源端带来的还是呈现侧引入的。
@@ -257,6 +260,10 @@ static std::atomic<double> g_cursorY{-1};
 // 程序自己调用 SetCursorPos 会引起 WM_MOUSEMOVE；用时间戳把它和用户真实
 // 输入区分开，否则每次跟随都会被当成「用户动了」，导致门控反复自锁。
 static std::atomic<int64_t> g_lastRemoteCursorMoveMs{ 0 };
+// 程序 SetCursorPos 的目标点。只过滤「时间接近且落点等于目标点」的那一次 WM_MOUSEMOVE，
+// 不能只看时间窗：Mac 光标高频移动时，真实本地移动会被一直吞掉。
+static std::atomic<LONG> g_lastRemoteCursorX{ INT_MIN };
+static std::atomic<LONG> g_lastRemoteCursorY{ INT_MIN };
 
 // 真实 Mac 光标图像（0x05）。网络线程只把收到的 BGRA 存进缓冲并 post 消息，
 // HCURSOR 的创建/替换/销毁统一在 UI 线程做，避免跨线程句柄竞态。
@@ -978,6 +985,9 @@ bool Decoder::DrainOutput(IMFSample** outSample) {
 
     MFT_OUTPUT_DATA_BUFFER buffer{};
     buffer.dwStreamID = outId_;
+    auto releaseEvents = [&] {
+        if (buffer.pEvents) { buffer.pEvents->Release(); buffer.pEvents = nullptr; }
+    };
 
     ComPtr<IMFSample> ourSample;
     if (provideSample) {
@@ -1013,17 +1023,20 @@ bool Decoder::DrainOutput(IMFSample** outSample) {
         // 解码器要求重设输出类型。常见于收到首个 SPS 之后。
         if (buffer.pSample && provideSample == false) buffer.pSample->Release();
         if (status & MFT_OUTPUT_DATA_BUFFER_FORMAT_CHANGE) {
-            if (!SetOutputTypeD3D()) return false;
+            if (!SetOutputTypeD3D()) { releaseEvents(); return false; }
             Log("输出类型已重建，继续解码");
         }
+        releaseEvents();
         return false;
     }
     if (hr == MF_E_TRANSFORM_NEED_MORE_INPUT) {
         if (buffer.pSample && buffer.pSample != ourSample.Get()) buffer.pSample->Release();
+        releaseEvents();
         return false;
     }
     if (FAILED(hr)) {
         if (buffer.pSample && buffer.pSample != ourSample.Get()) buffer.pSample->Release();
+        releaseEvents();
         return false;
     }
 
@@ -1035,7 +1048,7 @@ bool Decoder::DrainOutput(IMFSample** outSample) {
             *outSample = buffer.pSample;
         }
     }
-    if (buffer.pEvents) buffer.pEvents->Release();
+    releaseEvents();
     return *outSample != nullptr;
 }
 
@@ -1209,6 +1222,9 @@ bool Presenter::Init(Graphics* gfx, HWND hwnd, int width, int height) {
 bool Presenter::CreateProcessor() {
     processor_.Reset();
     enum_.Reset();
+    // 输入视图缓存依赖旧的 enum_/processor_，重建时必须一起失效，
+    // 否则分辨率切换后可能复用按旧枚举器创建的 input view，导致 Blt 失败或花屏。
+    inViewCache_.clear();
 
     D3D11_VIDEO_PROCESSOR_CONTENT_DESC cd{};
     cd.InputFrameFormat = D3D11_VIDEO_FRAME_FORMAT_PROGRESSIVE;
@@ -1351,10 +1367,9 @@ void Presenter::PresentSample(IMFSample* sample) {
     }
     // 记录两次上屏的间隔：vsync 会把节奏拉成刷新周期的整数倍，
     // 免同步则贴近源帧间隔。统计行打印 p50/p95 便于客观判断。
-    static double s_lastPresentMs = 0.0;   // 仅呈现线程调用
     double nowMs = QpcNowMs();
-    if (s_lastPresentMs > 0.0) PushPresentInterval(nowMs - s_lastPresentMs);
-    s_lastPresentMs = nowMs;
+    if (g_lastPresentMs > 0.0) PushPresentInterval(nowMs - g_lastPresentMs);
+    g_lastPresentMs = nowMs;
     g_stats.presented++;
 }
 
@@ -1585,9 +1600,13 @@ static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
         if (cw <= 0 || ch <= 0) return 0;
         POINT tl{ rc.left, rc.top };
         ClientToScreen(g_hwnd, &tl);
-        // 标记这次移动是程序发起的，随后的 WM_MOUSEMOVE 不要污染本地输入时间戳
+        // 标记这次移动是程序发起的，随后的 WM_MOUSEMOVE 只在落点等于目标点时才忽略
+        int sx = tl.x + (int)(cx / vw * cw);
+        int sy = tl.y + (int)(cy / vh * ch);
+        g_lastRemoteCursorX = sx;
+        g_lastRemoteCursorY = sy;
         g_lastRemoteCursorMoveMs = GetTickCount64();
-        SetCursorPos(tl.x + (int)(cx / vw * cw), tl.y + (int)(cy / vh * ch));
+        SetCursorPos(sx, sy);
         return 0;
     }
     case WM_TRAY:
@@ -1634,9 +1653,15 @@ static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
         }
         return 0;
     case WM_MOUSEMOVE: {
-        // 程序自己 SetCursorPos 引起的移动不算用户输入，否则远程跟随
-        // 每动一次就把本地时间戳刷新，门控随即自锁，光标一顿一顿。
-        if (GetTickCount64() - (uint64_t)g_lastRemoteCursorMoveMs.load() < 50) return 0;
+        // 只过滤程序自己 SetCursorPos 产生的那一次移动：时间接近且落点等于目标点。
+        // 不能只看时间窗，否则 Mac 光标高频移动时，真实本地移动会被一直吞掉，
+        // g_lastLocalInputMs 永不刷新，本地鼠标无法在 250ms 后抢回控制权。
+        POINT pt{ GET_X_LPARAM(l), GET_Y_LPARAM(l) };
+        ClientToScreen(h, &pt);
+        if (GetTickCount64() - (uint64_t)g_lastRemoteCursorMoveMs.load() < 50 &&
+            pt.x == g_lastRemoteCursorX.load() && pt.y == g_lastRemoteCursorY.load()) {
+            return 0;
+        }
         float vx, vy;
         if (ClientToVideo(GET_X_LPARAM(l), GET_Y_LPARAM(l), &vx, &vy)) {
             g_lastLocalInputMs = GetTickCount64();
@@ -1675,7 +1700,11 @@ static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
             g_lastLocalInputMs = GetTickCount64();
             g_moveX = vx;
             g_moveY = vy;
-            g_pendingWheel = (int16_t)(-delta);
+            // 两次滚轮落在同一个 4ms 窗口时累加，避免高精度滚轮丢格
+            int acc = (int)g_pendingWheel.load() - delta;
+            if (acc > 32767) acc = 32767;
+            if (acc < -32768) acc = -32768;
+            g_pendingWheel = (int16_t)acc;
             g_eventPending = true;   // 滚轮事件由 inputThread 立即发
         }
         return 0;
@@ -1718,7 +1747,7 @@ struct RunConfig {
                               // 需要铺满时用 --fullscreen 或 F11，且全屏也不置顶、不进不了任务栏。
     bool reconnect = true;    // 断线自动重连
     bool vsync = true;        // true=垂直同步（画面均匀），false=免同步（延迟最低但可能抖）
-    bool pace = false;        // --pace：一帧抖动缓冲，按自适应节拍上屏，抹平源端小抖动
+    bool pace = false;        // --pace：1~3 帧抖动缓冲，按自适应节拍上屏，抹平源端小抖动
     bool feedback = false;    // --feedback：每 2 秒向 Mac 回传 0x07 健康度，供自适应码率环使用
     std::string logFile;      // 非空则同时写日志文件
 };
@@ -1807,6 +1836,11 @@ static void NetworkLoop(const RunConfig& cfg, Graphics* gfx, Presenter* presente
         DWORD recvTimeoutMs = 500;
         setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO,
                    (const char*)&recvTimeoutMs, sizeof(recvTimeoutMs));
+        // 发送也要有超时。半开连接或对端不读时，阻塞 send 会卡住 inputThread，
+        // 退出时 join 永久等待，表现成「点退出没反应」。
+        DWORD sendTimeoutMs = 500;
+        setsockopt(sock, SOL_SOCKET, SO_SNDTIMEO,
+                   (const char*)&sendTimeoutMs, sizeof(sendTimeoutMs));
 
         // 复位统计，重连后从头计数
         g_stats.packets = 0; g_stats.bytes = 0; g_stats.decoded = 0;
@@ -1831,6 +1865,7 @@ static void NetworkLoop(const RunConfig& cfg, Graphics* gfx, Presenter* presente
         Decoder decoder;
         if (!decoder.Init(gfx, cfg.width, cfg.height)) {
             Log("解码器初始化失败，断开重试");
+            if (g_sock.load() == sock) g_sock = INVALID_SOCKET;
             closesocket(sock);
             if (!cfg.reconnect) break;
             Sleep(2000);
@@ -1897,7 +1932,13 @@ static void NetworkLoop(const RunConfig& cfg, Graphics* gfx, Presenter* presente
                         latest.smp = smp; latest.srcW = ow; latest.srcH = oh;
                         hasLatest = true;
                     }
-                    if (old) { g_stats.dropped++; old->Release(); }   // 旧帧还没上屏就被新帧取代，记一次呈现丢帧
+                    if (old) {
+                        // pace 模式下 latest 被新帧取代属于节拍主动丢帧，不计入拥塞丢帧，
+                        // 否则 Mac 的 dropLoad 会把节拍代价误判成网络拥塞。
+                        if (g_paceEnabled.load()) g_stats.paced++;
+                        else g_stats.dropped++;
+                        old->Release();
+                    }
                     latestCv.notify_one();
                 }
             }
@@ -1906,8 +1947,8 @@ static void NetworkLoop(const RunConfig& cfg, Graphics* gfx, Presenter* presente
         });
 
         // 呈现线程：默认只上屏最新帧。慢于解码时中间帧被丢，不影响解码参考链。
-        // --pace 时改为「一帧缓冲 + 自适应节拍」：先预填一帧，再按源端平均帧间隔
-        // 定期上屏，把偶发的双倍间隔吸收掉。代价是增加约一帧延迟。
+        // --pace 时改为「1~3 帧缓冲 + 自适应节拍」：先预填一帧，再按源端平均帧间隔
+        // 定期上屏，把偶发的双倍间隔吸收掉。代价是增加约 1~3 帧延迟。
         std::thread present([&] {
             struct PendingFrame { IMFSample* smp; int w; int h; };
             std::deque<PendingFrame> pending;
@@ -2094,14 +2135,18 @@ static void NetworkLoop(const RunConfig& cfg, Graphics* gfx, Presenter* presente
 
                 if (d == lastDecoded) {
                     ++stallRounds;
-                    uint8_t req = TYPE_KEYFRAME_REQUEST;
-                    int sent = 0;
-                    {
-                        std::lock_guard<std::mutex> lk(g_sendMtx);
-                        sent = send(sock, (const char*)&req, 1, 0);
-                    }
-                    if (sent == 1) {
-                        Log("无新帧 %d 轮，重新请求关键帧（0x02）", stallRounds);
+                    // 静止桌面不要每 2 秒都请求 IDR：Mac 的补帧逻辑会真的编一帧，
+                    // 造成周期性码率尖峰。第一次立即请求，之后每 5 轮（约 10 秒）一次。
+                    if (stallRounds == 1 || stallRounds % 5 == 0) {
+                        uint8_t req = TYPE_KEYFRAME_REQUEST;
+                        int sent = 0;
+                        {
+                            std::lock_guard<std::mutex> lk(g_sendMtx);
+                            sent = send(sock, (const char*)&req, 1, 0);
+                        }
+                        if (sent == 1) {
+                            Log("无新帧 %d 轮，重新请求关键帧（0x02）", stallRounds);
+                        }
                     }
                     // 连续 5 轮（约 10 秒）没新帧：多半是 Mac 那边画面完全静止。
                     // ScreenCaptureKit 是变化驱动的，静止就不出帧，请求关键帧也没用。
@@ -2314,7 +2359,7 @@ int main(int argc, char** argv) {
     presenter.setUseVsync(cfg.vsync);
     Log("呈现方式: %s", cfg.vsync ? "垂直同步（均匀）" : "免同步（低延迟）");
     g_paceEnabled = cfg.pace;
-    Log("抖动缓冲: %s", cfg.pace ? "开（一帧缓冲，自适应节拍，增加约一帧延迟）" : "关（即时上屏，延迟最低）");
+    Log("抖动缓冲: %s", cfg.pace ? "开（1~3 帧缓冲，自适应节拍，增加约 1~3 帧延迟）" : "关（即时上屏，延迟最低）");
     g_feedbackEnabled = cfg.feedback;
     Log("反馈包: %s", cfg.feedback ? "开（0x07 健康度，每 2 秒，供 Mac 自适应码率）" : "关");
 
@@ -2335,18 +2380,16 @@ int main(int argc, char** argv) {
         g_coordW.load(), g_coordH.load(), cfg.width, cfg.height,
         cfg.coordW > 0 ? "，命令行指定" : "，默认对齐物理");
 
-    // 光标跟随已停用（止血）。
+    // 光标跟随已改为事件驱动（见 WM_APP_REMOTE_CURSOR）。
     //
-    // 旧实现在这里起了一个 4ms 轮询的线程，把 0x03 收到的远程坐标换算到
-    // 窗口客户区后 SetCursorPos，直接搬系统光标。问题是 g_lastLocalInputMs
-    // 只在鼠标位于副屏客户区内时才刷新（WM_MOUSEMOVE + ClientToVideo 成功），
-    // 用户把鼠标移回主屏后时间戳不再更新，满 1 秒就被判定「本机没动」，
-    // 光标被拽回副屏旧坐标；SetCursorPos 又触发一次 WM_MOUSEMOVE 刷新时间戳，
-    // 于是形成每 1 秒一次的周期性抢光标。
+    // 历史：早期这里起过一个 4ms 轮询线程，把 0x03 远程坐标换算到窗口客户区后
+    // SetCursorPos。因为 g_lastLocalInputMs 只在副屏内刷新，鼠标回主屏 1 秒后
+    // 会被拽回。该线程已移除，不要再加回轮询版。
     //
-    // 现在窗口光标由 0x05 图像 + ApplyCursorImage + WM_SETCURSOR 本地绘制，
-    // 位置完全交给系统光标，两边互不抢占。若将来要做「远程驱动副屏光标」，
-    // 应改为在视频画面上绘制，而不是 SetCursorPos 搬系统光标。
+    // 现在的实现：0x03 位置变化时 PostMessage(WM_APP_REMOTE_CURSOR)，UI 线程在
+    // 「窗口在前台 + 本机鼠标 250ms 内没动」两个门控都通过时才 SetCursorPos；
+    // g_lastRemoteCursorMoveMs 用来区分程序移动与用户移动，避免门控自锁。
+    // 0x05 图像仍由 ApplyCursorImage + WM_SETCURSOR 本地绘制。
 
     // 输入回传线程：每 4ms 轮询，鼠标移动按 8ms 合并发（约 120Hz），
     // 按键/滚轮事件在下一轮立即发。单线程发送，避免与 UI 线程并发 send 同一 socket。

@@ -235,6 +235,7 @@ final class Encoder {
     private let width: Int32
     private let height: Int32
     private let bitrate: Int
+    private let captureHz: Double
     var onFrame: ((Data, Bool, UInt64) -> Void)?
 
     private(set) var encoded = 0
@@ -242,10 +243,11 @@ final class Encoder {
     private(set) var bytes = 0
     private(set) var lastKeyframeCheck = 0
 
-    init(width: Int, height: Int, bitrateMbps: Int) {
+    init(width: Int, height: Int, bitrateMbps: Int, captureHz: Double = 60) {
         self.width = Int32(width)
         self.height = Int32(height)
         self.bitrate = bitrateMbps * 1_000_000
+        self.captureHz = max(1, captureHz)
         self.currentMbps = bitrateMbps
     }
 
@@ -300,7 +302,7 @@ final class Encoder {
 
         VTSessionSetProperty(s, key: kVTCompressionPropertyKey_RealTime, value: kCFBooleanTrue)
         VTSessionSetProperty(s, key: kVTCompressionPropertyKey_ProfileLevel, value: kVTProfileLevel_H264_High_AutoLevel)
-        VTSessionSetProperty(s, key: kVTCompressionPropertyKey_ExpectedFrameRate, value: 60 as CFNumber)
+        VTSessionSetProperty(s, key: kVTCompressionPropertyKey_ExpectedFrameRate, value: NSNumber(value: captureHz))
         VTSessionSetProperty(s, key: kVTCompressionPropertyKey_MaxKeyFrameInterval, value: 600 as CFNumber)
 
         switch variant {
@@ -401,8 +403,11 @@ final class Encoder {
     func setBitrate(_ mbps: Int) {
         guard let s = session, mbps > 0 else { return }
         let clamped = max(8, min(mbps, 300))
-        VTSessionSetProperty(s, key: kVTCompressionPropertyKey_AverageBitRate,
-                             value: (clamped * 1_000_000) as CFNumber)
+        let stAvg = VTSessionSetProperty(s, key: kVTCompressionPropertyKey_AverageBitRate,
+                                         value: (clamped * 1_000_000) as CFNumber)
+        if stAvg != noErr {
+            Log.info("AverageBitRate 设置失败: \(stAvg)")
+        }
         // 同步硬上限：只改 AverageBitRate 时，DataRateLimits 可能仍停在初始化值，
         // 导致「码率降了但编码延迟没降」。方案 B 若不接受这两个属性，失败只记日志。
         let limits: [NSNumber] = [NSNumber(value: clamped * 1_000_000 / 8), NSNumber(value: 1.0)]
@@ -780,6 +785,8 @@ final class Sender {
             self.conn = c
             self.connected = true
             self.resetInFlight()          // 上一轮可能残留未完成的发送，必须清零
+            // 旧连接可能留下半个控制包，新连接数据接在残包后会把 0x07 误解析成 0x04。
+            self.ctrlBuf.removeAll()
             // 丢掉上个连接的残留帧：那可能是依赖旧参考帧的 P 帧，
             // 新接收端没有参考帧，解出来是花的。等新的 IDR。
             self.counterLock.lock()
@@ -1364,7 +1371,7 @@ if let mbps = Int(ProcessInfo.processInfo.environment["SECDISPLAY_MBPS"] ?? ""),
     cfg.bitrateMbps = max(20, min(200, Int(pixelsPerSec * 0.35 / 1_000_000)))
 }
 let vd = VirtualDisplayManager()
-let encoder = Encoder(width: cfg.width, height: cfg.height, bitrateMbps: cfg.bitrateMbps)
+let encoder = Encoder(width: cfg.width, height: cfg.height, bitrateMbps: cfg.bitrateMbps, captureHz: cfg.captureHz)
 let sender = Sender()
 sender.keepAliveGap = cfg.keepAliveGap
 
@@ -1525,11 +1532,23 @@ final class RateController {
         if s.captureFps < 10 {
             highRounds = 0
             lowRounds = 0
+            // 静止时链路仍可能拥塞：在途积压或有丢帧就先不回升
+            if s.inFlight >= 2 || s.droppedDelta > 0 {
+                idleRounds = 0
+                return
+            }
+            guard current < targetMbps else {
+                idleRounds = 0
+                return
+            }
             idleRounds += 1
-            guard idleRounds >= 3, current < targetMbps else { return }
+            guard idleRounds >= 3 else { return }
             idleRounds = 0
             let next = min(targetMbps, Int(Double(current) * 1.10) + 1)
-            guard abs(next - current) >= max(2, Int(Double(current) * 0.05)) else { return }
+            guard abs(next - current) >= max(2, Int(Double(current) * 0.05)) else {
+                idleRounds = 0
+                return
+            }
             current = next
             encoder.setBitrate(current)
             Log.info("静止回升，码率上调至 \(current) Mbps")
@@ -1541,7 +1560,7 @@ final class RateController {
         let encodeLoad = s.encodeMs / budgetMs
         let inflightLoad = Double(s.inFlight) / 2.0      // maxInFlight = 2
         let winQueueLoad = s.winQueueMs / 15.0           // Windows 侧额外排队，15ms 警戒
-        let dropLoad = (s.presentDrop > 0 || s.droppedDelta > 0) ? 1.5 : 0.0
+        let dropLoad = (s.presentDrop + s.droppedDelta) >= 2 ? 1.5 : 0.0
         // 编码延迟只在明显超标时参与，避免 1.1 这种噪声反复触发
         let encodeGuard = encodeLoad > 1.5 ? encodeLoad : 0.0
         let health = max(max(winQueueLoad, dropLoad), max(inflightLoad, encodeGuard))
