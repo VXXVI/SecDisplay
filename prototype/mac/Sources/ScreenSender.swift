@@ -537,8 +537,7 @@ final class Capture: NSObject, SCStreamOutput, SCStreamDelegate {
     private var needsRestart = false
     private var restarting = false
     private var restartCount = 0
-    /// 超过这个秒数没有新帧就认为流死了
-    private let stallTimeout: CFAbsoluteTime = 10.0   // 只作兜底，主要靠 didStopWithError
+    // 说明：不再用「无帧超时」判断流故障，理由见 tick()。
 
     init(encoder: Encoder, cfg: Config, displayID: @escaping () -> CGDirectDisplayID) {
         self.encoder = encoder
@@ -628,13 +627,12 @@ final class Capture: NSObject, SCStreamOutput, SCStreamDelegate {
             lastSeenCount = progressCount
             lastProgressAt = now
         }
-        let stalled = now - lastProgressAt > stallTimeout
-        guard needsRestart || stalled else { return }
-        if needsRestart {
-            Log.info("抓屏流已停止，准备重建")
-        } else {
-            Log.info("抓屏 \(Int(stallTimeout)) 秒无新帧，准备重建流")
-        }
+        // 只在 ScreenCaptureKit 明确报告停止时重建。
+        // 虚拟屏空桌面时 SCK 可能完全不发回调（连 idle 帧都没有），
+        // 用「无帧超时」判断会把静止画面误杀；重建过程会让 WindowServer
+        // 重配置显示，反而把虚拟屏踢掉，实测 17 秒内必现。
+        guard needsRestart else { return }
+        Log.info("抓屏流已停止，准备重建")
         needsRestart = false
         restartStream()
     }
