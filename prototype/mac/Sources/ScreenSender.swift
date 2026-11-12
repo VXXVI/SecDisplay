@@ -1174,11 +1174,16 @@ final class InputInjector {
 final class CursorTracker {
     private let sender: Sender
     private let bounds: () -> CGRect
-    // userInteractive：光标轮询是延迟敏感路径，默认 QoS 在系统负载高时
-    // 会被调度器推迟，实测 8ms 定时器在 CPU 争用下会掉到 20ms 以上，
-    // 光标包速率从 120/s 跌到 40/s，鼠标看起来就是一跳一跳的。
+    // userInteractive：光标发送是延迟敏感路径，默认 QoS 在系统负载高时
+    // 会被调度器推迟。
     private let queue = DispatchQueue(label: "SecDisplay.cursor", qos: .userInteractive)
     private var timer: DispatchSourceTimer?
+    private var eventMonitor: Any?
+    private let lock = NSLock()
+    private var pendingPoint: CGPoint?
+    private var lastEmitAt: CFAbsoluteTime = 0
+    private let minInterval: CFAbsoluteTime
+    private let targetHz: Double
     private var lastX: Float = .nan
     private var lastY: Float = .nan
     private var lastVisible = false
@@ -1188,14 +1193,31 @@ final class CursorTracker {
     init(sender: Sender, bounds: @escaping () -> CGRect) {
         self.sender = sender
         self.bounds = bounds
+        // 目标发送频率。60 是稳定档，90 用于高刷屏；用 SECDISPLAY_CURSOR_HZ 覆盖。
+        let hz = Double(ProcessInfo.processInfo.environment["SECDISPLAY_CURSOR_HZ"] ?? "") ?? 60
+        self.targetHz = max(30.0, min(240.0, hz))
+        self.minInterval = 1.0 / self.targetHz
     }
 
     func start() {
+        // 事件驱动：鼠标移动事件到达即记位置，按目标频率限流后立即发。
+        // 8ms 轮询在系统负载下实际只跑到 40Hz 左右，光标看着一跳一跳。
+        // 全局监视器需要辅助功能权限，screensender 已有该授权。
+        eventMonitor = NSEvent.addGlobalMonitorForEvents(
+            matching: [.mouseMoved, .leftMouseDragged, .rightMouseDragged, .otherMouseDragged]
+        ) { [weak self] _ in
+            self?.onMouseEvent()
+        }
+        let eventDriven = eventMonitor != nil
+        Log.info("光标通道: \(eventDriven ? "事件驱动" : "定时轮询")，目标 \(Int(targetHz)) Hz")
+
+        // 事件驱动时定时器只做兜底：鼠标停住前最后一段位移可能被限流丢掉。
+        // 监视器不可用时退回 8ms 轮询，保证至少还能工作。
+        let ms = eventDriven ? 50 : 8
         let t = DispatchSource.makeTimerSource(queue: queue)
-        // 120Hz 轮询。只在位置变化超过 0.5px 时才发包，
-        // 静止时几乎不产生流量。
-        t.schedule(deadline: .now(), repeating: .milliseconds(8), leeway: .microseconds(500))
-        t.setEventHandler { [weak self] in self?.tick() }
+        t.schedule(deadline: .now(), repeating: .milliseconds(ms),
+                   leeway: .microseconds(eventDriven ? 2000 : 500))
+        t.setEventHandler { [weak self] in self?.emitIfDue() }
         t.resume()
         timer = t
     }
@@ -1203,16 +1225,37 @@ final class CursorTracker {
     func stop() {
         timer?.cancel()
         timer = nil
+        if let m = eventMonitor {
+            NSEvent.removeMonitor(m)
+            eventMonitor = nil
+        }
     }
 
-    private func tick() {
+    private func onMouseEvent() {
+        guard sender.connected, let ev = CGEvent(source: nil) else { return }
+        lock.lock()
+        pendingPoint = ev.location
+        lock.unlock()
+        queue.async { [weak self] in self?.emitIfDue() }
+    }
+
+    private func emitIfDue() {
         // 没有连接时不记录位置，否则连上之后要等指针再次移动才会发第一包
         guard sender.connected else {
             lastX = .nan; lastY = .nan; lastVisible = false
             return
         }
-        guard let ev = CGEvent(source: nil) else { return }
-        let p = ev.location                 // 全局坐标，原点在主屏左上，y 向下
+        let now = CFAbsoluteTimeGetCurrent()
+        guard now - lastEmitAt >= minInterval else { return }
+        lock.lock()
+        let p = pendingPoint
+        lock.unlock()
+        guard let p else { return }
+        lastEmitAt = now
+        emit(p)
+    }
+
+    private func emit(_ p: CGPoint) {
         let b = bounds()
         let rx = Float(p.x - b.minX)
         let ry = Float(p.y - b.minY)

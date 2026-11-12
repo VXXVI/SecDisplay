@@ -24,6 +24,7 @@ var simMode = "none"
 var seconds = 0.0
 var speed = 600.0
 var radius = 160.0
+var usePost = false
 
 var args = CommandLine.arguments.dropFirst().makeIterator()
 while let a = args.next() {
@@ -36,6 +37,8 @@ while let a = args.next() {
         speed = Double(args.next() ?? "600") ?? 600
     case "--radius":
         radius = Double(args.next() ?? "160") ?? 160
+    case "--post":
+        usePost = true
     default:
         break
     }
@@ -74,7 +77,7 @@ func startSimulator() {
     guard simMode != "none", let center = vdCenter else { return }
     let q = DispatchQueue(label: "mouseprobe.sim")
     let t0 = DispatchTime.now().uptimeNanoseconds
-    let stepNs: UInt64 = 8_000_000
+    let stepNs: UInt64 = 4_000_000
     var lastWarp = t0
     q.async {
         while true {
@@ -101,7 +104,16 @@ func startSimulator() {
             }
             p.x = min(max(p.x, center.x - radius), center.x + radius)
             p.y = min(max(p.y, center.y - radius), center.y + radius)
-            CGWarpMouseCursorPosition(p)
+            if usePost {
+                // 产生真实 .mouseMoved 事件，能触发发送端的全局监视器。
+                // 需要辅助功能权限，否则系统会静默丢弃。
+                if let e = CGEvent(mouseEventSource: nil, mouseType: .mouseMoved,
+                                   mouseCursorPosition: p, mouseButton: .left) {
+                    e.post(tap: .cghidEventTap)
+                }
+            } else {
+                CGWarpMouseCursorPosition(p)
+            }
         }
     }
 }
