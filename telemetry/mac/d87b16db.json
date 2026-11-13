@@ -1,8 +1,8 @@
 {
   "schema": 1,
   "platform": "mac",
-  "generated_utc": "2026-11-13T08:31:23Z",
-  "commit": "4ee3613",
+  "generated_utc": "2026-11-13T08:36:41Z",
+  "commit": "8c5c12c",
   "coord": {
     "logical_w": 1600,
     "logical_h": 1000
@@ -14,7 +14,7 @@
     "preset": null,
     "encoder_variant": "A"
   },
-  "samples": 2411,
+  "samples": 2569,
   "metrics": {
     "peak_fps": {
       "min": 70.0,
@@ -24,8 +24,8 @@
     },
     "capture_ms": {
       "min": 50.1,
-      "median": 54.5,
-      "p95": 56.4,
+      "median": 54.6,
+      "p95": 56.5,
       "max": 111.7
     },
     "encode_ms": {
@@ -47,7 +47,7 @@
       "max": 153.0
     },
     "cursor_pkts_total": 2,
-    "input_pkts_total": 2411,
+    "input_pkts_total": 2569,
     "dropped_total": 0,
     "inflight_max": 1,
     "idle_last": 0.0
