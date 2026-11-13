@@ -2271,21 +2271,26 @@ final class StatusMenuTarget: NSObject, NSMenuItemValidation {
         showControlPanel()
     }
 
-    /// 状态栏按钮点击：自己 popUp 菜单，不再依赖 AppKit 的 status item 菜单会话。
-    @objc func toggleMenu(_ sender: Any?) {
-        guard let button = statusItem?.button, let menu = statusMenu else {
-            Log.info("菜单栏按钮点击但菜单未就绪")
+    /// 状态栏按钮点击：左键直接打开面板，右键（或 Control+左键）弹菜单。
+    /// 不再依赖菜单项派发：这个裸命令行进程里 status item 的菜单会话点不动。
+    @objc func handleClick(_ sender: Any?) {
+        guard let button = statusItem?.button else { return }
+        let ev = NSApp.currentEvent
+        let rightClick = ev?.type == .rightMouseUp
+            || (ev?.modifierFlags.contains(.control) ?? false)
+        if rightClick, let menu = statusMenu {
+            Log.info("菜单栏右键，弹菜单")
+            NSApp.activate(ignoringOtherApps: true)
+            button.highlight(true)
+            menu.popUp(positioning: nil,
+                       at: NSPoint(x: 0, y: button.bounds.height + 4),
+                       in: button)
+            button.highlight(false)
+            Log.info("菜单已关闭")
             return
         }
-        Log.info("菜单栏按钮被点击，准备弹菜单")
-        // 先激活再弹菜单，菜单窗口才有机会成为 key window。
-        NSApp.activate(ignoringOtherApps: true)
-        button.highlight(true)
-        menu.popUp(positioning: nil,
-                   at: NSPoint(x: 0, y: button.bounds.height + 4),
-                   in: button)
-        button.highlight(false)
-        Log.info("菜单已关闭")
+        Log.info("菜单栏左键，直接打开面板")
+        showControlPanel()
     }
 
     /// autoenablesItems 关掉后 AppKit 仍可能问一次，一律允许，
@@ -2352,8 +2357,8 @@ func setupStatusBar() -> NSApplication {
     item.menu = nil
     if let button = item.button {
         button.target = statusMenuTarget
-        button.action = #selector(StatusMenuTarget.toggleMenu(_:))
-        button.sendAction(on: [.leftMouseUp])
+        button.action = #selector(StatusMenuTarget.handleClick(_:))
+        button.sendAction(on: [.leftMouseUp, .rightMouseUp])
     }
 
     statusItem = item
@@ -2381,4 +2386,11 @@ Timer.scheduledTimer(withTimeInterval: 1.0, repeats: true) { _ in
 }
 
 Log.info("SecDisplay 服务已启动，菜单栏可退出")
+// 调试用：SECDISPLAY_SHOW_PANEL=1 启动后直接打开面板，便于不点菜单也能验证 UI。
+if ProcessInfo.processInfo.environment["SECDISPLAY_SHOW_PANEL"] == "1" {
+    DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) {
+        Log.info("SECDISPLAY_SHOW_PANEL=1，自动打开面板")
+        showControlPanel()
+    }
+}
 statusApp.run()
