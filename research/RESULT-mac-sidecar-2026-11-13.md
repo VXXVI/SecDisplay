@@ -36,6 +36,31 @@
 - 从 SSH 启动的发送端没有屏幕录制权限（TCC 归到 sshd），抓屏报 `-3801 The user declined TCCs`
 - 必须从 Mac 的 Terminal 启动，Terminal 有屏幕录制授权
 
+### 4. 隐藏镜像（2026-11-13 现场追加）
+
+权限都正常：屏幕录制已授权（抓屏 60fps，无 `-3801`），辅助功能无告警。
+
+但采集内容仍然是内建屏/Sidecar：
+
+- 发送端日志 `抓屏已启动 displayID=33`，`在线显示器身份` 里 `id=33 ... [SELF]`，抓的确实是虚拟屏
+- `CGDisplayMirrorsDisplay(33)=0`，`CGDisplayIsInMirrorSet(33)=0`，`system_profiler` 也是 `Mirror: Off`
+- 但窗口列表里虚拟屏只有 Finder 桌面，Sidecar 上有 Chrome/Music，而 Windows 端看到的是 Sidecar 的 Chrome
+- 说明虚拟屏的 framebuffer 在显示 Sidecar 的内容，这个镜像关系 CG 的 mirror API 看不到
+
+尝试过：
+
+- `CGConfigureDisplayMirrorOfDisplay` 对三块屏统一解除：`CGCompleteDisplayConfiguration` 返回 1001（illegal argument）
+- 只对 Sidecar + 虚拟屏解除：同样返回 1001
+- 把虚拟屏原点 1512 → 1513 → 1512 强制重配置：complete 返回 0，但采集内容不变
+
+结论：这个镜像由 macOS/Sidecar 在接入时建立，CG 的 mirror API 既不报告也拒绝修改。应用侧用 `CGConfigureDisplayMirrorOfDisplay` 拆不掉。
+
+可行的修复方向：
+
+1. 显示器变化（Sidecar 接入）后销毁并重建虚拟屏，再重建采集流，让新虚拟屏按扩展方式重新加入排列
+2. 不用 display filter，改成按虚拟屏自己的窗口列表做 window filter，避开镜像源
+3. 现场手动：显示器设置里选中 iPad，使用方式改成「扩展显示器」，排列图里把 iPad 和 SecDisplay 的矩形拖开；如果仍然镜像，先断开 Sidecar，重启发送端，再连 Sidecar 并立刻设成扩展
+
 ## 三、还差一步（需要现场操作）
 
 ### 1. 启动发送端
