@@ -34,6 +34,10 @@ final class AppModel: ObservableObject {
         ("2240 × 1400", 2240, 1400),
         ("2560 × 1600", 2560, 1600),
         ("2880 × 1800", 2880, 1800),
+        // 16:9 档位：Windows 显示器主流比例，选对了接收端全屏才能 1:1 不缩放
+        ("1920 × 1080", 1920, 1080),
+        ("2560 × 1440", 2560, 1440),
+        ("3840 × 2160", 3840, 2160),
     ]
 
     private init() {}
@@ -152,6 +156,10 @@ struct StatusView: View {
                         openLogsFolder()
                     }
                     Spacer()
+                    Button("隐藏") {
+                        hideControlPanel()
+                    }
+                    .keyboardShortcut(.cancelAction)
                     Button("退出") {
                         // 退出清理里有嵌套 RunLoop 等待，放回主队列执行，避免卡在动画/事件循环里
                         DispatchQueue.main.async { shutdown(signal: SIGTERM) }
@@ -212,6 +220,12 @@ func openLogsFolder() {
     } else {
         NSWorkspace.shared.open(URL(fileURLWithPath: (p as NSString).deletingLastPathComponent))
     }
+}
+
+/// 隐藏面板但保留进程。面板只是个查看窗口，关掉不该影响推流。
+func hideControlPanel() {
+    panelWindow?.orderOut(nil)
+    Log.info("面板已隐藏")
 }
 
 /// 打开/前置控制面板
