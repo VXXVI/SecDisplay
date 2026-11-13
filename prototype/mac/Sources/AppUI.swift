@@ -174,13 +174,20 @@ struct StatusView: View {
 }
 
 /// 切换分辨率：虚拟屏和编码器都在启动时按尺寸建好，改尺寸只能重建进程。
-/// 这里起一个延迟 9 秒的 shell，等 shutdown 的清理（约 6 秒）走完再拉起新进程。
+/// 命令行启动走 run.sh restart；.app 启动时没有 run.sh，直接重启自身。
 func restartWithResolution(_ w: Int, _ h: Int) {
     let dir = FileManager.default.currentDirectoryPath
     Log.info("面板切换分辨率 \(w)x\(h)，准备重启")
     let p = Process()
     p.executableURL = URL(fileURLWithPath: "/bin/zsh")
-    p.arguments = ["-c", "sleep 9; cd \"\(dir)\" && SECDISPLAY_W=\(w) SECDISPLAY_H=\(h) ./run.sh restart"]
+    if FileManager.default.fileExists(atPath: dir + "/run.sh") {
+        p.arguments = ["-c", "sleep 9; cd \"\(dir)\" && SECDISPLAY_W=\(w) SECDISPLAY_H=\(h) ./run.sh restart"]
+    } else {
+        let exe = Bundle.main.executablePath ?? CommandLine.arguments[0]
+        let logDir = (NSHomeDirectory() as NSString).appendingPathComponent("Library/Logs/SecDisplay")
+        try? FileManager.default.createDirectory(atPath: logDir, withIntermediateDirectories: true)
+        p.arguments = ["-c", "sleep 9; SECDISPLAY_W=\(w) SECDISPLAY_H=\(h) \"\(exe)\" >> \"\(logDir)/sender.log\" 2>&1 &"]
+    }
     p.standardOutput = FileHandle.nullDevice
     p.standardError = FileHandle.nullDevice
     try? p.run()

@@ -1648,9 +1648,32 @@ func reconfigureDisplays() {
 
 var cfg = Config()
 
+// 单实例：两个发送端会各建一块虚拟屏，还会抢 9922 端口，表现为画面来回跳。
+// .app 和命令行两条启动路径共用同一个 pid 文件。
+do {
+    let dir = (NSHomeDirectory() as NSString).appendingPathComponent("Library/Application Support/SecDisplay")
+    try? FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true)
+    let pidPath = (dir as NSString).appendingPathComponent("sender.pid")
+    if let s = try? String(contentsOfFile: pidPath, encoding: .utf8),
+       let old = pid_t(s.trimmingCharacters(in: .whitespacesAndNewlines)), old > 0,
+       old != getpid(), kill(old, 0) == 0 {
+        Log.info("已有发送端在运行 (pid=\(old))，本次启动退出。如需重启先结束旧进程。")
+        exit(0)
+    }
+    try? "\(getpid())".write(toFile: pidPath, atomically: true, encoding: .utf8)
+}
+
 // 预设档位：不同分辨率与采集帧率组合，用于对比流畅度与清晰度
 // 用 SECDISPLAY_PRESET 选择：sharp / balanced / smooth / fast
-if let preset = ProcessInfo.processInfo.environment["SECDISPLAY_PRESET"] {
+// 打包成 .app 从 Finder 启动时没有环境变量，读 Contents/Resources/preset。
+var presetName = ProcessInfo.processInfo.environment["SECDISPLAY_PRESET"]
+if presetName == nil, let rp = Bundle.main.resourcePath {
+    let p = rp + "/preset"
+    if let s = try? String(contentsOfFile: p, encoding: .utf8) {
+        presetName = s.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+}
+if let preset = presetName, !preset.isEmpty {
     switch preset {
     case "sharp":       // 最清晰，帧率最低
         cfg.width = 2880; cfg.height = 1800

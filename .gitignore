@@ -52,3 +52,6 @@ prototype/mac/.preset
 logs/
 prototype/mac/cleanup_orphan_vdisplay
 tools/mouseprobe
+
+# macOS 客户端打包产物
+prototype/mac/SecDisplay.app/
