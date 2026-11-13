@@ -1313,9 +1313,19 @@ final class CursorImageTracker {
               let cg = cur.image.cgImage(forProposedRect: nil, context: nil, hints: nil)
         else { return }
 
-        let w = min(cg.width, maxDim), h = min(cg.height, maxDim)
+        // 统一按 1x 逻辑尺寸发送：NSCursor.size 是点，hotSpot 也是点。
+        // 直接送 cgImage 会把当前屏的 backing scale 带进来（内建屏 2x、
+        // 虚拟屏 1x），热点也按点算，2x 位图下只剩一半，落点会偏半个光标。
+        // 接收端再按画面/逻辑尺寸的比例放大，视觉比例才和桌面元素一致。
+        let targetW = Int(cur.image.size.width.rounded())
+        let targetH = Int(cur.image.size.height.rounded())
+        let w = targetW > 0 ? min(targetW, maxDim) : min(cg.width, maxDim)
+        let h = targetH > 0 ? min(targetH, maxDim) : min(cg.height, maxDim)
         guard w > 0, h > 0 else { return }
-        let hotX = Int(cur.hotSpot.x), hotY = Int(cur.hotSpot.y)
+        let scaleX = targetW > 0 ? Double(w) / Double(targetW) : 1.0
+        let scaleY = targetH > 0 ? Double(h) / Double(targetH) : 1.0
+        let hotX = Int((cur.hotSpot.x * scaleX).rounded())
+        let hotY = Int((cur.hotSpot.y * scaleY).rounded())
 
         // 绘制到 BGRA 缓冲。用 kCGBitmapByteOrder32Little + premultipliedFirst
         // 在 little-endian 上得到 BGRA 排布，正是 Windows DIB 需要的。
@@ -1329,8 +1339,10 @@ final class CursorImageTracker {
         ctx.draw(cg, in: CGRect(x: 0, y: 0, width: w, height: h))
 
         // 指纹：尺寸 + 热点 + 抽样像素，足以区分不同光标形状
-        var fp = UInt64(w) << 48 | UInt64(h) << 32
-            | UInt64(hotX & 0xff) << 24 | UInt64(hotY & 0xff) << 16
+        var fp: UInt64 = UInt64(w) << 48
+        fp |= UInt64(h) << 32
+        fp |= UInt64(hotX & 0xff) << 24
+        fp |= UInt64(hotY & 0xff) << 16
         var hash: UInt64 = 1469598103934665603
         let step = max(1, bgra.count / 256)
         var i = 0
@@ -1350,6 +1362,9 @@ final class CursorImageTracker {
         lastSendAt = CFAbsoluteTimeGetCurrent()
         lastFingerprint = fp
         sentCount += 1
+        if force {
+            Log.info("光标图像 \(w)x\(h) hot=(\(hotX),\(hotY))")
+        }
 
         sender.sendCursorImage(width: w, height: h, hotX: hotX, hotY: hotY,
                                bgra: Data(bgra))
