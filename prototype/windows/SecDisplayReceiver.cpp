@@ -1403,6 +1403,9 @@ private:
     std::unordered_map<void*, ComPtr<ID3D11VideoProcessorOutputView>> outViewCache_;
     // 黑边靠每帧清后缓冲实现，RTV 同样按纹理指针缓存
     std::unordered_map<void*, ComPtr<ID3D11RenderTargetView>> rtvCache_;
+    // 交换链与三张缓存表会被呈现线程和 UI/网络线程同时碰：
+    // 以前只有会话切档会改尺寸，窗口一拖 WM_SIZE 就频繁触发，必须串起来。
+    std::mutex mtx_;
     bool tearing_ = false;
     bool useVsync_ = true;
     // 连续失败计数与限流日志：45fps 下每帧打日志会淹掉文件，
@@ -1533,6 +1536,7 @@ bool Presenter::CreateProcessor() {
 
 bool Presenter::SetSourceSize(int w, int h) {
     if (w <= 0 || h <= 0) return false;
+    std::lock_guard<std::mutex> lk(mtx_);
     if (w == srcW_ && h == srcH_) return true;
     srcW_ = w;
     srcH_ = h;
@@ -1541,6 +1545,7 @@ bool Presenter::SetSourceSize(int w, int h) {
 
 bool Presenter::Resize(int width, int height) {
     if (width <= 0 || height <= 0) return false;
+    std::lock_guard<std::mutex> lk(mtx_);
     if (width == width_ && height == height_) return true;
     if (!swap_) { width_ = width; height_ = height; return true; }
 
@@ -1578,6 +1583,8 @@ bool Presenter::PresentSample(IMFSample* sample) {
         }
         return false;
     };
+
+    std::lock_guard<std::mutex> lk(mtx_);
 
     if (!sample) return fail("空样本", E_POINTER);
     if (!swap_) return fail("交换链为空", E_UNEXPECTED);
@@ -1722,6 +1729,7 @@ bool Presenter::PresentSample(IMFSample* sample) {
 
 void Presenter::ClearToIdle() {
     if (!swap_ || !gfx_) return;
+    std::lock_guard<std::mutex> lk(mtx_);
     ComPtr<ID3D11Texture2D> back;
     if (FAILED(swap_->GetBuffer(0, IID_PPV_ARGS(&back))) || !back) return;
     ComPtr<ID3D11RenderTargetView> rtv;
@@ -1733,6 +1741,7 @@ void Presenter::ClearToIdle() {
 }
 
 void Presenter::Shutdown() {
+    std::lock_guard<std::mutex> lk(mtx_);
     inViewCache_.clear();
     outViewCache_.clear();
     rtvCache_.clear();
@@ -2513,8 +2522,8 @@ static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
         SetCursor(g_customCursor ? g_customCursor : LoadCursor(nullptr, IDC_ARROW));
         return TRUE;
     case WM_SYSCOMMAND:
-        // 窗口模式的「最大化」按钮 / Win+↑ 都接到整屏放大（EnterFullscreen），
-        // 走的是改窗口样式与位置，不动交换链尺寸，避免 ResizeBuffers 引发的黑屏风险。
+        // 窗口模式的「最大化」按钮 / Win+↑ 都接到整屏放大（EnterFullscreen）。
+        // 交换链尺寸由 WM_SIZE 的防抖同步跟上，不再固定在流尺寸上硬拉伸。
         if ((w & 0xFFF0) == SC_MAXIMIZE) {
             if (!g_isFullscreen) EnterFullscreen();
             return 0;
@@ -3456,7 +3465,20 @@ int main(int argc, char** argv) {
     }
 
     Presenter presenter;
-    if (!presenter.Init(&gfx, hwnd, cfg.width, cfg.height)) return 4;
+    {
+        // 交换链按客户区物理像素建，和窗口一一对应，DWM 不再二次拉伸。
+        RECT crc{};
+        GetClientRect(hwnd, &crc);
+        int cw = crc.right - crc.left;
+        int ch = crc.bottom - crc.top;
+        if (cw <= 0 || ch <= 0) { cw = cfg.width; ch = cfg.height; }
+        if (!presenter.Init(&gfx, hwnd, cw, ch)) return 4;
+        // 解码尺寸单独告诉呈现器，输入输出从此解耦
+        if (!presenter.SetSourceSize(cfg.width, cfg.height)) {
+            Log("呈现器设置解码尺寸失败 %dx%d", cfg.width, cfg.height);
+            return 4;
+        }
+    }
     presenter.setUseVsync(cfg.vsync);
     g_presenter = &presenter;
     g_vsyncEnabled = cfg.vsync;
