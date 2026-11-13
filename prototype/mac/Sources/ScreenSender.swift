@@ -1812,8 +1812,8 @@ Timer.scheduledTimer(withTimeInterval: 2.0, repeats: true) { _ in
     lastCursorCount = cursor.sentCount
     let imgDelta = cursorImage.sentCount - lastCursorImageCount
     lastCursorImageCount = cursorImage.sentCount
-    Log.info(String(format: "采集 %d  峰值 %.0ffps  空闲 %d  发送 %d  光标+%d  图像+%d  输入 %d  丢弃 %d  %.1f Mbps  在途 %d  采集延迟 %.1f  编码延迟 %.1f ms",
-                    cap.captured, peakFps, cap.idleFrameCount, sender.sent, cursorDelta, imgDelta,
+    Log.info(String(format: "采集 %d  峰值 %.0ffps  空闲 %d  静跳 %d  发送 %d  光标+%d  图像+%d  输入 %d  丢弃 %d  %.1f Mbps  在途 %d  采集延迟 %.1f  编码延迟 %.1f ms",
+                    cap.captured, peakFps, cap.idleFrameCount, cap.staticSkipCount, sender.sent, cursorDelta, imgDelta,
                     injector.eventCount, sender.dropped, mbps, sender.inFlight, capAvg, encAvg))
     cap.capLatSum = 0; cap.capLatCount = 0; cap.capLatMax = 0
     encoder.encLatSum = 0; encoder.encLatCount = 0; encoder.encLatMax = 0
