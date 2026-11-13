@@ -44,6 +44,8 @@
 #include <cstdio>
 #include <cstdint>
 #include <cstring>
+#include <fstream>
+#include <cctype>
 #include <cmath>
 #include <cstdlib>
 #include <exception>
@@ -241,6 +243,12 @@ static const uint8_t TYPE_VIDEO = 0x01;
 static const uint8_t TYPE_CURSOR = 0x03;   // 光标位置，与视频帧分离发送
 static const uint8_t TYPE_CURSOR_IMAGE = 0x05;  // 真实光标图像 + 热点（BGRA）
 static const uint8_t TYPE_KEYFRAME_REQUEST = 0x02;
+// 0x06 有两种形态：
+//   旧版发送端：9 字节空载荷心跳，只维持 TCP 有数据流动
+//   新版发送端：15 字节会话头，附带虚拟屏尺寸，接收端据此自动重建管线
+// 载荷（全大端）：[version u8][width u16][height u16][fps u8][reserved u8]，共 7 字节
+static const uint8_t TYPE_SESSION = 0x06;
+static const size_t SESSION_PAYLOAD_BYTES = 7;
 static const size_t HEADER_BYTES = 9;   // 类型 1 + 时间戳 8
 static const size_t MAX_PACKET = 64u * 1024u * 1024u;
 
@@ -257,6 +265,15 @@ static const size_t MAX_PACKET = 64u * 1024u * 1024u;
 // 解码/呈现/全屏窗口用 cfg.width/height（物理像素），两者一致时不冲突。
 static std::atomic<int> g_coordW{0};
 static std::atomic<int> g_coordH{0};
+
+// 对端会话头通告的虚拟屏尺寸与采集帧率。
+// 旧版发送端不发会话头，这里保持 0，接收端沿用启动参数。
+static std::atomic<int> g_sessW{0};
+static std::atomic<int> g_sessH{0};
+static std::atomic<int> g_sessFps{0};
+// 当前解码/呈现管线实际使用的尺寸。会话头与它不同就断开重连并重建管线。
+static std::atomic<int> g_displayW{0};
+static std::atomic<int> g_displayH{0};
 static std::atomic<double> g_cursorX{-1};
 static std::atomic<double> g_cursorY{-1};
 // 光标是否在副屏范围内。Mac 端把指针移回主屏时会发 visible=0，
@@ -1161,6 +1178,10 @@ public:
     // 变了就重建视频处理器，并按显示尺寸裁边。
     bool SetSourceSize(int w, int h);
 
+    // 对端会话头切换分辨率时重建交换链。调用时机必须在呈现线程退出之后，
+    // 否则 ResizeBuffers 会因后缓冲仍被引用而失败。
+    bool Resize(int width, int height);
+
 private:
     bool CreateProcessor();
 
@@ -1282,6 +1303,29 @@ bool Presenter::SetSourceSize(int w, int h) {
     srcW_ = w;
     srcH_ = h;
     return CreateProcessor();
+}
+
+bool Presenter::Resize(int width, int height) {
+    if (width <= 0 || height <= 0) return false;
+    if (width == width_ && height == height_) return true;
+    if (!swap_) { width_ = width; height_ = height; return true; }
+
+    // 输入/输出视图都缓存了后缓冲指针，改尺寸后必须全部失效
+    inViewCache_.clear();
+    outViewCache_.clear();
+
+    UINT flags = tearing_ ? DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING : 0;
+    HRESULT hr = swap_->ResizeBuffers(0, (UINT)width, (UINT)height,
+                                      DXGI_FORMAT_UNKNOWN, flags);
+    if (FAILED(hr)) {
+        Log("交换链改尺寸失败 %08X（保持 %dx%d）", hr, width_, height_);
+        return false;
+    }
+    width_ = width;
+    height_ = height;
+    if (!CreateProcessor()) return false;
+    Log("呈现器已切换到 %dx%d", width_, height_);
+    return true;
 }
 
 void Presenter::PresentSample(IMFSample* sample) {
@@ -1873,6 +1917,8 @@ static void ParseArgs(int argc, char** argv, RunConfig& cfg) {
             cfg.feedback = true;
         } else if ((a == "--log" || a == "-l") && i + 1 < argc) {
             cfg.logFile = argv[++i];
+        } else if (a == "--config" && i + 1 < argc) {
+            ++i;   // 配置文件已在 main 里读过，这里只跳过它的值
         } else if (a == "--coord" && i + 2 < argc) {
             // 显式指定坐标基准尺寸（如 --coord 2880 1800）。
             // 用于 Mac 端 CGDisplayBounds 尺寸与物理值不符时现场纠正，无需重编译。
@@ -1900,8 +1946,137 @@ static void ParseArgs(int argc, char** argv, RunConfig& cfg) {
 // 解码器每条连接重建一次：对端重启后参数集会变，沿用旧实例会解不出来。
 // ---------------------------------------------------------------------------
 
-static void NetworkLoop(const RunConfig& cfg, Graphics* gfx, Presenter* presenter) {
+// ---------------------------------------------------------------------------
+// 配置文件与免参数启动
+//
+// exe 同目录的 config.ini，键值形如 key=value，# 或 ; 开头为注释。
+// 命令行参数优先级高于配置文件，便于临时覆盖。
+// ---------------------------------------------------------------------------
+
+static std::string TrimStr(const std::string& s) {
+    size_t b = s.find_first_not_of(" \t\r\n");
+    if (b == std::string::npos) return "";
+    size_t e = s.find_last_not_of(" \t\r\n");
+    return s.substr(b, e - b + 1);
+}
+
+static std::string ExeDir() {
+    char buf[MAX_PATH] = {};
+    DWORD n = GetModuleFileNameA(nullptr, buf, MAX_PATH);
+    if (n == 0 || n >= MAX_PATH) return ".";
+    std::string p(buf, n);
+    size_t pos = p.find_last_of("\\/");
+    return pos == std::string::npos ? "." : p.substr(0, pos);
+}
+
+static bool Truthy(const std::string& v) {
+    return v == "1" || v == "true" || v == "yes" || v == "on";
+}
+
+static void LoadConfigFile(RunConfig& cfg, const std::string& path) {
+    std::ifstream f(path);
+    if (!f) return;
+    std::string line;
+    int applied = 0;
+    while (std::getline(f, line)) {
+        // 记事本保存的 UTF-8 可能带 BOM，不去掉会让第一个键名匹配失败
+        if (line.size() >= 3 &&
+            (unsigned char)line[0] == 0xEF &&
+            (unsigned char)line[1] == 0xBB &&
+            (unsigned char)line[2] == 0xBF) {
+            line.erase(0, 3);
+        }
+        line = TrimStr(line);
+        if (line.empty() || line[0] == '#' || line[0] == ';') continue;
+        size_t eq = line.find('=');
+        if (eq == std::string::npos) continue;
+        std::string key = TrimStr(line.substr(0, eq));
+        std::string val = TrimStr(line.substr(eq + 1));
+        std::transform(key.begin(), key.end(), key.begin(),
+                       [](unsigned char c) { return (char)std::tolower(c); });
+        if (key == "host") cfg.host = val;
+        else if (key == "port") cfg.port = atoi(val.c_str());
+        else if (key == "width") cfg.width = atoi(val.c_str());
+        else if (key == "height") cfg.height = atoi(val.c_str());
+        else if (key == "log") cfg.logFile = val;
+        else if (key == "fullscreen") cfg.fullscreen = Truthy(val);
+        else if (key == "vsync") cfg.vsync = Truthy(val);
+        else if (key == "pace") cfg.pace = Truthy(val);
+        else if (key == "feedback") cfg.feedback = Truthy(val);
+        else if (key == "coordw") cfg.coordW = atoi(val.c_str());
+        else if (key == "coordh") cfg.coordH = atoi(val.c_str());
+        else continue;
+        ++applied;
+    }
+    Log("已读取配置 %s（%d 项）", path.c_str(), applied);
+}
+
+// ---------------------------------------------------------------------------
+// 会话头与分辨率自适应
+// ---------------------------------------------------------------------------
+
+// 0x06 会话头：尺寸与当前管线不同就断开当前连接，让 NetworkLoop 在下一轮
+// 用新尺寸重建解码器、交换链与窗口。不在这里直接重建，是因为此刻解码与
+// 呈现线程都还在跑，ResizeBuffers 会因后缓冲被引用而失败。
+static void OnSessionPacket(const uint8_t* p, size_t n) {
+    if (n < SESSION_PAYLOAD_BYTES) return;   // 旧版空载荷心跳
+    uint8_t ver = p[0];
+    int w = (int)((p[1] << 8) | p[2]);
+    int h = (int)((p[3] << 8) | p[4]);
+    int fps = (int)p[5];
+    if (w <= 0 || h <= 0 || w > 16384 || h > 16384) return;
+    if (g_sessW.load() == w && g_sessH.load() == h && g_sessFps.load() == fps) return;
+
+    g_sessW = w; g_sessH = h; g_sessFps = fps;
+    Log("会话头: 协议 v%u  虚拟屏 %dx%d @ %d fps", ver, w, h, fps);
+
+    int dw = g_displayW.load(), dh = g_displayH.load();
+    if (w != dw || h != dh) {
+        Log("与当前管线 %dx%d 不一致，断开重连后按新尺寸重建", dw, dh);
+        SOCKET s = g_sock.load();
+        if (s != INVALID_SOCKET) shutdown(s, SD_BOTH);
+    }
+}
+
+// 窗口模式下按新宽高比调整窗口，保留当前客户区宽度；全屏不动窗口，
+// 交换链由 DXGI_SCALING_STRETCH 铺满屏幕。
+static void ResizeWindowForVideo(int w, int h) {
+    if (!g_hwnd || g_isFullscreen || w <= 0 || h <= 0) return;
+    RECT rc{};
+    GetClientRect(g_hwnd, &rc);
+    int cw = rc.right - rc.left;
+    int sw = GetSystemMetrics(SM_CXSCREEN);
+    int sh = GetSystemMetrics(SM_CYSCREEN);
+    if (cw <= 0) cw = sw / 2;
+    int ch = (int)((double)cw * h / w);
+    if (ch > sh * 2 / 3) { ch = sh * 2 / 3; cw = (int)((double)ch * w / h); }
+    RECT wr{ 0, 0, cw, ch };
+    AdjustWindowRect(&wr, WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX | WS_MAXIMIZEBOX, FALSE);
+    int winW = wr.right - wr.left, winH = wr.bottom - wr.top;
+    RECT cur{};
+    GetWindowRect(g_hwnd, &cur);
+    SetWindowPos(g_hwnd, nullptr, cur.left, cur.top, winW, winH, SWP_NOZORDER | SWP_NOACTIVATE);
+}
+
+static void NetworkLoop(RunConfig cfg, Graphics* gfx, Presenter* presenter) {
+    // 交换链改尺寸失败过的尺寸，避免每次重连都反复尝试同一个值
+    int failedW = 0, failedH = 0;
     while (g_alive) {
+        // 会话头切档：尺寸与当前管线不同就重建解码器、交换链与窗口
+        int sw = g_sessW.load(), sh = g_sessH.load();
+        if (sw > 0 && sh > 0 && (sw != cfg.width || sh != cfg.height) &&
+            !(sw == failedW && sh == failedH)) {
+            if (presenter->Resize(sw, sh)) {
+                cfg.width = sw; cfg.height = sh;
+                g_displayW = sw; g_displayH = sh;
+                if (cfg.coordW <= 0) { g_coordW = sw; g_coordH = sh; }
+                ResizeWindowForVideo(sw, sh);
+                Log("按会话头切换管线尺寸: %dx%d", sw, sh);
+            } else {
+                failedW = sw; failedH = sh;
+            }
+        }
+
         SOCKET sock = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
         if (sock == INVALID_SOCKET) {
             Log("socket 失败 %d，2 秒后重试", WSAGetLastError());
@@ -2005,7 +2180,11 @@ static void NetworkLoop(const RunConfig& cfg, Graphics* gfx, Presenter* presente
                     OnCursorImagePacket(packet.data() + HEADER_BYTES, len - HEADER_BYTES);
                     continue;
                 }
-                // 0x06 心跳 / 其它未知类型：忽略即可，TCP 已有数据流动
+                if (packet[0] == TYPE_SESSION) {
+                    OnSessionPacket(packet.data() + HEADER_BYTES, len - HEADER_BYTES);
+                    continue;
+                }
+                // 其它未知类型：忽略即可，TCP 已有数据流动
                 if (packet[0] != TYPE_VIDEO) continue;
 
                 uint64_t ts = 0;
@@ -2319,6 +2498,16 @@ int main(int argc, char** argv) {
     }
 
     RunConfig cfg;
+    // 免参数启动：先读 exe 同目录 config.ini，再让命令行覆盖。
+    // --config 指定别的文件，--no-config 跳过配置文件。
+    std::string cfgPath = ExeDir() + "\\config.ini";
+    bool useConfigFile = true;
+    for (int i = 1; i < argc; ++i) {
+        std::string a = argv[i];
+        if (a == "--config" && i + 1 < argc) cfgPath = argv[++i];
+        else if (a == "--no-config") useConfigFile = false;
+    }
+    if (useConfigFile) LoadConfigFile(cfg, cfgPath);
     ParseArgs(argc, argv, cfg);
 
     if (!cfg.logFile.empty()) {
@@ -2481,6 +2670,9 @@ int main(int argc, char** argv) {
     // 若换到 CGDisplayBounds 返回逻辑点的系统，用 --coord W H 现场纠正。
     g_coordW = cfg.coordW > 0 ? cfg.coordW : cfg.width;
     g_coordH = cfg.coordH > 0 ? cfg.coordH : cfg.height;
+    // 记录当前管线尺寸，供会话头比较；不一致时 NetworkLoop 会重建
+    g_displayW = cfg.width;
+    g_displayH = cfg.height;
     Log("坐标基准: 逻辑 %dx%d（物理 %dx%d%s）",
         g_coordW.load(), g_coordH.load(), cfg.width, cfg.height,
         cfg.coordW > 0 ? "，命令行指定" : "，默认对齐物理");

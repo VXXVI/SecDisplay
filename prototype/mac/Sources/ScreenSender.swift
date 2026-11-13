@@ -222,9 +222,34 @@ enum VirtualDisplayGuard {
 
 enum Log {
     static let fmt = DateFormatter()
+    private static let lock = NSLock()
+
+    /// 可选日志文件。
+    /// 命令行运行由 run.sh 重定向 stderr，不需要这里写文件；
+    /// 打成 .app 后由 LaunchServices 启动，stderr 看不到，默认写到
+    /// ~/Library/Logs/SecDisplay/sender.log，也允许用 SECDISPLAY_LOG 覆盖。
+    private static let fileHandle: FileHandle? = {
+        var path = ProcessInfo.processInfo.environment["SECDISPLAY_LOG"]
+        if path == nil, Bundle.main.bundleIdentifier != nil {
+            let dir = (NSHomeDirectory() as NSString).appendingPathComponent("Library/Logs/SecDisplay")
+            try? FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true)
+            path = (dir as NSString).appendingPathComponent("sender.log")
+        }
+        guard let p = path, !p.isEmpty else { return nil }
+        let fm = FileManager.default
+        if !fm.fileExists(atPath: p) { fm.createFile(atPath: p, contents: nil) }
+        return FileHandle(forWritingAtPath: p)
+    }()
+
     static func info(_ s: String) {
         let t = String(format: "%.3f", CFAbsoluteTimeGetCurrent().truncatingRemainder(dividingBy: 100000))
-        FileHandle.standardError.write("[\(t)] \(s)\n".data(using: .utf8)!)
+        let line = "[\(t)] \(s)\n"
+        let data = line.data(using: .utf8)!
+        FileHandle.standardError.write(data)
+        lock.lock()
+        fileHandle?.seekToEndOfFile()
+        fileHandle?.write(data)
+        lock.unlock()
     }
 }
 
@@ -793,6 +818,13 @@ final class Sender {
     var sentBytes = 0
     var connected = false
 
+    /// 会话头里通告的虚拟屏参数，由 main 在启动时写入。
+    /// 接收端据此自动调整窗口尺寸与坐标基准，两端不再手工对齐分辨率。
+    var sessionWidth = 0
+    var sessionHeight = 0
+    var sessionFps = 0
+    private var lastSessionSent: CFAbsoluteTime = 0
+
     // 0x07 反馈快照。drainControl 在 net queue 写，Timer 在 main queue 读。
     private let feedbackLock = NSLock()
     private var feedback = FeedbackSignals()
@@ -868,6 +900,8 @@ final class Sender {
                 }
             }
             c.start(queue: self.queue)
+            // 连接必须先 start 才能发；会话头紧跟在 start 之后，早于视频帧
+            self.sendSessionInfo()
             // 新连接一上来就准备关键帧，不依赖对端是否及时发 0x02。
             self.onKeyframeRequest?()
             self.receiveLoop(epoch: epoch)
@@ -1091,6 +1125,32 @@ final class Sender {
         c.send(content: packet, completion: .contentProcessed { _ in })
     }
 
+    /// 会话头：把当前虚拟屏尺寸与采集帧率告诉接收端。
+    /// 与空载荷心跳同为 0x06，靠长度区分：旧接收端只认 9 字节心跳，
+    /// 多出来的载荷会被直接忽略，所以两端版本错配不会断流。
+    ///
+    /// 载荷（全大端）：[version u8][width u16][height u16][fps u8][reserved u8]
+    func sendSessionInfo() {
+        guard connected, let c = conn else { return }
+        guard sessionWidth > 0, sessionHeight > 0 else { return }
+
+        var packet = Data(capacity: 20)
+        var len = UInt32(16).bigEndian       // 1 类型 + 8 时间戳 + 7 载荷
+        withUnsafeBytes(of: &len) { packet.append(contentsOf: $0) }
+        packet.append(0x06)
+        var ts = UInt64(CFAbsoluteTimeGetCurrent() * 1_000_000).bigEndian
+        withUnsafeBytes(of: &ts) { packet.append(contentsOf: $0) }
+        packet.append(1)                     // 协议版本
+        var w = UInt16(clamping: sessionWidth).bigEndian
+        withUnsafeBytes(of: &w) { packet.append(contentsOf: $0) }
+        var h = UInt16(clamping: sessionHeight).bigEndian
+        withUnsafeBytes(of: &h) { packet.append(contentsOf: $0) }
+        packet.append(UInt8(clamping: sessionFps))
+        packet.append(0)                     // 保留
+        c.send(content: packet, completion: .contentProcessed { _ in })
+        lastSessionSent = CFAbsoluteTimeGetCurrent()
+    }
+
     func send(frame: Data, captureTimeMicros: UInt64) {
         guard connected else { return }
         counterLock.lock()
@@ -1151,6 +1211,8 @@ final class Sender {
         timer.setEventHandler { [weak self] in
             guard let self, self.connected else { return }
             let now = CFAbsoluteTimeGetCurrent()
+            // 会话头每 5 秒补发一次：切档、重连、接收端重启都能自动收敛
+            if now - self.lastSessionSent >= 5.0 { self.sendSessionInfo() }
             self.counterLock.lock()
             let since = now - self.lastSendAt
             let payload = self.lastPayload
@@ -1437,6 +1499,27 @@ final class CursorImageTracker {
     }
 }
 
+// MARK: - 孤儿虚拟屏清理
+
+/// 触发 WindowServer 做一轮完整显示重配置，清掉 owner 已死的虚拟屏。
+/// 依据 research/RESULT-orphan-vdisplay-2026-11-12.md：显示器休眠再唤醒即可，
+/// 不注销、不重启 WindowServer。代价是屏幕会短暂黑一下，所以只在显式要求时执行。
+func reconfigureDisplays() {
+    func run(_ path: String, _ args: [String]) {
+        let p = Process()
+        p.executableURL = URL(fileURLWithPath: path)
+        p.arguments = args
+        p.standardOutput = FileHandle.nullDevice
+        p.standardError = FileHandle.nullDevice
+        try? p.run()
+        p.waitUntilExit()
+    }
+    run("/usr/bin/pmset", ["displaysleepnow"])
+    sleep(6)
+    run("/usr/bin/caffeinate", ["-u", "-t", "3"])
+    sleep(3)
+}
+
 // MARK: - 主流程
 
 var cfg = Config()
@@ -1510,11 +1593,24 @@ let vd = VirtualDisplayManager()
 let encoder = Encoder(width: cfg.width, height: cfg.height, bitrateMbps: cfg.bitrateMbps, captureHz: cfg.captureHz)
 let sender = Sender()
 sender.keepAliveGap = cfg.keepAliveGap
+sender.sessionWidth = cfg.width
+sender.sessionHeight = cfg.height
+sender.sessionFps = Int(cfg.captureHz.rounded())
 
 guard encoder.start() else { exit(3) }
 
 encoder.onFrame = { data, isKey, ts in
     sender.send(frame: data, captureTimeMicros: ts)
+}
+
+// 启动前检查残留虚拟屏。只有显式要求时才自动清理，避免每次启动都黑屏一下。
+if CommandLine.arguments.contains("--cleanup-orphan")
+    || ProcessInfo.processInfo.environment["SECDISPLAY_CLEANUP_ORPHAN"] == "1" {
+    let residual = listSecDisplays()
+    if !residual.isEmpty {
+        Log.info("启动前发现残留虚拟屏 \(residual.count) 块，执行显示重配置清理")
+        reconfigureDisplays()
+    }
 }
 
 do {
@@ -1528,7 +1624,7 @@ do {
         let desc = ours.map { "id=\($0.id)\($0.old ? "(旧身份)" : "")" }.joined(separator: " ")
         Log.info("检测到残留的 SecDisplay 虚拟屏: \(desc)")
         Log.info("原因：上一次运行异常退出，留下了虚拟屏占住了位置（Sidecar 共存不受影响）")
-        Log.info("处理：注销并重新登录（或重启）后再运行")
+        Log.info("处理：加 --cleanup-orphan 重启可自动清理；或注销重登")
     } else {
         var n: UInt32 = 0
         CGGetOnlineDisplayList(32, nil, &n)

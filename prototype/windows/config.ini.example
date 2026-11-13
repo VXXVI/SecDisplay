@@ -1,0 +1,26 @@
+# SecDisplay 接收端配置。
+# 放在 SecDisplayReceiver.exe 同目录，文件名 config.ini。
+# 命令行参数优先级更高，临时覆盖不用改这里。
+
+host=10.10.10.1
+port=9922
+
+# 初始尺寸只是提示。新版 Mac 发送端连接后会发会话头，
+# 接收端按实际虚拟屏尺寸自动重建，切档不用再改这里。
+width=2880
+height=1800
+
+# 1=全屏，0=窗口
+fullscreen=0
+
+# 1=垂直同步（均匀），0=免同步（低延迟）
+vsync=1
+
+# 抖动缓冲，默认关
+pace=0
+
+# 0x07 健康度回传，默认关
+feedback=0
+
+# 日志文件，相对路径按进程工作目录
+log=logs\ssh-receiver.log

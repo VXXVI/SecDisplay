@@ -69,6 +69,24 @@ cd prototype/mac
 ./run.sh stop       # 停止
 ```
 
+打包成 .app（长期使用推荐）：
+
+```bash
+cd prototype/mac
+./build_app.sh
+open SecDisplay.app
+```
+
+`.app` 用本机 Apple Development 证书签名（没有证书则退回 ad-hoc），屏幕录制授权更容易留住。日志在 `~/Library/Logs/SecDisplay/sender.log`。
+
+上次异常退出留下的残留虚拟屏：
+
+```bash
+SECDISPLAY_CLEANUP_ORPHAN=1 ./run.sh start
+```
+
+启动时会先做一轮显示器休眠加唤醒的重配置，把 owner 已死的虚拟屏清掉，再正常建屏。屏幕会黑几秒，只在显式设置这个变量时执行。
+
 日志写入 `prototype/mac/logs/`。
 
 也可以前台直接跑：
