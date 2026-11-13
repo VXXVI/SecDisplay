@@ -259,6 +259,9 @@ static std::atomic<int> g_coordW{0};
 static std::atomic<int> g_coordH{0};
 static std::atomic<double> g_cursorX{-1};
 static std::atomic<double> g_cursorY{-1};
+// 光标是否在副屏范围内。Mac 端把指针移回主屏时会发 visible=0，
+// 这里必须真的把 Windows 光标隐藏，否则它会一直停在最后位置。
+static std::atomic<bool> g_cursorVisible{true};
 // 程序自己调用 SetCursorPos 会引起 WM_MOUSEMOVE；用时间戳把它和用户真实
 // 输入区分开，否则每次跟随都会被当成「用户动了」，导致门控反复自锁。
 static std::atomic<int64_t> g_lastRemoteCursorMoveMs{ 0 };
@@ -272,6 +275,8 @@ static std::atomic<LONG> g_lastRemoteCursorY{ INT_MIN };
 static const UINT WM_APPLY_CURSOR = WM_APP + 2;
 // 0x03 远程光标位置：网络线程 post，UI 线程做门控与 SetCursorPos
 static const UINT WM_APP_REMOTE_CURSOR = WM_APP + 3;
+// 0x03 的可见性变化：UI 线程据此 SetCursor(cur) 或 SetCursor(nullptr)
+static const UINT WM_APP_CURSOR_VIS = WM_APP + 4;
 struct CursorImageBuf {
     std::mutex mtx;
     std::vector<uint8_t> bgra;
@@ -470,11 +475,17 @@ static void OnCursorPacket(const uint8_t* p, size_t payloadLen) {
     float ry = rdFloat(p + 4);
     uint8_t visible = p[8];
     if (!visible) {
-        // 光标离开副屏：清空坐标。留着旧值会让 UI 线程把系统光标拽回
-        // 上一次的位置，这正是「鼠标被反复重置」的来源。
+        // 光标离开副屏：清空坐标并通知 UI 线程隐藏本机光标。
+        // 只清坐标不隐藏，会让光标图像一直停在最后位置。
         g_cursorX = -1;
         g_cursorY = -1;
+        if (g_cursorVisible.exchange(false) && g_hwnd) {
+            PostMessageA(g_hwnd, WM_APP_CURSOR_VIS, 0, 0);
+        }
         return;
+    }
+    if (!g_cursorVisible.exchange(true) && g_hwnd) {
+        PostMessageA(g_hwnd, WM_APP_CURSOR_VIS, 0, 0);
     }
 
     double oldX = g_cursorX.load(), oldY = g_cursorY.load();
@@ -1554,7 +1565,7 @@ static void ApplyCursorImage() {
 
     if (g_customCursor) DestroyCursor(g_customCursor);
     g_customCursor = cur;
-    SetCursor(cur);
+    if (g_cursorVisible.load()) SetCursor(cur);
 }
 
 // 查询窗口所在显示器的当前刷新率。启动、显示模式变化、窗口跨屏移动时都用它。
@@ -1614,6 +1625,14 @@ static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
     case WM_APPLY_CURSOR:
         // 网络线程收到 0x05 后 post 到这里，HCURSOR 创建/销毁统一在 UI 线程
         ApplyCursorImage();
+        return 0;
+    case WM_APP_CURSOR_VIS:
+        // 0x03 的可见性变化：离开副屏就隐藏，回来就恢复自定义光标
+        if (g_cursorVisible.load()) {
+            SetCursor(g_customCursor ? g_customCursor : LoadCursor(nullptr, IDC_ARROW));
+        } else {
+            SetCursor(nullptr);
+        }
         return 0;
     case WM_DISPLAYCHANGE:
     case WM_EXITSIZEMOVE:
@@ -1748,6 +1767,11 @@ static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
         return 0;
     }
     case WM_SETCURSOR:
+        // 光标已离开副屏（Mac 发过 visible=0）时不画任何光标
+        if (!g_cursorVisible.load()) {
+            SetCursor(nullptr);
+            return TRUE;
+        }
         // 有 Mac 真实光标就用它，否则退回标准箭头
         SetCursor(g_customCursor ? g_customCursor : LoadCursor(nullptr, IDC_ARROW));
         return TRUE;
