@@ -2441,14 +2441,20 @@ static void NetworkLoop(RunConfig cfg, Graphics* gfx, Presenter* presenter) {
         std::thread recv([&] {
             while (g_alive && connAlive) {
                 uint32_t len = 0;
-                if (!RecvAll(sock, &len, 4)) break;
+                if (!RecvAll(sock, &len, 4)) {
+                    Log("收流结束：读包头失败 err=%d", WSAGetLastError());
+                    break;
+                }
                 len = ntohl(len);
                 if (len < HEADER_BYTES || len > MAX_PACKET) {
                     Log("包长度异常 %u，断开", len);
                     break;
                 }
                 packet.resize(len);
-                if (!RecvAll(sock, packet.data(), (int)len)) break;
+                if (!RecvAll(sock, packet.data(), (int)len)) {
+                    Log("收流结束：读载荷失败 err=%d len=%u", WSAGetLastError(), len);
+                    break;
+                }
 
                 if (packet[0] == TYPE_CURSOR) {
                     g_stats.cursor++;
@@ -2782,6 +2788,13 @@ int main(int argc, char** argv) {
     }
 
     RunConfig cfg;
+    // 单实例锁：旧实例被新实例顶掉后，旧窗口会停在最后一帧且不再 Present，
+    // 看起来像「画面冻结/像别的屏」。这里直接拒绝第二个实例。
+    HANDLE hSingle = CreateMutexW(nullptr, TRUE, L"Local\\SecDisplayReceiver_SingleInstance");
+    if (hSingle && GetLastError() == ERROR_ALREADY_EXISTS) {
+        fprintf(stderr, "SecDisplay 接收端已在运行，本实例退出\n");
+        return 0;
+    }
     // 免参数启动：先读 exe 同目录 config.ini，再让命令行覆盖。
     // --config 指定别的文件，--no-config 跳过配置文件。
     std::string cfgPath = ExeDir() + "\\config.ini";
