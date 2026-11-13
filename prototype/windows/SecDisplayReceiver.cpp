@@ -1532,6 +1532,43 @@ static void ApplyCursorImage() {
     }
     if (w <= 0 || h <= 0 || (int)bgra.size() < w * h * 4) return;
 
+    // 视频帧会被拉伸铺满客户区，光标位图也要按同样比例缩放。
+    // Windows 显示器分辨率高于 Mac 逻辑尺寸时（例如 2880x1800 对 1600x1000），
+    // 画面元素被放大而光标保持 1:1，视觉上就是「光标没变大」甚至偏小。
+    {
+        int vw = g_coordW.load(), vh = g_coordH.load();
+        RECT rc{};
+        if (vw > 0 && vh > 0 && g_hwnd && GetClientRect(g_hwnd, &rc)) {
+            int cw = rc.right - rc.left, ch = rc.bottom - rc.top;
+            if (cw > 0 && ch > 0) {
+                double sx = (double)cw / (double)vw;
+                double sy = (double)ch / (double)vh;
+                if (sx < 0.99 || sx > 1.01 || sy < 0.99 || sy > 1.01) {
+                    int w2 = (int)(w * sx + 0.5);
+                    int h2 = (int)(h * sy + 0.5);
+                    if (w2 < 1) w2 = 1;
+                    if (h2 < 1) h2 = 1;
+                    std::vector<uint8_t> dst((size_t)w2 * h2 * 4);
+                    for (int yy = 0; yy < h2; ++yy) {
+                        int sy0 = (int)((long long)yy * h / h2);
+                        if (sy0 >= h) sy0 = h - 1;
+                        for (int xx = 0; xx < w2; ++xx) {
+                            int sx0 = (int)((long long)xx * w / w2);
+                            if (sx0 >= w) sx0 = w - 1;
+                            memcpy(&dst[((size_t)yy * w2 + xx) * 4],
+                                   &bgra[((size_t)sy0 * w + sx0) * 4], 4);
+                        }
+                    }
+                    hotX = (int)(hotX * sx + 0.5);
+                    hotY = (int)(hotY * sy + 0.5);
+                    bgra.swap(dst);
+                    w = w2;
+                    h = h2;
+                }
+            }
+        }
+    }
+
     // color DIB：自底向上，32bpp BGRA
     BITMAPV5HEADER bi{};
     bi.bV5Size = sizeof(bi);
