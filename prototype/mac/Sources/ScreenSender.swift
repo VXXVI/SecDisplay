@@ -1191,8 +1191,10 @@ final class CursorTracker {
     init(sender: Sender, bounds: @escaping () -> CGRect) {
         self.sender = sender
         self.bounds = bounds
-        // 目标发送频率。60 是稳定档，90 用于高刷屏；用 SECDISPLAY_CURSOR_HZ 覆盖。
-        let hz = Double(ProcessInfo.processInfo.environment["SECDISPLAY_CURSOR_HZ"] ?? "") ?? 60
+        // 目标发送频率。默认 90：接收端物理屏是 89Hz，光标若只按 60Hz 更新，
+        // 每个位置会在屏上停留 1~2 个刷新周期，肉眼就是「鼠标一跳一跳」。
+        // 与 89Hz 接近的 90Hz 基本一更新一刷新，光标跟手。用 SECDISPLAY_CURSOR_HZ 覆盖。
+        let hz = Double(ProcessInfo.processInfo.environment["SECDISPLAY_CURSOR_HZ"] ?? "") ?? 90
         self.targetHz = max(30.0, min(240.0, hz))
         self.minInterval = 1.0 / self.targetHz
     }

@@ -87,7 +87,8 @@ while :; do
     if [ -n "$win_proc" ]; then
         win_alive=1
         win_pid=$(printf '%s' "$win_proc" | cut -d',' -f2 | tr -d '"')
-        win_rss_kb=$(printf '%s' "$win_proc" | cut -d',' -f5 | tr -cd '0-9')
+        # 内存字段是 "73,844 K"，含逗号，按引号切分取最后一个引号段。
+        win_rss_kb=$(printf '%s' "$win_proc" | awk -F'"' '{print $10}' | tr -cd '0-9')
         win_rss=$((win_rss_kb / 1024))
     else
         win_alive=0; win_pid=0; win_rss=0
