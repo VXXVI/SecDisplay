@@ -1,8 +1,8 @@
 {
   "schema": 1,
   "platform": "mac",
-  "generated_utc": "2026-11-13T02:33:15Z",
-  "commit": "33beba0",
+  "generated_utc": "2026-11-13T02:38:31Z",
+  "commit": "b25e522",
   "coord": {
     "logical_w": 1600,
     "logical_h": 1000
@@ -14,43 +14,43 @@
     "preset": "smooth",
     "encoder_variant": "A"
   },
-  "samples": 157,
+  "samples": 9,
   "metrics": {
     "peak_fps": {
-      "min": 1.0,
-      "median": 3.0,
-      "p95": 56.0,
+      "min": 54.0,
+      "median": 57.0,
+      "p95": 57.0,
       "max": 57.0
     },
     "capture_ms": {
-      "min": 0.0,
-      "median": 1.4,
-      "p95": 7.7,
-      "max": 39.0
+      "min": 1.7,
+      "median": 2.9,
+      "p95": 4.4,
+      "max": 5.8
     },
     "encode_ms": {
-      "min": 7.5,
-      "median": 15.9,
-      "p95": 21.6,
-      "max": 112.7
+      "min": 13.5,
+      "median": 15.5,
+      "p95": 17.8,
+      "max": 18.8
     },
     "mbps": {
-      "min": 0.0,
-      "median": 0.0,
-      "p95": 0.7,
-      "max": 6.8
+      "min": 0.3,
+      "median": 0.4,
+      "p95": 0.6,
+      "max": 0.6
     },
     "sent_per_sample": {
-      "min": 4.0,
-      "median": 6.0,
-      "p95": 108.0,
-      "max": 112.0
+      "min": 90.0,
+      "median": 111.0,
+      "p95": 112.0,
+      "max": 113.0
     },
-    "cursor_pkts_total": 2245,
-    "input_pkts_total": 3430,
-    "dropped_total": 157,
+    "cursor_pkts_total": 218,
+    "input_pkts_total": 17,
+    "dropped_total": 6,
     "inflight_max": 1,
-    "idle_last": 8205.0
+    "idle_last": 2.0
   },
   "warnings": [],
   "warning_counts": {}
