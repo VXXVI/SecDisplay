@@ -1177,6 +1177,11 @@ public:
     bool tearingSupported() const { return tearing_; }
     void setUseVsync(bool v) { useVsync_ = v; }
 
+    // 断线时把后缓冲清成深色并 Present 一次。
+    // FLIP 交换链停止 Present 后 DWM 会一直显示最后一个后缓冲，窗口就永久停在
+    // 最后一帧，看起来像「显示的是别的屏」。断线必须主动清掉。
+    void ClearToIdle();
+
     // 解码器实际输出尺寸可能与显示尺寸不同（硬解按宏块对齐，1800 -> 1808）。
     // 变了就重建视频处理器，并按显示尺寸裁边。
     bool SetSourceSize(int w, int h);
@@ -1433,6 +1438,18 @@ void Presenter::PresentSample(IMFSample* sample) {
     g_stats.presented++;
 }
 
+void Presenter::ClearToIdle() {
+    if (!swap_ || !gfx_) return;
+    ComPtr<ID3D11Texture2D> back;
+    if (FAILED(swap_->GetBuffer(0, IID_PPV_ARGS(&back))) || !back) return;
+    ComPtr<ID3D11RenderTargetView> rtv;
+    if (FAILED(gfx_->device->CreateRenderTargetView(back.Get(), nullptr, &rtv)) || !rtv) return;
+    const float c[4] = { 0.06f, 0.06f, 0.07f, 1.0f };
+    gfx_->context->ClearRenderTargetView(rtv.Get(), c);
+    gfx_->context->Flush();
+    swap_->Present(0, 0);
+}
+
 void Presenter::Shutdown() {
     inViewCache_.clear();
     outViewCache_.clear();
@@ -1459,8 +1476,9 @@ static RECT g_savedRect{};
 static HWND    g_hintHwnd = nullptr;
 static HBRUSH  g_hintBrush = nullptr;
 static HFONT   g_hintFont = nullptr;
-static const wchar_t* g_hintText =
+static const wchar_t* kDefaultHint =
     L"F11 或 Esc 返回窗口      Ctrl+Alt+H 最小化让位      再按一次 Esc 退出";
+static const wchar_t* g_hintText = kDefaultHint;
 static const UINT     WM_APP_HIDE_HINT = WM_APP + 1;
 static const UINT_PTR TIMER_HINT_HIDE  = 3;
 
@@ -1519,6 +1537,16 @@ static void ShowFullscreenHint() {
     if (GetMonitorInfoW(mon, &mi)) { px = mi.rcMonitor.left + 16; py = mi.rcMonitor.top + 16; }
     SetWindowPos(g_hintHwnd, HWND_TOP, px, py, 920, 60, SWP_SHOWWINDOW | SWP_NOACTIVATE);
     SetTimer(g_hwnd, TIMER_HINT_HIDE, 5000, nullptr);   // 5 秒后自动隐藏
+}
+
+/// 断线/重连状态提示，复用同一条提示条
+static void ShowStatusHint(const wchar_t* text) {
+    g_hintText = text;
+    ShowFullscreenHint();
+}
+
+static void RestoreDefaultHint() {
+    g_hintText = kDefaultHint;
 }
 
 /// 在当前所在的显示器上铺满。配合 per-monitor DPI 感知，
@@ -2333,7 +2361,15 @@ static void NetworkLoop(RunConfig cfg, Graphics* gfx, Presenter* presenter) {
         sockaddr_in addr{};
         addr.sin_family = AF_INET;
         addr.sin_port = htons((u_short)cfg.port);
-        inet_pton(AF_INET, cfg.host.c_str(), &addr.sin_addr);
+        // inet_pton 失败时 sin_addr 会留在 0.0.0.0，Windows 上等于连本机，
+        // 会连到本机 9922 上任意监听者，看起来就像「显示的是别的屏」。必须检查返回值。
+        if (inet_pton(AF_INET, cfg.host.c_str(), &addr.sin_addr) != 1) {
+            Log("主机名无法解析为 IPv4: %s（请直接填 IP）", cfg.host.c_str());
+            closesocket(sock);
+            if (!cfg.reconnect) break;
+            Sleep(2000);
+            continue;
+        }
 
         Log("连接 %s:%d ...", cfg.host.c_str(), cfg.port);
         if (connect(sock, (sockaddr*)&addr, sizeof(addr)) != 0) {
@@ -2345,6 +2381,8 @@ static void NetworkLoop(RunConfig cfg, Graphics* gfx, Presenter* presenter) {
         }
         Log("已连接，目标 %dx%d", cfg.width, cfg.height);
         g_sock = sock;
+        RestoreDefaultHint();
+        HideFullscreenHint();
 
         // 给 recv 设超时，退出时即便漏了 shutdown，阻塞的 recv 也会在
         // 500ms 内返回，让收流线程能轮询 g_alive 后退出（避免 net.join 卡死）。
@@ -2687,6 +2725,11 @@ static void NetworkLoop(RunConfig cfg, Graphics* gfx, Presenter* presenter) {
         present.join();
         watch.join();
 
+        // 断线必须把画面清掉并给出提示。否则 FLIP 交换链会一直显示最后一帧，
+        // 用户看到的是几分钟前的旧画面，容易误判成「显示的是别的屏」。
+        presenter->ClearToIdle();
+        if (g_alive) ShowStatusHint(L"连接已断开，2 秒后重连…");
+
         decoder.Shutdown();
         if (g_sock.load() == sock) g_sock = INVALID_SOCKET;
         shutdown(sock, SD_BOTH);
@@ -2750,6 +2793,19 @@ int main(int argc, char** argv) {
     }
     if (useConfigFile) LoadConfigFile(cfg, cfgPath);
     ParseArgs(argc, argv, cfg);
+
+    // 单实例。旧实例被新实例踢掉后收流线程退出、交换链停止 Present，
+    // 窗口会永久停在最后一帧，看起来就像「显示的是别的屏」。
+    // 这里直接拒绝第二个实例，并把已有窗口提到前台。
+    {
+        HANDLE instMutex = CreateMutexW(nullptr, TRUE, L"Global\\SecDisplayReceiver");
+        if (instMutex && GetLastError() == ERROR_ALREADY_EXISTS) {
+            HWND existing = FindWindowA("SecDisplayReceiver", nullptr);
+            if (existing) { ShowWindow(existing, SW_RESTORE); SetForegroundWindow(existing); }
+            Log("已有接收端实例在运行，本次启动退出（避免两个实例互踢留下冻结窗口）");
+            return 0;
+        }
+    }
 
     if (!cfg.logFile.empty()) {
         // 追加模式，保留历史便于回看崩溃前的日志。
