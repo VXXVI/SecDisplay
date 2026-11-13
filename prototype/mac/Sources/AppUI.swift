@@ -117,7 +117,8 @@ struct StatusView: View {
                     }
                     Spacer()
                     Button("退出") {
-                        shutdown(signal: SIGTERM)
+                        // 退出清理里有嵌套 RunLoop 等待，放回主队列执行，避免卡在动画/事件循环里
+                        DispatchQueue.main.async { shutdown(signal: SIGTERM) }
                     }
                     .keyboardShortcut("q")
                 }
@@ -156,11 +157,19 @@ func openLogsFolder() {
 
 /// 打开/前置控制面板
 func showControlPanel() {
+    // .accessory 进程不会自动激活，窗口只 makeKeyAndOrderFront 有可能被别的 App
+    // 压在后面，看起来像「点了没反应」。先激活，再置前，最后兜底 orderFrontRegardless。
+    Log.info("打开控制面板请求")
+    NSApp.activate(ignoringOtherApps: true)
+
     if let w = panelWindow {
+        Log.info("复用已有面板 isVisible=\(w.isVisible)")
         w.makeKeyAndOrderFront(nil)
-        NSApp.activate(ignoringOtherApps: true)
+        w.orderFrontRegardless()
+        Log.info("面板已前置 key=\(w.isKeyWindow) visible=\(w.isVisible)")
         return
     }
+
     let host = NSHostingView(rootView: StatusView())
     let w = NSWindow(
         contentRect: NSRect(x: 0, y: 0, width: 380, height: 520),
@@ -170,9 +179,11 @@ func showControlPanel() {
     w.title = "SecDisplay 发送端"
     w.titlebarAppearsTransparent = true
     w.isReleasedWhenClosed = false
+    w.hidesOnDeactivate = false
     w.contentView = host
     w.center()
     w.makeKeyAndOrderFront(nil)
-    NSApp.activate(ignoringOtherApps: true)
+    w.orderFrontRegardless()
     panelWindow = w
+    Log.info("面板已创建 frame=\(w.frame) key=\(w.isKeyWindow) visible=\(w.isVisible)")
 }

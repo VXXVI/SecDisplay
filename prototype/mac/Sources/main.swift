@@ -746,8 +746,9 @@ final class Capture: NSObject, SCStreamOutput, SCStreamDelegate {
             if d > 9 { changed += 1 }
             i += 3
         }
-        let total = cur.count / 3
-        return changed <= max(3, total / 500)
+        // 阈值必须很低：流光/闪烁这类动画只改几十个像素，按比例阈值会被当成静止
+        // 丢掉，只剩 0.5 秒补帧，看起来就是一跳一跳。只跳过真正没变的帧。
+        return changed <= 1
     }
 
     func stream(_ stream: SCStream, didOutputSampleBuffer sb: CMSampleBuffer, of type: SCStreamOutputType) {
@@ -1996,19 +1997,57 @@ Timer.scheduledTimer(withTimeInterval: 0.1, repeats: true) { _ in
 // 这里挂一个 NSStatusItem，给出可视入口：实时状态 + 一键退出。
 // 退出仍走 shutdown(signal:)，保证虚拟屏按正常时序销毁。
 
-final class StatusMenuTarget: NSObject {
+final class StatusMenuTarget: NSObject, NSMenuItemValidation {
     @objc func quit() {
         Log.info("菜单栏请求退出")
-        shutdown(signal: SIGTERM)
+        // 退出清理里会用嵌套 RunLoop 等采集停稳，排到 default 模式执行，
+        // 等菜单 tracking 彻底退出后再开始，避免菜单挂在屏幕上等 5 秒。
+        RunLoop.main.perform(inModes: [.default]) { shutdown(signal: SIGTERM) }
     }
+
     @objc func openPanel() {
+        Log.info("菜单栏请求打开面板")
         showControlPanel()
+    }
+
+    /// 状态栏按钮点击：自己 popUp 菜单，不再依赖 AppKit 的 status item 菜单会话。
+    @objc func toggleMenu(_ sender: Any?) {
+        guard let button = statusItem?.button, let menu = statusMenu else {
+            Log.info("菜单栏按钮点击但菜单未就绪")
+            return
+        }
+        Log.info("菜单栏按钮被点击，准备弹菜单")
+        // 先激活再弹菜单，菜单窗口才有机会成为 key window。
+        NSApp.activate(ignoringOtherApps: true)
+        button.highlight(true)
+        menu.popUp(positioning: nil,
+                   at: NSPoint(x: 0, y: button.bounds.height + 4),
+                   in: button)
+        button.highlight(false)
+        Log.info("菜单已关闭")
+    }
+
+    /// autoenablesItems 关掉后 AppKit 仍可能问一次，一律允许，
+    /// 避免菜单项被判定 disabled：菜单照常弹出但点了没有反应。
+    @objc func validateMenuItem(_ item: NSMenuItem) -> Bool { true }
+}
+
+/// 菜单开关状态打点。菜单弹出/收起都写日志，
+/// 用来区分「菜单没弹出」「弹出但点击没派发」「派发了但面板没显示」三种情况。
+final class StatusMenuDelegate: NSObject, NSMenuDelegate {
+    func menuWillOpen(_ menu: NSMenu) {
+        Log.info("菜单已弹出 autoenables=\(menu.autoenablesItems) items=\(menu.items.count)")
+    }
+    func menuDidClose(_ menu: NSMenu) {
+        Log.info("菜单已收起")
     }
 }
 
 let statusMenuTarget = StatusMenuTarget()
+let statusMenuDelegate = StatusMenuDelegate()
 var statusItem: NSStatusItem?
 var statusInfoItem: NSMenuItem?
+var statusMenu: NSMenu?
 
 func setupStatusBar() -> NSApplication {
     let app = NSApplication.shared
@@ -2022,6 +2061,11 @@ func setupStatusBar() -> NSApplication {
     }
 
     let menu = NSMenu()
+    // 不让 AppKit 自动校验菜单项。命令行进程没有 mainMenu，
+    // 校验路径一旦把项判成 disabled，菜单照常弹出但点击完全没反应。
+    menu.autoenablesItems = false
+    menu.delegate = statusMenuDelegate
+
     let info = NSMenuItem(title: "正在启动…", action: nil, keyEquivalent: "")
     info.isEnabled = false
     menu.addItem(info)
@@ -2029,18 +2073,33 @@ func setupStatusBar() -> NSApplication {
 
     let open = NSMenuItem(title: "打开面板…", action: #selector(StatusMenuTarget.openPanel), keyEquivalent: "o")
     open.target = statusMenuTarget
+    open.isEnabled = true
     menu.addItem(open)
     menu.addItem(.separator())
 
     let quit = NSMenuItem(title: "退出 SecDisplay", action: #selector(StatusMenuTarget.quit), keyEquivalent: "q")
     quit.target = statusMenuTarget
+    quit.isEnabled = true
     menu.addItem(quit)
 
-    item.menu = menu
+    // 关键：不再把菜单挂到 item.menu 上。
+    // 这个进程是裸命令行可执行文件，没有 bundle；status item 的自动菜单由
+    // AppKit 的 menu-bar scene extension 托管（系统日志里只有
+    // com.apple.menubar:menu-xpc-client 的会话激活，没有任何 action 派发），
+    // 实测菜单能弹出、菜单项点了不触发。改成自己处理按钮点击 + NSMenu.popUp，
+    // 走普通上下文菜单那条路径，不依赖 status item 的菜单会话。
+    item.menu = nil
+    if let button = item.button {
+        button.target = statusMenuTarget
+        button.action = #selector(StatusMenuTarget.toggleMenu(_:))
+        button.sendAction(on: [.leftMouseUp])
+    }
+
     statusItem = item
     statusInfoItem = info
+    statusMenu = menu
     if item.button != nil {
-        Log.info("菜单栏图标已创建（右侧菜单栏，可点开退出）")
+        Log.info("菜单栏图标已创建（右侧菜单栏，点击弹菜单）")
     } else {
         Log.info("警告: 菜单栏按钮创建失败，退出仍需 Ctrl-C")
     }
