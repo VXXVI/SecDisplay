@@ -204,6 +204,160 @@ final class VirtualDisplayManager {
     enum Err: Error { case classesMissing, initFailed, modeFailed, applyFailed }
 }
 
+// MARK: - 解除镜像
+//
+// Sidecar 会把自己镜像到「当前可用的外接屏」，虚拟屏一上线就可能被抢去当镜像目标：
+// iPad 上出现一块空桌面，Mac 的显示器排列里多一块没人用的屏。
+// 两处兜底：建屏后主动解一次；系统重配置回调里再检查一次。
+// 注意：重配置回调里不能直接改显示配置（CG 会拒绝），必须丢回主队列再改。
+enum MirrorGuard {
+    nonisolated(unsafe) private static var target: CGDirectDisplayID = 0
+    nonisolated(unsafe) private static var registered = false
+    nonisolated(unsafe) private static var busy = false
+    nonisolated(unsafe) private static var lastAttempt: CFAbsoluteTime = 0
+
+    /// 记下要守护的虚拟屏，并挂上显示重配置回调（只挂一次）。
+    static func install(_ id: CGDirectDisplayID) {
+        target = id
+        guard !registered else { return }
+        registered = true
+        CGDisplayRegisterReconfigurationCallback(mirrorReconfigCallback, nil)
+        Log.info("镜像守护: 已接管虚拟屏 id=\(id)，建屏后与每次显示重配置都会检查镜像关系")
+    }
+
+    /// 解除与虚拟屏相关的镜像关系：
+    ///   a) 虚拟屏自己是 slave（CGDisplayMirrorsDisplay(vd) != 0）
+    ///   b) 别的屏镜像到虚拟屏（Sidecar 抢镜像目标的典型形态）
+    /// 只在真的存在镜像关系时才动配置，避免无谓的显示重配置造成闪烁。
+    static func release(_ reason: String) {
+        let id = target
+        guard id != 0, !busy else { return }
+
+        // 屏已经不在线（退出清理途中）就别再改配置了
+        let online = onlineDisplayIDs()
+        guard online.contains(id) else { return }
+
+        let master = CGDisplayMirrorsDisplay(id)
+        let slaves = online.filter { $0 != id && CGDisplayMirrorsDisplay($0) == id }
+        guard master != kCGNullDirectDisplay || !slaves.isEmpty else { return }
+
+        // 节流只对「真的要改配置」生效。放前面会把空转回调的时间戳一起推后，
+        // 真正的镜像事件反而被饿掉。
+        let now = CFAbsoluteTimeGetCurrent()
+        guard now - lastAttempt >= 0.5 else { return }
+        lastAttempt = now
+        busy = true
+        defer { busy = false }
+
+        var cfgRef: CGDisplayConfigRef?
+        let begin = CGBeginDisplayConfiguration(&cfgRef)
+        guard begin == .success, let cfg = cfgRef else {
+            Log.info("解除镜像失败(\(reason)): 无法开始显示配置 err=\(begin.rawValue)")
+            return
+        }
+        if master != kCGNullDirectDisplay {
+            let e = CGConfigureDisplayMirrorOfDisplay(cfg, id, kCGNullDirectDisplay)
+            Log.info("解除镜像(\(reason)): 虚拟屏 id=\(id) 原镜像源=\(master)，改为独立 err=\(e.rawValue)")
+        }
+        for s in slaves {
+            let e = CGConfigureDisplayMirrorOfDisplay(cfg, s, kCGNullDirectDisplay)
+            Log.info("解除镜像(\(reason)): id=\(s) 原镜像到虚拟屏 id=\(id)，改为独立 err=\(e.rawValue)")
+        }
+        let done = CGCompleteDisplayConfiguration(cfg, .permanently)
+        if done != .success {
+            Log.info("解除镜像未生效(\(reason)): CGCompleteDisplayConfiguration err=\(done.rawValue)")
+        }
+    }
+
+    private static func onlineDisplayIDs() -> [CGDirectDisplayID] {
+        var n: UInt32 = 0
+        CGGetOnlineDisplayList(32, nil, &n)
+        guard n > 0 else { return [] }
+        var ids = [CGDirectDisplayID](repeating: 0, count: Int(n))
+        CGGetOnlineDisplayList(n, &ids, &n)
+        return Array(ids.prefix(Int(n)))
+    }
+}
+
+/// C 回调：只处理「配置已完成」的那一轮（begin 标志清零），丢回主队列再改配置。
+private func mirrorReconfigCallback(_ display: CGDirectDisplayID,
+                                    _ flags: CGDisplayChangeSummaryFlags,
+                                    _ userInfo: UnsafeMutableRawPointer?) {
+    guard !flags.contains(.beginConfigurationFlag) else { return }
+    DispatchQueue.main.async { MirrorGuard.release("显示重配置") }
+}
+
+// MARK: - 雷雳链路检测
+//
+// 拔线后 TCP 往往不会立刻报错（对端没发 FIN，要等下一次写满重传超时），
+// 只看 sender.connected 会拖十几秒。这里直接读链路层 carrier：
+// SIOCGIFMEDIA 的 ifm_status，与 `ifconfig bridge0` 的 `status: active` 同源。
+// 不用 IFF_RUNNING 判：实测 bridge0 的成员口 en1/en2 没插线也带 RUNNING 标志，
+// 只有 media 状态反映真实 carrier。
+// 也不向 10.10.10.2:9922 发探测连接——那会顶掉接收端的真实连接。
+enum LinkMonitor {
+    /// 默认雷雳网桥。换接口用 SECDISPLAY_LINK_IF 覆盖。
+    static let ifName = ProcessInfo.processInfo.environment["SECDISPLAY_LINK_IF"] ?? "bridge0"
+
+    /// true=有 carrier，false=接口在但链路断，nil=接口不存在或不支持（不做链路加速）
+    static func probe() -> Bool? {
+        if let active = mediaActive(ifName) { return active }
+        return flagsRunning(ifName)
+    }
+
+    /// struct ifmediareq（Darwin）: name[16] + 5×int32 + int*，按 4 字节对齐合计 44 字节。
+    /// Swift 没导出这个结构，也没有 SIOCGIFMEDIA 常量，按 _IOWR('i',56,size) 自己算。
+    private struct MediaReq {
+        var ifm_name: (CChar, CChar, CChar, CChar, CChar, CChar, CChar, CChar,
+                       CChar, CChar, CChar, CChar, CChar, CChar, CChar, CChar) =
+            (0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0)
+        var ifm_current: Int32 = 0
+        var ifm_mask: Int32 = 0
+        var ifm_status: Int32 = 0
+        var ifm_active: Int32 = 0
+        var ifm_count: Int32 = 0
+        var ifm_ulist: (Int32, Int32) = (0, 0)
+    }
+    private static let siocgifmedia: UInt =
+        0xC0000000 | (UInt(MemoryLayout<MediaReq>.size & 0x1fff) << 16)
+        | (UInt(UInt8(ascii: "i")) << 8) | 56
+    private static let ifmAValid: Int32 = 0x1
+    private static let ifmActive: Int32 = 0x2
+
+    private static func mediaActive(_ name: String) -> Bool? {
+        let fd = socket(AF_INET, SOCK_DGRAM, 0)
+        guard fd >= 0 else { return nil }
+        defer { close(fd) }
+        var req = MediaReq()
+        let rc = withUnsafeMutablePointer(to: &req) { p -> Int32 in
+            let raw = UnsafeMutableRawPointer(p)
+            name.withCString { _ = strlcpy(raw.assumingMemoryBound(to: CChar.self), $0, 16) }
+            return ioctl(fd, siocgifmedia, p)
+        }
+        guard rc == 0, (req.ifm_status & ifmAValid) != 0 else { return nil }
+        return (req.ifm_status & ifmActive) != 0
+    }
+
+    /// 兜底：少数接口不支持 SIOCGIFMEDIA，退回 ifaddrs 的 UP+RUNNING。
+    private static func flagsRunning(_ name: String) -> Bool? {
+        var ifap: UnsafeMutablePointer<ifaddrs>?
+        guard getifaddrs(&ifap) == 0 else { return nil }
+        defer { freeifaddrs(ifap) }
+        var found = false
+        var running = false
+        var cur = ifap
+        while let p = cur {
+            if String(cString: p.pointee.ifa_name) == name {
+                found = true
+                let f = Int32(bitPattern: p.pointee.ifa_flags)
+                if (f & IFF_UP) != 0 && (f & IFF_RUNNING) != 0 { running = true }
+            }
+            cur = p.pointee.ifa_next
+        }
+        return found ? running : nil
+    }
+}
+
 // MARK: - 退出清理
 
 /// 信号处理器里只置标志位。真正的清理在主循环里做，
@@ -707,48 +861,11 @@ final class Capture: NSObject, SCStreamOutput, SCStreamDelegate {
 
     /// 与上一帧做步进采样对比，返回 true 表示这一帧可以跳过编码。
     private func shouldSkipStatic(_ pb: CVPixelBuffer) -> Bool {
-        // 兜底：最长 0.5s 一定编码一次，避免慢变化（光标闪烁、进度条）被压死。
-        if CFAbsoluteTimeGetCurrent() - lastEncodeAt >= 0.5 { return false }
-        CVPixelBufferLockBaseAddress(pb, .readOnly)
-        defer { CVPixelBufferUnlockBaseAddress(pb, .readOnly) }
-        guard let base = CVPixelBufferGetBaseAddress(pb) else { return false }
-        let w = CVPixelBufferGetWidth(pb)
-        let h = CVPixelBufferGetHeight(pb)
-        let bpr = CVPixelBufferGetBytesPerRow(pb)
-        let stepX = max(1, w / 96)
-        let stepY = max(1, h / 60)
-        let p = base.assumingMemoryBound(to: UInt8.self)
-        var cur = [UInt8]()
-        cur.reserveCapacity(96 * 60 * 3)
-        var y = 0
-        while y < h {
-            let row = p + y * bpr
-            var x = 0
-            while x < w {
-                let o = x * 4
-                cur.append(row[o]); cur.append(row[o + 1]); cur.append(row[o + 2])
-                x += stepX
-            }
-            y += stepY
-        }
-        let key = w * 10_000 + h
-        let prev = prevSamples
-        let sameSize = prevSampleKey == key && prev.count == cur.count
-        prevSamples = cur
-        prevSampleKey = key
-        guard sameSize else { return false }
-        var changed = 0
-        var i = 0
-        while i < cur.count {
-            let d = abs(Int(cur[i]) - Int(prev[i]))
-                + abs(Int(cur[i + 1]) - Int(prev[i + 1]))
-                + abs(Int(cur[i + 2]) - Int(prev[i + 2]))
-            if d > 9 { changed += 1 }
-            i += 3
-        }
-        // 阈值必须很低：流光/闪烁这类动画只改几十个像素，按比例阈值会被当成静止
-        // 丢掉，只剩 0.5 秒补帧，看起来就是一跳一跳。只跳过真正没变的帧。
-        return changed <= 1
+        // 用户要求满帧率：不再跳过静止帧。
+        // 之前的 0.5 秒兜底 + 96x60 采样会让静止桌面只有 2fps，
+        // 计数器、光标、小动画看起来一跳一跳。直连带宽和 M1 Pro 硬编都够，
+        // 改为全量编码，SCK 送多少帧就编多少帧。
+        return false
     }
 
     func stream(_ stream: SCStream, didOutputSampleBuffer sb: CMSampleBuffer, of type: SCStreamOutputType) {
@@ -1646,6 +1763,10 @@ do {
     exit(2)
 }
 
+// 建屏后立刻解除镜像。此时还没起采集，重配置不会打断视频流。
+MirrorGuard.install(vd.displayID)
+MirrorGuard.release("建屏后")
+
 // 打印在线显示器身份，便于现场确认选屏锚定命中正确、且 Sidecar 被正确排除
 var onN: UInt32 = 0
 CGGetOnlineDisplayList(32, nil, &onN)
@@ -1990,6 +2111,146 @@ Timer.scheduledTimer(withTimeInterval: 0.1, repeats: true) { _ in
     VirtualDisplayGuard.pendingSignal = 0
     shutdown(signal: sig)
 }
+
+// MARK: - 客户端看门狗
+//
+// 客户端走了（或线拔了）就收工，别让一块空虚拟屏一直挂在显示器排列里，
+// 也别让 Sidecar 继续往空屏上镜像。
+//   1. 从未连上过：启动后 180 秒宽限，超时清理退出（开机自启空跑的场景）
+//   2. 连上过又断开：连续断开 8 秒退出；链路已断（拔线）时缩到 2 秒
+//   3. 链路断满 2 秒直接算断开：拔线后 TCP 可能几十秒都不报错，
+//      只等 connected 变 false 会一直不退出
+//   4. 重新连上/链路恢复立即复位计时
+// 判据用 sender.connected，它由连接状态回调和发送失败回调维护。
+final class ClientWatchdog {
+    private enum LinkState: String {
+        case up = "正常"
+        case down = "已断"
+        case unknown = "未知"
+    }
+
+    private let initialGrace: Double
+    private let graceLinkUp: Double
+    private let graceLinkDown: Double
+
+    private var timer: Timer?
+    private var startedAt = CFAbsoluteTimeGetCurrent()
+    private var everConnected = false
+    private var lastConnectedAt: CFAbsoluteTime = 0
+    private var linkDownSince: CFAbsoluteTime?
+    private var lastLink: LinkState?
+    private var lastLoggedConnected: Bool?
+    private var fired = false
+
+    init(initialGrace: Double, graceLinkUp: Double, graceLinkDown: Double) {
+        self.initialGrace = initialGrace
+        self.graceLinkUp = graceLinkUp
+        self.graceLinkDown = graceLinkDown
+    }
+
+    func start() {
+        guard timer == nil else { return }
+        startedAt = CFAbsoluteTimeGetCurrent()
+        _ = currentLink()   // 先打一条初始链路状态，便于对照日志
+        let t = Timer(timeInterval: 1.0, repeats: true) { [weak self] _ in self?.tick() }
+        // .common：菜单展开（eventTracking）期间也要照常计时
+        RunLoop.main.add(t, forMode: .common)
+        timer = t
+        Log.info("看门狗已启动: 未连接宽限 \(Int(initialGrace))s，断开宽限 \(Int(graceLinkUp))s/链路断 \(Int(graceLinkDown))s")
+    }
+
+    private func currentLink() -> LinkState {
+        let link: LinkState
+        switch LinkMonitor.probe() {
+        case .some(true):  link = .up
+        case .some(false): link = .down
+        case .none:        link = .unknown
+        }
+        if link != lastLink {
+            lastLink = link
+            switch link {
+            case .up:
+                Log.info("链路: \(LinkMonitor.ifName) carrier 正常")
+            case .down:
+                Log.info("链路: \(LinkMonitor.ifName) carrier 丢失（拔线），断开宽限缩短到 \(Int(graceLinkDown))s")
+            case .unknown:
+                Log.info("链路: 未找到接口 \(LinkMonitor.ifName)，不做链路加速，只按 TCP 断开判定")
+            }
+        }
+        return link
+    }
+
+    private func tick() {
+        guard !fired else { return }
+        let now = CFAbsoluteTimeGetCurrent()
+        let link = currentLink()
+        let connected = sender.connected
+
+        if connected != lastLoggedConnected {
+            lastLoggedConnected = connected
+            if connected {
+                Log.info("看门狗: 客户端已连接，断开计时复位")
+            } else {
+                Log.info(everConnected ? "看门狗: 客户端已断开，开始计时" : "看门狗: 等待客户端连接")
+            }
+        }
+
+        if connected {
+            everConnected = true
+            lastConnectedAt = now
+        }
+
+        // 链路断满宽限就直接算断开。拔线后 TCP 往往要等重传超时才报错，
+        // 那时 connected 还是 true，只等它变 false 会让空虚拟屏继续挂几十秒。
+        if everConnected {
+            if link == .down {
+                if linkDownSince == nil { linkDownSince = now }
+                if let since = linkDownSince, now - since >= graceLinkDown {
+                    fire(String(format: "链路已断 %.1f 秒（宽限 %.0f 秒），按断开处理",
+                                now - since, graceLinkDown))
+                    return
+                }
+            } else {
+                linkDownSince = nil
+            }
+        }
+
+        if connected { return }
+
+        if !everConnected {
+            let waited = now - startedAt
+            if waited >= initialGrace {
+                fire(String(format: "启动后 %.0f 秒仍无客户端连接", waited))
+            }
+            return
+        }
+
+        let grace = (link == .down) ? graceLinkDown : graceLinkUp
+        let off = now - lastConnectedAt
+        if off >= grace {
+            fire(String(format: "客户端断开 %.1f 秒（宽限 %.0f 秒，链路 %@）",
+                        off, grace, link.rawValue))
+        }
+    }
+
+    private func fire(_ why: String) {
+        guard !fired else { return }
+        fired = true
+        timer?.invalidate()
+        timer = nil
+        Log.info("看门狗触发退出: \(why)")
+        // 与菜单退出同一条路径：排到下一个 default 轮次再清理。
+        // shutdown 内部会跑嵌套 RunLoop 等采集停稳，不能在定时器回调里直接进去。
+        RunLoop.main.perform(inModes: [.default]) { shutdown(signal: SIGTERM) }
+    }
+}
+
+let clientWatchdog = ClientWatchdog(
+    initialGrace: Double(ProcessInfo.processInfo.environment["SECDISPLAY_INITIAL_GRACE"] ?? "") ?? 180,
+    graceLinkUp: Double(ProcessInfo.processInfo.environment["SECDISPLAY_DISCONNECT_GRACE"] ?? "") ?? 8,
+    graceLinkDown: Double(ProcessInfo.processInfo.environment["SECDISPLAY_DISCONNECT_GRACE_LINKDOWN"] ?? "") ?? 2
+)
+clientWatchdog.start()
 
 // MARK: - 菜单栏图标
 //

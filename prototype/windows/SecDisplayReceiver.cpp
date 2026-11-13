@@ -306,6 +306,10 @@ static const UINT WM_APPLY_CURSOR = WM_APP + 2;
 static const UINT WM_APP_REMOTE_CURSOR = WM_APP + 3;
 // 0x03 的可见性变化：UI 线程据此 SetCursor(cur) 或 SetCursor(nullptr)
 static const UINT WM_APP_CURSOR_VIS = WM_APP + 4;
+// 老 SDK 的 winuser.h 可能没定义 WM_DPICHANGED（需要 WINVER >= 0x0603）
+#ifndef WM_DPICHANGED
+#define WM_DPICHANGED 0x02E0
+#endif
 struct CursorImageBuf {
     std::mutex mtx;
     std::vector<uint8_t> bgra;
@@ -314,6 +318,10 @@ struct CursorImageBuf {
 };
 static CursorImageBuf g_cursorImage;
 static HCURSOR g_customCursor = nullptr;   // 仅 UI 线程访问
+// 已建好的 HCURSOR 对应的位图指纹与缩放（千分比）。同一张位图、同一缩放不重建，
+// 避免重复的 CreateIconIndirect/DestroyCursor 造成光标闪烁和句柄抖动。
+static uint64_t g_cursorAppliedFp = 0;     // 仅 UI 线程访问
+static int g_cursorAppliedScalePm = 0;     // 仅 UI 线程访问
 
 // 输入回传：把窗口内的鼠标位置和按键状态发给 Mac，由它重放事件。
 // 不再用 SetCursorPos 搬本机光标——那会和用户自己的鼠标抢位置，
@@ -2050,6 +2058,29 @@ static void ShowControlPanel() {
     }
 }
 
+// 光标要按「屏幕物理像素」绘制：本窗口所在显示器的 DPI 缩放（96 DPI = 1.0）。
+// 用 GetDpiForWindow 而不是 GetDpiForSystem：多屏不同缩放时后者只反映系统/主屏。
+// 两者都用 GetProcAddress 取，保持与 DpiScale 相同的旧系统兼容路径。
+static double WindowDpiScale(HWND hwnd) {
+    typedef UINT (WINAPI *GetDpiForWindowFn)(HWND);
+    typedef UINT (WINAPI *GetDpiForSystemFn)(void);
+    HMODULE u32 = GetModuleHandleA("user32.dll");
+    UINT dpi = 0;
+    if (u32 && hwnd) {
+        auto fn = (GetDpiForWindowFn)GetProcAddress(u32, "GetDpiForWindow");
+        if (fn) dpi = fn(hwnd);
+    }
+    if (dpi == 0 && u32) {
+        auto fn = (GetDpiForSystemFn)GetProcAddress(u32, "GetDpiForSystem");
+        if (fn) dpi = fn();
+    }
+    if (dpi == 0) dpi = 96;
+    double s = (double)dpi / 96.0;
+    if (s < 1.0) s = 1.0;   // 低于 96 DPI 也不缩小，光标只能因为高 DPI 变大
+    if (s > 4.0) s = 4.0;   // 上限保护，避免 4x 屏上出现超大指针
+    return s;
+}
+
 // 用收到的 BGRA 像素造一个 32bpp 带 alpha 的 HCURSOR。
 // 仅在 UI 线程(WM_APPLY_CURSOR)调用；旧 cursor 在此销毁，无跨线程句柄竞态。
 static void ApplyCursorImage() {
@@ -2065,43 +2096,63 @@ static void ApplyCursorImage() {
         g_cursorImage.pending = false;
     }
     if (w <= 0 || h <= 0 || (int)bgra.size() < w * h * 4) return;
+    const int rawW = w, rawH = h, rawHotX = hotX, rawHotY = hotY;   // 原始参数，仅供日志
 
-    // 视频帧会被拉伸铺满客户区，光标位图也要按同样比例缩放。
-    // Windows 显示器分辨率高于 Mac 逻辑尺寸时（例如 2880x1800 对 1600x1000），
-    // 画面元素被放大而光标保持 1:1，视觉上就是「光标没变大」甚至偏小。
+    // 位图指纹：尺寸 + 热点 + 全像素。同一张位图且缩放没变就不用重建 HCURSOR。
+    // 放在缩放之前算，指纹只跟网络收到的原始数据相关，跨 DPI 变化也能复用。
+    uint64_t fp = 1469598103934665603ull;
     {
-        int vw = g_coordW.load(), vh = g_coordH.load();
-        RECT rc{};
-        if (vw > 0 && vh > 0 && g_hwnd && GetClientRect(g_hwnd, &rc)) {
-            int cw = rc.right - rc.left, ch = rc.bottom - rc.top;
-            if (cw > 0 && ch > 0) {
-                double sx = (double)cw / (double)vw;
-                double sy = (double)ch / (double)vh;
-                if (sx < 0.99 || sx > 1.01 || sy < 0.99 || sy > 1.01) {
-                    int w2 = (int)(w * sx + 0.5);
-                    int h2 = (int)(h * sy + 0.5);
-                    if (w2 < 1) w2 = 1;
-                    if (h2 < 1) h2 = 1;
-                    std::vector<uint8_t> dst((size_t)w2 * h2 * 4);
-                    for (int yy = 0; yy < h2; ++yy) {
-                        int sy0 = (int)((long long)yy * h / h2);
-                        if (sy0 >= h) sy0 = h - 1;
-                        for (int xx = 0; xx < w2; ++xx) {
-                            int sx0 = (int)((long long)xx * w / w2);
-                            if (sx0 >= w) sx0 = w - 1;
-                            memcpy(&dst[((size_t)yy * w2 + xx) * 4],
-                                   &bgra[((size_t)sy0 * w + sx0) * 4], 4);
-                        }
-                    }
-                    hotX = (int)(hotX * sx + 0.5);
-                    hotY = (int)(hotY * sy + 0.5);
-                    bgra.swap(dst);
-                    w = w2;
-                    h = h2;
-                }
+        int key[4] = { w, h, hotX, hotY };
+        const uint8_t* kp = (const uint8_t*)key;
+        for (size_t i = 0; i < sizeof(key); ++i) { fp ^= kp[i]; fp *= 1099511628211ull; }
+        const uint8_t* bp = bgra.data();
+        size_t n = (size_t)w * h * 4;
+        for (size_t i = 0; i < n; ++i) { fp ^= bp[i]; fp *= 1099511628211ull; }
+    }
+
+    // 缩放基准：Mac 送来的位图是 1x 逻辑点（CursorImageTracker 用 NSCursor.size 归一化），
+    // 客户区坐标却是物理像素（PER_MONITOR_AWARE_V2）。
+    // 旧做法按「客户区 / 流尺寸」缩放是错的：窗口模式客户区固定取屏幕宽度的一半
+    // （见窗口创建处的 sw/2），系数恒为 0.5，箭头只剩一半尺寸，肉眼几乎看不见；
+    // 全屏时系数恒为 1，又完全不补偿 DPI，在高 DPI 屏上同样偏小。
+    // 指针是给用户直接看的，按屏幕物理像素绘制，只乘本显示器的 DPI 缩放。
+    // 1600x1000 客户区铺满 1600x1000 流、DPI 100% 时系数正好是 1。
+    const double scale = WindowDpiScale(g_hwnd);
+    const int scalePm = (int)(scale * 1000.0 + 0.5);
+    if (g_customCursor && fp == g_cursorAppliedFp && scalePm == g_cursorAppliedScalePm) {
+        return;   // 同一张图同一缩放，沿用现有 HCURSOR
+    }
+
+    int w2 = (int)(w * scale + 0.5);
+    int h2 = (int)(h * scale + 0.5);
+    if (w2 < 1) w2 = 1;
+    if (h2 < 1) h2 = 1;
+    if (w2 > 256) w2 = 256;
+    if (h2 > 256) h2 = 256;
+    if (w2 != w || h2 != h) {
+        std::vector<uint8_t> dst((size_t)w2 * h2 * 4);
+        for (int yy = 0; yy < h2; ++yy) {
+            int sy0 = (int)((long long)yy * h / h2);
+            if (sy0 >= h) sy0 = h - 1;
+            for (int xx = 0; xx < w2; ++xx) {
+                int sx0 = (int)((long long)xx * w / w2);
+                if (sx0 >= w) sx0 = w - 1;
+                memcpy(&dst[((size_t)yy * w2 + xx) * 4],
+                       &bgra[((size_t)sy0 * w + sx0) * 4], 4);
             }
         }
+        // 热点跟着位图同比例缩放，否则指针尖和实际点击点会错位
+        hotX = (int)((double)hotX * (double)w2 / (double)w + 0.5);
+        hotY = (int)((double)hotY * (double)h2 / (double)h + 0.5);
+        bgra.swap(dst);
+        w = w2;
+        h = h2;
     }
+    // 热点必须落在位图内，越界会让 CreateIconIndirect 造出的指针跑偏或直接不可见
+    if (hotX < 0) hotX = 0;
+    if (hotY < 0) hotY = 0;
+    if (hotX > w - 1) hotX = w - 1;
+    if (hotY > h - 1) hotY = h - 1;
 
     // color DIB：自底向上，32bpp BGRA
     BITMAPV5HEADER bi{};
@@ -2132,11 +2183,18 @@ static void ApplyCursorImage() {
     HCURSOR cur = CreateIconIndirect(&ii);
     DeleteObject(color);
     DeleteObject(mask);
-    if (!cur) return;
+    if (!cur) return;   // 不更新指纹，下一包重试
 
-    if (g_customCursor) DestroyCursor(g_customCursor);
+    Log("光标位图 %dx%d hot=(%d,%d) 缩放 %.2fx → 实际 %dx%d hot=(%d,%d)",
+        rawW, rawH, rawHotX, rawHotY, scale, w, h, hotX, hotY);
+
+    // 先挂上新的再销毁旧的：反过来的话，销毁到 SetCursor 之间系统光标句柄是悬空的
+    HCURSOR old = g_customCursor;
     g_customCursor = cur;
+    g_cursorAppliedFp = fp;
+    g_cursorAppliedScalePm = scalePm;
     if (g_cursorVisible.load()) SetCursor(cur);
+    if (old) DestroyCursor(old);
 }
 
 // 查询窗口所在显示器的当前刷新率。启动、显示模式变化、窗口跨屏移动时都用它。
@@ -2210,6 +2268,15 @@ static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
         // 显示模式变化或窗口跨屏移动后，刷新率可能变了，--pace 的节拍要跟着更新
         UpdateRefreshHz();
         return 0;
+    case WM_DPICHANGED:
+        // 窗口被拖到另一块缩放不同的显示器：按新 DPI 重建光标位图。
+        // 原始位图仍留在 g_cursorImage.bgra，只是 pending 已被清掉，这里重新置位。
+        {
+            std::lock_guard<std::mutex> lk(g_cursorImage.mtx);
+            if (!g_cursorImage.bgra.empty()) g_cursorImage.pending = true;
+        }
+        ApplyCursorImage();
+        break;   // 窗口位置/尺寸仍交给 DefWindowProc
     case WM_APP_REMOTE_CURSOR: {
         // 事件驱动：只有收到新的远程位置才搬一次光标，不再 4ms 轮询。
         // Mac 端静止时本来就不发包，所以不会出现「停下 1 秒就被拽回」。
