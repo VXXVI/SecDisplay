@@ -24,6 +24,17 @@ final class AppModel: ObservableObject {
     @Published var presetName = "-"
     @Published var cursorImageOn = true
     @Published var logLine = ""
+    @Published var resolutionIndex = 0
+    /// 刷新时置位，避免程序化改选中项触发重启
+    var suppressResolutionChange = false
+
+    static let resolutions: [(label: String, w: Int, h: Int)] = [
+        ("1600 × 1000", 1600, 1000),
+        ("1920 × 1200", 1920, 1200),
+        ("2240 × 1400", 2240, 1400),
+        ("2560 × 1600", 2560, 1600),
+        ("2880 × 1800", 2880, 1800),
+    ]
 
     private init() {}
 
@@ -43,6 +54,9 @@ final class AppModel: ObservableObject {
         cursorImageOn = !disableCursorImage
         presetName = ProcessInfo.processInfo.environment["SECDISPLAY_PRESET"] ?? "自定义"
         logLine = Log.currentPath
+        suppressResolutionChange = true
+        resolutionIndex = AppModel.resolutions.firstIndex { $0.w == cfg.width && $0.h == cfg.height } ?? -1
+        suppressResolutionChange = false
     }
 }
 
@@ -93,6 +107,28 @@ struct StatusView: View {
                 StatRow(label: "静止跳过", value: "\(model.skipped)")
                 StatRow(label: "光标频率", value: String(format: "%.0f Hz", model.cursorHz))
                 StatRow(label: "画质档位", value: model.presetName)
+
+                HStack {
+                    Text("切换分辨率").foregroundStyle(.secondary)
+                    Spacer()
+                    Picker("", selection: Binding(
+                        get: { model.resolutionIndex },
+                        set: { idx in
+                            guard !model.suppressResolutionChange, idx >= 0,
+                                  idx < AppModel.resolutions.count else { return }
+                            let r = AppModel.resolutions[idx]
+                            restartWithResolution(r.w, r.h)
+                        })) {
+                        ForEach(Array(AppModel.resolutions.enumerated()), id: \.offset) { i, r in
+                            Text(r.label).tag(i)
+                        }
+                        if model.resolutionIndex < 0 {
+                            Text("自定义").tag(-1)
+                        }
+                    }
+                    .labelsHidden()
+                    .frame(width: 160)
+                }
             }
 
             Divider()
@@ -134,6 +170,22 @@ struct StatusView: View {
         }
         .padding(18)
         .frame(width: 380)
+    }
+}
+
+/// 切换分辨率：虚拟屏和编码器都在启动时按尺寸建好，改尺寸只能重建进程。
+/// 这里起一个延迟 9 秒的 shell，等 shutdown 的清理（约 6 秒）走完再拉起新进程。
+func restartWithResolution(_ w: Int, _ h: Int) {
+    let dir = FileManager.default.currentDirectoryPath
+    Log.info("面板切换分辨率 \(w)x\(h)，准备重启")
+    let p = Process()
+    p.executableURL = URL(fileURLWithPath: "/bin/zsh")
+    p.arguments = ["-c", "sleep 9; cd \"\(dir)\" && SECDISPLAY_W=\(w) SECDISPLAY_H=\(h) ./run.sh restart"]
+    p.standardOutput = FileHandle.nullDevice
+    p.standardError = FileHandle.nullDevice
+    try? p.run()
+    DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
+        shutdown(signal: SIGTERM)
     }
 }
 
