@@ -1211,9 +1211,11 @@ final class CursorTracker {
         let eventDriven = eventMonitor != nil
         Log.info("光标通道: \(eventDriven ? "事件驱动" : "定时轮询")，目标 \(Int(targetHz)) Hz")
 
-        // 事件驱动时定时器只做兜底：鼠标停住前最后一段位移可能被限流丢掉。
-        // 监视器不可用时退回 8ms 轮询，保证至少还能工作。
-        let ms = eventDriven ? 50 : 8
+        // 事件驱动时定时器做「保底节拍」：系统在锁屏/高负载下会把 mouseMoved
+        // 事件节流到 ~40Hz，只靠事件光标会掉到 40Hz 以下。9ms 轮询配合实时位置读取，
+        // 即使事件被压也能维持接近目标频率。emitIfDue 内部按 minInterval 限流，
+        // 事件与轮询叠加不会超频。
+        let ms = eventDriven ? 9 : 8
         let t = DispatchSource.makeTimerSource(queue: queue)
         t.schedule(deadline: .now(), repeating: .milliseconds(ms),
                    leeway: .microseconds(eventDriven ? 2000 : 500))
