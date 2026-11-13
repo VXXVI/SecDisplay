@@ -2557,7 +2557,10 @@ final class ClientWatchdog {
 
         // 链路断满宽限就直接算断开。拔线后 TCP 往往要等重传超时才报错，
         // 那时 connected 还是 true，只等它变 false 会让空虚拟屏继续挂几十秒。
-        if everConnected {
+        // 链路断满宽限就直接算断开，不要求「连过」。
+        // 拔线时虚拟屏必须马上消失，否则会一直挂在显示器排列里。
+        // 启动后 10 秒内的链路抖动不算（开机时网桥可能还没起来）。
+        if now - startedAt >= 10 {
             if link == .down {
                 if linkDownSince == nil { linkDownSince = now }
                 if let since = linkDownSince, now - since >= graceLinkDown {
