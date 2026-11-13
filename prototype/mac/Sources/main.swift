@@ -488,7 +488,11 @@ final class Encoder {
         VTSessionSetProperty(s, key: kVTCompressionPropertyKey_RealTime, value: kCFBooleanTrue)
         VTSessionSetProperty(s, key: kVTCompressionPropertyKey_ProfileLevel, value: kVTProfileLevel_H264_High_AutoLevel)
         VTSessionSetProperty(s, key: kVTCompressionPropertyKey_ExpectedFrameRate, value: NSNumber(value: captureHz))
-        VTSessionSetProperty(s, key: kVTCompressionPropertyKey_MaxKeyFrameInterval, value: 600 as CFNumber)
+        // GOP 长度。600 帧在 55fps 下约 11 秒，实测每 12 秒一次编码延迟尖峰
+        // (38~70ms)，表现为「间歇性卡一下」。TCP 不丢包，关键帧只在
+        // 新客户端连上时按 0x02 请求补发，所以可以拉长。用 SECDISPLAY_GOP 覆盖。
+        let gop = Int(ProcessInfo.processInfo.environment["SECDISPLAY_GOP"] ?? "") ?? 3000
+        VTSessionSetProperty(s, key: kVTCompressionPropertyKey_MaxKeyFrameInterval, value: gop as CFNumber)
 
         switch variant {
         case "B":
@@ -686,7 +690,11 @@ final class Encoder {
             }
         }
 
-        if isKey { keyframeCount += 1 }
+        if isKey {
+            keyframeCount += 1
+            // 关键帧编码明显更贵，打一行便于把「间歇性卡顿」和 GOP 对上。
+            Log.info("编码关键帧 #\(keyframeCount)")
+        }
         encoded += 1
         bytes += out.count
         onFrame?(out, isKey, captureTime)
@@ -1649,18 +1657,17 @@ func reconfigureDisplays() {
 var cfg = Config()
 
 // 单实例：两个发送端会各建一块虚拟屏，还会抢 9922 端口，表现为画面来回跳。
-// .app 和命令行两条启动路径共用同一个 pid 文件。
+// 用 flock 而不是 pid 文件：锁在进程退出时由内核释放，不存在 pid 被回收后的误判。
 do {
     let dir = (NSHomeDirectory() as NSString).appendingPathComponent("Library/Application Support/SecDisplay")
     try? FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true)
-    let pidPath = (dir as NSString).appendingPathComponent("sender.pid")
-    if let s = try? String(contentsOfFile: pidPath, encoding: .utf8),
-       let old = pid_t(s.trimmingCharacters(in: .whitespacesAndNewlines)), old > 0,
-       old != getpid(), kill(old, 0) == 0 {
-        Log.info("已有发送端在运行 (pid=\(old))，本次启动退出。如需重启先结束旧进程。")
+    let lockPath = (dir as NSString).appendingPathComponent("sender.lock")
+    let fd = open(lockPath, O_CREAT | O_RDWR, 0o644)
+    if fd >= 0 && flock(fd, LOCK_EX | LOCK_NB) != 0 {
+        Log.info("已有发送端在运行，本次启动退出。如需重启先结束旧进程。")
         exit(0)
     }
-    try? "\(getpid())".write(toFile: pidPath, atomically: true, encoding: .utf8)
+    // fd 故意不关闭，锁随进程存活
 }
 
 // 预设档位：不同分辨率与采集帧率组合，用于对比流畅度与清晰度
