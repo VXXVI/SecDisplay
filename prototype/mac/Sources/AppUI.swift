@@ -28,16 +28,19 @@ final class AppModel: ObservableObject {
     /// 刷新时置位，避免程序化改选中项触发重启
     var suppressResolutionChange = false
 
-    static let resolutions: [(label: String, w: Int, h: Int)] = [
-        ("1600 × 1000", 1600, 1000),
-        ("1920 × 1200", 1920, 1200),
-        ("2240 × 1400", 2240, 1400),
-        ("2560 × 1600", 2560, 1600),
-        ("2880 × 1800", 2880, 1800),
+    static let resolutions: [(label: String, w: Int, h: Int, lw: Int, lh: Int)] = [
+        ("1600 × 1000", 1600, 1000, 1600, 1000),
+        ("1920 × 1200", 1920, 1200, 1920, 1200),
+        ("2240 × 1400", 2240, 1400, 2240, 1400),
+        ("2560 × 1600", 2560, 1600, 2560, 1600),
+        ("2880 × 1800", 2880, 1800, 2880, 1800),
+        // 2880×1800 像素 + 1440×900 逻辑 = 标准 2x HiDPI。
+        // Windows 200% 缩放的 2880×1800 屏用这一档文字最锐，桌面布局也正常。
+        ("2880 × 1800 @ 2x", 2880, 1800, 1440, 900),
         // 16:9 档位：Windows 显示器主流比例，选对了接收端全屏才能 1:1 不缩放
-        ("1920 × 1080", 1920, 1080),
-        ("2560 × 1440", 2560, 1440),
-        ("3840 × 2160", 3840, 2160),
+        ("1920 × 1080", 1920, 1080, 1920, 1080),
+        ("2560 × 1440", 2560, 1440, 2560, 1440),
+        ("3840 × 2160", 3840, 2160, 3840, 2160),
     ]
 
     private init() {}
@@ -59,7 +62,7 @@ final class AppModel: ObservableObject {
         presetName = ProcessInfo.processInfo.environment["SECDISPLAY_PRESET"] ?? "自定义"
         logLine = Log.currentPath
         suppressResolutionChange = true
-        resolutionIndex = AppModel.resolutions.firstIndex { $0.w == cfg.width && $0.h == cfg.height } ?? -1
+        resolutionIndex = AppModel.resolutions.firstIndex { $0.w == cfg.width && $0.h == cfg.height && $0.lw == cfg.logicalWidth && $0.lh == cfg.logicalHeight } ?? -1
         suppressResolutionChange = false
     }
 }
@@ -121,7 +124,7 @@ struct StatusView: View {
                             guard !model.suppressResolutionChange, idx >= 0,
                                   idx < AppModel.resolutions.count else { return }
                             let r = AppModel.resolutions[idx]
-                            restartWithResolution(r.w, r.h)
+                            restartWithResolution(r.w, r.h, r.lw, r.lh)
                         })) {
                         ForEach(Array(AppModel.resolutions.enumerated()), id: \.offset) { i, r in
                             Text(r.label).tag(i)
@@ -183,18 +186,18 @@ struct StatusView: View {
 
 /// 切换分辨率：虚拟屏和编码器都在启动时按尺寸建好，改尺寸只能重建进程。
 /// 命令行启动走 run.sh restart；.app 启动时没有 run.sh，直接重启自身。
-func restartWithResolution(_ w: Int, _ h: Int) {
+func restartWithResolution(_ w: Int, _ h: Int, _ lw: Int, _ lh: Int) {
     let dir = FileManager.default.currentDirectoryPath
     Log.info("面板切换分辨率 \(w)x\(h)，准备重启")
     let p = Process()
     p.executableURL = URL(fileURLWithPath: "/bin/zsh")
     if FileManager.default.fileExists(atPath: dir + "/run.sh") {
-        p.arguments = ["-c", "sleep 9; cd \"\(dir)\" && SECDISPLAY_W=\(w) SECDISPLAY_H=\(h) ./run.sh restart"]
+        p.arguments = ["-c", "sleep 9; cd \"\(dir)\" && SECDISPLAY_W=\(w) SECDISPLAY_H=\(h) SECDISPLAY_LOGICAL_W=\(lw) SECDISPLAY_LOGICAL_H=\(lh) ./run.sh restart"]
     } else {
         // .app 场景：用 open 重新拉起 bundle，保持 TCC 归属在 bundle 上。
         // 直接跑 Contents/MacOS/SecDisplay 会被当成裸二进制，权限可能对不上。
         let appPath = Bundle.main.bundlePath
-        p.arguments = ["-c", "sleep 9; open -n \"\(appPath)\" --env SECDISPLAY_W=\(w) --env SECDISPLAY_H=\(h)"]
+        p.arguments = ["-c", "sleep 9; open -n \"\(appPath)\" --env SECDISPLAY_W=\(w) --env SECDISPLAY_H=\(h) --env SECDISPLAY_LOGICAL_W=\(lw) --env SECDISPLAY_LOGICAL_H=\(lh)"]
     }
     p.standardOutput = FileHandle.nullDevice
     p.standardError = FileHandle.nullDevice
@@ -203,8 +206,6 @@ func restartWithResolution(_ w: Int, _ h: Int) {
         shutdown(signal: SIGTERM)
     }
 }
-
-private var panelWindow: NSWindow?
 
 /// 打开日志目录。命令行运行时日志在 ./logs，打包成 app 后在 ~/Library/Logs/SecDisplay。
 func openLogsFolder() {
@@ -222,41 +223,43 @@ func openLogsFolder() {
     }
 }
 
-/// 隐藏面板但保留进程。面板只是个查看窗口，关掉不该影响推流。
+/// 关闭面板但保留进程。面板只是个查看窗口，关掉不该影响推流。
 func hideControlPanel() {
-    panelWindow?.orderOut(nil)
-    Log.info("面板已隐藏")
+    guard let p = panelPopover else { return }
+    p.performClose(nil)
+    Log.info("面板已关闭")
 }
 
-/// 打开/前置控制面板
-func showControlPanel() {
-    // .accessory 进程不会自动激活，窗口只 makeKeyAndOrderFront 有可能被别的 App
-    // 压在后面，看起来像「点了没反应」。先激活，再置前，最后兜底 orderFrontRegardless。
-    Log.info("打开控制面板请求")
-    NSApp.activate(ignoringOtherApps: true)
+private var panelPopover: NSPopover?
 
-    if let w = panelWindow {
-        Log.info("复用已有面板 isVisible=\(w.isVisible)")
-        w.makeKeyAndOrderFront(nil)
-        w.orderFrontRegardless()
-        Log.info("面板已前置 key=\(w.isKeyWindow) visible=\(w.isVisible)")
+/// 控制面板做成挂在菜单栏图标上的 popover。
+///
+/// 之前用的是独立 NSWindow：这个进程是 .accessory，窗口要先激活 App 才能拿到 key，
+/// 而在这台机器上激活一直被别的进程抢走，结果窗口画得出来、所有按钮点不动。
+/// popover 由状态栏按钮托管，激活和事件路由都走系统那条成熟路径，不靠我们自己抢焦点。
+/// .transient 让点外面就自动收起，正好符合「不挡工作」。
+func showControlPanel() {
+    Log.info("打开控制面板请求")
+
+    if let p = panelPopover, p.isShown {
+        p.performClose(nil)
+        Log.info("面板已收起")
         return
     }
 
-    let host = NSHostingView(rootView: StatusView())
-    let w = NSWindow(
-        contentRect: NSRect(x: 0, y: 0, width: 380, height: 520),
-        styleMask: [.titled, .closable, .miniaturizable, .fullSizeContentView],
-        backing: .buffered,
-        defer: false)
-    w.title = "SecDisplay 发送端"
-    w.titlebarAppearsTransparent = true
-    w.isReleasedWhenClosed = false
-    w.hidesOnDeactivate = false
-    w.contentView = host
-    w.center()
-    w.makeKeyAndOrderFront(nil)
-    w.orderFrontRegardless()
-    panelWindow = w
-    Log.info("面板已创建 frame=\(w.frame) key=\(w.isKeyWindow) visible=\(w.isVisible)")
+    guard let button = statusItem?.button else {
+        Log.info("面板打开失败: 菜单栏按钮不存在")
+        return
+    }
+
+    let p = NSPopover()
+    p.behavior = .transient
+    p.animates = true
+    p.contentSize = NSSize(width: 380, height: 520)
+    p.contentViewController = NSHostingController(rootView: StatusView())
+    panelPopover = p
+
+    NSApp.activate(ignoringOtherApps: true)
+    p.show(relativeTo: button.bounds, of: button, preferredEdge: .minY)
+    Log.info("面板已弹出 shown=\(p.isShown)")
 }
