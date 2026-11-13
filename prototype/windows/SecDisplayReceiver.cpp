@@ -404,6 +404,15 @@ static HWND g_hwnd = nullptr;   // 主窗口句柄，ClientToVideo 与全屏切�
 // false 时所有后台线程（收流/光标/监控）应尽快结束。
 static std::atomic<bool> g_alive{ true };
 
+// 可中断的等待：退出时不用等满整个重连间隔，避免「点退出没反应」
+static void SleepAlive(int ms) {
+    while (ms > 0 && g_alive.load()) {
+        int step = ms > 100 ? 100 : ms;
+        Sleep(step);
+        ms -= step;
+    }
+}
+
 // ---------------------------------------------------------------------------
 // 系统托盘：全屏置顶无边框窗口没有关闭按钮，唯一退出口是 Esc。
 // 加一个托盘小图标，让「退出」永远点得到，不用盲敲命令。
@@ -1710,6 +1719,8 @@ static const wchar_t* kDefaultHint =
     L"F11 或 Esc 返回窗口      Ctrl+Alt+H 最小化让位      再按一次 Esc 退出";
 static const wchar_t* g_hintText = kDefaultHint;
 static const UINT     WM_APP_HIDE_HINT = WM_APP + 1;
+static const UINT     WM_APP_SHOW_STATUS = WM_APP + 5;
+static const wchar_t* g_pendingStatus = nullptr;
 static const UINT_PTR TIMER_HINT_HIDE  = 3;
 
 static LRESULT CALLBACK HintWndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
@@ -1773,6 +1784,12 @@ static void ShowFullscreenHint() {
 static void ShowStatusHint(const wchar_t* text) {
     g_hintText = text;
     ShowFullscreenHint();
+}
+
+/// 从网络线程请求 UI 线程显示状态提示（提示窗只能在 UI 线程碰）
+static void ShowStatusHintAsync(const wchar_t* text) {
+    g_pendingStatus = text;
+    if (g_hwnd) PostMessageW(g_hwnd, WM_APP_SHOW_STATUS, 0, 0);
 }
 
 static void RestoreDefaultHint() {
@@ -2251,6 +2268,9 @@ static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
     case WM_APP_HIDE_HINT:
         HideFullscreenHint();
         return 0;
+    case WM_APP_SHOW_STATUS:
+        if (g_pendingStatus) ShowStatusHint(g_pendingStatus);
+        return 0;
     case WM_APPLY_CURSOR:
         // 网络线程收到 0x05 后 post 到这里，HCURSOR 创建/销毁统一在 UI 线程
         ApplyCursorImage();
@@ -2617,6 +2637,9 @@ static void ResizeWindowForVideo(int w, int h) {
 }
 
 static void NetworkLoop(RunConfig cfg, Graphics* gfx, Presenter* presenter) {
+    // 还没连上时先给一个明确的等待状态，避免全屏黑屏被当成卡死
+    presenter->ClearToIdle();
+    ShowStatusHintAsync(L"等待 Mac 发送端…");
     // 交换链改尺寸失败过的尺寸，避免每次重连都反复尝试同一个值
     int failedW = 0, failedH = 0;
     while (g_alive) {
@@ -2638,7 +2661,7 @@ static void NetworkLoop(RunConfig cfg, Graphics* gfx, Presenter* presenter) {
         SOCKET sock = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
         if (sock == INVALID_SOCKET) {
             Log("socket 失败 %d，2 秒后重试", WSAGetLastError());
-            Sleep(2000);
+            SleepAlive(2000);
             continue;
         }
 
@@ -2656,18 +2679,48 @@ static void NetworkLoop(RunConfig cfg, Graphics* gfx, Presenter* presenter) {
             Log("主机名无法解析为 IPv4: %s（请直接填 IP）", cfg.host.c_str());
             closesocket(sock);
             if (!cfg.reconnect) break;
-            Sleep(2000);
+            SleepAlive(2000);
             continue;
         }
 
         Log("连接 %s:%d ...", cfg.host.c_str(), cfg.port);
-        if (connect(sock, (sockaddr*)&addr, sizeof(addr)) != 0) {
-            Log("连接失败 %d", WSAGetLastError());
+        // 非阻塞 connect + 2 秒超时：Mac 没开机时 IP 不可达，阻塞 connect 会卡十几秒，
+        // 退出时 net.join 也跟着等，表现成「点了退出没反应」。
+        u_long nb = 1;
+        ioctlsocket(sock, FIONBIO, &nb);
+        int rc = connect(sock, (sockaddr*)&addr, sizeof(addr));
+        bool connected = (rc == 0);
+        if (!connected) {
+            int err = WSAGetLastError();
+            if (err == WSAEWOULDBLOCK) {
+                fd_set wf;
+                FD_ZERO(&wf);
+                FD_SET(sock, &wf);
+                timeval tv{ 2, 0 };
+                int sel = select(0, nullptr, &wf, nullptr, &tv);
+                if (sel > 0) {
+                    int soErr = 0, soLen = (int)sizeof(soErr);
+                    getsockopt(sock, SOL_SOCKET, SO_ERROR, (char*)&soErr, &soLen);
+                    connected = (soErr == 0);
+                    if (!connected) Log("连接失败 %d", soErr);
+                } else if (sel == 0) {
+                    Log("连接超时（2 秒）");
+                } else {
+                    Log("连接失败 %d", WSAGetLastError());
+                }
+            } else {
+                Log("连接失败 %d", err);
+            }
+        }
+        if (!connected) {
             closesocket(sock);
             if (!cfg.reconnect) break;
-            Sleep(2000);
+            ShowStatusHintAsync(L"等待 Mac 发送端…");
+            SleepAlive(2000);
             continue;
         }
+        nb = 0;
+        ioctlsocket(sock, FIONBIO, &nb);
         Log("已连接，目标 %dx%d", cfg.width, cfg.height);
         g_sock = sock;
         RestoreDefaultHint();
@@ -2711,7 +2764,7 @@ static void NetworkLoop(RunConfig cfg, Graphics* gfx, Presenter* presenter) {
             if (g_sock.load() == sock) g_sock = INVALID_SOCKET;
             closesocket(sock);
             if (!cfg.reconnect) break;
-            Sleep(2000);
+            SleepAlive(2000);
             continue;
         }
 
@@ -3101,7 +3154,7 @@ static void NetworkLoop(RunConfig cfg, Graphics* gfx, Presenter* presenter) {
         Log("连接结束");
         if (!cfg.reconnect) break;
         Log("2 秒后重连");
-        Sleep(2000);
+        SleepAlive(2000);
     }
     Log("网络循环退出");
 }
