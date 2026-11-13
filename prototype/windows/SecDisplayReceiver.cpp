@@ -1395,11 +1395,13 @@ private:
     ComPtr<ID3D11VideoContext> videoCtx_;
     ComPtr<ID3D11VideoProcessor> processor_;
     ComPtr<ID3D11VideoProcessorEnumerator> enum_;
-    int width_ = 0, height_ = 0;      // 显示尺寸（= 交换链尺寸）
+    int width_ = 0, height_ = 0;      // 交换链尺寸，恒等于窗口客户区物理像素
     int srcW_ = 0, srcH_ = 0;         // 解码器实际输出尺寸
     // 视频处理器视图按纹理指针缓存：每帧新建在 45fps 下是每秒 90 次 Create*View
     std::unordered_map<uint64_t, ComPtr<ID3D11VideoProcessorInputView>> inViewCache_;
     std::unordered_map<void*, ComPtr<ID3D11VideoProcessorOutputView>> outViewCache_;
+    // 黑边靠每帧清后缓冲实现，RTV 同样按纹理指针缓存
+    std::unordered_map<void*, ComPtr<ID3D11RenderTargetView>> rtvCache_;
     bool tearing_ = false;
     bool useVsync_ = true;
     // 连续失败计数与限流日志：45fps 下每帧打日志会淹掉文件，
@@ -1461,6 +1463,24 @@ bool Presenter::Init(Graphics* gfx, HWND hwnd, int width, int height) {
     return true;
 }
 
+/// 把 sw×sh 等比装进 dw×dh，居中，返回目标矩形。
+/// 整数取整后可能差一两个像素，全部夹在输出范围内。
+static RECT FitRect(int sw, int sh, int dw, int dh) {
+    if (sw <= 0 || sh <= 0 || dw <= 0 || dh <= 0) return RECT{ 0, 0, dw, dh };
+    const double sx = (double)dw / sw;
+    const double sy = (double)dh / sh;
+    const double s = sx < sy ? sx : sy;
+    int w = (int)(sw * s + 0.5);
+    int h = (int)(sh * s + 0.5);
+    if (w > dw) w = dw;
+    if (h > dh) h = dh;
+    if (w < 1) w = 1;
+    if (h < 1) h = 1;
+    const int x = (dw - w) / 2;
+    const int y = (dh - h) / 2;
+    return RECT{ x, y, x + w, y + h };
+}
+
 bool Presenter::CreateProcessor() {
     processor_.Reset();
     enum_.Reset();
@@ -1486,25 +1506,27 @@ bool Presenter::CreateProcessor() {
     videoCtx_->VideoProcessorSetStreamFrameFormat(processor_.Get(), 0,
                                                   D3D11_VIDEO_FRAME_FORMAT_PROGRESSIVE);
 
-    // 裁边/缩放：VideoProcessorBlt 默认把整个输入表面映射到输出，
-    // 这里只在需要时覆盖 StreamSourceRect，且右下角绝不越出输入纹理。
-    //   src >= dst：硬解按宏块对齐多出几行(如 1808 vs 1800)，取 dst 大小裁掉多余行。
-    //   src <  dst：Mac 切到低分辨率档位(如 smooth 2240x1408 对命令行 2880x1800)，
-    //               取整个 src，让 VideoProcessor 缩放到输出，不能按 dst 取(会越界)。
-    //   src == dst：不设，走默认整面映射。
-    if (srcW_ != width_ || srcH_ != height_) {
-        RECT src{};
-        if (srcW_ >= width_ && srcH_ >= height_) {
-            src = RECT{ 0, 0, width_, height_ };          // 裁掉对齐多出的行/列
-            Log("呈现器: 输入 %dx%d，裁到 %dx%d（去掉宏块对齐余量）",
-                srcW_, srcH_, width_, height_);
-        } else {
-            src = RECT{ 0, 0, srcW_, srcH_ };             // 取整个源，缩放到输出
-            Log("呈现器: 输入 %dx%d，小于显示 %dx%d，缩放铺满（不裁边）",
-                srcW_, srcH_, width_, height_);
-        }
-        videoCtx_->VideoProcessorSetStreamSourceRect(processor_.Get(), 0, TRUE, &src);
+    // 输入永远取整帧：硬解按宏块对齐多出的行(如 1808 vs 1800)交给输出矩形去处理，
+    // 不再从源上裁，否则缩放基准会跟着错。
+    RECT src{ 0, 0, srcW_, srcH_ };
+    videoCtx_->VideoProcessorSetStreamSourceRect(processor_.Get(), 0, TRUE, &src);
+
+    // 输出按等比装进交换链，装不满的地方留黑边。
+    // 交换链尺寸现在恒等于窗口客户区，所以这里缩完就是最终像素，
+    // DWM 不会再拉第二次。之前交换链按流尺寸建、客户区又是另一个尺寸，
+    // 等于被 VideoProcessor 和 DWM 各双线性一次，文字就是这么糊掉的。
+    RECT dst = FitRect(srcW_, srcH_, width_, height_);
+    const bool letterbox = dst.left > 0 || dst.top > 0 ||
+                           dst.right < width_ || dst.bottom < height_;
+    if (letterbox) {
+        videoCtx_->VideoProcessorSetOutputTargetRect(processor_.Get(), TRUE, &dst);
+    } else {
+        videoCtx_->VideoProcessorSetOutputTargetRect(processor_.Get(), FALSE, nullptr);
     }
+    Log("呈现器: 输入 %dx%d → 输出 %dx%d，画面矩形 %d,%d - %d,%d%s",
+        srcW_, srcH_, width_, height_,
+        (int)dst.left, (int)dst.top, (int)dst.right, (int)dst.bottom,
+        letterbox ? "（留黑边）" : "（满幅）");
     return true;
 }
 
@@ -1524,6 +1546,7 @@ bool Presenter::Resize(int width, int height) {
     // 输入/输出视图都缓存了后缓冲指针，改尺寸后必须全部失效
     inViewCache_.clear();
     outViewCache_.clear();
+    rtvCache_.clear();
 
     UINT flags = tearing_ ? DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING : 0;
     HRESULT hr = swap_->ResizeBuffers(0, (UINT)width, (UINT)height,
@@ -1566,6 +1589,25 @@ bool Presenter::PresentSample(IMFSample* sample) {
     HRESULT hr = swap_->GetBuffer(0, IID_PPV_ARGS(&backTex));
     if (FAILED(hr)) return fail("交换链 GetBuffer(0)", hr);
     if (!backTex) return fail("交换链 GetBuffer(0) 返回空纹理", E_POINTER);
+
+    // 黑边每帧都要重画：FLIP 交换链的后缓冲内容在 Present 之后即失效，
+    // 上一帧留下的黑边不会自己保留。这里只清一次全屏，代价远低于一次缩放。
+    {
+        ComPtr<ID3D11RenderTargetView> rtv;
+        void* rtvKey = (void*)backTex.Get();
+        auto itRtv = rtvCache_.find(rtvKey);
+        if (itRtv != rtvCache_.end()) {
+            rtv = itRtv->second;
+        } else {
+            if (rtvCache_.size() > 8) rtvCache_.clear();
+            if (SUCCEEDED(gfx_->device->CreateRenderTargetView(backTex.Get(), nullptr, &rtv)) && rtv)
+                rtvCache_[rtvKey] = rtv;
+        }
+        if (rtv) {
+            const float bg[4] = { 0.0f, 0.0f, 0.0f, 1.0f };
+            gfx_->context->ClearRenderTargetView(rtv.Get(), bg);
+        }
+    }
 
     // 取解码输出的纹理
     ComPtr<IMFMediaBuffer> buf;
@@ -1692,6 +1734,7 @@ void Presenter::ClearToIdle() {
 void Presenter::Shutdown() {
     inViewCache_.clear();
     outViewCache_.clear();
+    rtvCache_.clear();
     processor_.Reset();
     enum_.Reset();
     videoCtx_.Reset();
@@ -1851,6 +1894,13 @@ static std::atomic<bool> g_vsyncEnabled{true};
 static std::string g_peerHost = "10.10.10.1";
 static int g_peerPort = 9922;
 static std::string g_logPath;
+
+// 客户区尺寸变化的防抖同步：拖窗口时会连发 WM_SIZE，
+// 每次 ResizeBuffers 都可能撞上呈现线程占着后缓冲，攒到停手再改一次最稳。
+static int  g_pendingClientW = 0;
+static int  g_pendingClientH = 0;
+static int  g_syncSwapRetry = 0;
+static const UINT_PTR TIMER_SYNC_SWAP = 4;
 
 static const int IDC_PANEL_STATUS   = 2001;
 static const int IDC_PANEL_PEER     = 2002;
@@ -2258,10 +2308,36 @@ static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
         TrayRemove();
         PostQuitMessage(0);
         return 0;
+    case WM_SIZE:
+        // 客户区变了就把交换链跟过去。不跟的话 DWM 会把按流尺寸建的交换链
+        // 双线性拉伸到窗口大小，文字边缘就是这么糊的。
+        // 拖动时 WM_SIZE 连发，攒 120ms 只改一次，避免和呈现线程抢后缓冲。
+        if (w != SIZE_MINIMIZED) {
+            g_pendingClientW = LOWORD(l);
+            g_pendingClientH = HIWORD(l);
+            g_syncSwapRetry = 0;
+            SetTimer(h, TIMER_SYNC_SWAP, 120, nullptr);
+        }
+        return 0;
     case WM_TIMER:
         if (w == TIMER_HINT_HIDE) {
             KillTimer(g_hwnd, TIMER_HINT_HIDE);
             HideFullscreenHint();
+            return 0;
+        }
+        if (w == TIMER_SYNC_SWAP) {
+            KillTimer(h, TIMER_SYNC_SWAP);
+            if (g_presenter && g_pendingClientW > 0 && g_pendingClientH > 0) {
+                if (!g_presenter->Resize(g_pendingClientW, g_pendingClientH)) {
+                    // 后缓冲还被呈现线程占着，隔一轮再试，最多 8 次
+                    if (++g_syncSwapRetry < 8) {
+                        SetTimer(h, TIMER_SYNC_SWAP, 150, nullptr);
+                    } else {
+                        Log("交换链同步放弃: 目标 %dx%d 连续失败", g_pendingClientW, g_pendingClientH);
+                        g_syncSwapRetry = 0;
+                    }
+                }
+            }
             return 0;
         }
         break;
@@ -2616,24 +2692,35 @@ static void OnSessionPacket(const uint8_t* p, size_t n) {
     }
 }
 
-// 窗口模式下按新宽高比调整窗口，保留当前客户区宽度；全屏不动窗口，
-// 交换链由 DXGI_SCALING_STRETCH 铺满屏幕。
+// 窗口模式下把客户区直接设成流的尺寸，做到 1:1 上屏。
+// 放不下时按比例缩到工作区的 90%，此时交给 VideoProcessor 做一次等比缩放。
 static void ResizeWindowForVideo(int w, int h) {
     if (!g_hwnd || g_isFullscreen || w <= 0 || h <= 0) return;
-    RECT rc{};
-    GetClientRect(g_hwnd, &rc);
-    int cw = rc.right - rc.left;
-    int sw = GetSystemMetrics(SM_CXSCREEN);
-    int sh = GetSystemMetrics(SM_CYSCREEN);
-    if (cw <= 0) cw = sw / 2;
-    int ch = (int)((double)cw * h / w);
-    if (ch > sh * 2 / 3) { ch = sh * 2 / 3; cw = (int)((double)ch * w / h); }
+
+    int maxW = w, maxH = h;
+    HMONITOR mon = MonitorFromWindow(g_hwnd, MONITOR_DEFAULTTONEAREST);
+    MONITORINFO mi{}; mi.cbSize = sizeof(mi);
+    if (GetMonitorInfoW(mon, &mi)) {
+        maxW = (mi.rcWork.right - mi.rcWork.left) * 9 / 10;
+        maxH = (mi.rcWork.bottom - mi.rcWork.top) * 9 / 10;
+    }
+
+    int cw = w, ch = h;
+    if (cw > maxW || ch > maxH) {
+        const double s = std::min((double)maxW / w, (double)maxH / h);
+        cw = (int)(w * s + 0.5);
+        ch = (int)(h * s + 0.5);
+    }
+    if (cw < 160) cw = 160;
+    if (ch < 100) ch = 100;
+
     RECT wr{ 0, 0, cw, ch };
     AdjustWindowRect(&wr, WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX | WS_MAXIMIZEBOX, FALSE);
     int winW = wr.right - wr.left, winH = wr.bottom - wr.top;
     RECT cur{};
     GetWindowRect(g_hwnd, &cur);
     SetWindowPos(g_hwnd, nullptr, cur.left, cur.top, winW, winH, SWP_NOZORDER | SWP_NOACTIVATE);
+    Log("窗口按流尺寸调整: 客户区 %dx%d（流 %dx%d）", cw, ch, w, h);
 }
 
 static void NetworkLoop(RunConfig cfg, Graphics* gfx, Presenter* presenter) {
@@ -3290,19 +3377,24 @@ int main(int argc, char** argv) {
                                0, 0, sw, sh,
                                nullptr, nullptr, wc.hInstance, nullptr);
     } else {
-        // 窗口模式：占屏幕中间一块，不置顶，方便远程调试时还能操作桌面
-        int sw = GetSystemMetrics(SM_CXSCREEN);
-        int sh = GetSystemMetrics(SM_CYSCREEN);
-        int ww = sw / 2;
-        int wh = (int)((double)ww * cfg.height / cfg.width);
-        if (wh > sh * 2 / 3) { wh = sh * 2 / 3; ww = (int)((double)wh * cfg.width / cfg.height); }
+        // 窗口模式：客户区直接取流尺寸，1:1 上屏。放不下就按比例缩到工作区的 90%，
+        // 这时由 VideoProcessor 做一次等比缩放，比让 DWM 拉伸清楚得多。
+        int maxW = GetSystemMetrics(SM_CXSCREEN) * 9 / 10;
+        int maxH = GetSystemMetrics(SM_CYSCREEN) * 9 / 10;
+        int ww = cfg.width, wh = cfg.height;
+        if (ww > maxW || wh > maxH) {
+            const double s = std::min((double)maxW / ww, (double)maxH / wh);
+            ww = (int)(ww * s + 0.5);
+            wh = (int)(wh * s + 0.5);
+        }
         RECT rc{ 0, 0, ww, wh };
         AdjustWindowRect(&rc, WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX | WS_MAXIMIZEBOX, FALSE);
         int winW = rc.right - rc.left;
         int winH = rc.bottom - rc.top;
         hwnd = CreateWindowExA(WS_EX_APPWINDOW, "SecDisplayReceiver", "SecDisplay",
                                WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX | WS_MAXIMIZEBOX | WS_VISIBLE,
-                               (sw - winW) / 2, (sh - winH) / 2,
+                               (GetSystemMetrics(SM_CXSCREEN) - winW) / 2,
+                               (GetSystemMetrics(SM_CYSCREEN) - winH) / 2,
                                winW, winH,
                                nullptr, nullptr, wc.hInstance, nullptr);
     }
