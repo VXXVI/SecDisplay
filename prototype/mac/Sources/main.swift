@@ -2744,6 +2744,13 @@ Timer.scheduledTimer(withTimeInterval: 1.0, repeats: true) { _ in
 }
 
 Log.info("SecDisplay 服务已启动，菜单栏可退出")
+// 打印构建标记，用来判断跑的是不是旧包
+if let rp = Bundle.main.resourcePath,
+   let stamp = try? String(contentsOfFile: rp + "/build-stamp", encoding: .utf8) {
+    Log.info("构建标记: \(stamp.trimmingCharacters(in: .whitespacesAndNewlines))")
+} else {
+    Log.info("构建标记: 无（命令行构建或旧包）")
+}
 // 调试用：SECDISPLAY_SHOW_PANEL=1 启动后直接打开面板，便于不点菜单也能验证 UI。
 if ProcessInfo.processInfo.environment["SECDISPLAY_SHOW_PANEL"] == "1" {
     DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) {

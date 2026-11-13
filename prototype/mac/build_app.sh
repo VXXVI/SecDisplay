@@ -30,6 +30,11 @@ else
     echo "smooth" > "$APP/Contents/Resources/preset"
 fi
 
+# 构建标记：启动日志会打印，用来判断跑的是不是旧包
+REPO="$(cd ../.. && pwd)"
+printf '%s %s\n' "$(git -C "$REPO" rev-parse --short HEAD 2>/dev/null || echo nogit)" \
+    "$(date '+%Y-%m-%d %H:%M:%S')" > "$APP/Contents/Resources/build-stamp"
+
 cat > "$APP/Contents/Info.plist" <<'PLIST'
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
