@@ -132,7 +132,7 @@ start)
     if [ -f .preset ]; then
         _preset="$(cat .preset 2>/dev/null | tr -cd 'a-z')"
         case "$_preset" in
-            sharp|balanced|smooth|fast) export SECDISPLAY_PRESET="$_preset"
+            sharp|balanced|smooth|compact|fast) export SECDISPLAY_PRESET="$_preset"
                 echo "应用预设档位: $_preset" ;;
         esac
     fi

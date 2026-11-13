@@ -1687,6 +1687,10 @@ if let preset = presetName, !preset.isEmpty {
         cfg.width = 2240; cfg.height = 1400
         cfg.logicalWidth = 1120; cfg.logicalHeight = 700
         cfg.captureHz = 60
+    case "compact":     // 1x 小屏：物理=逻辑，适合 Sidecar 共存时用
+        cfg.width = 1600; cfg.height = 1000
+        cfg.logicalWidth = 1600; cfg.logicalHeight = 1000
+        cfg.captureHz = 60
     case "fast":        // 最流畅，清晰度最差
         cfg.width = 1920; cfg.height = 1200
         cfg.logicalWidth = 960; cfg.logicalHeight = 600

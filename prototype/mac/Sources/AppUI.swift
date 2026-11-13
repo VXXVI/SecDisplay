@@ -183,10 +183,10 @@ func restartWithResolution(_ w: Int, _ h: Int) {
     if FileManager.default.fileExists(atPath: dir + "/run.sh") {
         p.arguments = ["-c", "sleep 9; cd \"\(dir)\" && SECDISPLAY_W=\(w) SECDISPLAY_H=\(h) ./run.sh restart"]
     } else {
-        let exe = Bundle.main.executablePath ?? CommandLine.arguments[0]
-        let logDir = (NSHomeDirectory() as NSString).appendingPathComponent("Library/Logs/SecDisplay")
-        try? FileManager.default.createDirectory(atPath: logDir, withIntermediateDirectories: true)
-        p.arguments = ["-c", "sleep 9; SECDISPLAY_W=\(w) SECDISPLAY_H=\(h) \"\(exe)\" >> \"\(logDir)/sender.log\" 2>&1 &"]
+        // .app 场景：用 open 重新拉起 bundle，保持 TCC 归属在 bundle 上。
+        // 直接跑 Contents/MacOS/SecDisplay 会被当成裸二进制，权限可能对不上。
+        let appPath = Bundle.main.bundlePath
+        p.arguments = ["-c", "sleep 9; open -n \"\(appPath)\" --env SECDISPLAY_W=\(w) --env SECDISPLAY_H=\(h)"]
     }
     p.standardOutput = FileHandle.nullDevice
     p.standardError = FileHandle.nullDevice
