@@ -30,6 +30,15 @@
    ```text
    10.10.10.1 9922 1600 1000 --log logs\ssh-receiver.log
    ```
+   **注意**：计划任务默认 `DisallowStartIfOnBatteries=True`，笔记本用电池时任务会一直排队不启动。注册后补一条：
+
+   ```powershell
+   $t = Get-ScheduledTask -TaskName 'SecDisplay-Receiver'
+   $t.Settings.DisallowStartIfOnBatteries = $false
+   $t.Settings.StopIfGoingOnBatteries = $false
+   Set-ScheduledTask -TaskName 'SecDisplay-Receiver' -Settings $t.Settings
+   ```
+
 
 3. 如果桌面已登录且当前没有接收端在运行，执行 `schtasks /Run /TN SecDisplay-Receiver`，确认窗口能在桌面出现、日志可读。已有接收端在运行时保留它，回报启动验收待做。保持 `--feedback` 默认关闭，等 Mac agent 确认运行中的发送端支持 `0x07` 后再做对照。
 
