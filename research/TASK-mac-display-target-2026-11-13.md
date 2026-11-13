@@ -43,7 +43,29 @@ Windows 接收端收到的是 1600x1000 的实时画面，内容却是内建屏�
 2. `buildStream` 的兜底改成严格校验：`wantID` 对应屏的 vendor/model 也必须匹配 0xEEEE/0x5344，否则抛错并打印所有候选屏身份，不要静默抓别的屏。
 3. 启动日志补一行虚拟屏的 mirror 状态和 bounds，便于现场判断。
 
-## 六、本轮不做
+## 六、Sidecar 连接后的镜像行为（2026-11-13 现场补充）
+
+现象：先关 Sidecar，SecDisplay 显示正常；再开 Sidecar 并在显示器设置里选「扩展」，实际 Sidecar 镜像了 SecDisplay。
+
+这不是采集代码的问题，是 macOS 的显示器排列与记忆：
+
+- macOS 按显示器身份记住上一次的排列，Sidecar 重新接入时会恢复上次的排列，默认经常是镜像主屏或最后活跃的那块屏
+- 在「使用方式」里选「扩展显示器」只改模式，不会移动排列图里的矩形；两块屏的矩形仍然重叠时，系统仍按镜像处理
+- SecDisplay 虚拟屏如果被设为菜单栏所在的主屏，新接入的 Sidecar 更容易默认镜像到它
+
+现场处理顺序：
+
+1. 系统设置 → 显示器 → 选中 iPad/Sidecar，使用方式选「扩展显示器」
+2. 排列页把 Sidecar 的矩形拖到 SecDisplay 矩形之外，不要重叠
+3. 把菜单栏拖回内建屏，让内建屏当主屏
+4. 断开再重连 Sidecar，确认排列被记住
+
+代码侧可选加固：
+
+- 注册 `CGDisplayRegisterReconfigurationCallback`，在显示器变化后检查 `CGDisplayMirrorsDisplay(vdID)`，如果虚拟屏变成镜像源或被镜像，重新应用一次排列
+- 启动和每次重配置时打印每块屏的 `CGDisplayMirrorsDisplay`、bounds、主屏标记，便于现场判断
+
+## 七、本轮不做
 
 - 不改协议
 - 不改 Windows 接收端
