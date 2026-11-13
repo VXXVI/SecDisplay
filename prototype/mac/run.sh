@@ -112,13 +112,13 @@ start)
     need_build=0
     if [ ! -x "$BIN" ]; then
         need_build=1
-    elif [ Sources/ScreenSender.swift -nt "$BIN" ]; then
+    elif [ Sources/main.swift -nt "$BIN" ] || [ Sources/AppUI.swift -nt "$BIN" ]; then
         need_build=1
         echo "源码已更新，重新编译"
     fi
     if [ "$need_build" = "1" ]; then
         echo "编译中..."
-        swiftc -O Sources/ScreenSender.swift -o screensender || exit 1
+        swiftc -O Sources/main.swift Sources/AppUI.swift -o screensender || exit 1
         sign_binary || exit 1
         echo "已重签稳定身份: $SIGN_ID"
     elif ! sign_ok; then

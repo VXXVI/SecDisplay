@@ -251,6 +251,12 @@ enum Log {
         fileHandle?.write(data)
         lock.unlock()
     }
+
+    /// 当前日志文件路径，面板「打开日志」用
+    static var currentPath: String {
+        if let p = ProcessInfo.processInfo.environment["SECDISPLAY_LOG"], !p.isEmpty { return p }
+        return (NSHomeDirectory() as NSString).appendingPathComponent("Library/Logs/SecDisplay/sender.log")
+    }
 }
 
 // MARK: - 编码器
@@ -1302,7 +1308,7 @@ final class CursorTracker {
     private var pendingPoint: CGPoint?
     private var lastEmitAt: CFAbsoluteTime = 0
     private let minInterval: CFAbsoluteTime
-    private let targetHz: Double
+    let targetHz: Double
     private var lastX: Float = .nan
     private var lastY: Float = .nan
     private var lastVisible = false
@@ -1680,7 +1686,7 @@ cursor.start()
 // 真实光标图像（0x05）。SECDISPLAY_NOCURSORIMG=1 可整体关闭，
 // 用于 A/B 判断「光标卡顿是否由接收端反复重建光标引起」——关掉后回退 Windows 标准箭头。
 let cursorImage = CursorImageTracker(sender: sender)
-let disableCursorImage = ProcessInfo.processInfo.environment["SECDISPLAY_NOCURSORIMG"] == "1"
+var disableCursorImage = ProcessInfo.processInfo.environment["SECDISPLAY_NOCURSORIMG"] == "1"
 if disableCursorImage {
     Log.info("已关闭真实光标图像(0x05)，使用接收端标准箭头（SECDISPLAY_NOCURSORIMG=1）")
 } else {
@@ -1885,10 +1891,17 @@ Timer.scheduledTimer(withTimeInterval: 1.0, repeats: true) { _ in
 // 统计
 var lastDroppedCount = 0
 var lastCapturedCount = 0
+/// 面板展示用的最近一轮统计
+var lastEncAvgMs: Double = 0
+var lastCapAvgMs: Double = 0
+var lastMbps: Double = 0
 Timer.scheduledTimer(withTimeInterval: 2.0, repeats: true) { _ in
     let mbps = Double(sender.sentBytes) * 8 / 2.0 / 1_000_000
     let encAvg = encoder.encLatCount > 0 ? encoder.encLatSum / Double(encoder.encLatCount) : 0
     let capAvg = cap.capLatCount > 0 ? cap.capLatSum / Double(cap.capLatCount) : 0
+    lastEncAvgMs = encAvg
+    lastCapAvgMs = capAvg
+    lastMbps = mbps
     let droppedDelta = sender.dropped - lastDroppedCount
     lastDroppedCount = sender.dropped
     let capturedDelta = cap.captured - lastCapturedCount
@@ -1988,6 +2001,9 @@ final class StatusMenuTarget: NSObject {
         Log.info("菜单栏请求退出")
         shutdown(signal: SIGTERM)
     }
+    @objc func openPanel() {
+        showControlPanel()
+    }
 }
 
 let statusMenuTarget = StatusMenuTarget()
@@ -2011,6 +2027,11 @@ func setupStatusBar() -> NSApplication {
     menu.addItem(info)
     menu.addItem(.separator())
 
+    let open = NSMenuItem(title: "打开面板…", action: #selector(StatusMenuTarget.openPanel), keyEquivalent: "o")
+    open.target = statusMenuTarget
+    menu.addItem(open)
+    menu.addItem(.separator())
+
     let quit = NSMenuItem(title: "退出 SecDisplay", action: #selector(StatusMenuTarget.quit), keyEquivalent: "q")
     quit.target = statusMenuTarget
     menu.addItem(quit)
@@ -2030,11 +2051,13 @@ let statusApp = setupStatusBar()
 
 // 每秒刷新菜单栏文字：连接状态、帧率、编码延迟、在途
 Timer.scheduledTimer(withTimeInterval: 1.0, repeats: true) { _ in
-    guard let info = statusInfoItem else { return }
-    let enc = encoder.encLatCount > 0 ? encoder.encLatSum / Double(encoder.encLatCount) : 0
-    let conn = sender.connected ? "已连接" : "等待连接"
-    info.title = String(format: "%@ · %.0f fps · 编码 %.0f ms · %d 在途",
-                        conn, peakFps, enc, sender.inFlight)
+    if let info = statusInfoItem {
+        let enc = encoder.encLatCount > 0 ? encoder.encLatSum / Double(encoder.encLatCount) : 0
+        let conn = sender.connected ? "已连接" : "等待连接"
+        info.title = String(format: "%@ · %.0f fps · 编码 %.0f ms · %d 在途",
+                            conn, peakFps, enc, sender.inFlight)
+    }
+    AppModel.shared.refresh()
 }
 
 Log.info("SecDisplay 服务已启动，菜单栏可退出")
