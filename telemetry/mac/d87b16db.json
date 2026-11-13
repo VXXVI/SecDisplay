@@ -1,8 +1,8 @@
 {
   "schema": 1,
   "platform": "mac",
-  "generated_utc": "2026-11-13T01:51:47Z",
-  "commit": "f073c56",
+  "generated_utc": "2026-11-13T01:56:57Z",
+  "commit": "009b1e5",
   "coord": {
     "logical_w": 1600,
     "logical_h": 1000
@@ -14,7 +14,7 @@
     "preset": "smooth",
     "encoder_variant": "A"
   },
-  "samples": 18027,
+  "samples": 18182,
   "metrics": {
     "peak_fps": {
       "min": 0.0,
@@ -56,6 +56,6 @@
     "stream_rebuild"
   ],
   "warning_counts": {
-    "stream_rebuild": 67358
+    "stream_rebuild": 67978
   }
 }
