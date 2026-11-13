@@ -2788,13 +2788,6 @@ int main(int argc, char** argv) {
     }
 
     RunConfig cfg;
-    // 单实例锁：旧实例被新实例顶掉后，旧窗口会停在最后一帧且不再 Present，
-    // 看起来像「画面冻结/像别的屏」。这里直接拒绝第二个实例。
-    HANDLE hSingle = CreateMutexW(nullptr, TRUE, L"Local\\SecDisplayReceiver_SingleInstance");
-    if (hSingle && GetLastError() == ERROR_ALREADY_EXISTS) {
-        fprintf(stderr, "SecDisplay 接收端已在运行，本实例退出\n");
-        return 0;
-    }
     // 免参数启动：先读 exe 同目录 config.ini，再让命令行覆盖。
     // --config 指定别的文件，--no-config 跳过配置文件。
     std::string cfgPath = ExeDir() + "\\config.ini";
