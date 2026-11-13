@@ -1247,10 +1247,13 @@ final class CursorTracker {
         }
         let now = CFAbsoluteTimeGetCurrent()
         guard now - lastEmitAt >= minInterval else { return }
+        // 优先读当前指针实时位置：事件监视器在系统负载/锁屏时会被节流到 ~40Hz，
+        // 只靠 pendingPoint 会漏更新；这里用 CGEvent 实时位置兜底，保证光标不落后。
+        let cur = CGEvent(source: nil)?.location
         lock.lock()
-        let p = pendingPoint
+        let pp = pendingPoint
         lock.unlock()
-        guard let p else { return }
+        guard let p = cur ?? pp else { return }
         lastEmitAt = now
         emit(p)
     }
