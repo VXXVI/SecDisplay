@@ -1,0 +1,10 @@
+# 豆包生成的原始候选图，只作本地参考，体积太大不进仓库。
+# 需要重新生成时按 README 里的提示词跑一遍即可。
+*.png
+fullbleed/
+glass/
+
+# 中间产物。正式图标在 assets/app-icon/。
+build/
+
+!README.md
