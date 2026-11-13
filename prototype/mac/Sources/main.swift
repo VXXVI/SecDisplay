@@ -21,6 +21,7 @@
 
 import Foundation
 import CoreGraphics
+import Accelerate
 import CoreVideo
 import VideoToolbox
 import ScreenCaptureKit
@@ -28,6 +29,27 @@ import Network
 import ObjectiveC.runtime
 import AppKit
 import Darwin
+import ImageIO
+import CoreImage
+import UniformTypeIdentifiers
+
+/// 调试用：把采集到的 CVPixelBuffer 落盘成 PNG，用来核对「发送端到底抓了什么」。
+/// SCK 可能给 BGRA 也可能给 YUV，走 CoreImage 转换最稳。
+func dumpPixelBuffer(_ pb: CVPixelBuffer, to path: String) {
+    let fmt = CVPixelBufferGetPixelFormatType(pb)
+    let fourcc = String(format: "%c%c%c%c",
+                        (fmt >> 24) & 0xff, (fmt >> 16) & 0xff, (fmt >> 8) & 0xff, fmt & 0xff)
+    let ci = CIImage(cvPixelBuffer: pb)
+    let ctx = CIContext(options: [.useSoftwareRenderer: false])
+    let url = URL(fileURLWithPath: path)
+    do {
+        try ctx.writePNGRepresentation(of: ci, to: url, format: .RGBA8,
+                                       colorSpace: CGColorSpaceCreateDeviceRGB())
+        Log.info("落盘成功 \(CVPixelBufferGetWidth(pb))x\(CVPixelBufferGetHeight(pb)) fmt=\(fourcc)")
+    } catch {
+        Log.info("落盘失败 fmt=\(fourcc): \(error)")
+    }
+}
 
 setvbuf(stdout, nil, _IONBF, 0)
 
@@ -280,9 +302,15 @@ enum MirrorGuard {
 }
 
 /// C 回调：只处理「配置已完成」的那一轮（begin 标志清零），丢回主队列再改配置。
+nonisolated(unsafe) var gCaptureRebuildRequested = false
+
 private func mirrorReconfigCallback(_ display: CGDirectDisplayID,
                                     _ flags: CGDisplayChangeSummaryFlags,
                                     _ userInfo: UnsafeMutableRawPointer?) {
+    // 屏增删标志可能只出现在 begin 回调里，先置位再过滤 begin。
+    if flags.contains(.addFlag) || flags.contains(.removeFlag) {
+        gCaptureRebuildRequested = true
+    }
     guard !flags.contains(.beginConfigurationFlag) else { return }
     DispatchQueue.main.async { MirrorGuard.release("显示重配置") }
 }
@@ -453,7 +481,7 @@ final class Encoder {
             // 用原生 YUV 而不是 BGRA：SCK 直接给 YUV，编码器也直接吃 YUV，
             // 省掉两次全画面色彩转换。2880x1800 下 BGRA 每帧 20MB，
             // YUV420 只有 7.8MB，内存带宽少 60%。
-            kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange,
+            kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32BGRA,
             kCVPixelBufferWidthKey as String: width,
             kCVPixelBufferHeightKey as String: height,
             kCVPixelBufferIOSurfacePropertiesKey as String: [:],
@@ -735,8 +763,14 @@ final class Capture: NSObject, SCStreamOutput, SCStreamDelegate {
     private var prevSampleKey = 0
     private var lastEncodeAt: CFAbsoluteTime = 0
     private(set) var staticSkipCount = 0
+    /// 调试落盘只做一次
+    private var dumpedOnce = false
+    /// 调试落盘节流
+    private var lastDumpAt: CFAbsoluteTime = 0
+    private var dumpSeq = 0
     private var lastProgressAt = CFAbsoluteTimeGetCurrent()
     private var needsRestart = false
+    private var didStartupRebuild = false
     private var restarting = false
     private var restartCount = 0
     // 说明：不再用「无帧超时」判断流故障，理由见 tick()。
@@ -755,6 +789,10 @@ final class Capture: NSObject, SCStreamOutput, SCStreamDelegate {
     }
 
     private func buildStream() async throws {
+        if isCompositeMode {
+            startCompositeCapture()
+            return
+        }
         let wantID = displayIDProvider()
         let content = try await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: false)
 
@@ -763,6 +801,12 @@ final class Capture: NSObject, SCStreamOutput, SCStreamDelegate {
         // 或被 AirPlay 屏复用；单靠 id 或「非主屏 + 宽度相等」会抓到 iPad / 别的虚拟屏。
         // isOurVirtualDisplay 用 vendor/product/serial 精确锚定我们自己建的屏，
         // 内建(0x610)、Sidecar(aapl/iPad)、GameViewer、Duet 都不会误命中。
+        let sckList = content.displays.map { d -> String in
+            String(format: "id=%u frame=(%.0f,%.0f %.0fx%.0f)", d.displayID,
+                   d.frame.origin.x, d.frame.origin.y, d.frame.width, d.frame.height)
+        }.joined(separator: " | ")
+        Log.info("SCK 显示列表: \(sckList)")
+
         var target = content.displays.first(where: { isOurVirtualDisplay($0.displayID) })
         // 兜底：极少数情况下三元组尚未就绪，再按创建时记下的 id 找一次。
         if target == nil {
@@ -781,6 +825,13 @@ final class Capture: NSObject, SCStreamOutput, SCStreamDelegate {
             ])
         }
 
+        // 记录 SCK 实际拿到的 SCDisplay 身份。历史上出现过「displayID 说是虚拟屏，
+        // 抓出来的却是 Sidecar 内容」的情况，这行日志能直接把两者对上。
+        Log.info(String(format: "采集目标 SCDisplay id=%u vendor=0x%x model=0x%x %dx%d",
+                        display.displayID,
+                        CGDisplayVendorNumber(display.displayID),
+                        CGDisplayModelNumber(display.displayID),
+                        display.width, display.height))
         let filter = SCContentFilter(display: display, excludingWindows: [])
         let c = SCStreamConfiguration()
         c.width = cfg.width
@@ -793,7 +844,7 @@ final class Capture: NSObject, SCStreamOutput, SCStreamDelegate {
         // 队列深度直接决定 SCK 内部的缓冲帧数，也就直接决定延迟。
         // 3 帧在 60fps 下约 50ms；越深越不容易丢帧，但延迟越高。
         c.queueDepth = Int(ProcessInfo.processInfo.environment["SECDISPLAY_QD"] ?? "") ?? 3
-        c.pixelFormat = kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange
+        c.pixelFormat = kCVPixelFormatType_32BGRA
         // 光标不画进视频：视频帧率只有 45fps，指针会把延迟放大成拖影。
         // 指针位置改由独立的轻量消息高频发送，客户端本地绘制。
         c.showsCursor = false
@@ -809,6 +860,98 @@ final class Capture: NSObject, SCStreamOutput, SCStreamDelegate {
         lastProgressAt = CFAbsoluteTimeGetCurrent()
         lastSeenCount = progressCount
         Log.info("抓屏已启动 displayID=\(display.displayID) \(cfg.width)x\(cfg.height)，采集上限 \(Int(capHz))fps")
+
+        // 虚拟屏刚上线时 SCK 的显示列表可能还没刷新，displayID 会映射到
+        // 内建屏的 IOSurface，导致送出去的是内建内容。启动 2 秒后再重建一次，
+        // 此时 WindowServer 已稳定，重新取 SCShareableContent 才能绑对屏。
+        if !didStartupRebuild {
+            didStartupRebuild = true
+            DispatchQueue.global().asyncAfter(deadline: .now() + 2.0) { [weak self] in
+                guard let self else { return }
+                self.ctl.async { self.needsRestart = true }
+                Log.info("启动 2 秒后重建采集流，刷新显示列表")
+            }
+        }
+    }
+
+    // MARK: - 合成抓屏（绕开虚拟屏显示管道）
+
+    // macOS 在 Sidecar 接入后会把虚拟屏的显示管道接到内建屏：
+    // CGDisplayMirrorsDisplay 报 0、排列文件也是扩展，但 SCK 抓
+    // displayID 拿到的就是内建画面。窗口服务器的合成层却是正确的
+    // （screencapture -R 能抓到虚拟屏自己的壁纸），所以直接抓虚拟屏
+    // 所在矩形的合成结果，完全绕开显示管道。
+    private var compositeTimer: DispatchSourceTimer?
+    private var compositeSeq: Int64 = 0
+    private let compositeQueue = DispatchQueue(label: "SecDisplay.capture.composite")
+
+    /// 默认走合成抓屏；SECDISPLAY_CAPTURE=sck 可退回 ScreenCaptureKit。
+    private var isCompositeMode: Bool {
+        ProcessInfo.processInfo.environment["SECDISPLAY_CAPTURE"] != "sck"
+    }
+
+    private func startCompositeCapture() {
+        compositeTimer?.cancel()
+        let hz = Double(ProcessInfo.processInfo.environment["SECDISPLAY_HZ"] ?? "") ?? cfg.captureHz
+        let fps = max(1.0, hz)
+        let t = DispatchSource.makeTimerSource(queue: compositeQueue)
+        t.schedule(deadline: .now(), repeating: 1.0 / fps, leeway: .milliseconds(1))
+        t.setEventHandler { [weak self] in self?.captureCompositeFrame() }
+        t.resume()
+        compositeTimer = t
+        lastProgressAt = CFAbsoluteTimeGetCurrent()
+        Log.info("合成抓屏已启动，虚拟屏 id=\(displayIDProvider())，目标 \(Int(fps))fps")
+    }
+
+    // SDK 把 CGWindowListCreateImage 标成 unavailable，但符号还在，运行时取。
+    private typealias WindowImageFn = @convention(c) (CGRect, UInt32, UInt32, UInt32) -> Unmanaged<CGImage>?
+    private static let windowImageFn: WindowImageFn? = {
+        guard let sym = dlsym(UnsafeMutableRawPointer(bitPattern: -2), "CGWindowListCreateImage") else { return nil }
+        return unsafeBitCast(sym, to: WindowImageFn.self)
+    }()
+
+    private func captureCompositeFrame() {
+        let vd = displayIDProvider()
+        let rect = CGDisplayBounds(vd)
+        guard rect.width > 1, rect.height > 1 else { return }
+        let onScreen = CGWindowListOption.optionOnScreenOnly.rawValue
+        let imgOpts = CGWindowImageOption.bestResolution.rawValue | CGWindowImageOption.boundsIgnoreFraming.rawValue
+        guard let fn = Self.windowImageFn,
+              let cg = fn(rect, onScreen, 0, imgOpts)?.takeRetainedValue() else { return }
+        guard let pb = makeVideoFrame(from: cg, width: cfg.width, height: cfg.height) else { return }
+        let now = CFAbsoluteTimeGetCurrent()
+        captured += 1
+        progressCount += 1
+        lastFrameTime = now
+        lastEncodeAt = now
+        let nowMicros = UInt64(now * 1_000_000)
+        compositeSeq += 1
+        let hz = CMTimeScale(max(1.0, Double(cfg.captureHz)))
+        encoder.encode(pb, pts: CMTime(value: compositeSeq, timescale: hz), captureTimeMicros: nowMicros)
+    }
+
+    /// CGImage -> 420v CVPixelBuffer。先画进 BGRA，再用 vImage 转 YUV，
+    /// 编码器保持只吃 420v，不用改编码链路。
+    private func makeVideoFrame(from cg: CGImage, width: Int, height: Int) -> CVPixelBuffer? {
+        var bgra: CVPixelBuffer?
+        let attrs: [String: Any] = [kCVPixelBufferIOSurfacePropertiesKey as String: [:]]
+        guard CVPixelBufferCreate(kCFAllocatorDefault, width, height,
+                                  kCVPixelFormatType_32BGRA,
+                                  attrs as CFDictionary, &bgra) == kCVReturnSuccess,
+              let src = bgra else { return nil }
+        CVPixelBufferLockBaseAddress(src, [])
+        defer { CVPixelBufferUnlockBaseAddress(src, []) }
+        guard let base = CVPixelBufferGetBaseAddress(src) else { return nil }
+        let bitmapInfo = CGImageAlphaInfo.premultipliedFirst.rawValue | CGBitmapInfo.byteOrder32Little.rawValue
+        guard let ctx = CGContext(data: base, width: width, height: height,
+                                  bitsPerComponent: 8,
+                                  bytesPerRow: CVPixelBufferGetBytesPerRow(src),
+                                  space: CGColorSpaceCreateDeviceRGB(),
+                                  bitmapInfo: bitmapInfo) else { return nil }
+        ctx.interpolationQuality = .none
+        ctx.draw(cg, in: CGRect(x: 0, y: 0, width: width, height: height))
+
+        return src
     }
 
     // MARK: 看门狗
@@ -833,6 +976,11 @@ final class Capture: NSObject, SCStreamOutput, SCStreamDelegate {
         // 虚拟屏空桌面时 SCK 可能完全不发回调（连 idle 帧都没有），
         // 用「无帧超时」判断会把静止画面误杀；重建过程会让 WindowServer
         // 重配置显示，反而把虚拟屏踢掉，实测 17 秒内必现。
+        if gCaptureRebuildRequested {
+            gCaptureRebuildRequested = false
+            needsRestart = true
+            Log.info("显示重配置，请求重建采集流")
+        }
         guard needsRestart else { return }
         Log.info("抓屏流已停止，准备重建")
         needsRestart = false
@@ -844,6 +992,8 @@ final class Capture: NSObject, SCStreamOutput, SCStreamDelegate {
         ctl.async { [weak self] in
             guard let self, !self.restarting else { return }
             self.restarting = true
+            self.compositeTimer?.cancel()
+            self.compositeTimer = nil
             self.restartCount += 1
             let n = self.restartCount
 
@@ -912,6 +1062,15 @@ final class Capture: NSObject, SCStreamOutput, SCStreamDelegate {
             if delayMs > capLatMax { capLatMax = delayMs }
         }
         let nowMicros = UInt64(CFAbsoluteTimeGetCurrent() * 1_000_000)
+        if let dumpPath = ProcessInfo.processInfo.environment["SECDISPLAY_DUMP_FRAME"],
+           !dumpPath.isEmpty,
+           CFAbsoluteTimeGetCurrent() - lastDumpAt >= 5.0 {
+            lastDumpAt = CFAbsoluteTimeGetCurrent()
+            dumpSeq += 1
+            let p = dumpPath.replacingOccurrences(of: ".png", with: "_\(dumpSeq).png")
+            dumpPixelBuffer(pb, to: p)
+            Log.info("已落盘采集帧 #\(dumpSeq) \(CVPixelBufferGetWidth(pb))x\(CVPixelBufferGetHeight(pb)) -> \(p)")
+        }
         if shouldSkipStatic(pb) {
             staticSkipCount += 1
             return
@@ -925,6 +1084,168 @@ final class Capture: NSObject, SCStreamOutput, SCStreamDelegate {
         // ScreenCaptureKit 不会自己恢复，交给看门狗重建
         ctl.async { [weak self] in self?.needsRestart = true }
     }
+}
+
+// MARK: - 采集（截图轮询）
+//
+// 背景：macOS 27 上 ScreenCaptureKit 的 SCStream 无法正确采集 CGVirtualDisplay。
+// 实测过滤器指向虚拟屏（SCDisplay id=54 vendor=0xeeee 与身份日志一致），
+// 但回调里拿到的却是主屏画面；同一时刻 SCScreenshotManager 抓同一块屏是正确的。
+// 落盘对比过：SCStream 帧是主屏 Chrome，SCScreenshotManager 帧是虚拟屏空桌面。
+// 所以这里改用 SCScreenshotManager 轮询：单次约 35ms，4 路并发实测约 45fps。
+final class ScreenshotCapture {
+    let encoder: Encoder
+    private let cfg: Config
+    private let displayIDProvider: () -> CGDirectDisplayID
+
+    var captured = 0
+    var capLatSum: Double = 0
+    var capLatCount = 0
+    var capLatMax: Double = 0
+    var lastFrameTime: CFAbsoluteTime = 0
+    private(set) var idleFrameCount = 0
+    private(set) var staticSkipCount = 0
+
+    private let encodeQueue = DispatchQueue(label: "SecDisplay.encode")
+    private var running = false
+    private var cachedContent: SCShareableContent?
+    private var cachedAt: CFAbsoluteTime = 0
+    private var lastDumpAt: CFAbsoluteTime = 0
+    private var dumpSeq = 0
+    private var lastErrorLogAt: CFAbsoluteTime = 0
+    private var supervisor: DispatchSourceTimer?
+    private var lastSupervisorCount = -1
+    private var lastSupervisorAt: CFAbsoluteTime = 0
+
+    init(encoder: Encoder, cfg: Config, displayID: @escaping () -> CGDirectDisplayID) {
+        self.encoder = encoder
+        self.cfg = cfg
+        self.displayIDProvider = displayID
+    }
+
+    func start() async throws {
+        let content = try await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: false)
+        guard content.displays.contains(where: { isOurVirtualDisplay($0.displayID) }) else {
+            let avail = content.displays.map {
+                String(format: "id=%u vendor=0x%x", $0.displayID, CGDisplayVendorNumber($0.displayID))
+            }
+            throw NSError(domain: "Capture", code: 1, userInfo: [
+                NSLocalizedDescriptionKey: "找不到 SecDisplay 虚拟屏，当前: \(avail.joined(separator: ", "))"
+            ])
+        }
+        cachedContent = content
+        cachedAt = CFAbsoluteTimeGetCurrent()
+        running = true
+        spawnWorkers()
+        // 看护：并发调用 SCScreenshotManager 偶尔会整体卡住（实测跑约 26 秒后
+        // 采集数不再增长，CPU 掉到 1%）。发现 3 秒没新帧就重新拉起工作线程。
+        supervisor = DispatchSource.makeTimerSource(queue: DispatchQueue(label: "SecDisplay.capture.sup"))
+        supervisor?.schedule(deadline: .now() + 3, repeating: 3)
+        supervisor?.setEventHandler { [weak self] in
+            guard let self, self.running else { return }
+            let now = CFAbsoluteTimeGetCurrent()
+            if self.captured == self.lastSupervisorCount && now - self.lastSupervisorAt > 3.0 {
+                Log.info("截图采集停滞（\(Int(now - self.lastSupervisorAt))s 无新帧），重启工作线程")
+                self.spawnWorkers()
+            }
+            if self.captured != self.lastSupervisorCount {
+                self.lastSupervisorCount = self.captured
+                self.lastSupervisorAt = now
+            }
+        }
+        supervisor?.resume()
+    }
+
+    private func spawnWorkers() {
+        let workers = 4
+        lastSupervisorAt = CFAbsoluteTimeGetCurrent()
+        Log.info("采集通道: SCScreenshotManager 轮询，\(workers) 路并发")
+        for i in 0..<workers {
+            Task.detached(priority: .userInitiated) { [weak self] in
+                await self?.loop(index: i)
+            }
+        }
+    }
+
+    func stop() { running = false }
+
+    private func loop(index: Int) async {
+        while running {
+            let t0 = CFAbsoluteTimeGetCurrent()
+            do {
+                let content = try await currentContent()
+                guard let d = content.displays.first(where: { isOurVirtualDisplay($0.displayID) }) else {
+                    try? await Task.sleep(nanoseconds: 200_000_000)
+                    continue
+                }
+                let filter = SCContentFilter(display: d, excludingWindows: [])
+                let c = SCStreamConfiguration()
+                c.width = cfg.width
+                c.height = cfg.height
+                c.showsCursor = false
+                let img = try await SCScreenshotManager.captureImage(contentFilter: filter, configuration: c)
+                guard let pb = makePixelBuffer(from: img) else { continue }
+                let now = CFAbsoluteTimeGetCurrent()
+                encodeQueue.sync {
+                    captured += 1
+                    lastFrameTime = now
+                    let delay = (now - t0) * 1000
+                    capLatSum += delay
+                    capLatCount += 1
+                    if delay > capLatMax { capLatMax = delay }
+                    if let dumpPath = ProcessInfo.processInfo.environment["SECDISPLAY_DUMP_FRAME"],
+                       !dumpPath.isEmpty, now - lastDumpAt >= 5.0 {
+                        lastDumpAt = now
+                        dumpSeq += 1
+                        let p = dumpPath.replacingOccurrences(of: ".png", with: "_\(dumpSeq).png")
+                        dumpPixelBuffer(pb, to: p)
+                        Log.info("已落盘采集帧 #\(dumpSeq) -> \(p)")
+                    }
+                    // PTS 用当前主机时钟，保证进编码器的顺序单调
+                    let pts = CMClockGetTime(CMClockGetHostTimeClock())
+                    encoder.encode(pb, pts: pts, captureTimeMicros: UInt64(now * 1_000_000))
+                }
+            } catch {
+                let now = CFAbsoluteTimeGetCurrent()
+                if now - lastErrorLogAt > 2.0 {
+                    lastErrorLogAt = now
+                    Log.info("截图采集失败: \(error)")
+                }
+                try? await Task.sleep(nanoseconds: 50_000_000)
+            }
+        }
+    }
+
+    private func currentContent() async throws -> SCShareableContent {
+        let now = CFAbsoluteTimeGetCurrent()
+        if let c = cachedContent, now - cachedAt < 2.0 { return c }
+        let c = try await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: false)
+        cachedContent = c
+        cachedAt = now
+        return c
+    }
+}
+
+/// CGImage → CVPixelBuffer(BGRA)，VideoToolbox 直接吃这个格式。
+func makePixelBuffer(from img: CGImage) -> CVPixelBuffer? {
+    let w = img.width, h = img.height
+    var pb: CVPixelBuffer?
+    let attrs: [CFString: Any] = [
+        kCVPixelBufferIOSurfacePropertiesKey: [:] as CFDictionary,
+        kCVPixelBufferPixelFormatTypeKey: kCVPixelFormatType_32BGRA,
+    ]
+    guard CVPixelBufferCreate(nil, w, h, kCVPixelFormatType_32BGRA, attrs as CFDictionary, &pb) == kCVReturnSuccess,
+          let pb else { return nil }
+    CVPixelBufferLockBaseAddress(pb, [])
+    defer { CVPixelBufferUnlockBaseAddress(pb, []) }
+    guard let ctx = CGContext(data: CVPixelBufferGetBaseAddress(pb), width: w, height: h,
+                              bitsPerComponent: 8, bytesPerRow: CVPixelBufferGetBytesPerRow(pb),
+                              space: CGColorSpaceCreateDeviceRGB(),
+                              bitmapInfo: CGImageAlphaInfo.premultipliedFirst.rawValue
+                                  | CGBitmapInfo.byteOrder32Little.rawValue)
+    else { return nil }
+    ctx.draw(img, in: CGRect(x: 0, y: 0, width: w, height: h))
+    return pb
 }
 
 // MARK: - 网络发送
@@ -1850,7 +2171,7 @@ if disableCursorImage {
 }
 
 // 传入 id 获取闭包：虚拟屏重建后 id 会变，采集侧每次重建流都重新问
-let cap = Capture(encoder: encoder, cfg: cfg, displayID: { vd.displayID })
+let cap = ScreenshotCapture(encoder: encoder, cfg: cfg, displayID: { vd.displayID })
 Task {
     do {
         try await cap.start()
@@ -2112,7 +2433,7 @@ func shutdown(signal sig: Int32) -> Never {
     Log.info("收到信号 \(sig)，开始清理")
     var stopped = false
     Task {
-        try? await cap.stream?.stopCapture()
+        cap.stop()
         sender.conn?.cancel()
         stopped = true
     }
