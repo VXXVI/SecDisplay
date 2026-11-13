@@ -30,8 +30,16 @@ else
     echo "smooth" > "$APP/Contents/Resources/preset"
 fi
 
-# 构建标记：启动日志会打印，用来判断跑的是不是旧包
+# 图标。源文件在 assets/app-icon，由 assets/icon-gen/build_icons.py 生成。
 REPO="$(cd ../.. && pwd)"
+ICON="$REPO/assets/app-icon/AppIcon.icns"
+if [ -f "$ICON" ]; then
+    cp "$ICON" "$APP/Contents/Resources/AppIcon.icns"
+else
+    echo "警告: 没找到 $ICON，bundle 将使用系统默认图标"
+fi
+
+# 构建标记：启动日志会打印，用来判断跑的是不是旧包
 printf '%s %s\n' "$(git -C "$REPO" rev-parse --short HEAD 2>/dev/null || echo nogit)" \
     "$(date '+%Y-%m-%d %H:%M:%S')" > "$APP/Contents/Resources/build-stamp"
 
@@ -54,6 +62,8 @@ cat > "$APP/Contents/Info.plist" <<'PLIST'
     <string>APPL</string>
     <key>CFBundleExecutable</key>
     <string>SecDisplay</string>
+    <key>CFBundleIconFile</key>
+    <string>AppIcon</string>
     <key>LSMinimumSystemVersion</key>
     <string>13.0</string>
     <key>LSUIElement</key>
