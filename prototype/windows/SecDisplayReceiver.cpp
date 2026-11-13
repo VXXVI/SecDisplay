@@ -396,6 +396,7 @@ static const UINT ID_TRAY_EXIT = 1001;
 static const UINT ID_TRAY_TOGGLE = 1002;
 static const UINT ID_TRAY_ABOUT  = 1003;
 static const UINT ID_TRAY_MINIMIZE = 1004;
+static const UINT ID_TRAY_PANEL = 1005;
 static const int  HOTKEY_QUIT_ID = 1;
 static const int  HOTKEY_HIDE_ID = 2;   // Ctrl+Alt+H：最小化让位/还原，不退出
 // 用 W 版托盘结构与宽字符提示：A 版在 CP936 下会把 UTF-8 中文按 GBK 解码，
@@ -455,6 +456,8 @@ static void TrayShowMenu(HWND hwnd) {
     HMENU menu = CreatePopupMenu();
     if (!menu) return;
     // W 版菜单 + 宽字符：绕开 CP936 对 UTF-8 中文的 GBK 误解码
+    AppendMenuW(menu, MF_STRING, ID_TRAY_PANEL, L"控制面板");
+    AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
     AppendMenuW(menu, MF_STRING, ID_TRAY_TOGGLE, L"切换全屏 / 窗口  (F11)");
     AppendMenuW(menu, MF_STRING, ID_TRAY_MINIMIZE, L"最小化让位 / 还原  (Ctrl+Alt+H)");
     AppendMenuW(menu, MF_STRING, ID_TRAY_ABOUT,  L"关于 SecDisplay");
@@ -1560,6 +1563,243 @@ static void ExitFullscreen() {
     HideFullscreenHint();
 }
 
+// ---------------------------------------------------------------------------
+// 控制面板
+//
+// 独立于投屏窗口的轻量设置页：托盘菜单打开，关闭只隐藏，不影响投屏。
+// 状态直接读 g_stats，不额外开线程；开关即时生效，不写回配置文件。
+// ---------------------------------------------------------------------------
+
+static HWND g_panel = nullptr;
+static Presenter* g_presenter = nullptr;
+static std::atomic<bool> g_vsyncEnabled{true};
+static std::string g_peerHost = "10.10.10.1";
+static int g_peerPort = 9922;
+static std::string g_logPath;
+
+static const int IDC_PANEL_STATUS   = 2001;
+static const int IDC_PANEL_PEER     = 2002;
+static const int IDC_PANEL_SIZE     = 2003;
+static const int IDC_PANEL_FPS      = 2004;
+static const int IDC_PANEL_MBPS     = 2005;
+static const int IDC_PANEL_FAIL     = 2006;
+static const int IDC_PANEL_FULL     = 2010;
+static const int IDC_PANEL_RECONN   = 2011;
+static const int IDC_PANEL_LOG      = 2012;
+static const int IDC_PANEL_EXIT     = 2013;
+static const int IDC_PANEL_VSYNC    = 2020;
+static const int IDC_PANEL_PACE     = 2021;
+static const int IDC_PANEL_FEEDBACK = 2022;
+
+static int DpiScale(int v) {
+    static int dpi = 0;
+    if (dpi == 0) {
+        typedef UINT (WINAPI *GetDpiForSystemFn)(void);
+        auto fn = (GetDpiForSystemFn)GetProcAddress(GetModuleHandleA("user32.dll"), "GetDpiForSystem");
+        dpi = fn ? (int)fn() : 96;
+        if (dpi <= 0) dpi = 96;
+    }
+    return MulDiv(v, dpi, 96);
+}
+
+static HFONT PanelFont() {
+    static HFONT font = nullptr;
+    if (!font) {
+        NONCLIENTMETRICSW ncm{};
+        ncm.cbSize = sizeof(ncm);
+        if (SystemParametersInfoW(SPI_GETNONCLIENTMETRICS, sizeof(ncm), &ncm, 0)) {
+            font = CreateFontIndirectW(&ncm.lfMessageFont);
+        }
+        if (!font) font = (HFONT)GetStockObject(DEFAULT_GUI_FONT);
+    }
+    return font;
+}
+
+static void UpdateControlPanel() {
+    if (!g_panel) return;
+
+    static uint64_t lastDecoded = 0, lastBytes = 0;
+    static ULONGLONG lastTick = 0;
+    ULONGLONG now = GetTickCount64();
+    double dt = lastTick ? (double)(now - lastTick) / 1000.0 : 1.0;
+    uint64_t decoded = g_stats.decoded.load();
+    uint64_t bytes = g_stats.bytes.load();
+    double fps = dt > 0.0 ? (double)(decoded - lastDecoded) / dt : 0.0;
+    double mbps = dt > 0.0 ? (double)(bytes - lastBytes) * 8.0 / dt / 1e6 : 0.0;
+    lastDecoded = decoded;
+    lastBytes = bytes;
+    lastTick = now;
+
+    bool connected = g_sock.load() != INVALID_SOCKET;
+    bool receiving = connected && g_stats.packets.load() > 0;
+
+    wchar_t buf[256];
+    swprintf(buf, 256, L"状态: %s",
+             receiving ? L"已连接，正在接收" : (connected ? L"已连接，等待画面" : L"未连接，等待重连"));
+    SetWindowTextW(GetDlgItem(g_panel, IDC_PANEL_STATUS), buf);
+
+    std::wstring host = ToWide(g_peerHost.c_str(), (int)g_peerHost.size());
+    swprintf(buf, 256, L"对端: %s:%d", host.c_str(), g_peerPort);
+    SetWindowTextW(GetDlgItem(g_panel, IDC_PANEL_PEER), buf);
+
+    int dw = g_displayW.load(), dh = g_displayH.load();
+    if (dw <= 0 || dh <= 0) { dw = g_sessW.load(); dh = g_sessH.load(); }
+    swprintf(buf, 256, L"分辨率: %dx%d", dw, dh);
+    SetWindowTextW(GetDlgItem(g_panel, IDC_PANEL_SIZE), buf);
+
+    swprintf(buf, 256, L"帧率: %.1f fps", fps);
+    SetWindowTextW(GetDlgItem(g_panel, IDC_PANEL_FPS), buf);
+
+    swprintf(buf, 256, L"码率: %.1f Mbps", mbps);
+    SetWindowTextW(GetDlgItem(g_panel, IDC_PANEL_MBPS), buf);
+
+    swprintf(buf, 256, L"解码失败: %llu", (unsigned long long)g_stats.decodeFail.load());
+    SetWindowTextW(GetDlgItem(g_panel, IDC_PANEL_FAIL), buf);
+
+    SetWindowTextW(GetDlgItem(g_panel, IDC_PANEL_FULL),
+                   g_isFullscreen ? L"回到窗口" : L"全屏");
+}
+
+static LRESULT CALLBACK PanelWndProc(HWND h, UINT msg, WPARAM w, LPARAM l) {
+    switch (msg) {
+    case WM_CREATE: {
+        HFONT font = PanelFont();
+        auto mk = [&](const wchar_t* cls, const wchar_t* text, DWORD style,
+                      int x, int y, int cw, int ch, int id) -> HWND {
+            HWND c = CreateWindowExW(0, cls, text, WS_CHILD | WS_VISIBLE | style,
+                                     DpiScale(x), DpiScale(y), DpiScale(cw), DpiScale(ch),
+                                     h, (HMENU)(INT_PTR)id, GetModuleHandleW(nullptr), nullptr);
+            if (c && font) SendMessageW(c, WM_SETFONT, (WPARAM)font, TRUE);
+            return c;
+        };
+
+        mk(L"STATIC", L"连接状态", SS_LEFT, 20, 16, 200, 24, 0);
+        mk(L"STATIC", L"状态: --", SS_LEFT, 20, 48, 420, 24, IDC_PANEL_STATUS);
+        mk(L"STATIC", L"对端: --", SS_LEFT, 20, 80, 420, 24, IDC_PANEL_PEER);
+        mk(L"STATIC", L"分辨率: --", SS_LEFT, 20, 112, 420, 24, IDC_PANEL_SIZE);
+        mk(L"STATIC", L"帧率: --", SS_LEFT, 20, 144, 420, 24, IDC_PANEL_FPS);
+        mk(L"STATIC", L"码率: --", SS_LEFT, 20, 176, 420, 24, IDC_PANEL_MBPS);
+        mk(L"STATIC", L"解码失败: --", SS_LEFT, 20, 208, 420, 24, IDC_PANEL_FAIL);
+
+        mk(L"BUTTON", L"全屏", BS_PUSHBUTTON, 20, 252, 130, 36, IDC_PANEL_FULL);
+        mk(L"BUTTON", L"重新连接", BS_PUSHBUTTON, 165, 252, 130, 36, IDC_PANEL_RECONN);
+        mk(L"BUTTON", L"打开日志", BS_PUSHBUTTON, 310, 252, 130, 36, IDC_PANEL_LOG);
+        mk(L"BUTTON", L"退出 SecDisplay", BS_PUSHBUTTON, 20, 300, 130, 36, IDC_PANEL_EXIT);
+
+        HWND vs = mk(L"BUTTON", L"垂直同步", BS_AUTOCHECKBOX, 20, 360, 220, 28, IDC_PANEL_VSYNC);
+        HWND pc = mk(L"BUTTON", L"抖动缓冲", BS_AUTOCHECKBOX, 20, 396, 220, 28, IDC_PANEL_PACE);
+        HWND fb = mk(L"BUTTON", L"反馈", BS_AUTOCHECKBOX, 20, 432, 220, 28, IDC_PANEL_FEEDBACK);
+        if (vs) SendMessageW(vs, BM_SETCHECK, g_vsyncEnabled.load() ? BST_CHECKED : BST_UNCHECKED, 0);
+        if (pc) SendMessageW(pc, BM_SETCHECK, g_paceEnabled.load() ? BST_CHECKED : BST_UNCHECKED, 0);
+        if (fb) SendMessageW(fb, BM_SETCHECK, g_feedbackEnabled.load() ? BST_CHECKED : BST_UNCHECKED, 0);
+
+        mk(L"STATIC", L"Esc 退出    Ctrl+Alt+H 让位    F11 全屏", SS_LEFT, 20, 490, 420, 24, 0);
+        SetTimer(h, 1, 1000, nullptr);
+        return 0;
+    }
+    case WM_TIMER:
+        if (w == 1) UpdateControlPanel();
+        return 0;
+    case WM_CTLCOLORSTATIC:
+        // 静态文本默认用 COLOR_BTNFACE 画背景，会显示成一块块灰底；
+        // 改成透明背景加窗口底色，和面板融为一体
+        SetBkMode((HDC)w, TRANSPARENT);
+        SetTextColor((HDC)w, GetSysColor(COLOR_WINDOWTEXT));
+        return (LRESULT)GetSysColorBrush(COLOR_WINDOW);
+    case WM_COMMAND:
+        switch (LOWORD(w)) {
+        case IDC_PANEL_FULL:
+            if (g_hwnd) PostMessageW(g_hwnd, WM_COMMAND, ID_TRAY_TOGGLE, 0);
+            return 0;
+        case IDC_PANEL_RECONN: {
+            SOCKET s = g_sock.load();
+            if (s != INVALID_SOCKET) {
+                Log("控制面板请求重新连接");
+                shutdown(s, SD_BOTH);
+            }
+            return 0;
+        }
+        case IDC_PANEL_LOG:
+            if (!g_logPath.empty()) {
+                std::wstring path = ToWide(g_logPath.c_str(), (int)g_logPath.size());
+                ShellExecuteW(nullptr, L"open", path.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
+            } else {
+                MessageBoxW(h, L"当前没有配置日志文件（--log）", L"SecDisplay",
+                            MB_OK | MB_ICONINFORMATION);
+            }
+            return 0;
+        case IDC_PANEL_EXIT:
+            if (g_hwnd) PostMessageW(g_hwnd, WM_CLOSE, 0, 0);
+            return 0;
+        case IDC_PANEL_VSYNC:
+            g_vsyncEnabled = (SendMessageW((HWND)l, BM_GETCHECK, 0, 0) == BST_CHECKED);
+            if (g_presenter) g_presenter->setUseVsync(g_vsyncEnabled.load());
+            Log("控制面板: 垂直同步 %s", g_vsyncEnabled.load() ? "开" : "关");
+            return 0;
+        case IDC_PANEL_PACE:
+            g_paceEnabled = (SendMessageW((HWND)l, BM_GETCHECK, 0, 0) == BST_CHECKED);
+            Log("控制面板: 抖动缓冲 %s", g_paceEnabled.load() ? "开" : "关");
+            return 0;
+        case IDC_PANEL_FEEDBACK:
+            g_feedbackEnabled = (SendMessageW((HWND)l, BM_GETCHECK, 0, 0) == BST_CHECKED);
+            Log("控制面板: 反馈 %s", g_feedbackEnabled.load() ? "开" : "关");
+            return 0;
+        }
+        return 0;
+    case WM_CLOSE:
+        // 只隐藏，不销毁：投屏继续跑，下次从托盘再打开
+        ShowWindow(h, SW_HIDE);
+        return 0;
+    case WM_DESTROY:
+        KillTimer(h, 1);
+        return 0;
+    }
+    return DefWindowProcW(h, msg, w, l);
+}
+
+static void ShowControlPanel() {
+    if (g_panel) {
+        ShowWindow(g_panel, SW_SHOW);
+        SetForegroundWindow(g_panel);
+        UpdateControlPanel();
+        return;
+    }
+
+    Log("打开控制面板");
+    static bool registered = false;
+    if (!registered) {
+        WNDCLASSEXW wc{};
+        wc.cbSize = sizeof(wc);
+        wc.lpfnWndProc = PanelWndProc;
+        wc.hInstance = GetModuleHandleW(nullptr);
+        wc.hCursor = LoadCursorW(nullptr, (LPCWSTR)IDC_ARROW);
+        wc.hbrBackground = (HBRUSH)(COLOR_WINDOW + 1);
+        wc.lpszClassName = L"SecDisplayControl";
+        wc.hIcon = LoadIconW(nullptr, (LPCWSTR)IDI_APPLICATION);
+        RegisterClassExW(&wc);
+        registered = true;
+    }
+
+    DWORD style = WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX;
+    RECT rc{ 0, 0, DpiScale(470), DpiScale(540) };
+    AdjustWindowRect(&rc, style, FALSE);
+    int w = rc.right - rc.left;
+    int hgt = rc.bottom - rc.top;
+    int x = (GetSystemMetrics(SM_CXSCREEN) - w) / 2;
+    int y = (GetSystemMetrics(SM_CYSCREEN) - hgt) / 2;
+    g_panel = CreateWindowExW(WS_EX_APPWINDOW, L"SecDisplayControl", L"SecDisplay 控制面板",
+                              style, x, y, w, hgt,
+                              nullptr, nullptr, GetModuleHandleW(nullptr), nullptr);
+    if (g_panel) {
+        Log("控制面板已创建 hwnd=%p", (void*)g_panel);
+        ShowWindow(g_panel, SW_SHOW);
+        SetForegroundWindow(g_panel);
+        UpdateControlPanel();
+    } else {
+        Log("控制面板创建失败 %lu", GetLastError());
+    }
+}
+
 // 用收到的 BGRA 像素造一个 32bpp 带 alpha 的 HCURSOR。
 // 仅在 UI 线程(WM_APPLY_CURSOR)调用；旧 cursor 在此销毁，无跨线程句柄竞态。
 static void ApplyCursorImage() {
@@ -1757,6 +1997,7 @@ static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
         return 0;
     case WM_COMMAND:
         switch (LOWORD(w)) {
+        case ID_TRAY_PANEL:  ShowControlPanel(); return 0;
         case ID_TRAY_EXIT:   RequestQuit(); return 0;
         case ID_TRAY_TOGGLE:
             if (g_isFullscreen) ExitFullscreen(); else EnterFullscreen();
@@ -2651,6 +2892,11 @@ int main(int argc, char** argv) {
     Presenter presenter;
     if (!presenter.Init(&gfx, hwnd, cfg.width, cfg.height)) return 4;
     presenter.setUseVsync(cfg.vsync);
+    g_presenter = &presenter;
+    g_vsyncEnabled = cfg.vsync;
+    g_peerHost = cfg.host;
+    g_peerPort = cfg.port;
+    g_logPath = cfg.logFile;
     Log("呈现方式: %s", cfg.vsync ? "垂直同步（均匀）" : "免同步（低延迟）");
     g_paceEnabled = cfg.pace;
     Log("抖动缓冲: %s", cfg.pace ? "开（1~3 帧缓冲，自适应节拍，增加约 1~3 帧延迟）" : "关（即时上屏，延迟最低）");
@@ -2727,6 +2973,8 @@ int main(int argc, char** argv) {
     }
 
     // 退出清理：托盘图标和热键必须在进程结束前移除，否则托盘会留残影
+    if (g_panel) { DestroyWindow(g_panel); g_panel = nullptr; }
+    g_presenter = nullptr;
     TrayRemove();
     UnregisterHotKey(hwnd, HOTKEY_QUIT_ID);
     UnregisterHotKey(hwnd, HOTKEY_HIDE_ID);
