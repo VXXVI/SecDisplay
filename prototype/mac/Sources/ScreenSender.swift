@@ -533,6 +533,15 @@ final class Capture: NSObject, SCStreamOutput, SCStreamDelegate {
     /// 任何类型的回调都计数，用来区分「流死了」和「画面静止」
     private var progressCount = 0
     private(set) var idleFrameCount = 0
+    // --- 静止帧去重 ---
+    // 虚拟屏不会报 idle：静止桌面也按满帧率送 complete（实测 1 秒内只有
+    // 0.004% 像素变化，采集却跑 58fps）。编码器因此全速空转，白烧 CPU 和
+    // 带宽，视频帧还会把光标小包堵在 socket 后面。这里用步进采样对比上一帧，
+    // 差异极小时跳过编码。最长 0.5s 必编码一次，慢变化不会被永久压住。
+    private var prevSamples: [UInt8] = []
+    private var prevSampleKey = 0
+    private var lastEncodeAt: CFAbsoluteTime = 0
+    private(set) var staticSkipCount = 0
     private var lastProgressAt = CFAbsoluteTimeGetCurrent()
     private var needsRestart = false
     private var restarting = false
@@ -665,6 +674,51 @@ final class Capture: NSObject, SCStreamOutput, SCStreamDelegate {
         }
     }
 
+    /// 与上一帧做步进采样对比，返回 true 表示这一帧可以跳过编码。
+    private func shouldSkipStatic(_ pb: CVPixelBuffer) -> Bool {
+        // 兜底：最长 0.5s 一定编码一次，避免慢变化（光标闪烁、进度条）被压死。
+        if CFAbsoluteTimeGetCurrent() - lastEncodeAt >= 0.5 { return false }
+        CVPixelBufferLockBaseAddress(pb, .readOnly)
+        defer { CVPixelBufferUnlockBaseAddress(pb, .readOnly) }
+        guard let base = CVPixelBufferGetBaseAddress(pb) else { return false }
+        let w = CVPixelBufferGetWidth(pb)
+        let h = CVPixelBufferGetHeight(pb)
+        let bpr = CVPixelBufferGetBytesPerRow(pb)
+        let stepX = max(1, w / 96)
+        let stepY = max(1, h / 60)
+        let p = base.assumingMemoryBound(to: UInt8.self)
+        var cur = [UInt8]()
+        cur.reserveCapacity(96 * 60 * 3)
+        var y = 0
+        while y < h {
+            let row = p + y * bpr
+            var x = 0
+            while x < w {
+                let o = x * 4
+                cur.append(row[o]); cur.append(row[o + 1]); cur.append(row[o + 2])
+                x += stepX
+            }
+            y += stepY
+        }
+        let key = w * 10_000 + h
+        let prev = prevSamples
+        let sameSize = prevSampleKey == key && prev.count == cur.count
+        prevSamples = cur
+        prevSampleKey = key
+        guard sameSize else { return false }
+        var changed = 0
+        var i = 0
+        while i < cur.count {
+            let d = abs(Int(cur[i]) - Int(prev[i]))
+                + abs(Int(cur[i + 1]) - Int(prev[i + 1]))
+                + abs(Int(cur[i + 2]) - Int(prev[i + 2]))
+            if d > 9 { changed += 1 }
+            i += 3
+        }
+        let total = cur.count / 3
+        return changed <= max(3, total / 500)
+    }
+
     func stream(_ stream: SCStream, didOutputSampleBuffer sb: CMSampleBuffer, of type: SCStreamOutputType) {
         guard type == .screen else { return }
         guard let arr = CMSampleBufferGetSampleAttachmentsArray(sb, createIfNecessary: false) as? [[SCStreamFrameInfo: Any]],
@@ -701,6 +755,11 @@ final class Capture: NSObject, SCStreamOutput, SCStreamDelegate {
             if delayMs > capLatMax { capLatMax = delayMs }
         }
         let nowMicros = UInt64(CFAbsoluteTimeGetCurrent() * 1_000_000)
+        if shouldSkipStatic(pb) {
+            staticSkipCount += 1
+            return
+        }
+        lastEncodeAt = CFAbsoluteTimeGetCurrent()
         encoder.encode(pb, pts: pts, captureTimeMicros: nowMicros)
     }
 
