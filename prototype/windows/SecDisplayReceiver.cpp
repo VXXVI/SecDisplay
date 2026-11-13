@@ -86,6 +86,8 @@ struct Stats {
     std::atomic<uint64_t> dropped{0};
     std::atomic<uint64_t> paced{0};       // --pace 队列溢出时主动丢掉的旧帧
     std::atomic<uint64_t> decodeFail{0};
+    std::atomic<uint64_t> presentFail{0};   // 呈现路径静默 return 的次数（取缓冲/建视图/Blt/Present 失败）
+    std::atomic<uint64_t> dupFrame{0};      // 与上一帧编码数据完全相同的帧数（源端在重发最后一帧）
     std::atomic<uint64_t> lastLatencyUs{0};
     std::atomic<uint64_t> cursor{0};      // 收到的 0x03 光标包
     std::atomic<uint64_t> inputSent{0};   // 发出的 0x04 输入事件
@@ -117,10 +119,20 @@ static double QpcNowMs() {
 
 static double g_lastPresentMs = 0.0;   // 仅呈现线程写；重连时复位，避免断线时长污染 p95
 
+// 最近一次「成功 Present」的时刻。呈现线程写，看门狗读，所以用原子。
+// 看门狗据此判断「连接还在但画面不再更新」，2 秒没有成功上屏就清屏提示。
+static std::atomic<double> g_lastGoodPresentMs{ 0.0 };
+// 最近一次收到视频包的时刻（收流线程写，看门狗读）。用来区分
+// 「有帧在来但上不了屏」和「源端一个包都没发」，后者不能立刻判无信号，
+// 否则静止桌面（源端不出帧）会被误清屏。
+static std::atomic<double> g_lastVideoPacketMs{ 0.0 };
+
 static void ResetPresentRing() {
     std::lock_guard<std::mutex> lk(g_presentMtx);
     g_presentRingCount = 0;
     g_lastPresentMs = 0.0;
+    g_lastGoodPresentMs.store(0.0);   // 新连接从零开始算，避免把上一段连接的时长算进看门狗
+    g_lastVideoPacketMs.store(0.0);
 }
 
 // 解码到达间隔：与上屏间隔并排，用来判断抖动是源端带来的还是呈现侧引入的。
@@ -654,6 +666,142 @@ static bool ExtractParamSets(const uint8_t* data, size_t len,
 }
 
 // ---------------------------------------------------------------------------
+// 极简 SPS 解析：只为拿到码流里的真实编码宽高
+//
+// 为什么需要：接收端协商输入类型时用的是 config.ini / 命令行的尺寸（默认
+// 2880x1800），而 Mac 侧虚拟屏切档后实际可能是 1600x1000。按错误尺寸声明
+// MF_MT_FRAME_SIZE 会让 H.264 解码器的 SetInputType 或输出类型协商反复失败，
+// 表现是一直没有输出，而日志里只有一行 SetInputType 失败。
+// 这里从 SPS 里解出真实宽高，协商前先纠正 width_/height_。
+//
+// 只处理常见语法（progressive、无 scaling list）。遇到不支持的语法返回 false，
+// 调用方沿用原尺寸，行为与改动前一致，解析失败不会把链路弄坏。
+// ---------------------------------------------------------------------------
+
+struct SpsBitReader {
+    const uint8_t* p;
+    size_t n;          // 字节数
+    size_t pos = 0;    // 位偏移
+    bool ok = true;
+
+    explicit SpsBitReader(const std::vector<uint8_t>& d) : p(d.data()), n(d.size()) {}
+
+    uint32_t u(int bits) {
+        uint32_t v = 0;
+        for (int i = 0; i < bits; ++i) {
+            if (pos >= n * 8) { ok = false; return 0; }
+            v = (v << 1) | (uint32_t)((p[pos >> 3] >> (7 - (pos & 7))) & 1);
+            ++pos;
+        }
+        return v;
+    }
+
+    // 无符号指数哥伦布
+    uint32_t ue() {
+        int zeros = 0;
+        while (ok) {
+            if (u(1) != 0) break;
+            if (++zeros > 31) { ok = false; return 0; }
+        }
+        if (!ok) return 0;
+        if (zeros == 0) return 0;
+        return ((1u << zeros) - 1u) + u(zeros);
+    }
+
+    // 有符号指数哥伦布
+    int32_t se() {
+        uint32_t k = ue();
+        if (!ok) return 0;
+        return (k & 1u) ? (int32_t)((k + 1u) / 2u) : -(int32_t)(k / 2u);
+    }
+};
+
+/// sps 含 NAL 头字节（0x67）。成功时写回真实宽高。
+static bool ParseSpsDimensions(const std::vector<uint8_t>& sps, int& outW, int& outH) {
+    if (sps.size() < 4) return false;
+
+    // 去掉防竞争字节（00 00 03 -> 00 00）
+    std::vector<uint8_t> rbsp;
+    rbsp.reserve(sps.size());
+    int zeros = 0;
+    for (size_t i = 0; i < sps.size(); ++i) {
+        uint8_t b = sps[i];
+        if (zeros >= 2 && b == 0x03) { zeros = 0; continue; }
+        rbsp.push_back(b);
+        zeros = (b == 0) ? zeros + 1 : 0;
+    }
+    if (rbsp.size() < 4) return false;
+
+    SpsBitReader br(rbsp);
+    br.u(8);                 // NAL 头
+    uint32_t profile = br.u(8);
+    br.u(8);                 // constraint_set 标志 + reserved
+    br.u(8);                 // level_idc
+    br.ue();                 // seq_parameter_set_id
+
+    uint32_t chroma = 1;     // 非 High profile 隐含 4:2:0
+    if (profile == 100 || profile == 110 || profile == 122 || profile == 244 ||
+        profile == 44 || profile == 83 || profile == 86 || profile == 118 ||
+        profile == 128 || profile == 138 || profile == 139 || profile == 134 ||
+        profile == 135) {
+        chroma = br.ue();
+        if (chroma == 3) br.u(1);   // separate_colour_plane_flag
+        br.ue();                    // bit_depth_luma_minus8
+        br.ue();                    // bit_depth_chroma_minus8
+        br.u(1);                    // qpprime_y_zero_transform_bypass_flag
+        if (br.u(1)) return false;  // seq_scaling_matrix_present_flag：不解析
+    }
+    if (!br.ok) return false;
+
+    br.ue();                        // log2_max_frame_num_minus4
+    uint32_t pocType = br.ue();
+    if (pocType == 0) {
+        br.ue();                    // log2_max_pic_order_cnt_lsb_minus4
+    } else if (pocType == 1) {
+        br.u(1);                    // delta_pic_order_always_zero_flag
+        br.se();                    // offset_for_non_ref_pic
+        br.se();                    // offset_for_top_to_bottom_field
+        uint32_t cycle = br.ue();
+        if (!br.ok || cycle > 255) return false;
+        for (uint32_t i = 0; i < cycle; ++i) br.se();
+    } else if (pocType != 2) {
+        return false;
+    }
+    br.ue();                        // max_num_ref_frames
+    br.u(1);                        // gaps_in_frame_num_value_allowed_flag
+
+    uint32_t wMbs = br.ue() + 1;        // pic_width_in_mbs_minus1
+    uint32_t hMapUnits = br.ue() + 1;   // pic_height_in_map_units_minus1
+    uint32_t frameMbsOnly = br.u(1);
+    if (!frameMbsOnly) br.u(1);     // mb_adaptive_frame_field_flag
+    br.u(1);                        // direct_8x8_inference_flag
+    uint32_t cropL = 0, cropR = 0, cropT = 0, cropB = 0;
+    if (br.u(1)) {                  // frame_cropping_flag
+        cropL = br.ue(); cropR = br.ue(); cropT = br.ue(); cropB = br.ue();
+    }
+    if (!br.ok) return false;
+
+    // 裁剪单位按色度格式取，4:2:0 是 2x2，其它见 H.264 7.4.2.1.1
+    int cropUnitX = 1;
+    int cropUnitY = (int)(2 - frameMbsOnly);
+    if (chroma == 1) {
+        cropUnitX = 2;
+        cropUnitY = 2 * (int)(2 - frameMbsOnly);
+    } else if (chroma == 2) {
+        cropUnitX = 2;
+    } else if (chroma != 0 && chroma != 3) {
+        return false;
+    }
+
+    int w = (int)wMbs * 16 - cropUnitX * (int)(cropL + cropR);
+    int h = (int)(2 - frameMbsOnly) * (int)hMapUnits * 16 - cropUnitY * (int)(cropT + cropB);
+    if (w <= 0 || h <= 0 || w > 16384 || h > 16384) return false;
+    outW = w;
+    outH = h;
+    return true;
+}
+
+// ---------------------------------------------------------------------------
 // D3D11 设备（解码与呈现共用同一台，才能零拷贝）
 // ---------------------------------------------------------------------------
 
@@ -1096,10 +1244,30 @@ bool Decoder::Decode(const uint8_t* avcc, size_t len, IMFSample** outSample) {
         merged.insert(merged.end(), sps.begin(), sps.end());
         merged.insert(merged.end(), pps.begin(), pps.end());
         if (merged != paramSetsCache_) {
-            if (SetInputTypeFromParamSets(sps, pps)) {
+            // 先用 SPS 里的真实编码尺寸协商，再退回启动参数。
+            // Mac 切档后虚拟屏可能是 1600x1000，而接收端启动参数还是 2880x1800，
+            // 按错尺寸声明 MF_MT_FRAME_SIZE 会让 SetInputType 反复失败、一直无输出。
+            const int prevW = width_, prevH = height_;
+            int spsW = 0, spsH = 0;
+            const bool haveSps = ParseSpsDimensions(sps, spsW, spsH);
+            if (haveSps) { width_ = spsW; height_ = spsH; }
+
+            bool applied = SetInputTypeFromParamSets(sps, pps);
+            if (!applied && haveSps && (spsW != prevW || spsH != prevH)) {
+                // SPS 尺寸被拒（少见）：退回原尺寸再试一次，保证不比改动前更差
+                Log("按 SPS 尺寸 %dx%d 设输入类型失败，退回 %dx%d 重试",
+                    spsW, spsH, prevW, prevH);
+                width_ = prevW; height_ = prevH;
+                applied = SetInputTypeFromParamSets(sps, pps);
+            }
+            if (applied) {
                 paramSetsCache_ = merged;
                 transform_->ProcessMessage(MFT_MESSAGE_COMMAND_FLUSH, 0);
                 ready_ = false;
+                if (haveSps && (spsW != prevW || spsH != prevH)) {
+                    Log("按 SPS 更新编码尺寸: %dx%d（启动参数 %dx%d）",
+                        spsW, spsH, prevW, prevH);
+                }
             }
         }
     }
@@ -1141,9 +1309,18 @@ bool Decoder::Decode(const uint8_t* avcc, size_t len, IMFSample** outSample) {
 
     if (FAILED(hr)) {
         g_stats.decodeFail++;
-        // 送不进去，但手上可能已有解好的帧，交给调用方，别丢
-        *outSample = pending;
-        return pending != nullptr;
+        // 关键：重送仍失败时，pending 是「更早」的旧帧，绝不能当成新解出的帧
+        // 交回调用方。原来这里 return pending != nullptr，调用方会把旧帧计进
+        // decoded、再交给呈现线程重复上屏，外部表现就是
+        // 「连接正常、每 2 秒都有帧、画面却永远不动」且没有任何错误日志。
+        if (pending) { pending->Release(); pending = nullptr; }
+        static double lastLogMs = 0.0;
+        double nowMs = QpcNowMs();
+        if (lastLogMs == 0.0 || nowMs - lastLogMs > 2000.0) {
+            lastLogMs = nowMs;
+            Log("送帧失败 %08X（解码器拒绝输入），丢弃这一帧", (unsigned)hr);
+        }
+        return false;
     }
 
     IMFSample* out = nullptr;
@@ -1172,7 +1349,9 @@ void Decoder::Shutdown() {
 class Presenter {
 public:
     bool Init(Graphics* gfx, HWND hwnd, int width, int height);
-    void PresentSample(IMFSample* sample);
+    // 返回是否真的把一帧送上了屏。中间任何一步失败都返回 false 并计数，
+    // 调用方据此跑看门狗：静默失败会让 FLIP 交换链永久停在旧帧上。
+    bool PresentSample(IMFSample* sample);
     void Shutdown();
     bool tearingSupported() const { return tearing_; }
     void setUseVsync(bool v) { useVsync_ = v; }
@@ -1206,6 +1385,10 @@ private:
     std::unordered_map<void*, ComPtr<ID3D11VideoProcessorOutputView>> outViewCache_;
     bool tearing_ = false;
     bool useVsync_ = true;
+    // 连续失败计数与限流日志：45fps 下每帧打日志会淹掉文件，
+    // 只打第一次和之后每 2 秒一次，既能定位又不会刷屏。
+    uint64_t failStreak_ = 0;
+    double lastFailLogMs_ = 0.0;
 };
 
 bool Presenter::Init(Graphics* gfx, HWND hwnd, int width, int height) {
@@ -1264,9 +1447,12 @@ bool Presenter::Init(Graphics* gfx, HWND hwnd, int width, int height) {
 bool Presenter::CreateProcessor() {
     processor_.Reset();
     enum_.Reset();
-    // 输入视图缓存依赖旧的 enum_/processor_，重建时必须一起失效，
-    // 否则分辨率切换后可能复用按旧枚举器创建的 input view，导致 Blt 失败或花屏。
+    // 输入/输出视图都持有创建时那个 enum_ 的引用，重建时必须一起失效，
+    // 否则分辨率切换后复用按旧枚举器创建的视图，VideoProcessorBlt 会持续
+    // 返回 E_INVALIDARG（上屏静默失败，画面永久停在旧帧）。
+    // 原来只清了 inViewCache_，输出视图仍按旧 enum_ 命中缓存，是个漏点。
     inViewCache_.clear();
+    outViewCache_.clear();
 
     D3D11_VIDEO_PROCESSOR_CONTENT_DESC cd{};
     cd.InputFrameFormat = D3D11_VIDEO_FRAME_FORMAT_PROGRESSIVE;
@@ -1336,32 +1522,57 @@ bool Presenter::Resize(int width, int height) {
     return true;
 }
 
-void Presenter::PresentSample(IMFSample* sample) {
-    if (!sample) return;
+bool Presenter::PresentSample(IMFSample* sample) {
+    // 所有失败都从这里走：计数 + 限流日志。
+    // 原来这里 8 个静默 return，设备移除、交换链失效、VideoProcessorBlt 失败时
+    // 画面会永久停在旧帧，日志里一行线索都没有，看起来就像「连着却显示别的屏」。
+    auto fail = [&](const char* what, HRESULT hr) -> bool {
+        ++failStreak_;
+        g_stats.presentFail++;
+        double nowMs = QpcNowMs();
+        if (failStreak_ == 1 || nowMs - lastFailLogMs_ > 2000.0) {
+            lastFailLogMs_ = nowMs;
+            Log("上屏失败（连续 %llu 次）: %s  hr=%08X",
+                (unsigned long long)failStreak_, what, (unsigned)hr);
+        }
+        return false;
+    };
+
+    if (!sample) return fail("空样本", E_POINTER);
+    if (!swap_) return fail("交换链为空", E_UNEXPECTED);
+    if (!processor_) return fail("视频处理器未就绪", E_UNEXPECTED);
 
     // FLIP 模型下交换链有多个物理缓冲随 Present 轮转，且每次 GetBuffer 拿到的
     // 可能是不同的表面。必须每帧重新获取，缓存指针会画到错误或不可写的缓冲上，
     // 表现为隔帧黑屏或花屏。
     ComPtr<ID3D11Texture2D> backTex;
-    if (FAILED(swap_->GetBuffer(0, IID_PPV_ARGS(&backTex))) || !backTex) return;
+    HRESULT hr = swap_->GetBuffer(0, IID_PPV_ARGS(&backTex));
+    if (FAILED(hr)) return fail("交换链 GetBuffer(0)", hr);
+    if (!backTex) return fail("交换链 GetBuffer(0) 返回空纹理", E_POINTER);
 
     // 取解码输出的纹理
     ComPtr<IMFMediaBuffer> buf;
-    if (FAILED(sample->GetBufferByIndex(0, &buf))) return;
+    hr = sample->GetBufferByIndex(0, &buf);
+    if (FAILED(hr)) return fail("样本 GetBufferByIndex(0)", hr);
+    if (!buf) return fail("样本没有缓冲区", E_POINTER);
 
     ComPtr<IMFDXGIBuffer> dxgiBuf;
     ComPtr<ID3D11Texture2D> inputTex;
     UINT subIdx = 0;
 
     if (SUCCEEDED(buf.As(&dxgiBuf))) {
-        if (FAILED(dxgiBuf->GetResource(IID_PPV_ARGS(&inputTex)))) return;
+        hr = dxgiBuf->GetResource(IID_PPV_ARGS(&inputTex));
+        if (FAILED(hr)) return fail("IMFDXGIBuffer::GetResource", hr);
         dxgiBuf->GetSubresourceIndex(&subIdx);
     } else {
         // 解码器给的是系统内存：需要上传到纹理
         ComPtr<IMF2DBuffer> twoD;
         BYTE* scan0 = nullptr;
         LONG pitch = 0;
-        if (FAILED(buf.As(&twoD)) || FAILED(twoD->Lock2D(&scan0, &pitch))) return;
+        hr = buf.As(&twoD);
+        if (FAILED(hr) || !twoD) return fail("样本不支持 IMF2DBuffer", hr);
+        hr = twoD->Lock2D(&scan0, &pitch);
+        if (FAILED(hr) || !scan0) return fail("Lock2D", hr);
 
         D3D11_TEXTURE2D_DESC td{};
         td.Width = srcW_;
@@ -1373,7 +1584,8 @@ void Presenter::PresentSample(IMFSample* sample) {
         td.Usage = D3D11_USAGE_DEFAULT;
         td.BindFlags = D3D11_BIND_DECODER;
         ComPtr<ID3D11Texture2D> tex;
-        if (FAILED(gfx_->device->CreateTexture2D(&td, nullptr, &tex))) { twoD->Unlock2D(); return; }
+        hr = gfx_->device->CreateTexture2D(&td, nullptr, &tex);
+        if (FAILED(hr) || !tex) { twoD->Unlock2D(); return fail("创建 NV12 上传纹理", hr); }
 
         D3D11_BOX box{ 0, 0, 0, (UINT)srcW_, (UINT)srcH_, 1 };
         gfx_->context->UpdateSubresource(tex.Get(), 0, &box, scan0, (UINT)pitch, 0);
@@ -1381,7 +1593,7 @@ void Presenter::PresentSample(IMFSample* sample) {
         inputTex = tex;
         subIdx = 0;
     }
-    if (!inputTex) return;
+    if (!inputTex) return fail("输入纹理为空", E_POINTER);
 
     D3D11_VIDEO_PROCESSOR_INPUT_VIEW_DESC ivd{};
     ivd.FourCC = 0;
@@ -1395,8 +1607,9 @@ void Presenter::PresentSample(IMFSample* sample) {
         inView = itIn->second;
     } else {
         if (inViewCache_.size() > 32) inViewCache_.clear();
-        if (FAILED(videoDevice_->CreateVideoProcessorInputView(inputTex.Get(), enum_.Get(),
-                                                               &ivd, &inView))) return;
+        hr = videoDevice_->CreateVideoProcessorInputView(inputTex.Get(), enum_.Get(),
+                                                         &ivd, &inView);
+        if (FAILED(hr) || !inView) return fail("创建输入视图", hr);
         inViewCache_[inKey] = inView;
     }
 
@@ -1410,32 +1623,41 @@ void Presenter::PresentSample(IMFSample* sample) {
         outView = itOut->second;
     } else {
         if (outViewCache_.size() > 8) outViewCache_.clear();
-        if (FAILED(videoDevice_->CreateVideoProcessorOutputView(backTex.Get(), enum_.Get(),
-                                                                &ovd, &outView))) return;
+        hr = videoDevice_->CreateVideoProcessorOutputView(backTex.Get(), enum_.Get(),
+                                                          &ovd, &outView);
+        if (FAILED(hr) || !outView) return fail("创建输出视图", hr);
         outViewCache_[outKey] = outView;
     }
 
     D3D11_VIDEO_PROCESSOR_STREAM stream{};
     stream.Enable = TRUE;
     stream.pInputSurface = inView.Get();
-    if (FAILED(videoCtx_->VideoProcessorBlt(processor_.Get(), outView.Get(), 0, 1, &stream))) return;
+    hr = videoCtx_->VideoProcessorBlt(processor_.Get(), outView.Get(), 0, 1, &stream);
+    if (FAILED(hr)) return fail("VideoProcessorBlt", hr);
 
     // 呈现方式：
     //   垂直同步（默认）—— 帧对齐到刷新周期，画面均匀。显示器 89Hz 而输出 43fps 时，
     //     每帧占约 2 个刷新周期，节奏稳定；免同步会让这个比例在 2~3 之间跳，看起来就是卡。
     //   免同步 —— 延迟最低，但刷新节奏不均时会有抖动的观感。
+    HRESULT phr = S_OK;
     if (tearing_ && !useVsync_) {
-        HRESULT hr = swap_->Present(0, DXGI_PRESENT_ALLOW_TEARING);
-        if (FAILED(hr)) swap_->Present(1, 0);
+        phr = swap_->Present(0, DXGI_PRESENT_ALLOW_TEARING);
+        if (FAILED(phr)) phr = swap_->Present(1, 0);
     } else {
-        swap_->Present(1, 0);
+        phr = swap_->Present(1, 0);
     }
+    if (FAILED(phr)) return fail("Present", phr);
+
+    // 走到这里才算真的上了屏。看门狗只看这个时刻，不看解码计数。
+    failStreak_ = 0;
+    double nowMs = QpcNowMs();
+    g_lastGoodPresentMs.store(nowMs);
     // 记录两次上屏的间隔：vsync 会把节奏拉成刷新周期的整数倍，
     // 免同步则贴近源帧间隔。统计行打印 p50/p95 便于客观判断。
-    double nowMs = QpcNowMs();
     if (g_lastPresentMs > 0.0) PushPresentInterval(nowMs - g_lastPresentMs);
     g_lastPresentMs = nowMs;
     g_stats.presented++;
+    return true;
 }
 
 void Presenter::ClearToIdle() {
@@ -2398,6 +2620,7 @@ static void NetworkLoop(RunConfig cfg, Graphics* gfx, Presenter* presenter) {
         // 复位统计，重连后从头计数
         g_stats.packets = 0; g_stats.bytes = 0; g_stats.decoded = 0;
         g_stats.presented = 0; g_stats.dropped = 0; g_stats.paced = 0; g_stats.decodeFail = 0;
+        g_stats.presentFail = 0; g_stats.dupFrame = 0;
         ResetPresentRing();
         ResetDecodeRing();
         g_lastDecodeMs = 0.0;
@@ -2436,6 +2659,10 @@ static void NetworkLoop(RunConfig cfg, Graphics* gfx, Presenter* presenter) {
         std::condition_variable latestCv;
         LatestFrame latest;
         bool hasLatest = false;
+        // 同帧重复诊断：Mac 静止时不重编，而是把最后一帧原样重发（保活）。
+        // 字节完全相同说明源端没有新画面，接收端再怎么解码上屏也只是同一张旧图。
+        size_t lastPayloadLen = 0;
+        uint64_t lastPayloadHash = 0;
 
         // 收流 + 解码线程
         std::thread recv([&] {
@@ -2477,6 +2704,20 @@ static void NetworkLoop(RunConfig cfg, Graphics* gfx, Presenter* presenter) {
 
                 g_stats.packets++;
                 g_stats.bytes += len;
+                g_lastVideoPacketMs.store(QpcNowMs());
+
+                // 同帧重复诊断：哈希编码载荷（不含包头时间戳），和上一帧比对。
+                // Mac 的保活会原样重发最后一帧，时间戳是新的、字节完全一样，
+                // 这条计数能在日志里把「有帧但画面不动」和「真的没帧」区分开。
+                {
+                    const uint8_t* pb = packet.data() + HEADER_BYTES;
+                    size_t pn = len - HEADER_BYTES;
+                    uint64_t h = 14695981039346656037ull;   // FNV-1a 64 偏移基
+                    for (size_t i = 0; i < pn; ++i) { h ^= pb[i]; h *= 1099511628211ull; }
+                    if (pn == lastPayloadLen && h == lastPayloadHash) g_stats.dupFrame++;
+                    lastPayloadLen = pn;
+                    lastPayloadHash = h;
+                }
 
                 IMFSample* smp = nullptr;
                 if (decoder.Decode(packet.data() + HEADER_BYTES, len - HEADER_BYTES, &smp) && smp) {
@@ -2517,6 +2758,11 @@ static void NetworkLoop(RunConfig cfg, Graphics* gfx, Presenter* presenter) {
             std::deque<PendingFrame> pending;
             double lastPresentMs = 0.0;
             bool primed = false;
+            // 看门狗状态：连接起点用于「一帧都没上过」的初始宽限；
+            // idleCleared 保证清屏和提示只做一次，恢复后再复位。
+            const double connStartMs = QpcNowMs();
+            const double kNoPresentLimitMs = 2000.0;
+            bool idleCleared = false;
 
             auto dropOldest = [&] {
                 if (!pending.empty()) {
@@ -2542,12 +2788,12 @@ static void NetworkLoop(RunConfig cfg, Graphics* gfx, Presenter* presenter) {
                 {
                     std::unique_lock<std::mutex> lk(latestMtx);
                     if (!hasLatest) {
-                        if (timed) {
-                            latestCv.wait_for(lk, std::chrono::duration<double, std::milli>(waitMs),
-                                              [&] { return hasLatest || !connAlive || !g_alive; });
-                        } else {
-                            latestCv.wait(lk, [&] { return hasLatest || !connAlive || !g_alive; });
-                        }
+                        // 必须带超时：完全没有新帧时（源端停发、只发心跳）也要定期
+                        // 醒来看门狗，否则这一等就是永久，画面永远停在旧帧上。
+                        double blockMs = timed ? waitMs : 200.0;
+                        if (blockMs < 20.0) blockMs = 20.0;
+                        latestCv.wait_for(lk, std::chrono::duration<double, std::milli>(blockMs),
+                                          [&] { return hasLatest || !connAlive || !g_alive; });
                     }
                     if (hasLatest) {
                         pending.push_back({ latest.smp, latest.srcW, latest.srcH });
@@ -2555,6 +2801,29 @@ static void NetworkLoop(RunConfig cfg, Graphics* gfx, Presenter* presenter) {
                     }
                 }
                 if (!g_alive || !connAlive) break;
+
+                // 看门狗：连接还在、包也还在来，但连续 2 秒没有一次成功 Present，
+                // 说明卡在呈现路径（交换链失效、设备移除、Blt 持续失败）。
+                // FLIP 交换链不 Present 就永远显示最后一个后缓冲，必须主动清屏，
+                // 否则用户看到的是很久以前的旧帧，还会误判成「显示的是别的屏」。
+                {
+                    double nowMs = QpcNowMs();
+                    double good = g_lastGoodPresentMs.load();
+                    double pkt = g_lastVideoPacketMs.load();
+                    double sinceGood = (good > 0.0) ? (nowMs - good) : (nowMs - connStartMs);
+                    double sincePkt = (pkt > 0.0) ? (nowMs - pkt) : (nowMs - connStartMs);
+                    // 有视频包在来但 2 秒上不了屏：卡在呈现路径。
+                    // 一个包都没有：给 8 秒宽限，避免源端静止桌面（本来就不出帧）被误判。
+                    const bool lost = (sincePkt <= 1500.0 && sinceGood >= kNoPresentLimitMs) ||
+                                      sinceGood >= 8000.0;
+                    if (!idleCleared && lost) {
+                        idleCleared = true;
+                        Log("看门狗: %.1f 秒没有成功上屏（%.1f 秒无视频包），清屏并提示无信号",
+                            sinceGood / 1000.0, sincePkt / 1000.0);
+                        presenter->ClearToIdle();
+                        ShowStatusHint(L"无信号，等待画面…");
+                    }
+                }
 
                 // 源快于节拍时丢最旧保实时，队列最多留 3 帧
                 while (pending.size() > 3) dropOldest();
@@ -2576,8 +2845,14 @@ static void NetworkLoop(RunConfig cfg, Graphics* gfx, Presenter* presenter) {
                 pending.pop_front();
                 presenter->SetSourceSize(f.w, f.h);
                 lastPresentMs = QpcNowMs();   // 以本次上屏开始时刻为节拍基准，避免把 Present 阻塞时长叠加进节拍
-                presenter->PresentSample(f.smp);
+                const bool shown = presenter->PresentSample(f.smp);
                 f.smp->Release();
+                if (shown && idleCleared) {
+                    idleCleared = false;
+                    RestoreDefaultHint();
+                    HideFullscreenHint();
+                    Log("看门狗: 画面已恢复");
+                }
             }
 
             // 清理退出前尚未上屏的样本
@@ -2595,6 +2870,8 @@ static void NetworkLoop(RunConfig cfg, Graphics* gfx, Presenter* presenter) {
         std::thread watch([&] {
             uint64_t lastBytes = 0, lastDecoded = 0, lastCursor = 0;
             uint64_t lastPresented = 0, lastDropped = 0, lastPaced = 0;
+            uint64_t lastDup = 0;
+            int dupWarnCount = 0;
             double recentFps[5] = { 0, 0, 0, 0, 0 };   // 近 10 秒的每秒解码帧数
             int fpsIdx = 0;
             int stallRounds = 0;
@@ -2608,6 +2885,9 @@ static void NetworkLoop(RunConfig cfg, Graphics* gfx, Presenter* presenter) {
                 uint64_t pc = g_stats.paced;
                 uint64_t dropDelta = dr - lastDropped;
                 uint64_t pacedDelta = pc - lastPaced;
+                uint64_t dup = g_stats.dupFrame;
+                uint64_t dupDelta = dup - lastDup;
+                lastDup = dup;
                 double mbps = (b - lastBytes) * 8 / 2.0 / 1e6;
 
                 // 当前帧率 = 本 2 秒窗口的实时解码速率；峰值 = 近 5 个窗口（约 10 秒）最大值。
@@ -2655,7 +2935,8 @@ static void NetworkLoop(RunConfig cfg, Graphics* gfx, Presenter* presenter) {
                 Log("包 %llu  解码 %llu(+%llu)  当前 %.1f fps  峰值 %.1f fps"
                     "  上屏 +%llu  呈现丢帧 +%llu  源间隔 p50 %.1f p95 %.1f ms"
                     "  上屏间隔 p50 %.1f p95 %.1f ms  节拍 %.1f ms  节拍丢帧 +%llu"
-                    "  %.1f Mbps  附加延迟 %.1f ms  解码失败 %llu  光标+%llu  输入 %llu",
+                    "  %.1f Mbps  附加延迟 %.1f ms  解码失败 %llu  上屏失败 %llu"
+                    "  同帧重复 +%llu  光标+%llu  输入 %llu",
                     (unsigned long long)g_stats.packets,
                     (unsigned long long)d,
                     (unsigned long long)(d - lastDecoded),
@@ -2670,8 +2951,16 @@ static void NetworkLoop(RunConfig cfg, Graphics* gfx, Presenter* presenter) {
                     mbps,
                     g_stats.lastLatencyUs / 1000.0,
                     (unsigned long long)g_stats.decodeFail,
+                    (unsigned long long)g_stats.presentFail,
+                    (unsigned long long)dupDelta,
                     (unsigned long long)(curPkts - lastCursor),
                     (unsigned long long)g_stats.inputSent.load());
+                // 连续收到字节完全相同的编码帧：源端在重发最后一帧，画面不会更新。
+                // 每 5 个窗口（约 10 秒）提示一次，避免刷屏。
+                if (dupDelta >= 3 && (d - lastDecoded) > 0 && (++dupWarnCount % 5) == 1) {
+                    Log("注意: 本窗口 %llu 帧与上一帧编码数据完全相同，"
+                        "源端在重发最后一帧（画面不会更新）", (unsigned long long)dupDelta);
+                }
                 lastCursor = curPkts;
                 lastPresented = p;
                 lastDropped = dr;
