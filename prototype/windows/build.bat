@@ -61,7 +61,12 @@ if errorlevel 1 (
 
 echo.
 echo   [2/2] SecDisplayReceiver.exe
-cl /nologo /EHsc /std:c++17 /O2 /utf-8 SecDisplayReceiver.cpp /Fe:SecDisplayReceiver.exe
+rc /nologo /fo SecDisplayReceiver.res SecDisplayReceiver.rc
+if errorlevel 1 (
+    echo       资源编译失败
+    set FAILED=1
+)
+cl /nologo /EHsc /std:c++17 /O2 /utf-8 SecDisplayReceiver.cpp SecDisplayReceiver.res /Fe:SecDisplayReceiver.exe
 if errorlevel 1 (
     echo       失败
     set FAILED=1

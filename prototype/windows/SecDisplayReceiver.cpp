@@ -460,8 +460,9 @@ static void TrayCreate(HWND hwnd) {
     g_nid.uID = 1;
     g_nid.uFlags = NIF_ICON | NIF_MESSAGE | NIF_TIP;
     g_nid.uCallbackMessage = WM_TRAY;
-    // 系统自带应用图标，省去资源文件。图标是数字资源 ID，A/W 版等价、无文本编码问题
-    g_nid.hIcon = LoadIconA(nullptr, IDI_APPLICATION);
+    // 优先用 exe 内嵌的 1 号图标；取不到再退回系统默认图标。
+    g_nid.hIcon = LoadIconA(GetModuleHandleA(nullptr), MAKEINTRESOURCEA(1));
+    if (!g_nid.hIcon) g_nid.hIcon = LoadIconA(nullptr, IDI_APPLICATION);
     // 宽字符悬浮提示：A 版在 CP936 下会把 UTF-8 中文按 GBK 解码成乱码。
     // lstrcpynW 来自 windows.h，保证按缓冲区截断并以 L'\0' 结尾，
     // MinGW / MSVC 都可用，不用 strcpy_s 这类 MSVC 扩展。
@@ -2100,7 +2101,8 @@ static void ShowControlPanel() {
         wc.hCursor = LoadCursorW(nullptr, (LPCWSTR)IDC_ARROW);
         wc.hbrBackground = (HBRUSH)(COLOR_WINDOW + 1);
         wc.lpszClassName = L"SecDisplayControl";
-        wc.hIcon = LoadIconW(nullptr, (LPCWSTR)IDI_APPLICATION);
+        wc.hIcon = LoadIconW(wc.hInstance, MAKEINTRESOURCEW(1));
+        if (!wc.hIcon) wc.hIcon = LoadIconW(nullptr, (LPCWSTR)IDI_APPLICATION);
         RegisterClassExW(&wc);
         registered = true;
     }
@@ -3346,6 +3348,7 @@ int main(int argc, char** argv) {
     wc.lpfnWndProc = WndProc;
     wc.hInstance = GetModuleHandleA(nullptr);
     wc.lpszClassName = "SecDisplayReceiver";
+    wc.hIcon = LoadIconA(wc.hInstance, MAKEINTRESOURCEA(1));
     RegisterClassA(&wc);
 
     HWND hwnd = nullptr;
