@@ -359,6 +359,9 @@ static int g_shakeHead = 0;
 // 放大状态与收缩进度。zoom 是当前实际倍数，收缩动画期间在 1.0~kShakeCursorZoom 之间插值。
 static bool g_shakeActive = false;
 static int64_t g_shakeLastMoveMs = 0;
+// 每一个远程光标包的时间（不管是否在晃动）。TickShakeShrink 用它判断
+// 「已经多久没有新位置了」，不依赖 DetectShake 再次被调用。
+static int64_t g_shakeLastPacketMs = 0;
 static double g_shakeZoom = 1.0;
 static bool g_shakeHolding = false;      // 已停止晃动、正在等待 hold 到期
 static int64_t g_shakeHoldUntil = 0;
@@ -2664,19 +2667,24 @@ static bool DetectShake(int64_t now, int x, int y) {
             g_shakeZoom = kShakeCursorZoom;
             Log("检测到快速晃动（反转 x%d y%d，摆幅 x%dp y%dp），放大光标 %.1fx",
                 reversalsX, reversalsY, spanX, spanY, kShakeCursorZoom);
-            // 定时器负责 hold 到期后的收缩动画；光标停住就没有新位置包了，
-            // 这条定时器是唯一的收回路径。
-            SetTimer(g_hwnd, kShakeTimer, kShakeTickMs, nullptr);
+            // 定时器负责 hold 到期后的收缩动画。光标停住就不会再有位置包，
+            // 这条定时器是唯一的收回路径，所以创建失败必须回滚，
+            // 否则光标会永久停在放大状态。
+            if (SetTimer(g_hwnd, kShakeTimer, kShakeTickMs, nullptr) == 0) {
+                Log("警告: 创建晃动定时器失败，放弃本次放大");
+                g_shakeActive = false;
+                g_shakeZoom = 1.0;
+                return false;
+            }
         }
         return true;
     }
-    // 不再晃动：进入 hold，到期后由定时器做收缩动画
+    // 不再晃动。hold 的判定统一交给 TickShakeShrink（它按「最后一个光标包」计时），
+    // 这里只负责把「本次不再晃动」这个事实记下来，不再自己算 hold 期限 ——
+    // 之前两边各算一次，导致停手后 holding 永远等不到。
     if (g_shakeActive) {
-        if (!g_shakeHolding) {
-            g_shakeHolding = true;
-            g_shakeHoldUntil = g_shakeLastMoveMs + kShakeHoldMs;
-        }
-        return now < g_shakeHoldUntil;
+        g_shakeHolding = false;
+        return true;
     }
     return false;
 }
@@ -2685,7 +2693,17 @@ static bool DetectShake(int64_t now, int x, int y) {
 // 用 ease-out（1-(1-t)^3）让收缩前段快、尾段贴住原尺寸，观感比线性自然。
 static bool TickShakeShrink(int64_t now) {
     if (!g_shakeActive) return false;
-    if (!g_shakeHolding) return true;          // 仍在晃动，保持放大
+
+    // 关键：不能只等 DetectShake 来置 holding。
+    // DetectShake 只在 WM_APP_REMOTE_CURSOR 里被调用，而晃动结束的标准用法
+    // 就是「停手不再移动」——此后再无光标包，holding 永远不会被置上，
+    // 光标就会永久停在放大状态、定时器永久空转。
+    // 所以这里用「距离最后一个光标包」来判断，由定时器自己转入 hold。
+    if (!g_shakeHolding) {
+        if (now - g_shakeLastPacketMs < kShakeHoldMs) return true;   // 还在动
+        g_shakeHolding = true;
+        g_shakeHoldUntil = now + kShakeHoldMs;
+    }
     if (now < g_shakeHoldUntil) return true;   // hold 未到期
 
     const int64_t t0 = g_shakeHoldUntil;
@@ -2885,17 +2903,20 @@ static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
 
         // 晃动检测：放大状态变化时重建光标位图。放在 SetCursorPos 之后，
         // 用屏幕坐标参与判定（客户区坐标在窗口移动时会整体平移，容易误判）。
-        // 只在「本次真的发生状态切换」时重建，稳态下不产生额外 GDI 调用。
         {
+            const int64_t nowMs = GetTickCount64();
+            g_shakeLastPacketMs = nowMs;   // 每个包都记，供 TickShakeShrink 判「停手」
             const bool wasActive = g_shakeActive;
-            DetectShake(GetTickCount64(), sx, sy);
+            DetectShake(nowMs, sx, sy);
             // 从收缩中途再次晃动时 DetectShake 只把 holding 置 false，
-            // 不会重新把 zoom 拉回满值，这里统一补齐，保证再晃一定回到最大。
-            if (wasActive && g_shakeActive && !g_shakeHolding
-                && g_shakeZoom < kShakeCursorZoom) {
+            // 不会重新把 zoom 拉回满值，这里统一补齐，并立即重建光标，
+            // 保证「放大是立刻的」而不是等下一个 16ms 定时器。
+            if (g_shakeActive && !g_shakeHolding && g_shakeZoom < kShakeCursorZoom) {
                 g_shakeZoom = kShakeCursorZoom;
+                RefreshCursorScale();
+            } else if (g_shakeActive != wasActive) {
+                RefreshCursorScale();
             }
-            if (g_shakeActive != wasActive) RefreshCursorScale();
         }
         return 0;
     }

@@ -101,13 +101,22 @@ cat > "$APP/Contents/Info.plist" <<'PLIST'
 PLIST
 
 # 优先用本机 Apple Development 证书；没有就退回 ad-hoc。
-# 证书签名的 designated requirement 稳定，重编译后屏幕录制授权不会失效。
+#
+# 这一段的正确性直接决定屏幕录制授权能不能跨编译保留：
+#   - 证书签名：designated requirement 绑定到证书身份，重编译后 TCC 授权仍在
+#   - ad-hoc 签名：每次都按 cdhash 生成新的 DR，TCC 认不出是同一个 app，
+#     表现为「权限页里勾了、重开又失效」，反复授权都无效
+#
+# 注意不能用 `| head -1`：head 读够一行就关管道，security 收到 SIGPIPE，
+# 在 pipefail 下整条管道判为失败，`|| CERT=""` 会把已经拿到的证书名清空，
+# 于是一定走 ad-hoc 分支。改成整段读进变量再取第一行，避免 SIGPIPE。
 CERT="${SECDISPLAY_SIGN_CERT:-}"
 if [ -z "$CERT" ]; then
-    # security 失败或 head 提前关管道（SIGPIPE）在 pipefail 下都会非零，
-    # 这里吞掉错误当作「没有证书」，交给后面的 ad-hoc 分支。
-    CERT=$(security find-identity -v -p codesigning 2>/dev/null \
-        | sed -n 's/.*"\(Apple Development: [^"]*\)"/\1/p' | head -1) || CERT=""
+    IDENTITIES="$(security find-identity -v -p codesigning 2>/dev/null || true)"
+    if [ -n "$IDENTITIES" ]; then
+        CERT="$(printf '%s\n' "$IDENTITIES" \
+            | sed -n 's/.*"\(Apple Development: [^"]*\)".*/\1/p' | sed -n '1p')"
+    fi
 fi
 if [ -n "$CERT" ]; then
     # set -e 下不能直接裸调：证书过期/钥匙串锁定时会中断整个打包，
