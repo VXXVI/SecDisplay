@@ -2148,6 +2148,10 @@ if !AXIsProcessTrusted() {
 }
 let injector = InputInjector()
 sender.onInput = { x, y, buttons, wheel in
+    // 面板可见时暂停回放：否则 InputInjector 每个输入包都 post 一个
+    // .mouseMoved 把本机光标 warp 到虚拟屏，用户点面板的鼠标会被瞬间拽走。
+    // 面板关掉后自动恢复，副屏操作不受影响。
+    guard !isControlPanelVisible else { return }
     injector.handle(x: x, y: y, buttons: buttons, wheel: wheel,
                     bounds: CGDisplayBounds(vd.displayID))
 }
@@ -2629,8 +2633,7 @@ final class StatusMenuTarget: NSObject, NSMenuItemValidation {
         showControlPanel()
     }
 
-    /// 状态栏按钮点击：左键直接打开面板，右键（或 Control+左键）弹菜单。
-    /// 不再依赖菜单项派发：这个裸命令行进程里 status item 的菜单会话点不动。
+    /// 状态栏按钮点击：左键打开控制面板，右键（或 Control+左键）弹快捷菜单。
     @objc func handleClick(_ sender: Any?) {
         guard let button = statusItem?.button else { return }
         let ev = NSApp.currentEvent
@@ -2638,16 +2641,14 @@ final class StatusMenuTarget: NSObject, NSMenuItemValidation {
             || (ev?.modifierFlags.contains(.control) ?? false)
         if rightClick, let menu = statusMenu {
             Log.info("菜单栏右键，弹菜单")
-            NSApp.activate(ignoringOtherApps: true)
             button.highlight(true)
             menu.popUp(positioning: nil,
                        at: NSPoint(x: 0, y: button.bounds.height + 4),
                        in: button)
             button.highlight(false)
-            Log.info("菜单已关闭")
             return
         }
-        Log.info("菜单栏左键，直接打开面板")
+        Log.info("菜单栏左键，打开控制面板")
         showControlPanel()
     }
 

@@ -223,43 +223,72 @@ func openLogsFolder() {
     }
 }
 
-/// 关闭面板但保留进程。面板只是个查看窗口，关掉不该影响推流。
+/// 隐藏面板但保留进程。面板只是个查看窗口，关掉不该影响推流。
 func hideControlPanel() {
-    guard let p = panelPopover else { return }
-    p.performClose(nil)
-    Log.info("面板已关闭")
+    panelWindow?.orderOut(nil)
+    NSApp.setActivationPolicy(.accessory)
+    Log.info("面板已隐藏")
+}
+private var panelWindow: NSWindow?
+
+/// 面板可见期间暂停 Windows 输入回放。
+///
+/// InputInjector.handle 每个输入包都会 post 一个 .mouseMoved，把 Mac 光标
+/// warp 到虚拟屏坐标。Windows 端持续发包时，用户去点本机面板的鼠标会被
+/// 瞬间拽走，表现为「面板画得出来、所有按钮点不动」。
+/// 用显式开关而不是「判断当前光标位置」：后者一旦光标被拽进虚拟屏就会
+/// 自我放行、把光标钉死，且会在副屏操作时误丢事件。
+var isControlPanelVisible: Bool {
+    (panelWindow?.isVisible ?? false)
 }
 
-private var panelPopover: NSPopover?
+/// 把面板固定放到内建主屏，不跟随鼠标所在屏。
+/// 用 NSEvent.mouseLocation 选屏时，一旦光标被输入回放 warp 到虚拟屏，
+/// 面板就会跟着跑到扩展桌面那侧，用户在 Mac 上根本看不到。
+private func placeOnUserScreen(_ w: NSWindow) {
+    let screen = NSScreen.screens.first { s in
+        // 主屏：frame 原点在 (0,0)。虚拟屏 origin.x 通常 > 0，Sidecar 在负 x。
+        abs(s.frame.origin.x) < 1 && abs(s.frame.origin.y) < 1
+    } ?? NSScreen.screens.first
+    guard let s = screen else { w.center(); return }
+    let vf = s.visibleFrame
+    let size = w.frame.size
+    w.setFrameOrigin(NSPoint(x: vf.midX - size.width / 2,
+                             y: vf.midY - size.height / 2))
+}
 
-/// 控制面板做成挂在菜单栏图标上的 popover。
-///
-/// 之前用的是独立 NSWindow：这个进程是 .accessory，窗口要先激活 App 才能拿到 key，
-/// 而在这台机器上激活一直被别的进程抢走，结果窗口画得出来、所有按钮点不动。
-/// popover 由状态栏按钮托管，激活和事件路由都走系统那条成熟路径，不靠我们自己抢焦点。
-/// .transient 让点外面就自动收起，正好符合「不挡工作」。
+/// 打开/前置控制面板
 func showControlPanel() {
+    // 这个进程平时是 .accessory（LSUIElement），菜单栏常驻、不进 Dock。
+    // 但 LSUIElement 应用里 activate(ignoringOtherApps:) 通常不会让它真正 active，
+    // 面板窗口能画出来、按钮却收不到鼠标事件，表现就是「全都点不动」。
+    // 显示面板时临时切成 .regular 让 App 能拿到前台与 key；关面板再切回去。
     Log.info("打开控制面板请求")
-
-    if let p = panelPopover, p.isShown {
-        p.performClose(nil)
-        Log.info("面板已收起")
-        return
-    }
-
-    guard let button = statusItem?.button else {
-        Log.info("面板打开失败: 菜单栏按钮不存在")
-        return
-    }
-
-    let p = NSPopover()
-    p.behavior = .transient
-    p.animates = true
-    p.contentSize = NSSize(width: 380, height: 520)
-    p.contentViewController = NSHostingController(rootView: StatusView())
-    panelPopover = p
-
+    NSApp.setActivationPolicy(.regular)
     NSApp.activate(ignoringOtherApps: true)
-    p.show(relativeTo: button.bounds, of: button, preferredEdge: .minY)
-    Log.info("面板已弹出 shown=\(p.isShown)")
+
+    if let w = panelWindow {
+        placeOnUserScreen(w)
+        w.makeKeyAndOrderFront(nil)
+        w.orderFrontRegardless()
+        Log.info("面板已前置 key=\(w.isKeyWindow) visible=\(w.isVisible) frame=\(w.frame)")
+        return
+    }
+
+    let host = NSHostingView(rootView: StatusView())
+    let w = NSWindow(
+        contentRect: NSRect(x: 0, y: 0, width: 380, height: 520),
+        styleMask: [.titled, .closable, .miniaturizable, .fullSizeContentView],
+        backing: .buffered,
+        defer: false)
+    w.title = "SecDisplay 发送端"
+    w.titlebarAppearsTransparent = true
+    w.isReleasedWhenClosed = false
+    w.hidesOnDeactivate = false
+    w.contentView = host
+    placeOnUserScreen(w)
+    w.makeKeyAndOrderFront(nil)
+    w.orderFrontRegardless()
+    panelWindow = w
+    Log.info("面板已创建 frame=\(w.frame) key=\(w.isKeyWindow) visible=\(w.isVisible)")
 }
