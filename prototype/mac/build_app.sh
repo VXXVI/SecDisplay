@@ -91,9 +91,16 @@ if [ -z "$CERT" ]; then
         | sed -n 's/.*"\(Apple Development: [^"]*\)"/\1/p' | head -1)
 fi
 if [ -n "$CERT" ]; then
-    codesign --force --sign "$CERT" --identifier "$SIGN_ID" --timestamp=none "$APP" >/dev/null
-    echo "已用证书签名: $CERT"
-else
+    # set -e 下不能直接裸调：证书过期/钥匙串锁定时会中断整个打包，
+    # 应该回退 ad-hoc 而不是什么都不产出。
+    if codesign --force --sign "$CERT" --identifier "$SIGN_ID" --timestamp=none "$APP" >/dev/null 2>&1; then
+        echo "已用证书签名: $CERT"
+    else
+        echo "证书签名失败，回退 ad-hoc: $CERT"
+        CERT=""
+    fi
+fi
+if [ -z "$CERT" ]; then
     codesign --force --sign - --identifier "$SIGN_ID" \
         -r="designated => identifier \"$SIGN_ID\"" --timestamp=none "$APP" >/dev/null
     echo "已用 ad-hoc 签名（identifier 型 DR，重编译不丢授权）"
@@ -121,7 +128,11 @@ if [ "$INSTALL" = "1" ]; then
 fi
 
 echo
-echo "启动: open /Applications/SecDisplay.app"
+if [ "$INSTALL" = "1" ]; then
+    echo "启动: open /Applications/SecDisplay.app"
+else
+    echo "启动: open $(pwd)/SecDisplay.app"
+fi
 echo "日志: ~/Library/Logs/SecDisplay/sender.log"
 echo "切档: echo sharp > $(pwd)/.preset && ./build_app.sh"
 echo "首次启动若黑屏, 到 系统设置 > 隐私与安全 > 屏幕录制 勾选 SecDisplay 后重开"
