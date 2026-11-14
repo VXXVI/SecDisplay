@@ -1417,9 +1417,7 @@ private:
     // 视频处理器视图按纹理指针缓存：每帧新建在 45fps 下是每秒 90 次 Create*View
     std::unordered_map<uint64_t, ComPtr<ID3D11VideoProcessorInputView>> inViewCache_;
     std::unordered_map<void*, ComPtr<ID3D11VideoProcessorOutputView>> outViewCache_;
-    // 黑边靠每帧清后缓冲实现，RTV 同样按纹理指针缓存
-    std::unordered_map<void*, ComPtr<ID3D11RenderTargetView>> rtvCache_;
-    // 交换链与三张缓存表会被呈现线程和 UI/网络线程同时碰：
+    // 交换链与视图缓存表会被呈现线程和 UI/网络线程同时碰：
     // 以前只有会话切档会改尺寸，窗口一拖 WM_SIZE 就频繁触发，必须串起来。
     std::mutex mtx_;
     bool tearing_ = false;
@@ -1526,16 +1524,27 @@ bool Presenter::CreateProcessor() {
     videoCtx_->VideoProcessorSetStreamFrameFormat(processor_.Get(), 0,
                                                   D3D11_VIDEO_FRAME_FORMAT_PROGRESSIVE);
 
-    // 输入永远取整帧：硬解按宏块对齐多出的行(如 1808 vs 1800)交给输出矩形去处理，
-    // 不再从源上裁，否则缩放基准会跟着错。
-    RECT src{ 0, 0, srcW_, srcH_ };
+    // 裁掉 H.264 宏块对齐多出的边缘(如 2880x1808 里的底端 8 行)，否则会被当成有效画面
+    // 参与等比缩放，原本能 1:1 满幅的 2880x1800 被迫缩到 2867x1800。
+    int cropW = srcW_, cropH = srcH_;
+    const int dispW = g_displayW.load(), dispH = g_displayH.load();
+    if (dispW > 0 && dispH > 0 &&
+        srcW_ >= dispW && srcH_ >= dispH &&
+        srcW_ - dispW <= 16 && srcH_ - dispH <= 16) {
+        cropW = dispW;
+        cropH = dispH;
+    }
+    RECT src{ 0, 0, cropW, cropH };
     videoCtx_->VideoProcessorSetStreamSourceRect(processor_.Get(), 0, TRUE, &src);
 
-    // 输出按等比装进交换链，装不满的地方留黑边。
-    // 交换链尺寸现在恒等于窗口客户区，所以这里缩完就是最终像素，
-    // DWM 不会再拉第二次。之前交换链按流尺寸建、客户区又是另一个尺寸，
-    // 等于被 VideoProcessor 和 DWM 各双线性一次，文字就是这么糊掉的。
-    RECT dst = FitRect(srcW_, srcH_, width_, height_);
+    // 用 VideoProcessor 原生背景色画黑边，不再每帧在 3D 管线调 ClearRenderTargetView
+    // 去和 VideoProcessorBlt 混写同一个 FLIP 后缓冲。
+    D3D11_VIDEO_COLOR bgColor{};
+    bgColor.RGBA.R = 0.0f; bgColor.RGBA.G = 0.0f; bgColor.RGBA.B = 0.0f; bgColor.RGBA.A = 1.0f;
+    videoCtx_->VideoProcessorSetOutputBackgroundColor(processor_.Get(), FALSE, &bgColor);
+
+    // 输出按等比装进交换链，装不满的地方由 VideoProcessor 用背景色填黑边。
+    RECT dst = FitRect(cropW, cropH, width_, height_);
     const bool letterbox = dst.left > 0 || dst.top > 0 ||
                            dst.right < width_ || dst.bottom < height_;
     if (letterbox) {
@@ -1543,8 +1552,8 @@ bool Presenter::CreateProcessor() {
     } else {
         videoCtx_->VideoProcessorSetOutputTargetRect(processor_.Get(), FALSE, nullptr);
     }
-    Log("呈现器: 输入 %dx%d → 输出 %dx%d，画面矩形 %d,%d - %d,%d%s",
-        srcW_, srcH_, width_, height_,
+    Log("呈现器: 输入 %dx%d(裁 %dx%d) → 输出 %dx%d，画面矩形 %d,%d - %d,%d%s",
+        srcW_, srcH_, cropW, cropH, width_, height_,
         (int)dst.left, (int)dst.top, (int)dst.right, (int)dst.bottom,
         letterbox ? "（留黑边）" : "（满幅）");
     return true;
@@ -1568,7 +1577,6 @@ bool Presenter::Resize(int width, int height) {
     // 输入/输出视图都缓存了后缓冲指针，改尺寸后必须全部失效
     inViewCache_.clear();
     outViewCache_.clear();
-    rtvCache_.clear();
 
     UINT flags = tearing_ ? DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING : 0;
     HRESULT hr = swap_->ResizeBuffers(0, (UINT)width, (UINT)height,
@@ -1613,25 +1621,6 @@ bool Presenter::PresentSample(IMFSample* sample) {
     HRESULT hr = swap_->GetBuffer(0, IID_PPV_ARGS(&backTex));
     if (FAILED(hr)) return fail("交换链 GetBuffer(0)", hr);
     if (!backTex) return fail("交换链 GetBuffer(0) 返回空纹理", E_POINTER);
-
-    // 黑边每帧都要重画：FLIP 交换链的后缓冲内容在 Present 之后即失效，
-    // 上一帧留下的黑边不会自己保留。这里只清一次全屏，代价远低于一次缩放。
-    {
-        ComPtr<ID3D11RenderTargetView> rtv;
-        void* rtvKey = (void*)backTex.Get();
-        auto itRtv = rtvCache_.find(rtvKey);
-        if (itRtv != rtvCache_.end()) {
-            rtv = itRtv->second;
-        } else {
-            if (rtvCache_.size() > 8) rtvCache_.clear();
-            if (SUCCEEDED(gfx_->device->CreateRenderTargetView(backTex.Get(), nullptr, &rtv)) && rtv)
-                rtvCache_[rtvKey] = rtv;
-        }
-        if (rtv) {
-            const float bg[4] = { 0.0f, 0.0f, 0.0f, 1.0f };
-            gfx_->context->ClearRenderTargetView(rtv.Get(), bg);
-        }
-    }
 
     // 取解码输出的纹理
     ComPtr<IMFMediaBuffer> buf;
@@ -1760,7 +1749,6 @@ void Presenter::Shutdown() {
     std::lock_guard<std::mutex> lk(mtx_);
     inViewCache_.clear();
     outViewCache_.clear();
-    rtvCache_.clear();
     processor_.Reset();
     enum_.Reset();
     videoCtx_.Reset();
@@ -1894,6 +1882,24 @@ static void EnterFullscreen() {
 
 static void ExitFullscreen() {
     if (!g_hwnd || !g_isFullscreen) return;
+    // 以 --fullscreen / config fullscreen=1 直接全屏启动时，没走过 EnterFullscreen()，
+    // g_savedStyle / g_savedRect 可能是 0；退回合理的默认窗口矩形，避免缩成 2x2 黑窗。
+    if (g_savedStyle == 0 || (g_savedRect.right - g_savedRect.left) < 160 ||
+        (g_savedRect.bottom - g_savedRect.top) < 100) {
+        g_savedStyle = WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX | WS_MAXIMIZEBOX | WS_VISIBLE;
+        g_savedExStyle = WS_EX_APPWINDOW;
+        HMONITOR mon = MonitorFromWindow(g_hwnd, MONITOR_DEFAULTTONEAREST);
+        MONITORINFO mi{}; mi.cbSize = sizeof(mi);
+        int ww = 1280, wh = 800;
+        int mx = 0, my = 0;
+        if (GetMonitorInfoW(mon, &mi)) {
+            ww = (mi.rcWork.right - mi.rcWork.left) * 3 / 4;
+            wh = (mi.rcWork.bottom - mi.rcWork.top) * 3 / 4;
+            mx = mi.rcWork.left + ((mi.rcWork.right - mi.rcWork.left) - ww) / 2;
+            my = mi.rcWork.top + ((mi.rcWork.bottom - mi.rcWork.top) - wh) / 2;
+        }
+        g_savedRect = RECT{ mx, my, mx + ww, my + wh };
+    }
     SetWindowLongPtr(g_hwnd, GWL_STYLE, g_savedStyle);
     SetWindowLongPtr(g_hwnd, GWL_EXSTYLE, g_savedExStyle);
     SetWindowPos(g_hwnd, HWND_NOTOPMOST,
@@ -2500,11 +2506,20 @@ static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
         // 客户区变了就把交换链跟过去。不跟的话 DWM 会把按流尺寸建的交换链
         // 双线性拉伸到窗口大小，文字边缘就是这么糊的。
         // 拖动时 WM_SIZE 连发，攒 120ms 只改一次，避免和呈现线程抢后缓冲。
-        if (w != SIZE_MINIMIZED) {
-            g_pendingClientW = LOWORD(l);
-            g_pendingClientH = HIWORD(l);
-            g_syncSwapRetry = 0;
-            SetTimer(h, TIMER_SYNC_SWAP, 120, nullptr);
+        // 最小化/还原过渡期间 Windows 偶尔会发 2x2 的瞬态客户区，低于 64px 一律忽略并取消定时器，
+        // 否则交换链被切成 2x2 会直接黑屏。
+        if (w == SIZE_MINIMIZED) {
+            KillTimer(h, TIMER_SYNC_SWAP);
+        } else {
+            const int cw = LOWORD(l), ch = HIWORD(l);
+            if (cw >= 64 && ch >= 64) {
+                g_pendingClientW = cw;
+                g_pendingClientH = ch;
+                g_syncSwapRetry = 0;
+                SetTimer(h, TIMER_SYNC_SWAP, 120, nullptr);
+            } else {
+                KillTimer(h, TIMER_SYNC_SWAP);
+            }
         }
         return 0;
     case WM_TIMER:
@@ -2515,13 +2530,17 @@ static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
         }
         if (w == TIMER_SYNC_SWAP) {
             KillTimer(h, TIMER_SYNC_SWAP);
-            if (g_presenter && g_pendingClientW > 0 && g_pendingClientH > 0) {
-                if (!g_presenter->Resize(g_pendingClientW, g_pendingClientH)) {
+            RECT cur{};
+            if (g_presenter && !IsIconic(h) && GetClientRect(h, &cur) &&
+                cur.right - cur.left >= 64 && cur.bottom - cur.top >= 64) {
+                const int tw = cur.right - cur.left;
+                const int th = cur.bottom - cur.top;
+                if (!g_presenter->Resize(tw, th)) {
                     // 后缓冲还被呈现线程占着，隔一轮再试，最多 8 次
                     if (++g_syncSwapRetry < 8) {
                         SetTimer(h, TIMER_SYNC_SWAP, 150, nullptr);
                     } else {
-                        Log("交换链同步放弃: 目标 %dx%d 连续失败", g_pendingClientW, g_pendingClientH);
+                        Log("交换链同步放弃: 目标 %dx%d 连续失败", tw, th);
                         g_syncSwapRetry = 0;
                     }
                 }
