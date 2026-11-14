@@ -111,6 +111,8 @@ nonisolated(unsafe) var vdBackingScale: Double = 1.0
 nonisolated(unsafe) var gKeyboard: KeyboardInjector?
 /// 鼠标注入器。断连时同样要清，否则按住左键时对端消失会让 Mac 一直保持按下态。
 nonisolated(unsafe) var gMouse: InputInjector?
+/// 编码器。断连时从这里释放保留的最后一帧（整帧 7.4MB，断连后没必要钉着）。
+nonisolated(unsafe) var gEncoder: Encoder?
 
 /// 清空输入注入状态并补发残留的 keyUp / mouseUp。
 /// 连接建立与断开都要调：事件是投到 .cghidEventTap 的，系统 HID 层的
@@ -668,7 +670,8 @@ final class Encoder {
             // 用原生 YUV 而不是 BGRA：SCK 直接给 YUV，编码器也直接吃 YUV，
             // 省掉两次全画面色彩转换。2880x1800 下 BGRA 每帧 20MB，
             // YUV420 只有 7.8MB，内存带宽少 60%。
-            kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32BGRA,
+            kCVPixelBufferPixelFormatTypeKey as String:
+                kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange,
             kCVPixelBufferWidthKey as String: width,
             kCVPixelBufferHeightKey as String: height,
             kCVPixelBufferIOSurfacePropertiesKey as String: [:],
@@ -771,6 +774,14 @@ final class Encoder {
     /// 串行化编码调用。采集线程和关键帧补发可能并发进来，
     /// frameSeq 自增不是原子的，并发会产出重复 PTS。
     private let encodeLock = NSLock()
+
+    /// 断开时释放保留的最后一帧。整帧 2880x1800 即使改 YUV 也有 7.4MB，
+    /// 断连后一直钉着没有意义（下次连上必然会有新帧）。
+    func releaseLastFrame() {
+        lastBufferLock.lock()
+        lastPixelBuffer = nil
+        lastBufferLock.unlock()
+    }
 
     private func encodeInternal(_ pb: CVPixelBuffer, captureTimeMicros: UInt64) {
         encodeLock.lock()
@@ -1305,6 +1316,12 @@ final class ScreenshotCapture {
     private var lastSupervisorAt: CFAbsoluteTime = 0
     private var loggedFirstFrame = false
     private var lastSizeWarnAt: CFAbsoluteTime = 0
+    /// 上一帧内容的采样指纹。用来识别「帧还在来、但画面不再更新」——
+    /// SCScreenshotManager 跑约 30 秒后偶尔会开始返回陈旧内容，
+    /// 此时 captured 仍在增长，现有看护只看计数，抓不到这种情况。
+    private var lastFrameHash: UInt64 = 0
+    private var unchangedSince: CFAbsoluteTime = 0
+    private var lastFreezeLogAt: CFAbsoluteTime = 0
 
     init(encoder: Encoder, cfg: Config, displayID: @escaping () -> CGDirectDisplayID) {
         self.encoder = encoder
@@ -1372,22 +1389,43 @@ final class ScreenshotCapture {
                 c.width = cfg.width
                 c.height = cfg.height
                 c.showsCursor = false
+                // 直接要 YUV420 双平面（video range），不再让 SCK 交 BGRA 再由
+                // 本端重绘成 BGRA 再交给编码器。H.264 本来就是 4:2:0，色度最终
+                // 必然下采样，所以这一步不损失画质，但每帧缓冲从 19.8MB 降到 7.4MB，
+                // 而且省掉一次全屏 5.2M 像素的 CGContext 重绘。
+                c.pixelFormat = kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange
                 // 2x HiDPI 下显式要最高清晰度采样，避免 automatic 在负载时降到逻辑分辨率放大
                 if #available(macOS 14.0, *) {
                     c.captureResolution = .best
                 }
-                let img = try await SCScreenshotManager.captureImage(contentFilter: filter, configuration: c)
-                guard let pb = makePixelBuffer(from: img) else { continue }
+                let sb = try await Self.captureSample(c, filter: filter)
+                guard let pb = CMSampleBufferGetImageBuffer(sb) else { continue }
                 let now = CFAbsoluteTimeGetCurrent()
+                let fw = CVPixelBufferGetWidth(pb)
+                let fh = CVPixelBufferGetHeight(pb)
                 encodeQueue.sync {
                     if !loggedFirstFrame {
                         loggedFirstFrame = true
-                        Log.info("采集首帧实测: \(img.width)x\(img.height) (期望 \(cfg.width)x\(cfg.height))")
-                    } else if (img.width != cfg.width || img.height != cfg.height)
+                        Log.info("采集首帧实测: \(fw)x\(fh) (期望 \(cfg.width)x\(cfg.height))")
+                    } else if (fw != cfg.width || fh != cfg.height)
                                 && now - lastSizeWarnAt > 2.0 {
                         // 限流：尺寸偏移时每帧都打会淹日志并拖慢 encodeQueue 临界区
                         lastSizeWarnAt = now
-                        Log.info("警告: 采集帧尺寸偏移 \(img.width)x\(img.height) != \(cfg.width)x\(cfg.height)")
+                        Log.info("警告: 采集帧尺寸偏移 \(fw)x\(fh) != \(cfg.width)x\(cfg.height)")
+                    }
+                    // 内容冻结诊断：帧在来但画面完全不变时记一条日志。
+                    // 只在日志里报，不重启 —— 静止桌面本来就不变，重启会误伤，
+                    // 而且 spawnWorkers 不回收旧 worker，会把线程数越堆越多。
+                    let h = Self.frameFingerprint(pb)
+                    if h == lastFrameHash {
+                        if unchangedSince == 0 { unchangedSince = now }
+                        if now - unchangedSince > 8.0 && now - lastFreezeLogAt > 30.0 {
+                            lastFreezeLogAt = now
+                            Log.info("提示: 采集内容已 \(Int(now - unchangedSince))s 无变化（帧仍以 \(Int(cfg.captureHz))fps 到达）。若 Windows 端画面也不动，说明源画面本身静止")
+                        }
+                    } else {
+                        lastFrameHash = h
+                        unchangedSince = 0
                     }
                     captured += 1
                     lastFrameTime = now
@@ -1418,6 +1456,65 @@ final class ScreenshotCapture {
         }
     }
 
+    /// SCScreenshotManager 的 async 包装。
+    /// 用 captureSampleBuffer 而不是 captureImage：前者直接给 CVPixelBuffer
+    /// （IOSurface 支撑），后者给 CGImage，还要再 CVPixelBufferCreate + 全屏
+    /// CGContext 重绘一次。2880x1800 下这一步每帧多 19.8MB 和一次 5.2M 像素绘制。
+    private static func captureSample(_ c: SCStreamConfiguration,
+                                      filter: SCContentFilter) async throws -> CMSampleBuffer {
+        try await withCheckedThrowingContinuation { cont in
+            SCScreenshotManager.captureSampleBuffer(contentFilter: filter, configuration: c) { sb, err in
+                if let sb {
+                    cont.resume(returning: sb)
+                } else {
+                    cont.resume(throwing: err ?? NSError(domain: "Capture", code: 2, userInfo: [
+                        NSLocalizedDescriptionKey: "captureSampleBuffer 返回空",
+                    ]))
+                }
+            }
+        }
+    }
+
+    /// 采集帧内容的轻量指纹。按 64x64 网格抽样，取若干点做 FNV-1a。
+    /// 目的是判断「画面有没有变化」，不是做精确校验，所以抽样足够。
+    static func frameFingerprint(_ pb: CVPixelBuffer) -> UInt64 {
+        guard CVPixelBufferLockBaseAddress(pb, .readOnly) == kCVReturnSuccess else { return 0 }
+        defer { CVPixelBufferUnlockBaseAddress(pb, .readOnly) }
+
+        let w = CVPixelBufferGetWidth(pb)
+        let h = CVPixelBufferGetHeight(pb)
+        let fmt = CVPixelBufferGetPixelFormatType(pb)
+        let isPlanar = CVPixelBufferIsPlanar(pb)
+
+        var hash: UInt64 = 0xcbf2_9ce4_8422_2325
+        func mix(_ b: UInt64) {
+            hash = (hash ^ b) &* 0x0000_0100_0000_01B3
+        }
+
+        let gw = 32, gh = 18
+        for gy in 0..<gh {
+            for gx in 0..<gw {
+                let x = gx * max(1, w) / gw
+                let y = gy * max(1, h) / gh
+                if isPlanar, fmt == kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange
+                    || fmt == kCVPixelFormatType_420YpCbCr8BiPlanarFullRange {
+                    // 只用 Y 平面：亮度变化足以判断画面是否更新，且省掉两次平面遍历。
+                    guard let base = CVPixelBufferGetBaseAddressOfPlane(pb, 0) else { continue }
+                    let stride = CVPixelBufferGetBytesPerRowOfPlane(pb, 0)
+                    let p = base.advanced(by: y * stride + x)
+                    mix(UInt64(p.load(as: UInt8.self)))
+                } else {
+                    guard let base = CVPixelBufferGetBaseAddress(pb) else { continue }
+                    let stride = CVPixelBufferGetBytesPerRow(pb)
+                    let p = base.advanced(by: y * stride + x * 4)
+                    // 只取一个通道，避免字节序差异
+                    mix(UInt64(p.load(as: UInt8.self)))
+                }
+            }
+        }
+        return hash
+    }
+
     private func currentContent() async throws -> SCShareableContent {
         let now = CFAbsoluteTimeGetCurrent()
         // 显示排列变化（Sidecar 接入/拔线、镜像关系变动）时强制刷新一次共享内容，
@@ -1434,28 +1531,6 @@ final class ScreenshotCapture {
         cachedAt = now
         return c
     }
-}
-
-/// CGImage → CVPixelBuffer(BGRA)，VideoToolbox 直接吃这个格式。
-func makePixelBuffer(from img: CGImage) -> CVPixelBuffer? {
-    let w = img.width, h = img.height
-    var pb: CVPixelBuffer?
-    let attrs: [CFString: Any] = [
-        kCVPixelBufferIOSurfacePropertiesKey: [:] as CFDictionary,
-        kCVPixelBufferPixelFormatTypeKey: kCVPixelFormatType_32BGRA,
-    ]
-    guard CVPixelBufferCreate(nil, w, h, kCVPixelFormatType_32BGRA, attrs as CFDictionary, &pb) == kCVReturnSuccess,
-          let pb else { return nil }
-    CVPixelBufferLockBaseAddress(pb, [])
-    defer { CVPixelBufferUnlockBaseAddress(pb, []) }
-    guard let ctx = CGContext(data: CVPixelBufferGetBaseAddress(pb), width: w, height: h,
-                              bitsPerComponent: 8, bytesPerRow: CVPixelBufferGetBytesPerRow(pb),
-                              space: CGColorSpaceCreateDeviceRGB(),
-                              bitmapInfo: CGImageAlphaInfo.premultipliedFirst.rawValue
-                                  | CGBitmapInfo.byteOrder32Little.rawValue)
-    else { return nil }
-    ctx.draw(img, in: CGRect(x: 0, y: 0, width: w, height: h))
-    return pb
 }
 
 // MARK: - 网络发送
@@ -1558,10 +1633,13 @@ final class Sender {
                     // 对端可能是直接退出/拔线，此时用户手上可能正按着 Ctrl 或左键。
                     // 不在这里补发抬起事件，Mac 会一直保持按下态直到下次连上。
                     resetInjectionState()
+                    // 断开后不再需要保留整帧画面用于补关键帧，释放掉
+                    gEncoder?.releaseLastFrame()
                 case .cancelled:
                     Log.info("连接已取消（cancelled）")
                     self.connected = false
                     resetInjectionState()
+                    gEncoder?.releaseLastFrame()
                 case .ready:
                     Log.info("连接就绪")
                 default:
@@ -2636,6 +2714,7 @@ if let mbps = Int(ProcessInfo.processInfo.environment["SECDISPLAY_MBPS"] ?? ""),
 }
 let vd = VirtualDisplayManager()
 let encoder = Encoder(width: cfg.width, height: cfg.height, bitrateMbps: cfg.bitrateMbps, captureHz: cfg.captureHz)
+gEncoder = encoder
 let sender = Sender()
 sender.keepAliveGap = cfg.keepAliveGap
 sender.sessionWidth = cfg.width
