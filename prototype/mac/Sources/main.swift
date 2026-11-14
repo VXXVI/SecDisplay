@@ -107,6 +107,9 @@ func listSecDisplays() -> [(id: CGDirectDisplayID, old: Bool)] {
 /// 由建屏处统一写入一次即可。
 nonisolated(unsafe) var vdBackingScale: Double = 1.0
 
+/// 进程启动时刻（CFAbsoluteTime），面板用来算运行时长。
+let appStartTime = CFAbsoluteTimeGetCurrent()
+
 /// 键盘注入器。连接重建时从这里 reset，避免 Ctrl/Cmd 卡在按下态。
 nonisolated(unsafe) var gKeyboard: KeyboardInjector?
 /// 鼠标注入器。断连时同样要清，否则按住左键时对端消失会让 Mac 一直保持按下态。
@@ -1317,6 +1320,22 @@ final class ScreenshotCapture {
     private var lastSupervisorAt: CFAbsoluteTime = 0
     private var loggedFirstFrame = false
     private var lastSizeWarnAt: CFAbsoluteTime = 0
+    /// worker 代次。spawnWorkers 每次自增，旧代次的循环看到代次变了就退出。
+    /// 原来这里是直接再起 4 个 Task 而不停旧的，看护每触发一次线程数与
+    /// 采集缓冲就翻一倍（每个 worker 同时持有 CGImage + CVPixelBuffer 约 40MB）。
+    /// 写方是 supervisor 队列，读方是 worker 任务，用锁保护。
+    private let genLock = NSLock()
+    private var _workerGen = 0
+    private var workerGen: Int {
+        genLock.lock(); defer { genLock.unlock() }
+        return _workerGen
+    }
+    /// 自增代次并返回新值
+    private func bumpWorkerGen() -> Int {
+        genLock.lock(); defer { genLock.unlock() }
+        _workerGen &+= 1
+        return _workerGen
+    }
     /// 上一帧内容的采样指纹。用来识别「帧还在来、但画面不再更新」——
     /// SCScreenshotManager 跑约 30 秒后偶尔会开始返回陈旧内容，
     /// 此时 captured 仍在增长，现有看护只看计数，抓不到这种情况。
@@ -1365,19 +1384,24 @@ final class ScreenshotCapture {
 
     private func spawnWorkers() {
         let workers = 4
+        let gen = bumpWorkerGen()
         lastSupervisorAt = CFAbsoluteTimeGetCurrent()
-        Log.info("采集通道: SCScreenshotManager 轮询，\(workers) 路并发")
+        lastSupervisorCount = captured
+        Log.info("采集通道: SCScreenshotManager 轮询，\(workers) 路并发（代次 \(gen)）")
         for i in 0..<workers {
             Task.detached(priority: .userInitiated) { [weak self] in
-                await self?.loop(index: i)
+                await self?.loop(index: i, gen: gen)
             }
         }
     }
 
-    func stop() { running = false }
+    func stop() {
+        running = false
+        _ = bumpWorkerGen()     // 让在跑的 worker 立刻退出
+    }
 
-    private func loop(index: Int) async {
-        while running {
+    private func loop(index: Int, gen: Int) async {
+        while running && workerGen == gen {
             let t0 = CFAbsoluteTimeGetCurrent()
             do {
                 let content = try await currentContent()
@@ -1429,6 +1453,9 @@ final class ScreenshotCapture {
                     pb = buf
                 }
                 let now = CFAbsoluteTimeGetCurrent()
+                // 旧代次 worker 可能刚从一个长 await 里返回（单帧 60ms 甚至更久），
+                // 这里再确认一次代次/运行状态，避免逐个多发一帧干扰看护判断。
+                guard running && workerGen == gen else { return }
                 let fw = CVPixelBufferGetWidth(pb)
                 let fh = CVPixelBufferGetHeight(pb)
                 let actualFmt = CVPixelBufferGetPixelFormatType(pb)
@@ -1623,8 +1650,31 @@ final class Sender {
     private let maxInFlight = 2
     var dropped = 0
     var sent = 0
+    /// 累计发送帧数（不随 2 秒统计清零，给面板看总量）。
+    /// 写方 net 队列、读方主线程，走锁。
+    private let totalLock = NSLock()
+    private var _totalSent = 0
+    var totalSent: Int {
+        totalLock.lock(); defer { totalLock.unlock() }
+        return _totalSent
+    }
+    func bumpTotalSent() {
+        totalLock.lock(); _totalSent += 1; totalLock.unlock()
+    }
     var sentBytes = 0
     var connected = false
+
+    /// 对端地址描述。写方是 net 队列（建连回调），读方是主线程（面板），
+    /// String 是引用计数的多字节值类型，跨线程裸读写是 UB，必须走锁。
+    private let peerLock = NSLock()
+    private var _peerDescription = "-"
+    var peerDescription: String {
+        peerLock.lock(); defer { peerLock.unlock() }
+        return _peerDescription
+    }
+    func setPeerDescription(_ s: String) {
+        peerLock.lock(); _peerDescription = s; peerLock.unlock()
+    }
 
     /// 会话头里通告的虚拟屏参数，由 main 在启动时写入。
     /// 接收端据此自动调整窗口尺寸与坐标基准，两端不再手工对齐分辨率。
@@ -1677,6 +1727,7 @@ final class Sender {
             // 误标成断开，表现为连上后一帧都发不出去。
             self.connEpoch &+= 1
             let epoch = self.connEpoch
+            self.setPeerDescription(String(describing: c.endpoint))
 
             let old = self.conn
             self.conn = c
@@ -2011,6 +2062,7 @@ final class Sender {
         packet.append(frame)
 
         sent += 1
+        bumpTotalSent()
         sentBytes += packet.count
         // 捕获发起时的连接代数。重连时新连接先把 connected 置 true，
         // 旧连接上未完成的 send 随后会以错误回调；若不区分代数，这个迟到的
@@ -3002,6 +3054,11 @@ final class RateController {
     private var probeAt: CFAbsoluteTime = 0
     private var revertCooldownUntil: CFAbsoluteTime = 0
 
+    /// 面板展示用：当前生效码率
+    var currentBitrate: Int { current }
+    /// 面板展示用：最近一轮健康度（>1 表示过载）
+    private(set) var lastHealth: Double = 0
+
     init(encoder: Encoder, targetMbps: Int, captureHz: Double) {
         self.encoder = encoder
         self.targetMbps = targetMbps
@@ -3018,6 +3075,9 @@ final class RateController {
         if s.captureFps < 10 {
             highRounds = 0
             lowRounds = 0
+            // 静止时没有编码负载，把健康度归零，否则面板会一直停在
+            // 最后一次非静止时的数值（可能长期红着），排障时误导。
+            lastHealth = 0
             // 静止时链路仍可能拥塞：在途积压或有丢帧就先不回升
             if s.inFlight >= 2 || s.droppedDelta > 0 {
                 idleRounds = 0
@@ -3050,6 +3110,7 @@ final class RateController {
         // 编码延迟只在明显超标时参与，避免 1.1 这种噪声反复触发
         let encodeGuard = encodeLoad > 1.5 ? encodeLoad : 0.0
         let health = max(max(winQueueLoad, dropLoad), max(inflightLoad, encodeGuard))
+        lastHealth = health
 
         // 降档观察期：队列排空需要时间，给 8 秒；窗口内取最低健康度判断。
         if let pm = probeMbps {
