@@ -1394,19 +1394,42 @@ final class ScreenshotCapture {
                 // 必然下采样，所以这一步不损失画质，但每帧缓冲从 19.8MB 降到 7.4MB，
                 // 而且省掉一次全屏 5.2M 像素的 CGContext 重绘。
                 c.pixelFormat = kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange
+                // 420v/420f 才生效的色度矩阵。不显式指定就由 SCK 自选，
+                // 一旦与接收端按 709 解释的假设不一致就会偏色（不是黑屏，很难查）。
+                c.colorMatrix = CGDisplayStream.yCbCrMatrix_ITU_R_709_2
                 // 2x HiDPI 下显式要最高清晰度采样，避免 automatic 在负载时降到逻辑分辨率放大
                 if #available(macOS 14.0, *) {
                     c.captureResolution = .best
                 }
                 let sb = try await Self.captureSample(c, filter: filter)
-                guard let pb = CMSampleBufferGetImageBuffer(sb) else { continue }
+                guard let pb = CMSampleBufferGetImageBuffer(sb) else {
+                    // 拿不到 pixel buffer 等同于采集失败，但这条路径没有 catch 兜底，
+                    // 不打日志会表现成「采集在跑却一帧都没有」。
+                    let t = CFAbsoluteTimeGetCurrent()
+                    if t - lastErrorLogAt > 2.0 {
+                        lastErrorLogAt = t
+                        Log.info("采集样本没有 image buffer，丢弃该帧")
+                    }
+                    continue
+                }
                 let now = CFAbsoluteTimeGetCurrent()
                 let fw = CVPixelBufferGetWidth(pb)
                 let fh = CVPixelBufferGetHeight(pb)
+                let actualFmt = CVPixelBufferGetPixelFormatType(pb)
                 encodeQueue.sync {
                     if !loggedFirstFrame {
                         loggedFirstFrame = true
-                        Log.info("采集首帧实测: \(fw)x\(fh) (期望 \(cfg.width)x\(cfg.height))")
+                        // 打印实际像素格式：SCK 可能忽略 pixelFormat 仍给 BGRA，
+                        // 那样不会黑屏（VT 会自己转），但这次省内存的收益就没了，
+                        // 且从外部完全看不出来。这行是唯一的判据。
+                        let f4 = String(format: "%c%c%c%c",
+                                        (actualFmt >> 24) & 0xFF, (actualFmt >> 16) & 0xFF,
+                                        (actualFmt >> 8) & 0xFF, actualFmt & 0xFF)
+                        Log.info("采集首帧实测: \(fw)x\(fh) fmt=\(f4) (期望 \(cfg.width)x\(cfg.height) 420v)")
+                        if actualFmt != kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange
+                            && actualFmt != kCVPixelFormatType_420YpCbCr8BiPlanarFullRange {
+                            Log.info("警告: 采集实际格式是 \(f4) 而非 420v，VT 会额外做一次全屏转换，内存收益失效")
+                        }
                     } else if (fw != cfg.width || fh != cfg.height)
                                 && now - lastSizeWarnAt > 2.0 {
                         // 限流：尺寸偏移时每帧都打会淹日志并拖慢 encodeQueue 临界区
@@ -1416,16 +1439,18 @@ final class ScreenshotCapture {
                     // 内容冻结诊断：帧在来但画面完全不变时记一条日志。
                     // 只在日志里报，不重启 —— 静止桌面本来就不变，重启会误伤，
                     // 而且 spawnWorkers 不回收旧 worker，会把线程数越堆越多。
-                    let h = Self.frameFingerprint(pb)
-                    if h == lastFrameHash {
-                        if unchangedSince == 0 { unchangedSince = now }
-                        if now - unchangedSince > 8.0 && now - lastFreezeLogAt > 30.0 {
-                            lastFreezeLogAt = now
-                            Log.info("提示: 采集内容已 \(Int(now - unchangedSince))s 无变化（帧仍以 \(Int(cfg.captureHz))fps 到达）。若 Windows 端画面也不动，说明源画面本身静止")
+                    // 指纹为 nil（取锁失败）时跳过本次比较，不要当成「没变化」。
+                    if let h = Self.frameFingerprint(pb) {
+                        if h == lastFrameHash {
+                            if unchangedSince == 0 { unchangedSince = now }
+                            if now - unchangedSince > 8.0 && now - lastFreezeLogAt > 30.0 {
+                                lastFreezeLogAt = now
+                                Log.info("提示: 采集内容已 \(Int(now - unchangedSince))s 无变化（帧仍以 \(Int(cfg.captureHz))fps 到达）。若 Windows 端画面也不动，说明源画面本身静止")
+                            }
+                        } else {
+                            lastFrameHash = h
+                            unchangedSince = 0
                         }
-                    } else {
-                        lastFrameHash = h
-                        unchangedSince = 0
                     }
                     captured += 1
                     lastFrameTime = now
@@ -1475,10 +1500,12 @@ final class ScreenshotCapture {
         }
     }
 
-    /// 采集帧内容的轻量指纹。按 64x64 网格抽样，取若干点做 FNV-1a。
+    /// 采集帧内容的轻量指纹。按 32x18 网格抽样，取若干点做 FNV-1a。
     /// 目的是判断「画面有没有变化」，不是做精确校验，所以抽样足够。
-    static func frameFingerprint(_ pb: CVPixelBuffer) -> UInt64 {
-        guard CVPixelBufferLockBaseAddress(pb, .readOnly) == kCVReturnSuccess else { return 0 }
+    /// 返回 nil 表示取不到基地址（锁失败），调用方应跳过本次比较 ——
+    /// 不能返回 0，否则会与初始的 lastFrameHash=0 相等，被误判成画面冻结。
+    static func frameFingerprint(_ pb: CVPixelBuffer) -> UInt64? {
+        guard CVPixelBufferLockBaseAddress(pb, .readOnly) == kCVReturnSuccess else { return nil }
         defer { CVPixelBufferUnlockBaseAddress(pb, .readOnly) }
 
         let w = CVPixelBufferGetWidth(pb)
@@ -1499,12 +1526,12 @@ final class ScreenshotCapture {
                 if isPlanar, fmt == kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange
                     || fmt == kCVPixelFormatType_420YpCbCr8BiPlanarFullRange {
                     // 只用 Y 平面：亮度变化足以判断画面是否更新，且省掉两次平面遍历。
-                    guard let base = CVPixelBufferGetBaseAddressOfPlane(pb, 0) else { continue }
+                    guard let base = CVPixelBufferGetBaseAddressOfPlane(pb, 0) else { return nil }
                     let stride = CVPixelBufferGetBytesPerRowOfPlane(pb, 0)
                     let p = base.advanced(by: y * stride + x)
                     mix(UInt64(p.load(as: UInt8.self)))
                 } else {
-                    guard let base = CVPixelBufferGetBaseAddress(pb) else { continue }
+                    guard let base = CVPixelBufferGetBaseAddress(pb) else { return nil }
                     let stride = CVPixelBufferGetBytesPerRow(pb)
                     let p = base.advanced(by: y * stride + x * 4)
                     // 只取一个通道，避免字节序差异
