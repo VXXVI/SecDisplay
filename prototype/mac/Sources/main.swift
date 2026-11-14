@@ -107,6 +107,9 @@ func listSecDisplays() -> [(id: CGDirectDisplayID, old: Bool)] {
 /// 由建屏处统一写入一次即可。
 nonisolated(unsafe) var vdBackingScale: Double = 1.0
 
+/// 进程启动时刻（CFAbsoluteTime），面板用来算运行时长。
+let appStartTime = CFAbsoluteTimeGetCurrent()
+
 /// 键盘注入器。连接重建时从这里 reset，避免 Ctrl/Cmd 卡在按下态。
 nonisolated(unsafe) var gKeyboard: KeyboardInjector?
 /// 鼠标注入器。断连时同样要清，否则按住左键时对端消失会让 Mac 一直保持按下态。
@@ -1623,6 +1626,10 @@ final class Sender {
     private let maxInFlight = 2
     var dropped = 0
     var sent = 0
+    /// 累计发送帧数（不随 2 秒统计清零，给面板看总量）
+    private(set) var totalSent = 0
+    /// 对端地址描述，供面板显示
+    private(set) var peerDescription = "-"
     var sentBytes = 0
     var connected = false
 
@@ -1677,6 +1684,7 @@ final class Sender {
             // 误标成断开，表现为连上后一帧都发不出去。
             self.connEpoch &+= 1
             let epoch = self.connEpoch
+            self.peerDescription = String(describing: c.endpoint)
 
             let old = self.conn
             self.conn = c
@@ -2011,6 +2019,7 @@ final class Sender {
         packet.append(frame)
 
         sent += 1
+        totalSent += 1
         sentBytes += packet.count
         // 捕获发起时的连接代数。重连时新连接先把 connected 置 true，
         // 旧连接上未完成的 send 随后会以错误回调；若不区分代数，这个迟到的
@@ -3002,6 +3011,11 @@ final class RateController {
     private var probeAt: CFAbsoluteTime = 0
     private var revertCooldownUntil: CFAbsoluteTime = 0
 
+    /// 面板展示用：当前生效码率
+    var currentBitrate: Int { current }
+    /// 面板展示用：最近一轮健康度（>1 表示过载）
+    private(set) var lastHealth: Double = 0
+
     init(encoder: Encoder, targetMbps: Int, captureHz: Double) {
         self.encoder = encoder
         self.targetMbps = targetMbps
@@ -3050,6 +3064,7 @@ final class RateController {
         // 编码延迟只在明显超标时参与，避免 1.1 这种噪声反复触发
         let encodeGuard = encodeLoad > 1.5 ? encodeLoad : 0.0
         let health = max(max(winQueueLoad, dropLoad), max(inflightLoad, encodeGuard))
+        lastHealth = health
 
         // 降档观察期：队列排空需要时间，给 8 秒；窗口内取最低健康度判断。
         if let pm = probeMbps {

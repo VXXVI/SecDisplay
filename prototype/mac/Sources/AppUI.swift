@@ -29,6 +29,28 @@ final class AppModel: ObservableObject {
     /// 刷新时置位，避免程序化改选中项触发重启
     var suppressResolutionChange = false
 
+    // ---- 新增：链路与对端观测 ----
+    /// 码率：当前生效值 / 目标上限
+    @Published var bitrateNow = 0
+    @Published var bitrateTarget = 0
+    /// 码率控制健康度（>1 过载）
+    @Published var health: Double = 0
+    /// Windows 侧反馈（0x07）：呈现间隔 p95、解码 fps、非节拍丢帧
+    @Published var clientFps: Double = 0
+    @Published var clientPresentP95: Double = 0
+    @Published var clientQueueMs: Double = 0
+    @Published var clientPresentDrop = 0
+    /// 采集通道描述（像素格式 / 并发路数）
+    @Published var capturePath = "-"
+    /// 累计发送帧数与运行时长
+    @Published var totalSent: UInt64 = 0
+    @Published var uptimeSec: Double = 0
+    /// 对端地址
+    @Published var peer = "-"
+    /// 光标的发送计数（位置 / 图像）
+    @Published var cursorPosSent = 0
+    @Published var cursorImgSent = 0
+
     static let resolutions: [(label: String, w: Int, h: Int, lw: Int, lh: Int)] = [
         ("1600 × 1000 (1x)", 1600, 1000, 1600, 1000),
         ("1920 × 1200 (2x Retina)", 1920, 1200, 960, 600),
@@ -66,6 +88,22 @@ final class AppModel: ObservableObject {
         suppressResolutionChange = true
         resolutionIndex = AppModel.resolutions.firstIndex { $0.w == cfg.width && $0.h == cfg.height && $0.lw == cfg.logicalWidth && $0.lh == cfg.logicalHeight } ?? -1
         suppressResolutionChange = false
+
+        // 链路与对端
+        bitrateNow = rateCtl.currentBitrate
+        bitrateTarget = cfg.bitrateMbps
+        health = rateCtl.lastHealth
+        let fb = sender.latestFeedback()
+        clientFps = fb.decodeFps
+        clientPresentP95 = fb.presentP95
+        clientQueueMs = max(0, fb.presentP95 - fb.sourceP95)
+        clientPresentDrop = fb.presentDrop
+        capturePath = (pixelFormatChoice == "420v" ? "420v" : "BGRA") + " · 4 路"
+        totalSent = UInt64(max(0, sender.totalSent))
+        uptimeSec = CFAbsoluteTimeGetCurrent() - appStartTime
+        peer = sender.peerDescription
+        cursorPosSent = cursor.sentCount
+        cursorImgSent = cursorImage.sentCount
     }
 }
 
@@ -82,52 +120,122 @@ private struct StatRow: View {
     let label: String
     let value: String
     var mono = true
+    /// 告警色：非 nil 时用该颜色覆盖（过载/失败指标用）
+    var warn: Color? = nil
     var body: some View {
         HStack {
             Text(label).foregroundStyle(.secondary)
             Spacer()
             Text(value)
                 .font(mono ? .system(.body, design: .monospaced) : .body)
-                .foregroundStyle(.primary)
+                .foregroundStyle(warn ?? .primary)
         }
     }
+}
+
+/// 小节标题，带细分隔线，让长面板可扫读
+private struct SectionHeader: View {
+    let title: String
+    var body: some View {
+        HStack(spacing: 6) {
+            Text(title)
+                .font(.system(size: 11, weight: .semibold))
+                .foregroundStyle(.secondary)
+                .textCase(.uppercase)
+            Rectangle().fill(Color.secondary.opacity(0.25)).frame(height: 1)
+        }
+    }
+}
+
+private func fmtUptime(_ s: Double) -> String {
+    let t = Int(max(0, s))
+    if t >= 3600 { return String(format: "%d:%02d:%02d", t / 3600, (t / 60) % 60, t % 60) }
+    return String(format: "%02d:%02d", t / 60, t % 60)
 }
 
 struct StatusView: View {
     @ObservedObject var model = AppModel.shared
 
+    private var healthText: String {
+        String(format: "%.2f", model.health)
+    }
+    private var healthColor: Color? {
+        if model.health >= 1.0 { return .red }
+        if model.health >= 0.7 { return .orange }
+        return nil
+    }
+
     var body: some View {
-        VStack(alignment: .leading, spacing: 14) {
-            // 头部
-            HStack(spacing: 10) {
-                Circle()
-                    .fill(model.connected ? Color.green : Color.orange)
-                    .frame(width: 10, height: 10)
-                Text(model.connected ? "已连接" : "等待接收端")
-                    .font(.headline)
-                Spacer()
-                Text(model.scale > 1.5
-                     ? "\(model.width)×\(model.height) · 2x"
-                     : "\(model.width)×\(model.height) · 1x")
-                    .font(.system(.subheadline, design: .monospaced))
-                    .foregroundStyle(.secondary)
-            }
+        ScrollView {
+            VStack(alignment: .leading, spacing: 14) {
+                // 头部
+                HStack(spacing: 10) {
+                    Circle()
+                        .fill(model.connected ? Color.green : Color.orange)
+                        .frame(width: 10, height: 10)
+                    Text(model.connected ? "已连接" : "等待接收端")
+                        .font(.headline)
+                    Spacer()
+                    Text(model.scale > 1.5
+                         ? "\(model.width)×\(model.height) · 2x"
+                         : "\(model.width)×\(model.height) · 1x")
+                        .font(.system(.subheadline, design: .monospaced))
+                        .foregroundStyle(.secondary)
+                }
 
-            Divider()
+                // 连接
+                SectionHeader(title: "连接")
+                VStack(spacing: 6) {
+                    StatRow(label: "对端", value: model.peer)
+                    StatRow(label: "运行时长", value: fmtUptime(model.uptimeSec))
+                    StatRow(label: "累计发送", value: "\(model.totalSent) 帧")
+                }
 
-            // 实时指标
-            VStack(spacing: 8) {
-                StatRow(label: "帧率", value: String(format: "%.0f fps", model.fps))
-                StatRow(label: "编码延迟", value: String(format: "%.1f ms", model.encMs))
-                StatRow(label: "采集延迟", value: String(format: "%.1f ms", model.capMs))
-                StatRow(label: "码率", value: String(format: "%.1f Mbps", model.mbps))
-                StatRow(label: "在途 / 丢弃", value: "\(model.inFlight) / \(model.dropped)")
-                StatRow(label: "静止跳过", value: "\(model.skipped)")
-                StatRow(label: "光标频率", value: String(format: "%.0f Hz", model.cursorHz))
-                StatRow(label: "画质档位", value: model.presetName)
+                // 采集与编码（发送端本地）
+                SectionHeader(title: "采集 / 编码")
+                VStack(spacing: 6) {
+                    StatRow(label: "采集帧率", value: String(format: "%.0f fps", model.fps))
+                    StatRow(label: "采集通道", value: model.capturePath)
+                    StatRow(label: "采集延迟", value: String(format: "%.1f ms", model.capMs))
+                    StatRow(label: "编码延迟", value: String(format: "%.1f ms", model.encMs))
+                    StatRow(label: "画质档位", value: model.presetName)
+                    StatRow(label: "静止跳过", value: "\(model.skipped)")
+                }
 
+                // 码率控制
+                SectionHeader(title: "码率控制")
+                VStack(spacing: 6) {
+                    StatRow(label: "当前 / 目标",
+                            value: "\(model.bitrateNow) / \(model.bitrateTarget) Mbps")
+                    StatRow(label: "实际发送", value: String(format: "%.1f Mbps", model.mbps))
+                    StatRow(label: "健康度", value: healthText, warn: healthColor)
+                    StatRow(label: "在途 / 丢弃", value: "\(model.inFlight) / \(model.dropped)",
+                            warn: model.dropped > 0 ? .orange : nil)
+                }
+
+                // Windows 侧观测（0x07 反馈）
+                SectionHeader(title: "接收端（Windows）")
+                VStack(spacing: 6) {
+                    StatRow(label: "解码帧率", value: String(format: "%.1f fps", model.clientFps))
+                    StatRow(label: "呈现 p95", value: String(format: "%.1f ms", model.clientPresentP95))
+                    StatRow(label: "额外排队", value: String(format: "%.1f ms", model.clientQueueMs),
+                            warn: model.clientQueueMs >= 15 ? .orange : nil)
+                    StatRow(label: "非节拍丢帧", value: "\(model.clientPresentDrop)",
+                            warn: model.clientPresentDrop > 0 ? .orange : nil)
+                }
+
+                // 光标
+                SectionHeader(title: "光标")
+                VStack(spacing: 6) {
+                    StatRow(label: "采样频率", value: String(format: "%.0f Hz", model.cursorHz))
+                    StatRow(label: "位置 / 图像", value: "\(model.cursorPosSent) / \(model.cursorImgSent)")
+                }
+
+                Divider()
+
+                // 设置
                 HStack {
-                    Text("切换分辨率").foregroundStyle(.secondary)
+                    Text("分辨率").foregroundStyle(.secondary)
                     Spacer()
                     Picker("", selection: Binding(
                         get: { model.resolutionIndex },
@@ -145,14 +253,9 @@ struct StatusView: View {
                         }
                     }
                     .labelsHidden()
-                    .frame(width: 160)
+                    .frame(width: 190)
                 }
-            }
 
-            Divider()
-
-            // 控制
-            VStack(spacing: 10) {
                 Toggle("发送真实光标图像", isOn: Binding(
                     get: { model.cursorImageOn },
                     set: { on in
@@ -166,33 +269,58 @@ struct StatusView: View {
                         encoder.forceEncodeLastFrame()
                         Log.info("面板请求强制关键帧")
                     }
-                    Button("打开日志") {
-                        openLogsFolder()
-                    }
+                    Button("打开日志") { openLogsFolder() }
+                    Button("复制诊断") { copyDiagnostics() }
                     Spacer()
-                    Button("隐藏") {
-                        hideControlPanel()
-                    }
-                    .keyboardShortcut(.cancelAction)
+                    Button("隐藏") { hideControlPanel() }
+                        .keyboardShortcut(.cancelAction)
                     Button("退出") {
-                        // 退出清理里有嵌套 RunLoop 等待，放回主队列执行，避免卡在动画/事件循环里
                         DispatchQueue.main.async { shutdown(signal: SIGTERM) }
                     }
                     .keyboardShortcut("q")
                 }
-            }
 
-            if !model.logLine.isEmpty {
-                Text(model.logLine)
-                    .font(.system(size: 10, design: .monospaced))
-                    .foregroundStyle(.tertiary)
-                    .lineLimit(1)
-                    .truncationMode(.head)
+                if !model.logLine.isEmpty {
+                    Text(model.logLine)
+                        .font(.system(size: 10, design: .monospaced))
+                        .foregroundStyle(.tertiary)
+                        .lineLimit(1)
+                        .truncationMode(.head)
+                }
             }
+            .padding(18)
         }
-        .padding(18)
-        .frame(width: 380)
+        .frame(width: 400, height: 620)
     }
+}
+
+/// 复制诊断信息到剪贴板。排障时比让人截图快得多。
+func copyDiagnostics() {
+    let m = AppModel.shared
+    let fb = sender.latestFeedback()
+    let text = """
+    SecDisplay 发送端诊断
+    ==================
+    连接: \(m.connected ? "已连接" : "未连接")
+    对端: \(m.peer)
+    分辨率: \(m.width)x\(m.height)  scale=\(String(format: "%.2f", m.scale))
+    采集通道: \(m.capturePath)
+    采集帧率: \(String(format: "%.0f", m.fps)) fps
+    采集延迟: \(String(format: "%.1f", m.capMs)) ms
+    编码延迟: \(String(format: "%.1f", m.encMs)) ms
+    码率: \(m.bitrateNow)/\(m.bitrateTarget) Mbps  实际 \(String(format: "%.1f", m.mbps)) Mbps
+    健康度: \(String(format: "%.2f", m.health))
+    在途/丢弃: \(m.inFlight)/\(m.dropped)
+    对端解码: \(String(format: "%.1f", m.clientFps)) fps  呈现p95 \(String(format: "%.1f", m.clientPresentP95)) ms
+    对端额外排队: \(String(format: "%.1f", m.clientQueueMs)) ms  非节拍丢帧 \(m.clientPresentDrop)
+    源码率p95: \(String(format: "%.1f", fb.sourceP95)) ms  节拍丢帧 \(fb.pacedDrop)
+    累计发送: \(m.totalSent) 帧  运行 \(fmtUptime(m.uptimeSec))
+    日志: \(m.logLine)
+    """
+    let pb = NSPasteboard.general
+    pb.clearContents()
+    pb.setString(text, forType: .string)
+    Log.info("面板: 诊断信息已复制到剪贴板")
 }
 
 /// 切换分辨率：虚拟屏和编码器都在启动时按尺寸建好，改尺寸只能重建进程。
@@ -309,7 +437,7 @@ func showControlPanel() {
     } else {
         let host = NSHostingView(rootView: StatusView())
         let w = NSWindow(
-            contentRect: NSRect(x: 0, y: 0, width: 380, height: 520),
+            contentRect: NSRect(x: 0, y: 0, width: 400, height: 620),
             styleMask: [.titled, .closable, .miniaturizable, .fullSizeContentView],
             backing: .buffered,
             defer: false)

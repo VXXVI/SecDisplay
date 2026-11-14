@@ -28,6 +28,7 @@
 #include <windows.h>
 #include <windowsx.h>
 #include <shellapi.h>      // 系统托盘 Shell_NotifyIcon
+#include <psapi.h>         // GetProcessMemoryInfo（控制面板显示进程内存）
 #include <winsock2.h>
 #include <ws2tcpip.h>
 #include <d3d11.h>
@@ -62,6 +63,7 @@
 #include <condition_variable>
 
 #pragma comment(lib, "ws2_32.lib")
+#pragma comment(lib, "psapi.lib")
 #pragma comment(lib, "d3d11.lib")
 #pragma comment(lib, "dxgi.lib")
 #pragma comment(lib, "mfplat.lib")
@@ -94,6 +96,11 @@ struct Stats {
 };
 
 static Stats g_stats;
+
+// 解码器描述（硬件/软件 + 友好名），由 Decoder::Init 写入，控制面板读取。
+// 放在 Decoder 定义之前，因为 Init 里要写它。
+static std::mutex g_decoderInfoMtx;
+static std::wstring g_decoderInfo = L"--";
 
 // 可选抖动缓冲：默认关闭。--pace 打开后，呈现线程用一个小队列按自适应节拍上屏，
 // 吸收源端偶发的双倍帧间隔；代价是增加约 1~3 帧延迟（队列上限 3）。
@@ -358,6 +365,8 @@ static int g_shakeCount = 0;
 static int g_shakeHead = 0;
 // 放大状态与收缩进度。zoom 是当前实际倍数，收缩动画期间在 1.0~kShakeCursorZoom 之间插值。
 static bool g_shakeActive = false;
+// 晃动找光标总开关（可在控制面板关闭）
+static std::atomic<bool> g_shakeEnabled{true};
 // 每一个远程光标包的时间（不管是否在晃动）。TickShakeShrink 用它判断
 // 「已经多久没有新位置了」，不依赖 DetectShake 再次被调用。
 static int64_t g_shakeLastPacketMs = 0;
@@ -1115,6 +1124,7 @@ bool Decoder::Init(Graphics* gfx, int width, int height) {
     // 只按属性声明去猜不可靠，直接试才是准的。
     bool hardware = false;
     ComPtr<IMFTransform> fallback;   // 第一个能激活但拒绝 D3D 的候选，留作软件兜底
+    std::wstring chosenName;         // 选中的解码器友好名，供控制面板显示
 
     for (UINT32 i = 0; i < count && !transform_; ++i) {
         ComPtr<IMFTransform> candidate;
@@ -1139,9 +1149,19 @@ bool Decoder::Init(Graphics* gfx, int width, int height) {
         if (accepted) {
             transform_ = candidate;
             hardware = true;
+            LPWSTR nm = nullptr; UINT32 nl = 0;
+            if (SUCCEEDED(acts[i]->GetAllocatedString(MFT_FRIENDLY_NAME_Attribute, &nm, &nl)) && nm) {
+                chosenName = nm;
+                CoTaskMemFree(nm);
+            }
             Log("候选 [%u] 接受 D3D 管理器，启用 DXVA 硬件解码", i);
         } else if (!fallback) {
             fallback = candidate;
+            LPWSTR nm = nullptr; UINT32 nl = 0;
+            if (SUCCEEDED(acts[i]->GetAllocatedString(MFT_FRIENDLY_NAME_Attribute, &nm, &nl)) && nm) {
+                chosenName = nm;
+                CoTaskMemFree(nm);
+            }
         }
     }
 
@@ -1154,6 +1174,13 @@ bool Decoder::Init(Graphics* gfx, int width, int height) {
     for (UINT32 i = 0; i < count; ++i) acts[i]->Release();
     CoTaskMemFree(acts);
     if (!transform_) { Log("没有可用的解码器"); return false; }
+
+    // 记录给控制面板看：硬件/软件 + 友好名
+    {
+        std::lock_guard<std::mutex> lk(g_decoderInfoMtx);
+        g_decoderInfo = (hardware ? L"硬件 · " : L"软件 · ");
+        g_decoderInfo += chosenName.empty() ? L"未知" : chosenName;
+    }
 
     DWORD inId = 0, outId = 0;
     transform_->GetStreamIDs(1, &inId, 1, &outId);
@@ -2086,11 +2113,20 @@ static const int IDC_PANEL_TOP      = 2017;
 static const int IDC_PANEL_KEY      = 2018;
 static const int IDC_PANEL_CFG      = 2019;
 static const int IDC_PANEL_COPY     = 2023;
+// 新增：硬件与资源
+static const int IDC_PANEL_DECODER  = 2024;
+static const int IDC_PANEL_GPUMEM   = 2025;
+static const int IDC_PANEL_PROCMEM  = 2026;
+static const int IDC_PANEL_CPU      = 2027;
+static const int IDC_PANEL_SHAKE    = 2028;
 
 static std::atomic<bool> g_panelTopmost{false};
 static std::atomic<ULONGLONG> g_connStartTick{0};
 static std::atomic<double> g_srcP50{0.0}, g_srcP95{0.0}, g_presP50{0.0}, g_presP95{0.0};
 static double g_uiFps = 0.0, g_uiMbps = 0.0;
+
+// 主 Graphics 对象，控制面板查 GPU 显存用
+static Graphics* g_gfx = nullptr;
 
 static int PanelDpi() {
     static int dpi = 0;
@@ -2275,6 +2311,82 @@ static void UpdateControlPanel() {
                    g_isFullscreen ? L"回到窗口" : L"全屏");
     SetWindowTextW(GetDlgItem(g_panel, IDC_PANEL_TOP),
                    g_panelTopmost.load() ? L"取消置顶" : L"置顶");
+
+    // ---- 硬件与资源 ----
+    {
+        std::lock_guard<std::mutex> lk(g_decoderInfoMtx);
+        swprintf(buf, 256, L"解码器: %s", g_decoderInfo.c_str());
+        SetWindowTextW(GetDlgItem(g_panel, IDC_PANEL_DECODER), buf);
+    }
+
+    // 进程内存：PrivateWorkingSet 才是真实占用，WorkingSet 含共享的 DLL 页
+    {
+        PROCESS_MEMORY_COUNTERS_EX pmc{};
+        pmc.cb = sizeof(pmc);
+        if (GetProcessMemoryInfo(GetCurrentProcess(),
+                                 (PROCESS_MEMORY_COUNTERS*)&pmc, sizeof(pmc))) {
+            swprintf(buf, 256, L"进程内存: 工作集 %.0f MB / 私有 %.0f MB",
+                     pmc.WorkingSetSize / 1048576.0, pmc.PrivateUsage / 1048576.0);
+            SetWindowTextW(GetDlgItem(g_panel, IDC_PANEL_PROCMEM), buf);
+        }
+    }
+
+    // CPU：两次采样之间的内核+用户时间增量 / 墙钟时间 / 核数
+    {
+        static ULONGLONG lastCpuTick = 0;
+        static ULONGLONG lastKernel = 0, lastUser = 0;
+        FILETIME ct, et, kt, ut;
+        if (GetProcessTimes(GetCurrentProcess(), &ct, &et, &kt, &ut)) {
+            ULONGLONG k = ((ULONGLONG)kt.dwHighDateTime << 32) | kt.dwLowDateTime;
+            ULONGLONG u = ((ULONGLONG)ut.dwHighDateTime << 32) | ut.dwLowDateTime;
+            static double cpuPct = 0.0;
+            if (lastCpuTick != 0) {
+                double dtMs = (double)(now - lastCpuTick);
+                if (dtMs > 100.0) {
+                    // FILETIME 单位 100ns
+                    double busyMs = (double)((k - lastKernel) + (u - lastUser)) / 10000.0;
+                    cpuPct = busyMs / dtMs * 100.0;
+                }
+            }
+            lastCpuTick = now;
+            lastKernel = k;
+            lastUser = u;
+            SYSTEM_INFO si{};
+            GetSystemInfo(&si);
+            int cores = si.dwNumberOfProcessors > 0 ? (int)si.dwNumberOfProcessors : 1;
+            swprintf(buf, 256, L"CPU: %.1f%% (单核口径 %.1f%%)", cpuPct / cores, cpuPct);
+            SetWindowTextW(GetDlgItem(g_panel, IDC_PANEL_CPU), buf);
+        }
+    }
+
+    // GPU 显存：DXGI 进程级用量，取不到就不显示
+    {
+        static IDXGIAdapter3* adapter3 = nullptr;
+        static bool probed = false;
+        if (!probed) {
+            probed = true;
+            if (g_gfx && g_gfx->device) {
+                ComPtr<IDXGIDevice> dxgiDev;
+                if (SUCCEEDED(g_gfx->device.As(&dxgiDev)) && dxgiDev) {
+                    ComPtr<IDXGIAdapter> ad;
+                    if (SUCCEEDED(dxgiDev->GetAdapter(&ad)) && ad) {
+                        ComPtr<IDXGIAdapter3> a3;
+                        if (SUCCEEDED(ad.As(&a3))) {
+                            adapter3 = a3.Detach();
+                        }
+                    }
+                }
+            }
+        }
+        if (adapter3) {
+            DXGI_QUERY_VIDEO_MEMORY_INFO info{};
+            if (SUCCEEDED(adapter3->QueryVideoMemoryInfo(0, DXGI_MEMORY_SEGMENT_GROUP_LOCAL, &info))) {
+                swprintf(buf, 256, L"GPU 显存: %.0f MB (预算 %.0f MB)",
+                         info.CurrentUsage / 1048576.0, info.Budget / 1048576.0);
+                SetWindowTextW(GetDlgItem(g_panel, IDC_PANEL_GPUMEM), buf);
+            }
+        }
+    }
 }
 
 static LRESULT CALLBACK PanelWndProc(HWND h, UINT msg, WPARAM w, LPARAM l) {
@@ -2321,6 +2433,15 @@ static LRESULT CALLBACK PanelWndProc(HWND h, UINT msg, WPARAM w, LPARAM l) {
         if (vs) SendMessageW(vs, BM_SETCHECK, g_vsyncEnabled.load() ? BST_CHECKED : BST_UNCHECKED, 0);
         if (pc) SendMessageW(pc, BM_SETCHECK, g_paceEnabled.load() ? BST_CHECKED : BST_UNCHECKED, 0);
         if (fb) SendMessageW(fb, BM_SETCHECK, g_feedbackEnabled.load() ? BST_CHECKED : BST_UNCHECKED, 0);
+
+        // 第三列：硬件与资源（原面板只有连接与画面两块）
+        mk(L"STATIC", L"硬件 / 资源", SS_LEFT, 560, 16, 220, 24, 0);
+        mk(L"STATIC", L"解码器: --", SS_LEFT, 560, 48, 300, 24, IDC_PANEL_DECODER);
+        mk(L"STATIC", L"进程内存: --", SS_LEFT, 560, 76, 300, 24, IDC_PANEL_PROCMEM);
+        mk(L"STATIC", L"CPU: --", SS_LEFT, 560, 104, 300, 24, IDC_PANEL_CPU);
+        mk(L"STATIC", L"GPU 显存: --", SS_LEFT, 560, 132, 300, 24, IDC_PANEL_GPUMEM);
+        HWND sk = mk(L"BUTTON", L"晃动找光标", BS_AUTOCHECKBOX, 560, 164, 200, 28, IDC_PANEL_SHAKE);
+        if (sk) SendMessageW(sk, BM_SETCHECK, g_shakeEnabled.load() ? BST_CHECKED : BST_UNCHECKED, 0);
 
         mk(L"STATIC", L"Esc 退出    Ctrl+Alt+H 让位    F11 全屏", SS_LEFT, 20, 416, 520, 24, 0);
         SetTimer(h, 1, 1000, nullptr);
@@ -2391,6 +2512,20 @@ static LRESULT CALLBACK PanelWndProc(HWND h, UINT msg, WPARAM w, LPARAM l) {
             g_feedbackEnabled = (SendMessageW((HWND)l, BM_GETCHECK, 0, 0) == BST_CHECKED);
             Log("控制面板: 反馈 %s", g_feedbackEnabled.load() ? "开" : "关");
             return 0;
+        case IDC_PANEL_SHAKE: {
+            bool on = (SendMessageW((HWND)l, BM_GETCHECK, 0, 0) == BST_CHECKED);
+            g_shakeEnabled = on;
+            if (!on) {
+                // 关掉时立刻把可能还处于放大状态的光标收回来
+                g_shakeActive = false;
+                g_shakeHolding = false;
+                g_shakeZoom = 1.0;
+                KillTimer(h, kShakeTimer);
+                RefreshCursorScale();
+            }
+            Log("控制面板: 晃动找光标 %s", on ? "开" : "关");
+            return 0;
+        }
         }
         return 0;
     case WM_CLOSE:
@@ -2658,6 +2793,7 @@ static bool DetectShake(int64_t now, int x, int y) {
     const bool shaking = shakeX || shakeY;
 
     if (shaking) {
+        if (!g_shakeEnabled.load()) return false;
         g_shakeHolding = false;
         if (!g_shakeActive) {
             g_shakeActive = true;
@@ -3882,6 +4018,7 @@ int main(int argc, char** argv) {
 
     Graphics gfx;
     if (!gfx.Init(cfg.width, cfg.height)) return 2;
+    g_gfx = &gfx;   // 控制面板查询 GPU 显存用
 
     WNDCLASSA wc{};
     wc.lpfnWndProc = WndProc;
