@@ -2120,6 +2120,9 @@ static const int IDC_PANEL_PROCMEM  = 2026;
 static const int IDC_PANEL_CPU      = 2027;
 static const int IDC_PANEL_SHAKE    = 2028;
 
+// 前向声明：面板要能立即把放大的光标收回（定义在 WndProc 之后）
+static void RefreshCursorScale();
+
 static std::atomic<bool> g_panelTopmost{false};
 static std::atomic<ULONGLONG> g_connStartTick{0};
 static std::atomic<double> g_srcP50{0.0}, g_srcP95{0.0}, g_presP50{0.0}, g_presP95{0.0};
