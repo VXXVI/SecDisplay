@@ -2023,10 +2023,16 @@ final class KeyboardInjector {
     private var pressed: Set<CGKeyCode> = []
     /// 按下中的修饰键 keyCode → 对应 mask。flags 由它取并集算出。
     private var heldModifiers: [CGKeyCode: CGEventFlags] = [:]
-    /// 按下时的 Windows VK → 该 VK 下按住的 keyCode 栈。
+    /// 按下时的 Windows VK → 该 VK 下按住的按键栈（含 scan/扩展位）。
     /// 左右 Ctrl/Shift 与两个 Enter 在 VK 上相同，只靠 keyCode 区分；
     /// 用单值映射会在「同时按住左右键、先松先按的那个」时配错并留下卡死的修饰键。
-    private var pressedVK: [UInt16: [CGKeyCode]] = [:]
+    /// 抬起时优先按 keyCode+scan+扩展位精确匹配，扩展位丢失时退回栈顶。
+    private struct HeldKey {
+        let keyCode: CGKeyCode
+        let scan: UInt16
+        let extended: Bool
+    }
+    private var pressedVK: [UInt16: [HeldKey]] = [:]
     private let lock = NSLock()
     private(set) var eventCount = 0
 
@@ -2075,7 +2081,8 @@ final class KeyboardInjector {
             let isRepeat = pressed.contains(keyCode)
             if !isRepeat {
                 pressed.insert(keyCode)
-                pressedVK[vk, default: []].append(keyCode)
+                pressedVK[vk, default: []].append(
+                    HeldKey(keyCode: keyCode, scan: scan, extended: extended))
                 if let mask {
                     heldModifiers[keyCode] = mask
                     rebuildFlags()
@@ -2083,22 +2090,35 @@ final class KeyboardInjector {
             }
             post(keyCode: keyCode, down: true, isRepeat: isRepeat)
         } else {
-            // 抬起优先按 VK 查回按下时的 keyCode。
+            // 抬起优先按 VK 查回按下时的按键。
             // down/up 两次报文的 scan 或扩展位未必一致（KVM、注入式输入把 scan 报成 0、
             // 某些远程栈丢扩展位），只按 keyCode 配对会配不上，keyUp 被吞掉键就粘住了。
-            // 同一 VK 可能对应多个物理键，按报文 keyCode 精确挑，挑不到再退回栈顶。
+            // 匹配顺序：完整三元组 → 同 keyCode 的栈顶 → 栈顶。
             var stack = pressedVK[vk] ?? []
             let kc: CGKeyCode
-            if let idx = stack.firstIndex(of: keyCode) {
-                kc = stack.remove(at: idx)
+            var matched: Int?
+            if let idx = stack.firstIndex(where: {
+                $0.keyCode == keyCode && $0.scan == scan && $0.extended == extended
+            }) {
+                matched = idx
+                kc = stack[idx].keyCode
+            } else if let idx = stack.lastIndex(where: { $0.keyCode == keyCode }) {
+                // 扩展位丢失时同 keyCode 可能对应两个物理键，取最近按下的那个。
+                matched = idx
+                kc = stack[idx].keyCode
             } else if !stack.isEmpty {
-                kc = stack.removeLast()
+                matched = stack.count - 1
+                kc = stack[stack.count - 1].keyCode
             } else {
                 kc = keyCode
             }
+
+            // 先确认这个键确实处于按下态，再消费栈条目，
+            // 避免 guard 失败时白掉一条记账、三张表不同步。
+            guard pressed.remove(kc) != nil else { return }
+            if let idx = matched { stack.remove(at: idx) }
             if stack.isEmpty { pressedVK.removeValue(forKey: vk) } else { pressedVK[vk] = stack }
 
-            guard pressed.remove(kc) != nil else { return }
             // 按真正抬起的 keyCode 清理修饰键，不用 up 报文里的 mask：
             // 左右修饰键 VK 相同，靠报文分不出清哪一侧。
             if heldModifiers.removeValue(forKey: kc) != nil {
@@ -3208,8 +3228,12 @@ final class ClientWatchdog {
 
 let clientWatchdog = ClientWatchdog(
     initialGrace: Double(ProcessInfo.processInfo.environment["SECDISPLAY_INITIAL_GRACE"] ?? "") ?? 180,
-    graceLinkUp: Double(ProcessInfo.processInfo.environment["SECDISPLAY_DISCONNECT_GRACE"] ?? "") ?? 8,
-    graceLinkDown: Double(ProcessInfo.processInfo.environment["SECDISPLAY_DISCONNECT_GRACE_LINKDOWN"] ?? "") ?? 2
+    // 断开宽限不能太短。接收端重启（改配置、换分辨率、手动退出再开）通常要几十秒，
+    // 8 秒的宽限会让发送端在接收端重启期间自己退出，连带销毁虚拟屏，用户下次
+    // 还得手工重开。60 秒足够覆盖重启，又不会让孤儿屏长期挂着。
+    graceLinkUp: Double(ProcessInfo.processInfo.environment["SECDISPLAY_DISCONNECT_GRACE"] ?? "") ?? 60,
+    // 链路断（拔线）仍是快速判定：线都拔了就没必要留屏占显示器排列。
+    graceLinkDown: Double(ProcessInfo.processInfo.environment["SECDISPLAY_DISCONNECT_GRACE_LINKDOWN"] ?? "") ?? 5
 )
 clientWatchdog.start()
 
