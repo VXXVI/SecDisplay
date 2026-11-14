@@ -1945,11 +1945,17 @@ final class InputInjector {
             let was = (lastButtons & bit) != 0
             let now = (buttons & bit) != 0
             if now && !was {
-                CGEvent(mouseEventSource: nil, mouseType: downType,
-                        mouseCursorPosition: p, mouseButton: btn)?.post(tap: .cghidEventTap)
+                if let e = CGEvent(mouseEventSource: nil, mouseType: downType,
+                                   mouseCursorPosition: p, mouseButton: btn) {
+                    e.flags = mods
+                    e.post(tap: .cghidEventTap)
+                }
             } else if !now && was {
-                CGEvent(mouseEventSource: nil, mouseType: upType,
-                        mouseCursorPosition: p, mouseButton: btn)?.post(tap: .cghidEventTap)
+                if let e = CGEvent(mouseEventSource: nil, mouseType: upType,
+                                   mouseCursorPosition: p, mouseButton: btn) {
+                    e.flags = mods
+                    e.post(tap: .cghidEventTap)
+                }
             }
         }
         lastButtons = buttons
@@ -1959,6 +1965,7 @@ final class InputInjector {
             if let e = CGEvent(scrollWheelEvent2Source: nil, units: .pixel,
                                wheelCount: 1, wheel1: Int32(wheel), wheel2: 0, wheel3: 0) {
                 e.location = p
+                e.flags = mods
                 e.post(tap: .cghidEventTap)
             }
         }
@@ -1973,16 +1980,33 @@ final class InputInjector {
 // 同样需要「辅助功能」权限，未授权时事件被系统静默丢弃。
 final class KeyboardInjector {
     private var flags: CGEventFlags = []
+    /// 每个 mask 的按下计数。左右 Shift 同时按下时，松开一个不能把 mask 整体清掉。
+    private var maskCounts: [UInt64: Int] = [:]
     private var pressed: Set<UInt16> = []
     private let lock = NSLock()
     private(set) var eventCount = 0
 
-    /// 重置所有修饰键状态（断连或失焦时调用，避免 Ctrl/Cmd 卡住）
+    /// 重置所有修饰键状态，并补发 keyUp。
+    /// 只清内部记账是不够的：事件投到 .cghidEventTap 后系统 HID 层的按键状态
+    /// 由投出去的事件驱动，不补 keyUp 的话断连后 Ctrl/Cmd 会一直卡在按下态。
     func reset() {
         lock.lock()
-        flags = []
+        let stuck = pressed
         pressed.removeAll()
+        flags = []
+        maskCounts.removeAll()
         lock.unlock()
+
+        // 在锁外补发，避免与 handle 的锁重入
+        guard !stuck.isEmpty else { return }
+        let src = CGEventSource(stateID: .hidSystemState)
+        for vk in stuck {
+            if let kc = Self.keyCode(forVK: vk, extended: false),
+               let ev = CGEvent(keyboardEventSource: src, virtualKey: kc, keyDown: false) {
+                ev.flags = []
+                ev.post(tap: .cghidEventTap)
+            }
+        }
     }
 
     /// 当前修饰键状态，供鼠标事件复用（Ctrl+点击、Shift+点击等组合键）。
@@ -2015,15 +2039,33 @@ final class KeyboardInjector {
     }
 
     private func updateModifierState(vk: UInt16, down: Bool) {
-        let mask: CGEventFlags
-        switch vk {
-        case 0x10, 0xA0, 0xA1: mask = .maskShift
-        case 0x11, 0xA2, 0xA3: mask = .maskControl
-        case 0x12, 0xA4, 0xA5: mask = .maskAlternate
-        case 0x5B, 0x5C:       mask = .maskCommand
-        default: return
+        guard let mask = Self.modifierMask(forVK: vk) else { return }
+        let key = mask.rawValue
+        if down {
+            let c = (maskCounts[key] ?? 0) + 1
+            maskCounts[key] = c
+            flags.insert(mask)
+        } else {
+            // 计数归零才真正清除。左右 Shift 同按时松开一个不会误清。
+            let c = max(0, (maskCounts[key] ?? 0) - 1)
+            if c == 0 {
+                maskCounts.removeValue(forKey: key)
+                flags.remove(mask)
+            } else {
+                maskCounts[key] = c
+            }
         }
-        if down { flags.insert(mask) } else { flags.remove(mask) }
+    }
+
+    /// 修饰键 → CGEventFlags。返回 nil 表示不是修饰键。
+    static func modifierMask(forVK vk: UInt16) -> CGEventFlags? {
+        switch vk {
+        case 0x10, 0xA0, 0xA1: return .maskShift
+        case 0x11, 0xA2, 0xA3: return .maskControl
+        case 0x12, 0xA4, 0xA5: return .maskAlternate
+        case 0x5B, 0x5C:       return .maskCommand
+        default:               return nil
+        }
     }
 
     /// Windows 虚拟键码 → macOS 虚拟键码。返回 nil 表示不支持的键（忽略）。
@@ -2517,17 +2559,20 @@ if CommandLine.arguments.contains("--cleanup-orphan")
 // 建屏前先确认雷雳链路 carrier 正常。
 // 虚拟屏只有在「Mac 发送端在跑 + 雷雳链路通」时才有意义：
 // 线没插时建屏会留下一块没人用的空屏，还会占住显示器排列。
-// 等最多 60 秒；超时仍建屏（保持原有可用性），只打警告。
+// 最多等 8 秒——等太久会让从 Finder 启动的 app 表现为「点了没反应、菜单栏没图标」。
 if LinkMonitor.probe() == false {
-    Log.info("雷雳链路未就绪（\(LinkMonitor.ifName) 无 carrier），等待连接…")
+    Log.info("雷雳链路未就绪（\(LinkMonitor.ifName) 无 carrier），最多等 8 秒…")
     var waited = 0.0
-    while LinkMonitor.probe() == false && waited < 60.0 {
+    while LinkMonitor.probe() == false && waited < 8.0 {
         usleep(500_000); waited += 0.5
     }
-    if LinkMonitor.probe() == false {
-        Log.info("等待 60 秒仍未检测到链路，先建屏（接收端连上后仍可用）")
-    } else {
+    switch LinkMonitor.probe() {
+    case .some(true):
         Log.info("雷雳链路已就绪，耗时 \(String(format: "%.1f", waited)) 秒")
+    case .some(false):
+        Log.info("链路仍未就绪，先建屏；接收端连上后仍可用")
+    case .none:
+        Log.info("未找到链路接口 \(LinkMonitor.ifName)，跳过等待")
     }
 }
 

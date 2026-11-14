@@ -245,7 +245,9 @@ private func setPanelVisible(_ v: Bool) {
     panelStateLock.unlock()
 }
 
-/// 面板可见期间暂停 Windows 输入回放（线程安全，供网络线程无风险读取，不跨线程碰 AppKit）。
+/// 面板可见标志。保留供 UI 侧查询，输入回放已不再依赖它
+/// （面板点不动的真根因是 NSEvent 全局监视器抢在 NSApplication 初始化前
+/// 建立 SkyLight 会话，已由延迟注册修复）。
 var isControlPanelVisible: Bool {
     panelStateLock.lock()
     let v = panelVisibleFlag
