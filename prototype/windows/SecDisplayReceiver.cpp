@@ -2470,6 +2470,10 @@ static double WindowDpiScale(HWND hwnd) {
     return s;
 }
 
+// 当前应使用的光标缩放（千分比）：DPI 与晃动动画倍数合并后算。
+// 在 ApplyCursorImage 之前声明，由下面定义。
+static int DesiredCursorScalePm();
+
 // 用收到的 BGRA 像素造一个 32bpp 带 alpha 的 HCURSOR。
 // 仅在 UI 线程(WM_APPLY_CURSOR)调用；旧 cursor 在此销毁，无跨线程句柄竞态。
 static void ApplyCursorImage() {
