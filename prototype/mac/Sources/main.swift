@@ -101,6 +101,12 @@ func listSecDisplays() -> [(id: CGDirectDisplayID, old: Bool)] {
 
 // MARK: - 配置
 
+/// 虚拟屏建屏后实测的 backing scale。2x HiDPI 生效时为 2.0，否则 1.0。
+/// 坐标链路用它把「逻辑点坐标」和「线上物理像素坐标」互相换算。
+/// 放在全局是因为 CursorTracker / InputInjector 是各自独立的闭包，
+/// 由建屏处统一写入一次即可。
+nonisolated(unsafe) var vdBackingScale: Double = 1.0
+
 struct Config {
     // 对应 Lenovo Yoga Slim 7 Pro 14IHU5（82NC）2880x1800 高刷版，
     // 系统 200% 缩放：物理 2880x1800，逻辑 1440x900。
@@ -197,7 +203,29 @@ final class VirtualDisplayManager {
             if ids.contains(displayID) { break }
             usleep(20_000); waited += 0.02
         }
-        Log.info("虚拟屏就绪 id=\(displayID) \(cfg.width)x\(cfg.height)")
+
+        // HiDPI 自检：读实际备份比例，别只看 hiDPI 开关返回值。
+        // 2026-11-14 实测（macOS 27）：CGVirtualDisplay 无论怎么配
+        // （220 PPI、单/多 mode、物理 anchor 前/后、hiDPI=true）
+        // 都拿不到 HiDPI 模式，恒 scale=1.00、HiDPI 模式 0 个。
+        // 保留这段自检，系统升级后可一键复测；坐标链路按实际 s 换算，
+        // 万一哪天 2x 生效也不用再改代码。
+        let wantHiDPI = cfg.logicalWidth * 2 <= cfg.width
+        let pw = CGDisplayPixelsWide(displayID)
+        let ph = CGDisplayPixelsHigh(displayID)
+        let bw = Int(CGDisplayBounds(displayID).width)
+        let bh = Int(CGDisplayBounds(displayID).height)
+        let s = (bw > 0 && pw > 0) ? Double(pw) / Double(bw) : 1.0
+        vdBackingScale = s
+        Log.info("HiDPI 自检: 背板 \(pw)x\(ph) 逻辑 \(bw)x\(bh) scale=\(String(format: "%.2f", s)) 期望=\(wantHiDPI ? 2.0 : 1.0)")
+        if let all = CGDisplayCopyAllDisplayModes(displayID, nil) as? [CGDisplayMode] {
+            let hi = all.filter { $0.pixelWidth > $0.width }
+            Log.info("HiDPI 自检: 模式 \(all.count) 个，其中 HiDPI \(hi.count) 个")
+            for m in all.prefix(6) {
+                Log.info("   模式 \(m.width)x\(m.height) 背板 \(m.pixelWidth)x\(m.pixelHeight)\(m.pixelWidth > m.width ? " [HiDPI]" : "")")
+            }
+        }
+        Log.info("虚拟屏就绪 id=\(displayID) \(cfg.width)x\(cfg.height) scale=\(String(format: "%.2f", s))")
     }
 
     /// 正确销毁：取出 CGVirtualDisplay 内部的 _client 指针，交给 CDVirtualDisplayDestroy。
@@ -1696,11 +1724,13 @@ final class InputInjector {
     private(set) var eventCount = 0
 
     /// - Parameters:
-    ///   - x/y: 相对虚拟屏左上角的逻辑点坐标（Windows 端用逻辑尺寸换算后发来）
+    ///   - x/y: Windows 回传的坐标，基准是「物理像素」（= 视频帧尺寸）。
+    ///          2x HiDPI 下要除以 backing scale 才能落到 CGDisplayBounds 的逻辑点空间。
     ///   - buttons: bit0 左键，bit1 右键，bit2 中键
     ///   - wheel: 滚动量，正数向下
     func handle(x: Float, y: Float, buttons: UInt8, wheel: Int16, bounds: CGRect) {
-        let p = CGPoint(x: bounds.minX + CGFloat(x), y: bounds.minY + CGFloat(y))
+        let s = CGFloat(vdBackingScale)
+        let p = CGPoint(x: bounds.minX + CGFloat(x) / s, y: bounds.minY + CGFloat(y) / s)
 
         // 先移动指针，再处理按键，保证点击落在正确位置
         if let mv = CGEvent(mouseEventSource: nil, mouseType: .mouseMoved,
@@ -1840,12 +1870,19 @@ final class CursorTracker {
         let ry = Float(p.y - b.minY)
         let inside = rx >= 0 && ry >= 0 && rx < Float(b.width) && ry < Float(b.height)
 
-        let moved = !(abs(rx - lastX) < 0.5 && abs(ry - lastY) < 0.5)
+        // 线上协议与 Windows g_coordW/H 用的是「物理像素」基准（= 视频帧尺寸）。
+        // 2x HiDPI 下 CGDisplayBounds 变成逻辑点（如 1440x900），这里把点坐标
+        // 乘回 backing scale，保证发出去的仍是 2880x1800 基准，Windows 端不用改。
+        let s = Float(vdBackingScale)
+        let ox = rx * s
+        let oy = ry * s
+
+        let moved = !(abs(ox - lastX) < 0.5 && abs(oy - lastY) < 0.5)
         guard moved || inside != lastVisible else { return }
 
-        lastX = rx; lastY = ry; lastVisible = inside
+        lastX = ox; lastY = oy; lastVisible = inside
         sentCount += 1
-        sender.sendCursor(x: rx, y: ry, visible: inside)
+        sender.sendCursor(x: ox, y: oy, visible: inside)
     }
 }
 
