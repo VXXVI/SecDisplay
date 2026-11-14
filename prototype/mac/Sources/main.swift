@@ -1441,8 +1441,9 @@ final class ScreenshotCapture {
                         let f4 = String(format: "%c%c%c%c",
                                         (actualFmt >> 24) & 0xFF, (actualFmt >> 16) & 0xFF,
                                         (actualFmt >> 8) & 0xFF, actualFmt & 0xFF)
-                        Log.info("采集首帧实测: \(fw)x\(fh) fmt=\(f4) (期望 \(cfg.width)x\(cfg.height) 420v)")
-                        if actualFmt != kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange
+                        let wantName = wantYUV ? "420v" : "BGRA"
+                        Log.info("采集首帧实测: \(fw)x\(fh) fmt=\(f4) (期望 \(cfg.width)x\(cfg.height) \(wantName))")
+                        if wantYUV && actualFmt != kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange
                             && actualFmt != kCVPixelFormatType_420YpCbCr8BiPlanarFullRange {
                             Log.info("警告: 采集实际格式是 \(f4) 而非 420v，VT 会额外做一次全屏转换，内存收益失效")
                         }
