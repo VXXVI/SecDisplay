@@ -1320,6 +1320,22 @@ final class ScreenshotCapture {
     private var lastSupervisorAt: CFAbsoluteTime = 0
     private var loggedFirstFrame = false
     private var lastSizeWarnAt: CFAbsoluteTime = 0
+    /// worker 代次。spawnWorkers 每次自增，旧代次的循环看到代次变了就退出。
+    /// 原来这里是直接再起 4 个 Task 而不停旧的，看护每触发一次线程数与
+    /// 采集缓冲就翻一倍（每个 worker 同时持有 CGImage + CVPixelBuffer 约 40MB）。
+    /// 写方是 supervisor 队列，读方是 worker 任务，用锁保护。
+    private let genLock = NSLock()
+    private var _workerGen = 0
+    private var workerGen: Int {
+        genLock.lock(); defer { genLock.unlock() }
+        return _workerGen
+    }
+    /// 自增代次并返回新值
+    private func bumpWorkerGen() -> Int {
+        genLock.lock(); defer { genLock.unlock() }
+        _workerGen &+= 1
+        return _workerGen
+    }
     /// 上一帧内容的采样指纹。用来识别「帧还在来、但画面不再更新」——
     /// SCScreenshotManager 跑约 30 秒后偶尔会开始返回陈旧内容，
     /// 此时 captured 仍在增长，现有看护只看计数，抓不到这种情况。
@@ -1368,19 +1384,24 @@ final class ScreenshotCapture {
 
     private func spawnWorkers() {
         let workers = 4
+        let gen = bumpWorkerGen()
         lastSupervisorAt = CFAbsoluteTimeGetCurrent()
-        Log.info("采集通道: SCScreenshotManager 轮询，\(workers) 路并发")
+        lastSupervisorCount = captured
+        Log.info("采集通道: SCScreenshotManager 轮询，\(workers) 路并发（代次 \(gen)）")
         for i in 0..<workers {
             Task.detached(priority: .userInitiated) { [weak self] in
-                await self?.loop(index: i)
+                await self?.loop(index: i, gen: gen)
             }
         }
     }
 
-    func stop() { running = false }
+    func stop() {
+        running = false
+        _ = bumpWorkerGen()     // 让在跑的 worker 立刻退出
+    }
 
-    private func loop(index: Int) async {
-        while running {
+    private func loop(index: Int, gen: Int) async {
+        while running && workerGen == gen {
             let t0 = CFAbsoluteTimeGetCurrent()
             do {
                 let content = try await currentContent()
