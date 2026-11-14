@@ -347,7 +347,6 @@ static ShakeSample g_shakeBuf[64];
 static int g_shakeCount = 0;
 static int g_shakeHead = 0;
 static bool g_shakeActive = false;
-static int64_t g_shakeStartMs = 0;
 static int64_t g_shakeLastMoveMs = 0;
 
 // 输入回传：把窗口内的鼠标位置和按键状态发给 Mac，由它重放事件。
@@ -2594,7 +2593,7 @@ static bool DetectShake(int64_t now, int x, int y) {
     // 收集窗口内的采样（按时间顺序）
     int n = 0;
     ShakeSample win[64];
-    for (int i = 0; i < g_shakeCount; ++i) {
+    for (int i = 0; i < g_shakeCount && n < 64; ++i) {
         int idx = (g_shakeHead - g_shakeCount + i + 64) % 64;
         if (now - g_shakeBuf[idx].t <= kShakeWinMs) win[n++] = g_shakeBuf[idx];
     }
@@ -2634,7 +2633,6 @@ static bool DetectShake(int64_t now, int x, int y) {
         g_shakeLastMoveMs = now;
         if (!g_shakeActive) {
             g_shakeActive = true;
-            g_shakeStartMs = now;
             Log("检测到快速晃动（反转 x%d y%d，摆幅 x%dp y%dp），放大光标 %.1fx",
                 reversalsX, reversalsY, spanX, spanY, kShakeCursorZoom);
             // 起一个定时器负责「停下后收回放大」：光标停住就没有新位置包了
