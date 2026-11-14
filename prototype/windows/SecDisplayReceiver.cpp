@@ -1645,12 +1645,17 @@ bool Presenter::Resize(int width, int height) {
     if (!CreateProcessor()) {
         // 同上：处理器重建失败时把交换链尺寸也回滚，
         // 否则下次 Resize 会因「尺寸相同」早退，永久不再重建。
-        width_ = prevW;
-        height_ = prevH;
         if (FAILED(swap_->ResizeBuffers(0, (UINT)prevW, (UINT)prevH,
                                         DXGI_FORMAT_UNKNOWN, flags))) {
-            Log("交换链回滚到 %dx%d 失败", prevW, prevH);
+            // 回滚交换链失败：真实尺寸仍是 width×height。
+            // 此时不能把 width_/height_ 改回旧值，否则记账与后缓冲不一致，
+            // 自愈分支会按错误尺寸重建处理器，VideoProcessorBlt 持续失败。
+            // 保留新尺寸，让 PresentSample 按真实尺寸重建。
+            Log("交换链回滚到 %dx%d 失败，保留新尺寸 %dx%d", prevW, prevH, width, height);
+            return false;
         }
+        width_ = prevW;
+        height_ = prevH;
         return false;
     }
     Log("呈现器已切换到 %dx%d", width_, height_);
