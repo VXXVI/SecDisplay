@@ -15,11 +15,28 @@
 set -euo pipefail
 cd "$(dirname "$0")"
 
-APP="SecDisplay.app"
-BIN="$APP/Contents/MacOS/SecDisplay"
 SIGN_ID="com.secdisplay.screensender"
 
-rm -rf "$APP"
+# 在系统临时目录里构建 bundle，不要放在仓库目录内。
+# 原因：只要 .app 在仓库路径下短暂存在过，LaunchServices 就会把它登记成一条
+# 独立记录（Spotlight / 启动台 / 系统设置的权限页都会多出一个空白图标条目）。
+# 即便构建完立刻 rm -rf，登记记录也不会跟着消失，只能靠 lsregister -kill -r 重建。
+# 放到 $TMPDIR 后，仓库里从头到尾不出现 .app，从根上断掉这条来源。
+WORK="$(mktemp -d "${TMPDIR:-/tmp}/secdisplay-build.XXXXXX")"
+APP="$WORK/SecDisplay.app"
+BIN="$APP/Contents/MacOS/SecDisplay"
+
+# --no-install 时要把产物留在原地给用户 open，所以不能删临时目录；
+# 默认安装模式下装完就删。
+INSTALL=1
+case "${1:-}" in
+    --no-install) INSTALL=0 ;;
+    --install)    INSTALL=1 ;;
+esac
+if [ "$INSTALL" = "1" ]; then
+    trap 'rm -rf "$WORK"' EXIT
+fi
+
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
 
 echo "编译中..."
@@ -84,16 +101,34 @@ cat > "$APP/Contents/Info.plist" <<'PLIST'
 PLIST
 
 # 优先用本机 Apple Development 证书；没有就退回 ad-hoc。
-# 证书签名的 designated requirement 稳定，重编译后屏幕录制授权不会失效。
+#
+# 这一段的正确性直接决定屏幕录制授权能不能跨编译保留：
+#   - 证书签名：designated requirement 绑定到证书身份，重编译后 TCC 授权仍在
+#   - ad-hoc 签名：每次都按 cdhash 生成新的 DR，TCC 认不出是同一个 app，
+#     表现为「权限页里勾了、重开又失效」，反复授权都无效
+#
+# 注意不能用 `| head -1`：head 读够一行就关管道，security 收到 SIGPIPE，
+# 在 pipefail 下整条管道判为失败，`|| CERT=""` 会把已经拿到的证书名清空，
+# 于是一定走 ad-hoc 分支。改成整段读进变量再取第一行，避免 SIGPIPE。
 CERT="${SECDISPLAY_SIGN_CERT:-}"
 if [ -z "$CERT" ]; then
-    CERT=$(security find-identity -v -p codesigning 2>/dev/null \
-        | sed -n 's/.*"\(Apple Development: [^"]*\)"/\1/p' | head -1)
+    IDENTITIES="$(security find-identity -v -p codesigning 2>/dev/null || true)"
+    if [ -n "$IDENTITIES" ]; then
+        CERT="$(printf '%s\n' "$IDENTITIES" \
+            | sed -n 's/.*"\(Apple Development: [^"]*\)".*/\1/p' | sed -n '1p')"
+    fi
 fi
 if [ -n "$CERT" ]; then
-    codesign --force --sign "$CERT" --identifier "$SIGN_ID" --timestamp=none "$APP" >/dev/null
-    echo "已用证书签名: $CERT"
-else
+    # set -e 下不能直接裸调：证书过期/钥匙串锁定时会中断整个打包，
+    # 应该回退 ad-hoc 而不是什么都不产出。
+    if codesign --force --sign "$CERT" --identifier "$SIGN_ID" --timestamp=none "$APP" >/dev/null 2>&1; then
+        echo "已用证书签名: $CERT"
+    else
+        echo "证书签名失败，回退 ad-hoc: $CERT"
+        CERT=""
+    fi
+fi
+if [ -z "$CERT" ]; then
     codesign --force --sign - --identifier "$SIGN_ID" \
         -r="designated => identifier \"$SIGN_ID\"" --timestamp=none "$APP" >/dev/null
     echo "已用 ad-hoc 签名（identifier 型 DR，重编译不丢授权）"
@@ -101,27 +136,23 @@ fi
 
 echo "已生成 $APP"
 
-# 默认直接装到 /Applications。--no-install 才跳过。
-# --install 保留为兼容旧调用，效果与默认一致。
-INSTALL=1
-case "${1:-}" in
-    --no-install) INSTALL=0 ;;
-    --install)    INSTALL=1 ;;
-esac
 if [ "$INSTALL" = "1" ]; then
     rm -rf "/Applications/SecDisplay.app"
     cp -R "$APP" /Applications/
-    # 清理本地构建暂存 bundle，确保全盘只保留 /Applications/SecDisplay.app，
-    # 避免启动台/Spotlight/系统权限页同时出现多个 SecDisplay.app 造成混淆。
-    rm -rf "$APP"
-    echo "已安装到 /Applications/SecDisplay.app（已清理构建目录冗余副本）"
+    echo "已安装到 /Applications/SecDisplay.app"
     if pgrep -f "/Applications/SecDisplay.app/Contents/MacOS/SecDisplay" >/dev/null 2>&1; then
         echo "提示: 检测到旧实例正在运行，先退出旧实例后再重新 open /Applications/SecDisplay.app"
     fi
 fi
 
 echo
-echo "启动: open /Applications/SecDisplay.app"
+if [ "$INSTALL" = "1" ]; then
+    echo "启动: open /Applications/SecDisplay.app"
+else
+    echo "启动: open \"$WORK/SecDisplay.app\""
+    echo "  （未安装模式，产物在临时目录 $WORK，系统重启或手动清理后消失；"
+    echo "    想长期使用请不带 --no-install 运行一次，装到 /Applications）"
+fi
 echo "日志: ~/Library/Logs/SecDisplay/sender.log"
 echo "切档: echo sharp > $(pwd)/.preset && ./build_app.sh"
 echo "首次启动若黑屏, 到 系统设置 > 隐私与安全 > 屏幕录制 勾选 SecDisplay 后重开"
