@@ -2023,9 +2023,10 @@ final class KeyboardInjector {
     private var pressed: Set<CGKeyCode> = []
     /// 按下中的修饰键 keyCode → 对应 mask。flags 由它取并集算出。
     private var heldModifiers: [CGKeyCode: CGEventFlags] = [:]
-    /// 按下时的 Windows VK → 当时算出的 keyCode。
-    /// keyUp 报文里的 scan/扩展位可能与 keyDown 不一致，靠它把抬起配回同一个键。
-    private var pressedVK: [UInt16: CGKeyCode] = [:]
+    /// 按下时的 Windows VK → 该 VK 下按住的 keyCode 栈。
+    /// 左右 Ctrl/Shift 与两个 Enter 在 VK 上相同，只靠 keyCode 区分；
+    /// 用单值映射会在「同时按住左右键、先松先按的那个」时配错并留下卡死的修饰键。
+    private var pressedVK: [UInt16: [CGKeyCode]] = [:]
     private let lock = NSLock()
     private(set) var eventCount = 0
 
@@ -2074,7 +2075,7 @@ final class KeyboardInjector {
             let isRepeat = pressed.contains(keyCode)
             if !isRepeat {
                 pressed.insert(keyCode)
-                pressedVK[vk] = keyCode
+                pressedVK[vk, default: []].append(keyCode)
                 if let mask {
                     heldModifiers[keyCode] = mask
                     rebuildFlags()
@@ -2085,10 +2086,22 @@ final class KeyboardInjector {
             // 抬起优先按 VK 查回按下时的 keyCode。
             // down/up 两次报文的 scan 或扩展位未必一致（KVM、注入式输入把 scan 报成 0、
             // 某些远程栈丢扩展位），只按 keyCode 配对会配不上，keyUp 被吞掉键就粘住了。
-            let kc = pressedVK.removeValue(forKey: vk) ?? keyCode
+            // 同一 VK 可能对应多个物理键，按报文 keyCode 精确挑，挑不到再退回栈顶。
+            var stack = pressedVK[vk] ?? []
+            let kc: CGKeyCode
+            if let idx = stack.firstIndex(of: keyCode) {
+                kc = stack.remove(at: idx)
+            } else if !stack.isEmpty {
+                kc = stack.removeLast()
+            } else {
+                kc = keyCode
+            }
+            if stack.isEmpty { pressedVK.removeValue(forKey: vk) } else { pressedVK[vk] = stack }
+
             guard pressed.remove(kc) != nil else { return }
-            if mask != nil {
-                heldModifiers.removeValue(forKey: kc)
+            // 按真正抬起的 keyCode 清理修饰键，不用 up 报文里的 mask：
+            // 左右修饰键 VK 相同，靠报文分不出清哪一侧。
+            if heldModifiers.removeValue(forKey: kc) != nil {
                 rebuildFlags()
             }
             post(keyCode: kc, down: false, isRepeat: false)
@@ -3004,7 +3017,22 @@ func vdStillOnline() -> Bool {
 ///
 /// 现在改为：Task 只负责停采集/断连；主线程等采集停稳 + 额外缓冲后再 destroy 一次，
 /// 给 WindowServer 足够时间异步移除，最后只做「检查并报告」，不做危险的重复销毁。
-func shutdown(signal sig: Int32) -> Never {
+///
+/// 清理全程约 11 秒，期间用户可能再按一次退出、或看门狗同时触发。这里用闸门保证
+/// 只跑一份清理：重复请求直接返回，避免第二次 destroy 抢在采集停稳之前。
+nonisolated(unsafe) private var shutdownStarted = false
+private let shutdownLock = NSLock()
+
+func shutdown(signal sig: Int32) {
+    shutdownLock.lock()
+    if shutdownStarted {
+        shutdownLock.unlock()
+        Log.info("已在清理中，忽略重复退出请求（信号 \(sig)）")
+        return
+    }
+    shutdownStarted = true
+    shutdownLock.unlock()
+
     Log.info("收到信号 \(sig)，开始清理")
     var stopped = false
     Task {
@@ -3250,9 +3278,9 @@ final class AppLifecycleDelegate: NSObject, NSApplicationDelegate {
         false
     }
 
-    /// Dock 图标「退出」与 Cmd+Q 走 -[NSApplication terminate:]，默认直接 exit()，
-    /// 会绕过 shutdown()，把虚拟屏留在 WindowServer 里成为孤儿屏，下次启动建屏失败。
-    /// 这里先取消这次退出，回主队列走完整清理流程。
+    /// Dock 图标「退出」与系统/Apple Event 发起的退出都会走 -[NSApplication terminate:]，
+    /// 默认直接 exit()，会绕过 shutdown()，把虚拟屏留在 WindowServer 里成为孤儿屏，
+    /// 下次启动建屏失败。这里先取消这次退出，回主队列走完整清理流程。
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
         Log.info("收到应用退出请求，开始清理")
         DispatchQueue.main.async {

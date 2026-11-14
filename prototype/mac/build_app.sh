@@ -87,8 +87,10 @@ PLIST
 # 证书签名的 designated requirement 稳定，重编译后屏幕录制授权不会失效。
 CERT="${SECDISPLAY_SIGN_CERT:-}"
 if [ -z "$CERT" ]; then
+    # security 失败或 head 提前关管道（SIGPIPE）在 pipefail 下都会非零，
+    # 这里吞掉错误当作「没有证书」，交给后面的 ad-hoc 分支。
     CERT=$(security find-identity -v -p codesigning 2>/dev/null \
-        | sed -n 's/.*"\(Apple Development: [^"]*\)"/\1/p' | head -1)
+        | sed -n 's/.*"\(Apple Development: [^"]*\)"/\1/p' | head -1) || CERT=""
 fi
 if [ -n "$CERT" ]; then
     # set -e 下不能直接裸调：证书过期/钥匙串锁定时会中断整个打包，
@@ -131,7 +133,7 @@ echo
 if [ "$INSTALL" = "1" ]; then
     echo "启动: open /Applications/SecDisplay.app"
 else
-    echo "启动: open $(pwd)/SecDisplay.app"
+    echo "启动: open \"$(pwd)/SecDisplay.app\""
 fi
 echo "日志: ~/Library/Logs/SecDisplay/sender.log"
 echo "切档: echo sharp > $(pwd)/.preset && ./build_app.sh"
