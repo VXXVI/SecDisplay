@@ -668,9 +668,9 @@ final class Encoder {
         }
         let attrs: [String: Any] = [
             // 与采集格式保持一致，避免 VT 再做一次全屏色彩转换。
-            // 采集侧由 SECDISPLAY_PIXFMT 决定，这里读同一个开关。
+            // 由 pixelFormatChoice 决定（环境变量或 bundle 内 pixfmt 文件）。
             kCVPixelBufferPixelFormatTypeKey as String:
-                (ProcessInfo.processInfo.environment["SECDISPLAY_PIXFMT"] == "420v"
+                (pixelFormatChoice == "420v"
                     ? kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange
                     : kCVPixelFormatType_32BGRA),
             kCVPixelBufferWidthKey as String: width,
@@ -1393,7 +1393,7 @@ final class ScreenshotCapture {
                 // 省内存的 420v 路径要以帧率为代价，而帧率是投屏的第一体验，
                 // 所以默认仍走 captureImage（原路径），
                 // 需要压内存（4K 屏/低内存机器）时用 SECDISPLAY_PIXFMT=420v 显式切换。
-                let wantYUV = ProcessInfo.processInfo.environment["SECDISPLAY_PIXFMT"] == "420v"
+                let wantYUV = pixelFormatChoice == "420v"
                 let pb: CVPixelBuffer
                 if wantYUV {
                     let c = SCStreamConfiguration()
@@ -2713,6 +2713,18 @@ if presetName == nil, let rp = Bundle.main.resourcePath {
     let p = rp + "/preset"
     if let s = try? String(contentsOfFile: p, encoding: .utf8) {
         presetName = s.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+}
+
+/// 采集像素格式：420v 省内存（44MB）但帧率掉一半，bgra 保帧率（136MB）。
+/// 同样支持环境变量与 bundle 内资源文件两种来源 —— 从 Finder 启动的 .app
+/// 拿不到环境变量，没有这个文件的话省内存选项等于用户根本用不上。
+/// 写 Contents/Resources/pixfmt 内容为 420v 即可切换。
+var pixelFormatChoice = ProcessInfo.processInfo.environment["SECDISPLAY_PIXFMT"]
+if pixelFormatChoice == nil, let rp = Bundle.main.resourcePath {
+    let p = rp + "/pixfmt"
+    if let s = try? String(contentsOfFile: p, encoding: .utf8) {
+        pixelFormatChoice = s.trimmingCharacters(in: .whitespacesAndNewlines)
     }
 }
 if let preset = presetName, !preset.isEmpty {

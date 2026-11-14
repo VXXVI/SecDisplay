@@ -345,7 +345,7 @@ static const int kShakeWinMs = 700;      // 观察窗口
 static const int kShakeMinReversals = 3; // 至少 3 次方向反转才算晃动
 static const int kShakeMinSpanPx = 180;  // 横向/纵向累计摆幅下限，防止细微抖动误触
 static const double kShakeCursorZoom = 2.5;  // 晃动时的放大倍数
-static const int64_t kShakeHoldMs = 700;     // 停下后保持放大的时间
+static const int64_t kShakeHoldMs = 700;     // 停手到开始收缩的静默时长
 static const int kShakeShrinkMs = 260;       // 收缩动画时长
 static const int kShakeTickMs = 16;          // 动画帧间隔（约 60fps）
 static const UINT_PTR kShakeTimer = 4004;
@@ -358,12 +358,11 @@ static int g_shakeCount = 0;
 static int g_shakeHead = 0;
 // 放大状态与收缩进度。zoom 是当前实际倍数，收缩动画期间在 1.0~kShakeCursorZoom 之间插值。
 static bool g_shakeActive = false;
-static int64_t g_shakeLastMoveMs = 0;
 // 每一个远程光标包的时间（不管是否在晃动）。TickShakeShrink 用它判断
 // 「已经多久没有新位置了」，不依赖 DetectShake 再次被调用。
 static int64_t g_shakeLastPacketMs = 0;
 static double g_shakeZoom = 1.0;
-static bool g_shakeHolding = false;      // 已停止晃动、正在等待 hold 到期
+static bool g_shakeHolding = false;      // 已停止晃动、正在等待静默期结束
 static int64_t g_shakeHoldUntil = 0;
 
 // 输入回传：把窗口内的鼠标位置和按键状态发给 Mac，由它重放事件。
@@ -2659,7 +2658,6 @@ static bool DetectShake(int64_t now, int x, int y) {
     const bool shaking = shakeX || shakeY;
 
     if (shaking) {
-        g_shakeLastMoveMs = now;
         g_shakeHolding = false;
         if (!g_shakeActive) {
             g_shakeActive = true;
@@ -2679,13 +2677,9 @@ static bool DetectShake(int64_t now, int x, int y) {
         }
         return true;
     }
-    // 不再晃动。hold 的判定统一交给 TickShakeShrink（它按「最后一个光标包」计时），
-    // 这里只负责把「本次不再晃动」这个事实记下来，不再自己算 hold 期限 ——
-    // 之前两边各算一次，导致停手后 holding 永远等不到。
-    if (g_shakeActive) {
-        g_shakeHolding = false;
-        return true;
-    }
+    // 不再晃动。返回值语义是「本次是否判定为晃动」，不是「是否仍处于放大态」——
+    // 调用方靠它区分「真晃动」和「收缩期间的孤立噪声包」。
+    // hold 的判定统一交给 TickShakeShrink（按「最后一个光标包」计时）。
     return false;
 }
 
@@ -2907,11 +2901,11 @@ static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
             const int64_t nowMs = GetTickCount64();
             g_shakeLastPacketMs = nowMs;   // 每个包都记，供 TickShakeShrink 判「停手」
             const bool wasActive = g_shakeActive;
-            DetectShake(nowMs, sx, sy);
-            // 从收缩中途再次晃动时 DetectShake 只把 holding 置 false，
-            // 不会重新把 zoom 拉回满值，这里统一补齐，并立即重建光标，
-            // 保证「放大是立刻的」而不是等下一个 16ms 定时器。
-            if (g_shakeActive && !g_shakeHolding && g_shakeZoom < kShakeCursorZoom) {
+            const bool shaking = DetectShake(nowMs, sx, sy);
+            // 只有「本次真的判定为晃动」才把缩放拉回满值并立即重建，
+            // 保证「放大是立刻的」。用 shaking 而不是 !holding 判断：
+            // 否则收缩期间来一个孤立噪声包也会把 2.1x 弹回 2.5x，看起来闪一下。
+            if (shaking && g_shakeZoom < kShakeCursorZoom) {
                 g_shakeZoom = kShakeCursorZoom;
                 RefreshCursorScale();
             } else if (g_shakeActive != wasActive) {
