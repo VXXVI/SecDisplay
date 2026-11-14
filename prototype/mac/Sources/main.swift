@@ -109,6 +109,16 @@ nonisolated(unsafe) var vdBackingScale: Double = 1.0
 
 /// 键盘注入器。连接重建时从这里 reset，避免 Ctrl/Cmd 卡在按下态。
 nonisolated(unsafe) var gKeyboard: KeyboardInjector?
+/// 鼠标注入器。断连时同样要清，否则按住左键时对端消失会让 Mac 一直保持按下态。
+nonisolated(unsafe) var gMouse: InputInjector?
+
+/// 清空输入注入状态并补发残留的 keyUp / mouseUp。
+/// 连接建立与断开都要调：事件是投到 .cghidEventTap 的，系统 HID 层的
+/// 按下状态由投出去的事件驱动，只清内部记账等于一直按着。
+func resetInjectionState() {
+    gKeyboard?.reset()
+    gMouse?.resetButtons()
+}
 
 struct Config {
     // 对应 Lenovo Yoga Slim 7 Pro 14IHU5（82NC）2880x1800 高刷版，
@@ -1529,8 +1539,8 @@ final class Sender {
             self.resetInFlight()          // 上一轮可能残留未完成的发送，必须清零
             // 旧连接可能留下半个控制包，新连接数据接在残包后会把 0x07 误解析成 0x04。
             self.ctrlBuf.removeAll()
-            // 新连接可能换了接收端，旧的修饰键状态必须清掉，否则 Cmd/Ctrl 会卡住
-            gKeyboard?.reset()
+            // 新连接可能换了接收端，旧的修饰键/按键状态必须清掉，否则 Cmd/Ctrl 会卡住
+            resetInjectionState()
             // 丢掉上个连接的残留帧：那可能是依赖旧参考帧的 P 帧，
             // 新接收端没有参考帧，解出来是花的。等新的 IDR。
             self.counterLock.lock()
@@ -1545,9 +1555,13 @@ final class Sender {
                 case .failed(let e):
                     Log.info("连接失败: \(e)")
                     self.connected = false
+                    // 对端可能是直接退出/拔线，此时用户手上可能正按着 Ctrl 或左键。
+                    // 不在这里补发抬起事件，Mac 会一直保持按下态直到下次连上。
+                    resetInjectionState()
                 case .cancelled:
                     Log.info("连接已取消（cancelled）")
                     self.connected = false
+                    resetInjectionState()
                 case .ready:
                     Log.info("连接就绪")
                 default:
@@ -1910,9 +1924,23 @@ final class InputInjector {
     private var lastButtons: UInt8 = 0
     private(set) var eventCount = 0
 
-    /// 面板开启期间暂停回放时清零本地记录的按键态，防止跨开关按住状态卡死。
+    /// 断连时补发残留的 mouseUp。
+    /// 只清 lastButtons 是不够的：事件投到 .cghidEventTap 后 HID 层的按下状态
+    /// 由投出去的事件驱动，按住左键时对端消失会让 Mac 一直保持按下态。
     func resetButtons() {
+        let held = lastButtons
         lastButtons = 0
+        guard held != 0 else { return }
+        let p = CGEvent(source: nil)?.location ?? .zero
+        let ups: [(UInt8, CGEventType, CGMouseButton)] = [
+            (0x1, .leftMouseUp, .left),
+            (0x2, .rightMouseUp, .right),
+            (0x4, .otherMouseUp, .center),
+        ]
+        for (bit, upType, btn) in ups where (held & bit) != 0 {
+            CGEvent(mouseEventSource: nil, mouseType: upType,
+                    mouseCursorPosition: p, mouseButton: btn)?.post(tap: .cghidEventTap)
+        }
     }
 
     /// - Parameters:
@@ -1928,9 +1956,15 @@ final class InputInjector {
         // 不设置 flags 时这些组合键在 Mac 上只会被当成普通单击。
         let mods = gKeyboard?.currentFlags() ?? []
 
-        // 先移动指针，再处理按键，保证点击落在正确位置
-        if let mv = CGEvent(mouseEventSource: nil, mouseType: .mouseMoved,
-                            mouseCursorPosition: p, mouseButton: .left) {
+        // 先移动指针，再处理按键，保证点击落在正确位置。
+        // 按住键时必须投 *MouseDragged 而不是 mouseMoved：选文字、拖滑块、
+        // 拖窗口内容这些操作在 Mac 上只认 drag 类型，moved 会被当成纯移动。
+        let drag: (CGEventType, CGMouseButton)? =
+            (buttons & 0x1) != 0 ? (.leftMouseDragged, .left) :
+            (buttons & 0x2) != 0 ? (.rightMouseDragged, .right) :
+            (buttons & 0x4) != 0 ? (.otherMouseDragged, .center) : nil
+        if let mv = CGEvent(mouseEventSource: nil, mouseType: drag?.0 ?? .mouseMoved,
+                            mouseCursorPosition: p, mouseButton: drag?.1 ?? .left) {
             mv.flags = mods
             mv.post(tap: .cghidEventTap)
         }
@@ -1980,29 +2014,31 @@ final class InputInjector {
 // 同样需要「辅助功能」权限，未授权时事件被系统静默丢弃。
 final class KeyboardInjector {
     private var flags: CGEventFlags = []
-    /// 每个 mask 的按下计数。左右 Shift 同时按下时，松开一个不能把 mask 整体清掉。
-    private var maskCounts: [UInt64: Int] = [:]
-    private var pressed: Set<UInt16> = []
+    /// 按下中的键，按 macOS 虚拟键码记录。
+    /// 用 keyCode 而不是 Windows VK：左右 Shift 在 VK 上都是 0x10，
+    /// 按 VK 去重会把两个物理键当成同一个，松开一个就整体抬起。
+    private var pressed: Set<CGKeyCode> = []
+    /// 按下中的修饰键 keyCode → 对应 mask。flags 由它取并集算出。
+    private var heldModifiers: [CGKeyCode: CGEventFlags] = [:]
     private let lock = NSLock()
     private(set) var eventCount = 0
 
-    /// 重置所有修饰键状态，并补发 keyUp。
+    /// 重置所有按键状态，并补发 keyUp。
     /// 只清内部记账是不够的：事件投到 .cghidEventTap 后系统 HID 层的按键状态
     /// 由投出去的事件驱动，不补 keyUp 的话断连后 Ctrl/Cmd 会一直卡在按下态。
     func reset() {
         lock.lock()
         let stuck = pressed
         pressed.removeAll()
+        heldModifiers.removeAll()
         flags = []
-        maskCounts.removeAll()
         lock.unlock()
 
         // 在锁外补发，避免与 handle 的锁重入
         guard !stuck.isEmpty else { return }
         let src = CGEventSource(stateID: .hidSystemState)
-        for vk in stuck {
-            if let kc = Self.keyCode(forVK: vk, extended: false),
-               let ev = CGEvent(keyboardEventSource: src, virtualKey: kc, keyDown: false) {
+        for keyCode in stuck {
+            if let ev = CGEvent(keyboardEventSource: src, virtualKey: keyCode, keyDown: false) {
                 ev.flags = []
                 ev.post(tap: .cghidEventTap)
             }
@@ -2020,15 +2056,26 @@ final class KeyboardInjector {
         lock.lock()
         defer { lock.unlock() }
 
-        updateModifierState(vk: vk, down: down)
+        let extended = (keyFlags & 0x01) != 0
+        guard let keyCode = Self.keyCode(forVK: vk, extended: extended, scan: scan) else { return }
+        let mask = Self.modifierMask(forVK: vk)
 
-        guard let keyCode = Self.keyCode(forVK: vk, extended: (keyFlags & 0x01) != 0) else { return }
-        // 重复按下只放行第一次，避免长按产生大量冗余事件
         if down {
-            if pressed.contains(vk) { return }
-            pressed.insert(vk)
+            // 重复按下只放行第一次，避免长按产生大量冗余事件。
+            // 去重必须放在改状态之前：先计数再去重的话，重复 keydown 会把
+            // 修饰键计数抬高，而 keyup 只减一次，mask 永远清不掉。
+            if pressed.contains(keyCode) { return }
+            pressed.insert(keyCode)
+            if let mask {
+                heldModifiers[keyCode] = mask
+                rebuildFlags()
+            }
         } else {
-            pressed.remove(vk)
+            guard pressed.remove(keyCode) != nil else { return }
+            if mask != nil {
+                heldModifiers.removeValue(forKey: keyCode)
+                rebuildFlags()
+            }
         }
 
         let src = CGEventSource(stateID: .hidSystemState)
@@ -2038,23 +2085,13 @@ final class KeyboardInjector {
         eventCount += 1
     }
 
-    private func updateModifierState(vk: UInt16, down: Bool) {
-        guard let mask = Self.modifierMask(forVK: vk) else { return }
-        let key = mask.rawValue
-        if down {
-            let c = (maskCounts[key] ?? 0) + 1
-            maskCounts[key] = c
-            flags.insert(mask)
-        } else {
-            // 计数归零才真正清除。左右 Shift 同按时松开一个不会误清。
-            let c = max(0, (maskCounts[key] ?? 0) - 1)
-            if c == 0 {
-                maskCounts.removeValue(forKey: key)
-                flags.remove(mask)
-            } else {
-                maskCounts[key] = c
-            }
-        }
+    /// flags 取所有按下中修饰键的并集。
+    /// 按 mask 计数在「同一 mask 有左右两个物理键」和「重复 keydown」两种情况下
+    /// 都会算错，改成按 keyCode 记账后两个问题都不存在。
+    private func rebuildFlags() {
+        var f: CGEventFlags = []
+        for (_, m) in heldModifiers { f.insert(m) }
+        flags = f
     }
 
     /// 修饰键 → CGEventFlags。返回 nil 表示不是修饰键。
@@ -2065,6 +2102,17 @@ final class KeyboardInjector {
         case 0x12, 0xA4, 0xA5: return .maskAlternate
         case 0x5B, 0x5C:       return .maskCommand
         default:               return nil
+        }
+    }
+
+    /// 左右修饰键在 Windows 的 wParam 里是同一个 generic VK（0x10/0x11/0x12），
+    /// 只能靠扫描码与扩展位区分。
+    static func keyCode(forVK vk: UInt16, extended: Bool, scan: UInt16) -> CGKeyCode? {
+        switch vk {
+        case 0x10: return scan == 0x36 ? 0x3C : 0x38   // 右 Shift 扫描码 0x36
+        case 0x11: return extended ? 0x3E : 0x3B       // 右 Ctrl 带扩展位
+        case 0x12: return extended ? 0x3D : 0x3A       // 右 Alt 带扩展位
+        default:   return keyCode(forVK: vk, extended: extended)
         }
     }
 
@@ -2635,6 +2683,7 @@ if !axTrusted {
     Log.info("辅助功能权限: 已授权，副屏点击与滚轮可正常回放")
 }
 let injector = InputInjector()
+gMouse = injector
 sender.onInput = { x, y, buttons, wheel in
     // 这里不能再按「面板是否可见」整条丢弃输入。
     // 早期为了防面板被光标劫持加过这个门控，但面板点不动的真正根因是
