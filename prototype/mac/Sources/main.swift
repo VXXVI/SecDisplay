@@ -667,11 +667,12 @@ final class Encoder {
             spec[kVTVideoEncoderSpecification_EnableLowLatencyRateControl as String] = true
         }
         let attrs: [String: Any] = [
-            // 用原生 YUV 而不是 BGRA：SCK 直接给 YUV，编码器也直接吃 YUV，
-            // 省掉两次全画面色彩转换。2880x1800 下 BGRA 每帧 20MB，
-            // YUV420 只有 7.8MB，内存带宽少 60%。
+            // 与采集格式保持一致，避免 VT 再做一次全屏色彩转换。
+            // 采集侧由 SECDISPLAY_PIXFMT 决定，这里读同一个开关。
             kCVPixelBufferPixelFormatTypeKey as String:
-                kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange,
+                (ProcessInfo.processInfo.environment["SECDISPLAY_PIXFMT"] == "420v"
+                    ? kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange
+                    : kCVPixelFormatType_32BGRA),
             kCVPixelBufferWidthKey as String: width,
             kCVPixelBufferHeightKey as String: height,
             kCVPixelBufferIOSurfacePropertiesKey as String: [:],
@@ -1385,32 +1386,47 @@ final class ScreenshotCapture {
                     continue
                 }
                 let filter = SCContentFilter(display: d, excludingWindows: [])
-                let c = SCStreamConfiguration()
-                c.width = cfg.width
-                c.height = cfg.height
-                c.showsCursor = false
-                // 直接要 YUV420 双平面（video range），不再让 SCK 交 BGRA 再由
-                // 本端重绘成 BGRA 再交给编码器。H.264 本来就是 4:2:0，色度最终
-                // 必然下采样，所以这一步不损失画质，但每帧缓冲从 19.8MB 降到 7.4MB，
-                // 而且省掉一次全屏 5.2M 像素的 CGContext 重绘。
-                c.pixelFormat = kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange
-                // 420v/420f 才生效的色度矩阵。不显式指定就由 SCK 自选，
-                // 一旦与接收端按 709 解释的假设不一致就会偏色（不是黑屏，很难查）。
-                c.colorMatrix = CGDisplayStream.yCbCrMatrix_ITU_R_709_2
-                // 2x HiDPI 下显式要最高清晰度采样，避免 automatic 在负载时降到逻辑分辨率放大
-                if #available(macOS 14.0, *) {
-                    c.captureResolution = .best
-                }
-                let sb = try await Self.captureSample(c, filter: filter)
-                guard let pb = CMSampleBufferGetImageBuffer(sb) else {
-                    // 拿不到 pixel buffer 等同于采集失败，但这条路径没有 catch 兜底，
-                    // 不打日志会表现成「采集在跑却一帧都没有」。
-                    let t = CFAbsoluteTimeGetCurrent()
-                    if t - lastErrorLogAt > 2.0 {
-                        lastErrorLogAt = t
-                        Log.info("采集样本没有 image buffer，丢弃该帧")
+                // 两条采集路径，实测数据（2880x1800，4 路并发）：
+                //   captureImage      + BGRA  : 单帧 ~60ms  → 峰值 60~77fps   【默认】
+                //   captureSampleBuffer+ BGRA  : 单帧 ~130ms → 峰值 35fps
+                //   captureSampleBuffer+ 420v  : 单帧 ~200ms → 峰值 20~37fps
+                // 省内存的 420v 路径要以帧率为代价，而帧率是投屏的第一体验，
+                // 所以默认仍走 captureImage（原路径），
+                // 需要压内存（4K 屏/低内存机器）时用 SECDISPLAY_PIXFMT=420v 显式切换。
+                let wantYUV = ProcessInfo.processInfo.environment["SECDISPLAY_PIXFMT"] == "420v"
+                let pb: CVPixelBuffer
+                if wantYUV {
+                    let c = SCStreamConfiguration()
+                    c.width = cfg.width
+                    c.height = cfg.height
+                    c.showsCursor = false
+                    // 直接要 YUV420 双平面（video range），每帧 7.4MB 而不是 19.8MB，
+                    // 也省掉一次全屏 RGB→YUV 的 CGContext 重绘。
+                    c.pixelFormat = kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange
+                    // 420v/420f 才生效的色度矩阵。不显式指定就由 SCK 自选，
+                    // 一旦与接收端按 709 解释的假设不一致就会偏色（不是黑屏，很难查）。
+                    c.colorMatrix = CGDisplayStream.yCbCrMatrix_ITU_R_709_2
+                    if #available(macOS 14.0, *) { c.captureResolution = .best }
+                    let sb = try await Self.captureSample(c, filter: filter)
+                    guard let buf = CMSampleBufferGetImageBuffer(sb) else {
+                        let t = CFAbsoluteTimeGetCurrent()
+                        if t - lastErrorLogAt > 2.0 {
+                            lastErrorLogAt = t
+                            Log.info("采集样本没有 image buffer，丢弃该帧")
+                        }
+                        continue
                     }
-                    continue
+                    pb = buf
+                } else {
+                    let c = SCStreamConfiguration()
+                    c.width = cfg.width
+                    c.height = cfg.height
+                    c.showsCursor = false
+                    // 2x HiDPI 下显式要最高清晰度采样，避免 automatic 在负载时降到逻辑分辨率放大
+                    if #available(macOS 14.0, *) { c.captureResolution = .best }
+                    let img = try await SCScreenshotManager.captureImage(contentFilter: filter, configuration: c)
+                    guard let buf = makePixelBuffer(from: img) else { continue }
+                    pb = buf
                 }
                 let now = CFAbsoluteTimeGetCurrent()
                 let fw = CVPixelBufferGetWidth(pb)
@@ -1558,6 +1574,32 @@ final class ScreenshotCapture {
         cachedAt = now
         return c
     }
+}
+
+/// CGImage → CVPixelBuffer(BGRA)。
+/// 默认采集路径用它：captureImage 给 CGImage，编码器要吃 CVPixelBuffer。
+/// 这一步是全屏 CGContext 重绘，2880x1800 下每帧 19.8MB、约 20ms；
+/// SECDISPLAY_PIXFMT=420v 走 captureSampleBuffer 时不需要它。
+func makePixelBuffer(from img: CGImage) -> CVPixelBuffer? {
+    let w = img.width, h = img.height
+    var pb: CVPixelBuffer?
+    let attrs: [CFString: Any] = [
+        kCVPixelBufferIOSurfacePropertiesKey: [:] as CFDictionary,
+        kCVPixelBufferPixelFormatTypeKey: kCVPixelFormatType_32BGRA,
+    ]
+    guard CVPixelBufferCreate(nil, w, h, kCVPixelFormatType_32BGRA,
+                              attrs as CFDictionary, &pb) == kCVReturnSuccess,
+          let pb else { return nil }
+    CVPixelBufferLockBaseAddress(pb, [])
+    defer { CVPixelBufferUnlockBaseAddress(pb, []) }
+    guard let ctx = CGContext(data: CVPixelBufferGetBaseAddress(pb), width: w, height: h,
+                              bitsPerComponent: 8, bytesPerRow: CVPixelBufferGetBytesPerRow(pb),
+                              space: CGColorSpaceCreateDeviceRGB(),
+                              bitmapInfo: CGImageAlphaInfo.premultipliedFirst.rawValue
+                                  | CGBitmapInfo.byteOrder32Little.rawValue)
+    else { return nil }
+    ctx.draw(img, in: CGRect(x: 0, y: 0, width: w, height: h))
+    return pb
 }
 
 // MARK: - 网络发送
