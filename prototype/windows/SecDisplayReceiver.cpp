@@ -335,19 +335,34 @@ static int g_cursorAppliedScalePm = 0;     // 仅 UI 线程访问
 // 在副屏上快速左右/上下晃动光标时，Mac 那边看不到你自己的手，容易找不到指针。
 // 这里在接收端本地检测晃动：把最近一小段时间的远程光标轨迹存进环形缓冲，
 // 统计方向反转次数与横向摆幅，达到阈值就把光标放大若干倍，停下后自动恢复。
-// 全部在 UI 线程（WM_APP_REMOTE_CURSOR）里做，不额外开线程。
+// 全部在 UI 线程（WM_APP_REMOTE_CURSOR / WM_TIMER）里做，不额外开线程。
+//
+// 时序对齐系统行为（参考 Accessibility → 指针 → 「晃动鼠标指针以定位」）：
+// 放大是立刻的，停下后保留约 1 秒再收缩，收缩本身是连续的缓动而不是瞬切。
+// 原来的实现是硬切，且只靠 120ms 定时器轮询判断结束，实际要 1 秒多才突然变小，
+// 观感上就是「变小很慢、还很突兀」。
 static const int kShakeWinMs = 700;      // 观察窗口
 static const int kShakeMinReversals = 3; // 至少 3 次方向反转才算晃动
 static const int kShakeMinSpanPx = 180;  // 横向/纵向累计摆幅下限，防止细微抖动误触
 static const double kShakeCursorZoom = 2.5;  // 晃动时的放大倍数
-static const int64_t kShakeHoldMs = 900;     // 松手后维持放大的时间
+static const int64_t kShakeHoldMs = 700;     // 停下后保持放大的时间
+static const int kShakeShrinkMs = 260;       // 收缩动画时长
+static const int kShakeTickMs = 16;          // 动画帧间隔（约 60fps）
 static const UINT_PTR kShakeTimer = 4004;
 struct ShakeSample { int64_t t; int x; int y; };
-static ShakeSample g_shakeBuf[64];
+// 环容量按「发送侧最高 240Hz × 700ms ≈ 170 个样本」留足余量，
+// 否则高刷新率下窗口会被截短，慢一点的晃动就检测不到。
+static const int kShakeCap = 256;
+static ShakeSample g_shakeBuf[kShakeCap];
 static int g_shakeCount = 0;
 static int g_shakeHead = 0;
+// 放大状态与收缩进度。zoom 是当前实际倍数，收缩动画期间在 1.0~kShakeCursorZoom 之间插值。
 static bool g_shakeActive = false;
 static int64_t g_shakeLastMoveMs = 0;
+static double g_shakeZoom = 1.0;
+static int g_shakeCurPm = 1000;          // 当前实际应用的缩放（千分比），用于避免重复重建
+static bool g_shakeHolding = false;      // 已停止晃动、正在等待 hold 到期
+static int64_t g_shakeHoldUntil = 0;
 
 // 输入回传：把窗口内的鼠标位置和按键状态发给 Mac，由它重放事件。
 // 不再用 SetCursorPos 搬本机光标——那会和用户自己的鼠标抢位置，
@@ -2491,19 +2506,23 @@ static void ApplyCursorImage() {
     // 全屏时系数恒为 1，又完全不补偿 DPI，在高 DPI 屏上同样偏小。
     // 指针是给用户直接看的，按屏幕物理像素绘制，只乘本显示器的 DPI 缩放。
     // 1600x1000 客户区铺满 1600x1000 流、DPI 100% 时系数正好是 1。
-    // 晃动放大在这里乘上去：放大倍数变化会走「重建 HCURSOR」这条路径。
-    const double scale = WindowDpiScale(g_hwnd) * (g_shakeActive ? kShakeCursorZoom : 1.0);
-    const int scalePm = (int)(scale * 1000.0 + 0.5);
+    // 晃动放大由 DesiredCursorScalePm 合并进来（DPI × 动画倍数），
+    // 这样缩放口径只有一处，日志也不会把 DPI 和放大倍数混在一起。
+    const int scalePm = DesiredCursorScalePm();
     if (g_customCursor && fp == g_cursorAppliedFp && scalePm == g_cursorAppliedScalePm) {
         return;   // 同一张图同一缩放，沿用现有 HCURSOR
     }
 
-    int w2 = (int)(w * scale + 0.5);
-    int h2 = (int)(h * scale + 0.5);
+    // 等比缩放：两轴用同一个系数，再整体夹到 256 上限。
+    // 逐轴独立夹会让非方形光标在放大后变扁（例如 32x64 在 DPI 300% 下被压成 240x256）。
+    double k = (double)scalePm / 1000.0;
+    const double maxSide = (double)(w > h ? w : h) * k;
+    if (maxSide > 256.0) k *= 256.0 / maxSide;
+
+    int w2 = (int)(w * k + 0.5);
+    int h2 = (int)(h * k + 0.5);
     if (w2 < 1) w2 = 1;
     if (h2 < 1) h2 = 1;
-    if (w2 > 256) w2 = 256;
-    if (h2 > 256) h2 = 256;
     if (w2 != w || h2 != h) {
         std::vector<uint8_t> dst((size_t)w2 * h2 * 4);
         for (int yy = 0; yy < h2; ++yy) {
@@ -2560,8 +2579,10 @@ static void ApplyCursorImage() {
     DeleteObject(mask);
     if (!cur) return;   // 不更新指纹，下一包重试
 
-    Log("光标位图 %dx%d hot=(%d,%d) 缩放 %.2fx → 实际 %dx%d hot=(%d,%d)",
-        rawW, rawH, rawHotX, rawHotY, scale, w, h, hotX, hotY);
+    // 日志把 DPI 与晃动倍数分开打印。合成后的倍率会变成 5.00x，
+// 排查 DPI 问题时容易误以为显示器变了。
+    Log("光标位图 %dx%d hot=(%d,%d) DPI %.2fx 晃动 %.2fx → 实际 %dx%d hot=(%d,%d)",
+        rawW, rawH, rawHotX, rawHotY, WindowDpiScale(g_hwnd), g_shakeZoom, w, h, hotX, hotY);
 
     // 先挂上新的再销毁旧的：反过来的话，销毁到 SetCursor 之间系统光标句柄是悬空的
     HCURSOR old = g_customCursor;
@@ -2579,7 +2600,7 @@ static bool DetectShake(int64_t now, int x, int y) {
     // 采样入环
     if (g_shakeCount > 0) {
         // 同一毫秒内多次移动只取最后一次，避免轨迹点重复导致方向判定噪音
-        int prevIdx = (g_shakeHead - 1 + 64) % 64;
+        int prevIdx = (g_shakeHead - 1 + kShakeCap) % kShakeCap;
         if (g_shakeBuf[prevIdx].t == now) {
             g_shakeBuf[prevIdx].x = x;
             g_shakeBuf[prevIdx].y = y;
@@ -2587,19 +2608,21 @@ static bool DetectShake(int64_t now, int x, int y) {
         }
     }
     g_shakeBuf[g_shakeHead] = ShakeSample{ now, x, y };
-    g_shakeHead = (g_shakeHead + 1) % 64;
-    if (g_shakeCount < 64) ++g_shakeCount;
+    g_shakeHead = (g_shakeHead + 1) % kShakeCap;
+    if (g_shakeCount < kShakeCap) ++g_shakeCount;
 
     // 收集窗口内的采样（按时间顺序）
     int n = 0;
-    ShakeSample win[64];
-    for (int i = 0; i < g_shakeCount && n < 64; ++i) {
-        int idx = (g_shakeHead - g_shakeCount + i + 64) % 64;
+    ShakeSample win[kShakeCap];
+    for (int i = 0; i < g_shakeCount && n < kShakeCap; ++i) {
+        int idx = (g_shakeHead - g_shakeCount + i + kShakeCap) % kShakeCap;
         if (now - g_shakeBuf[idx].t <= kShakeWinMs) win[n++] = g_shakeBuf[idx];
     }
     if (n < 4) return g_shakeActive;
 
-    // 位移方向序列（用相邻点差值，忽略 <4px 的抖动）
+    // 位移方向序列（用相邻点差值，忽略 <8px 的抖动）。
+    // 阈值从 4 提到 8：同毫秒去重会把轨迹降采样到约 60Hz，一两个像素的抖动
+    // 就能翻转方向，门槛太低会导致正常拖动误触。
     int reversalsX = 0, reversalsY = 0;
     int spanX = 0, spanY = 0;
     int minX = win[0].x, maxX = win[0].x, minY = win[0].y, maxY = win[0].y;
@@ -2611,12 +2634,12 @@ static bool DetectShake(int64_t now, int x, int y) {
         if (win[i].x > maxX) maxX = win[i].x;
         if (win[i].y < minY) minY = win[i].y;
         if (win[i].y > maxY) maxY = win[i].y;
-        if (dx > 4 || dx < -4) {
+        if (dx > 8 || dx < -8) {
             int d = dx > 0 ? 1 : -1;
             if (lastDirX != 0 && d != lastDirX) ++reversalsX;
             lastDirX = d;
         }
-        if (dy > 4 || dy < -4) {
+        if (dy > 8 || dy < -8) {
             int d = dy > 0 ? 1 : -1;
             if (lastDirY != 0 && d != lastDirY) ++reversalsY;
             lastDirY = d;
@@ -2631,22 +2654,58 @@ static bool DetectShake(int64_t now, int x, int y) {
 
     if (shaking) {
         g_shakeLastMoveMs = now;
+        g_shakeHolding = false;
         if (!g_shakeActive) {
             g_shakeActive = true;
+            // 放大是立刻的：直接把目标倍数给上，动画只用于收缩
+            g_shakeZoom = kShakeCursorZoom;
             Log("检测到快速晃动（反转 x%d y%d，摆幅 x%dp y%dp），放大光标 %.1fx",
                 reversalsX, reversalsY, spanX, spanY, kShakeCursorZoom);
-            // 起一个定时器负责「停下后收回放大」：光标停住就没有新位置包了
-            SetTimer(g_hwnd, kShakeTimer, 120, nullptr);
+            // 定时器负责 hold 到期后的收缩动画；光标停住就没有新位置包了，
+            // 这条定时器是唯一的收回路径。
+            SetTimer(g_hwnd, kShakeTimer, kShakeTickMs, nullptr);
         }
         return true;
     }
-    // 不再晃动：维持 kShakeHoldMs 再恢复，避免抖一下又缩回去
+    // 不再晃动：进入 hold，到期后由定时器做收缩动画
     if (g_shakeActive) {
-        if (now - g_shakeLastMoveMs < kShakeHoldMs) return true;
-        g_shakeActive = false;
-        Log("晃动结束，光标恢复原尺寸");
+        if (!g_shakeHolding) {
+            g_shakeHolding = true;
+            g_shakeHoldUntil = g_shakeLastMoveMs + kShakeHoldMs;
+        }
+        return now < g_shakeHoldUntil;
     }
     return false;
+}
+
+// 收缩动画的一帧。返回 true 表示动画仍在进行，需要继续定时器。
+// 用 ease-out（1-(1-t)^3）让收缩前段快、尾段贴住原尺寸，观感比线性自然。
+static bool TickShakeShrink(int64_t now) {
+    if (!g_shakeActive) return false;
+    if (!g_shakeHolding) return true;          // 仍在晃动，保持放大
+    if (now < g_shakeHoldUntil) return true;   // hold 未到期
+
+    const int64_t t0 = g_shakeHoldUntil;
+    const double p = (double)(now - t0) / (double)kShakeShrinkMs;
+    if (p >= 1.0) {
+        g_shakeActive = false;
+        g_shakeHolding = false;
+        g_shakeZoom = 1.0;
+        return false;
+    }
+    const double e = 1.0 - (1.0 - p) * (1.0 - p) * (1.0 - p);
+    g_shakeZoom = kShakeCursorZoom - (kShakeCursorZoom - 1.0) * e;
+    return true;
+}
+
+// 当前应使用的缩放（千分比）。DPI 与晃动倍数合并在这里算，
+// 避免两处各自乘导致口径不一致。
+static int DesiredCursorScalePm() {
+    const double dpi = WindowDpiScale(g_hwnd);
+    const int dpiPm = (int)(dpi * 1000.0 + 0.5);
+    const int zoomPm = (int)(g_shakeZoom * 1000.0 + 0.5);
+    // 先用整数乘再除，避免浮点误差在动画期间来回跳变
+    return (int)((int64_t)dpiPm * zoomPm / 1000);
 }
 
 // 放大状态变化后重建 HCURSOR。缩放参与指纹，所以改 g_shakeActive 后
@@ -2750,15 +2809,22 @@ static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
             return 0;
         }
         if (w == kShakeTimer) {
-            // 晃动停止后光标不再移动，就不会再有 WM_APP_REMOTE_CURSOR，
-            // 靠这个定时器把放大状态收回来。
-            if (g_shakeActive &&
-                GetTickCount64() - g_shakeLastMoveMs >= kShakeHoldMs) {
-                g_shakeActive = false;
-                Log("晃动结束，光标恢复原尺寸");
+            // 晃动停止后光标不再移动，就不会再有 WM_APP_REMOTE_CURSOR。
+            // 这条定时器是唯一的收回路径：hold 到期后逐帧收缩，直到回到 1.0。
+            const bool keep = TickShakeShrink(GetTickCount64());
+            // 缩放变了才重建 HCURSOR，否则每帧都在 CreateIconIndirect
+            const int want = DesiredCursorScalePm();
+            if (want != g_shakeCurPm) {
+                g_shakeCurPm = want;
                 RefreshCursorScale();
             }
-            if (!g_shakeActive) KillTimer(h, kShakeTimer);
+            if (!keep) {
+                g_shakeZoom = 1.0;
+                g_shakeCurPm = DesiredCursorScalePm();
+                RefreshCursorScale();
+                Log("晃动结束，光标已恢复原尺寸");
+                KillTimer(h, kShakeTimer);
+            }
             return 0;
         }
         break;
@@ -2824,8 +2890,12 @@ static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
         // 用屏幕坐标参与判定（客户区坐标在窗口移动时会整体平移，容易误判）。
         {
             const bool wasActive = g_shakeActive;
-            const bool nowActive = DetectShake(GetTickCount64(), sx, sy);
-            if (nowActive != wasActive) RefreshCursorScale();
+            DetectShake(GetTickCount64(), sx, sy);
+            const int want = DesiredCursorScalePm();
+            if (g_shakeActive != wasActive || want != g_shakeCurPm) {
+                g_shakeCurPm = want;
+                RefreshCursorScale();
+            }
         }
         return 0;
     }
