@@ -33,7 +33,7 @@ jobs:
       - name: 编译 Mac 发送端
         run: |
           cd prototype/mac
-          swiftc -O Sources/ScreenSender.swift -o screensender
+          swiftc -O Sources/main.swift Sources/AppUI.swift -o screensender
       - name: 产物检查
         run: test -f prototype/mac/screensender && echo "Mac 编译通过"
 
