@@ -101,6 +101,25 @@ func listSecDisplays() -> [(id: CGDirectDisplayID, old: Bool)] {
 
 // MARK: - 配置
 
+/// 虚拟屏建屏后实测的 backing scale。2x HiDPI 生效时为 2.0，否则 1.0。
+/// 坐标链路用它把「逻辑点坐标」和「线上物理像素坐标」互相换算。
+/// 放在全局是因为 CursorTracker / InputInjector 是各自独立的闭包，
+/// 由建屏处统一写入一次即可。
+nonisolated(unsafe) var vdBackingScale: Double = 1.0
+
+/// 键盘注入器。连接重建时从这里 reset，避免 Ctrl/Cmd 卡在按下态。
+nonisolated(unsafe) var gKeyboard: KeyboardInjector?
+/// 鼠标注入器。断连时同样要清，否则按住左键时对端消失会让 Mac 一直保持按下态。
+nonisolated(unsafe) var gMouse: InputInjector?
+
+/// 清空输入注入状态并补发残留的 keyUp / mouseUp。
+/// 连接建立与断开都要调：事件是投到 .cghidEventTap 的，系统 HID 层的
+/// 按下状态由投出去的事件驱动，只清内部记账等于一直按着。
+func resetInjectionState() {
+    gKeyboard?.reset()
+    gMouse?.resetButtons()
+}
+
 struct Config {
     // 对应 Lenovo Yoga Slim 7 Pro 14IHU5（82NC）2880x1800 高刷版，
     // 系统 200% 缩放：物理 2880x1800，逻辑 1440x900。
@@ -153,8 +172,13 @@ final class VirtualDisplayManager {
         d.setValue("SecDisplay", forKey: "name")
         d.setValue(NSNumber(value: cfg.width), forKey: "maxPixelsWide")
         d.setValue(NSNumber(value: cfg.height), forKey: "maxPixelsHigh")
-        d.setValue(NSValue(size: NSSize(width: 25.4 * Double(cfg.width) / 110.0,
-                                        height: 25.4 * Double(cfg.height) / 110.0)),
+        // 关键：macOS 按 EDID 物理尺寸算 PPI，约 192~200 PPI 以上才默认为 Retina 2x。
+        // 110 PPI 虽然也会在后台合成 HiDPI 模式，但系统默认挑 1x 原生模式跑。
+        // 2x 档位设 220 PPI，让系统首次上线即默认选中 2x Retina 模式；1x 档位保持 110 PPI。
+        let wantHiDPI = cfg.logicalWidth * 2 <= cfg.width
+        let ppi = wantHiDPI ? 220.0 : 110.0
+        d.setValue(NSValue(size: NSSize(width: 25.4 * Double(cfg.width) / ppi,
+                                        height: 25.4 * Double(cfg.height) / ppi)),
                    forKey: "sizeInMillimeters")
         d.setValue(NSValue(point: NSPoint(x: 0.6797, y: 0.3203)), forKey: "redPrimary")
         d.setValue(NSValue(point: NSPoint(x: 0.2559, y: 0.6983)), forKey: "greenPrimary")
@@ -166,17 +190,36 @@ final class VirtualDisplayManager {
         guard let disp = allocObj.perform(NSSelectorFromString("initWithDescriptor:"), with: d)?
                 .takeUnretainedValue() as? NSObject else { throw Err.initFailed }
 
-        let modeAlloc = modeCls.perform(NSSelectorFromString("alloc"))!.takeUnretainedValue() as! NSObject
         typealias ModeInit = @convention(c) (AnyObject, Selector, UInt, UInt, Double) -> AnyObject?
         let modeSel = NSSelectorFromString("initWithWidth:height:refreshRate:")
-        let modeInit = unsafeBitCast(modeAlloc.method(for: modeSel), to: ModeInit.self)
-        guard let mode = modeInit(modeAlloc, modeSel,
-                                  UInt(cfg.logicalWidth), UInt(cfg.logicalHeight),
-                                  cfg.refreshRate) as? NSObject else { throw Err.modeFailed }
+        func makeMode(_ w: Int, _ h: Int) -> NSObject? {
+            let a = modeCls.perform(NSSelectorFromString("alloc"))!.takeUnretainedValue() as! NSObject
+            let imp = unsafeBitCast(a.method(for: modeSel), to: ModeInit.self)
+            return imp(a, modeSel, UInt(w), UInt(h), cfg.refreshRate) as? NSObject
+        }
+
+        // HiDPI 需先声明物理背板模式让系统知道高密度面板能力，再列出逻辑模式与缩放档位；
+        // 非 HiDPI 声明单个 1x 模式即可。
+        var rawPairs: [(Int, Int)] = []
+        if wantHiDPI {
+            rawPairs.append((cfg.width, cfg.height))
+            rawPairs.append((cfg.logicalWidth, cfg.logicalHeight))
+            rawPairs.append((cfg.logicalWidth / 2, cfg.logicalHeight / 2))
+        } else {
+            rawPairs.append((cfg.logicalWidth, cfg.logicalHeight))
+        }
+        var modes: [NSObject] = []
+        var seenPairs = Set<String>()
+        for (mw, mh) in rawPairs where mw > 0 && mh > 0 {
+            let key = "\(mw)x\(mh)"
+            guard seenPairs.insert(key).inserted else { continue }
+            guard let m = makeMode(mw, mh) else { throw Err.modeFailed }
+            modes.append(m)
+        }
 
         let settings = setCls.init()
-        settings.setValue(cfg.logicalWidth * 2 <= cfg.width, forKey: "hiDPI")
-        settings.setValue([mode], forKey: "modes")
+        settings.setValue(wantHiDPI, forKey: "hiDPI")
+        settings.setValue(modes, forKey: "modes")
 
         // BOOL 返回值必须直接调用
         let applySel = NSSelectorFromString("applySettings:")
@@ -197,7 +240,147 @@ final class VirtualDisplayManager {
             if ids.contains(displayID) { break }
             usleep(20_000); waited += 0.02
         }
-        Log.info("虚拟屏就绪 id=\(displayID) \(cfg.width)x\(cfg.height)")
+        // 刚上线时 CGDisplayCopyDisplayMode 可能短暂返回 nil，等模式表就绪再自检/切换
+        var modeWait = 0.0
+        while modeWait < 1.5 {
+            if CGDisplayCopyDisplayMode(displayID) != nil { break }
+            usleep(20_000); modeWait += 0.02
+        }
+
+        // 若系统缓存的偏好（比如之前选过 1x）导致当前模式没落到目标 (logical, physical)，
+        // 主动切一次：先走公开 CGConfigureDisplayWithDisplayMode，不成再走 CGS 私有兜底。
+        enforceTargetModeIfNeeded(cfg)
+
+        // HiDPI 自检：不能用 CGDisplayPixelsWide！
+        // macOS 27 上 CGDisplayPixelsWide 连内建 Retina 屏都返回逻辑点宽（1512 而非 3024），
+        // 之前拿 CGDisplayPixelsWide / CGDisplayBounds 算 scale 永远得到 1.00 是误判。
+        // 真正反映背板与缩放的是 CGDisplayCopyDisplayMode 的 pixelWidth/width，
+        // 以及带 kCGDisplayShowDuplicateLowResolutionModes=true 的模式枚举。
+        let cur = CGDisplayCopyDisplayMode(displayID)
+        let pw = cur?.pixelWidth ?? Int(CGDisplayPixelsWide(displayID))
+        let ph = cur?.pixelHeight ?? Int(CGDisplayPixelsHigh(displayID))
+        let lw = cur?.width ?? Int(CGDisplayBounds(displayID).width)
+        let lh = cur?.height ?? Int(CGDisplayBounds(displayID).height)
+        let s = (lw > 0 && pw > 0) ? Double(pw) / Double(lw) : 1.0
+        vdBackingScale = s
+        Log.info("HiDPI 自检: 背板 \(pw)x\(ph) 逻辑 \(lw)x\(lh)@\(Int(cur?.refreshRate ?? 0))Hz scale=\(String(format: "%.2f", s)) 期望=\(wantHiDPI ? 2.0 : 1.0)")
+        if wantHiDPI && abs(s - 2.0) > 0.1 {
+            Log.info("警告: 期望 2x HiDPI 但当前 scale=\(String(format: "%.2f", s))，坐标仍按 cfg.width/bounds 比例对齐")
+        }
+        let opts = [kCGDisplayShowDuplicateLowResolutionModes as String: true] as CFDictionary
+        if let all = CGDisplayCopyAllDisplayModes(displayID, opts) as? [CGDisplayMode] {
+            let hi = all.filter { $0.pixelWidth > $0.width }
+            Log.info("HiDPI 自检: 模式 \(all.count) 个，其中 HiDPI \(hi.count) 个")
+            for m in all.filter({ $0.width == lw && $0.height == lh }).prefix(4) {
+                Log.info("   匹配模式 \(m.width)x\(m.height) 背板 \(m.pixelWidth)x\(m.pixelHeight)@\(Int(m.refreshRate))Hz\(m.pixelWidth > m.width ? " [HiDPI]" : "")")
+            }
+        }
+        Log.info("虚拟屏就绪 id=\(displayID) \(cfg.width)x\(cfg.height) 逻辑=\(lw)x\(lh) scale=\(String(format: "%.2f", s))")
+    }
+
+    /// 当系统默认模式与配置期望 (logicalWidth/Height, width/height) 不一致时强制切换。
+    /// macOS 会按 vendor+product id 记住上次模式偏好，如果之前在同 ID 上用过 1x，
+    /// 再切回 2x 时就需要主动把模式拨正。
+    private func enforceTargetModeIfNeeded(_ cfg: Config) {
+        func matches(_ m: CGDisplayMode) -> Bool {
+            m.width == cfg.logicalWidth && m.height == cfg.logicalHeight
+                && m.pixelWidth == cfg.width && m.pixelHeight == cfg.height
+        }
+        if let cur = CGDisplayCopyDisplayMode(displayID), matches(cur) {
+            return
+        }
+
+        let opts = [kCGDisplayShowDuplicateLowResolutionModes as String: true] as CFDictionary
+        if let all = CGDisplayCopyAllDisplayModes(displayID, opts) as? [CGDisplayMode] {
+            let target = all.first(where: { matches($0) && abs($0.refreshRate - cfg.refreshRate) < 1.0 })
+                ?? all.first(where: matches)
+            if let target {
+                var c: CGDisplayConfigRef?
+                if CGBeginDisplayConfiguration(&c) == .success, let cfgRef = c {
+                    let rc = CGConfigureDisplayWithDisplayMode(cfgRef, displayID, target, nil)
+                    if rc != .success {
+                        CGCancelDisplayConfiguration(cfgRef)
+                        Log.info("公开 API 配置虚拟屏模式失败: \(rc.rawValue)")
+                    } else {
+                        let done = CGCompleteDisplayConfiguration(cfgRef, .forSession)
+                        if done == .success {
+                            usleep(250_000)
+                            if let cur = CGDisplayCopyDisplayMode(displayID), matches(cur) {
+                                Log.info("公开 API 已纠正虚拟屏模式为 \(cur.width)x\(cur.height) (背板 \(cur.pixelWidth)x\(cur.pixelHeight))")
+                                return
+                            }
+                        } else {
+                            Log.info("公开 API 提交虚拟屏模式失败: \(done.rawValue)")
+                        }
+                    }
+                }
+            }
+        }
+
+        // 兜底：公开枚举漏掉的 GPU 缩放 HiDPI 模式，通过 CGS 私有模式表按 modeNumber 切换。
+        // 全部走 dlsym 弱查找，不依赖编译期私有符号。
+        let rtld = UnsafeMutableRawPointer(bitPattern: -2)
+        typealias CGSGetNumFn = @convention(c) (CGDirectDisplayID, UnsafeMutablePointer<Int32>) -> CGError
+        typealias CGSGetDescFn = @convention(c) (CGDirectDisplayID, Int32, UnsafeMutableRawPointer, Int32) -> CGError
+        typealias CGSConfigFn = @convention(c) (CGDisplayConfigRef?, CGDirectDisplayID, Int32) -> CGError
+        guard let gnSym = dlsym(rtld, "CGSGetNumberOfDisplayModes"),
+              let gdSym = dlsym(rtld, "CGSGetDisplayModeDescriptionOfLength"),
+              let cmSym = dlsym(rtld, "CGSConfigureDisplayMode") else {
+            Log.info("CGS 私有模式符号不可用，跳过兜底切换")
+            return
+        }
+        let getNum = unsafeBitCast(gnSym, to: CGSGetNumFn.self)
+        let getDesc = unsafeBitCast(gdSym, to: CGSGetDescFn.self)
+        let cfgMode = unsafeBitCast(cmSym, to: CGSConfigFn.self)
+
+        var cnt: Int32 = 0
+        guard getNum(displayID, &cnt) == .success, cnt > 0 else { return }
+        let wantDensity = Float(cfg.width) / Float(max(1, cfg.logicalWidth))
+        var buf = [UInt8](repeating: 0, count: 256)
+        var picked: Int32? = nil
+        var bestDiff = Double.greatestFiniteMagnitude
+        for idx in 0..<cnt {
+            buf.withUnsafeMutableBytes { raw in
+                guard let base = raw.baseAddress,
+                      getDesc(displayID, idx, base, 212) == .success else { return }
+                let modeNum = base.load(fromByteOffset: 0, as: UInt32.self)
+                let flags = base.load(fromByteOffset: 4, as: UInt32.self)
+                let w = Int(base.load(fromByteOffset: 8, as: UInt32.self))
+                let h = Int(base.load(fromByteOffset: 12, as: UInt32.self))
+                let freq = Int(base.load(fromByteOffset: 190, as: UInt16.self))
+                let density = base.load(fromByteOffset: 208, as: Float.self)
+                let unusable = (flags & 0x4000_0000) != 0
+                if !unusable && w == cfg.logicalWidth && h == cfg.logicalHeight && abs(density - wantDensity) < 0.1 {
+                    let diff = abs(Double(freq) - cfg.refreshRate)
+                    if picked == nil || diff < bestDiff {
+                        bestDiff = diff
+                        picked = Int32(bitPattern: modeNum)
+                    }
+                }
+            }
+        }
+        guard let targetMode = picked else {
+            Log.info("CGS 模式表未找到匹配模式 \(cfg.logicalWidth)x\(cfg.logicalHeight) density=\(wantDensity)")
+            return
+        }
+        var c: CGDisplayConfigRef?
+        guard CGBeginDisplayConfiguration(&c) == .success, let cfgRef = c else {
+            Log.info("CGS 兜底: 无法开始显示配置，跳过模式切换")
+            return
+        }
+        let rc = cfgMode(cfgRef, displayID, targetMode)
+        if rc != .success {
+            CGCancelDisplayConfiguration(cfgRef)
+            Log.info("CGS 私有模式切换失败: \(rc.rawValue)")
+            return
+        }
+        let done = CGCompleteDisplayConfiguration(cfgRef, .forSession)
+        if done == .success {
+            usleep(250_000)
+            Log.info("CGS 私有模式已切换到 modeNumber=\(targetMode)")
+        } else {
+            Log.info("CGS 私有模式提交失败: \(done.rawValue)")
+        }
     }
 
     /// 正确销毁：取出 CGVirtualDisplay 内部的 _client 指针，交给 CDVirtualDisplayDestroy。
@@ -288,6 +471,10 @@ enum MirrorGuard {
         let done = CGCompleteDisplayConfiguration(cfg, .permanently)
         if done != .success {
             Log.info("解除镜像未生效(\(reason)): CGCompleteDisplayConfiguration err=\(done.rawValue)")
+        } else {
+            // 解镜像后必须让采集侧丢掉旧的 SCDisplay 绑定，否则流仍绑在镜像源上，
+            // 画面继续是旧内容（这是「先开 SecDisplay 再连 Sidecar 被镜像」的直接原因之一）。
+            gCaptureRebuildRequested = true
         }
     }
 
@@ -1116,6 +1303,8 @@ final class ScreenshotCapture {
     private var supervisor: DispatchSourceTimer?
     private var lastSupervisorCount = -1
     private var lastSupervisorAt: CFAbsoluteTime = 0
+    private var loggedFirstFrame = false
+    private var lastSizeWarnAt: CFAbsoluteTime = 0
 
     init(encoder: Encoder, cfg: Config, displayID: @escaping () -> CGDirectDisplayID) {
         self.encoder = encoder
@@ -1183,10 +1372,23 @@ final class ScreenshotCapture {
                 c.width = cfg.width
                 c.height = cfg.height
                 c.showsCursor = false
+                // 2x HiDPI 下显式要最高清晰度采样，避免 automatic 在负载时降到逻辑分辨率放大
+                if #available(macOS 14.0, *) {
+                    c.captureResolution = .best
+                }
                 let img = try await SCScreenshotManager.captureImage(contentFilter: filter, configuration: c)
                 guard let pb = makePixelBuffer(from: img) else { continue }
                 let now = CFAbsoluteTimeGetCurrent()
                 encodeQueue.sync {
+                    if !loggedFirstFrame {
+                        loggedFirstFrame = true
+                        Log.info("采集首帧实测: \(img.width)x\(img.height) (期望 \(cfg.width)x\(cfg.height))")
+                    } else if (img.width != cfg.width || img.height != cfg.height)
+                                && now - lastSizeWarnAt > 2.0 {
+                        // 限流：尺寸偏移时每帧都打会淹日志并拖慢 encodeQueue 临界区
+                        lastSizeWarnAt = now
+                        Log.info("警告: 采集帧尺寸偏移 \(img.width)x\(img.height) != \(cfg.width)x\(cfg.height)")
+                    }
                     captured += 1
                     lastFrameTime = now
                     let delay = (now - t0) * 1000
@@ -1218,6 +1420,14 @@ final class ScreenshotCapture {
 
     private func currentContent() async throws -> SCShareableContent {
         let now = CFAbsoluteTimeGetCurrent()
+        // 显示排列变化（Sidecar 接入/拔线、镜像关系变动）时强制刷新一次共享内容，
+        // 否则会继续用旧的 SCDisplay 绑定，抓到的是镜像源画面。
+        if gCaptureRebuildRequested {
+            gCaptureRebuildRequested = false
+            cachedContent = nil
+            cachedAt = 0
+            Log.info("显示排列变化，刷新采集共享内容")
+        }
         if let c = cachedContent, now - cachedAt < 2.0 { return c }
         let c = try await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: false)
         cachedContent = c
@@ -1329,6 +1539,8 @@ final class Sender {
             self.resetInFlight()          // 上一轮可能残留未完成的发送，必须清零
             // 旧连接可能留下半个控制包，新连接数据接在残包后会把 0x07 误解析成 0x04。
             self.ctrlBuf.removeAll()
+            // 新连接可能换了接收端，旧的修饰键/按键状态必须清掉，否则 Cmd/Ctrl 会卡住
+            resetInjectionState()
             // 丢掉上个连接的残留帧：那可能是依赖旧参考帧的 P 帧，
             // 新接收端没有参考帧，解出来是花的。等新的 IDR。
             self.counterLock.lock()
@@ -1343,9 +1555,13 @@ final class Sender {
                 case .failed(let e):
                     Log.info("连接失败: \(e)")
                     self.connected = false
+                    // 对端可能是直接退出/拔线，此时用户手上可能正按着 Ctrl 或左键。
+                    // 不在这里补发抬起事件，Mac 会一直保持按下态直到下次连上。
+                    resetInjectionState()
                 case .cancelled:
                     Log.info("连接已取消（cancelled）")
                     self.connected = false
+                    resetInjectionState()
                 case .ready:
                     Log.info("连接就绪")
                 default:
@@ -1460,6 +1676,17 @@ final class Sender {
                 let wheel = Int16(bitPattern: (UInt16(b[o + 10]) << 8) | UInt16(b[o + 11]))
                 onInput?(x, y, buttons, wheel)
                 ctrlBuf.removeFirst(12)
+            } else if t == 0x09 {
+                // [0x09][vk u16][scan u16][down u8][flags u8] = 7 字节，全大端
+                guard ctrlBuf.count >= 7 else { return }
+                let b = ctrlBuf
+                let o = b.startIndex
+                let vk = (UInt16(b[o + 1]) << 8) | UInt16(b[o + 2])
+                let scan = (UInt16(b[o + 3]) << 8) | UInt16(b[o + 4])
+                let down = b[o + 5] != 0
+                let flags = b[o + 6]
+                onKey?(vk, scan, down, flags)
+                ctrlBuf.removeFirst(7)
             } else if t == 0x07 {
                 // [0x07][presentP95 u16][sourceP95 u16][decodeFps*10 u16]
                 // [presentDrop u16][pacedDrop u16][reserved u16] = 13 字节，全大端
@@ -1495,6 +1722,8 @@ final class Sender {
     var onKeyframeRequest: (() -> Void)?
     /// 收到对端 0x04 输入事件：(x, y, buttons, wheel)
     var onInput: ((Float, Float, UInt8, Int16) -> Void)?
+    /// 收到对端 0x09 键盘事件：(vk, scan, down, flags)
+    var onKey: ((UInt16, UInt16, Bool, UInt8) -> Void)?
 
     private let counterLock = NSLock()
 
@@ -1519,7 +1748,7 @@ final class Sender {
     var keepAliveGap: CFAbsoluteTime = 0.08
 
     /// 光标位置。不走视频帧，独立小包，不占用在途帧配额。
-    /// 坐标是相对虚拟屏左上角的逻辑点值（与 CGDisplayBounds / CGEvent.location 同基准）。
+    /// 坐标是相对虚拟屏左上角的视频像素基准（cfg.width x cfg.height，与 Windows g_coordW/H 对齐）。
     func sendCursor(x: Float, y: Float, visible: Bool) {
         guard connected, let c = conn else { return }
         var packet = Data(capacity: 19)
@@ -1695,16 +1924,51 @@ final class InputInjector {
     private var lastButtons: UInt8 = 0
     private(set) var eventCount = 0
 
+    /// 断连时补发残留的 mouseUp。
+    /// 只清 lastButtons 是不够的：事件投到 .cghidEventTap 后 HID 层的按下状态
+    /// 由投出去的事件驱动，按住左键时对端消失会让 Mac 一直保持按下态。
+    func resetButtons() {
+        let held = lastButtons
+        lastButtons = 0
+        guard held != 0 else { return }
+        let p = CGEvent(source: nil)?.location ?? .zero
+        let ups: [(UInt8, CGEventType, CGMouseButton)] = [
+            (0x1, .leftMouseUp, .left),
+            (0x2, .rightMouseUp, .right),
+            (0x4, .otherMouseUp, .center),
+        ]
+        for (bit, upType, btn) in ups where (held & bit) != 0 {
+            CGEvent(mouseEventSource: nil, mouseType: upType,
+                    mouseCursorPosition: p, mouseButton: btn)?.post(tap: .cghidEventTap)
+        }
+    }
+
     /// - Parameters:
-    ///   - x/y: 相对虚拟屏左上角的逻辑点坐标（Windows 端用逻辑尺寸换算后发来）
+    ///   - x/y: Windows 回传的坐标，基准是「物理像素」（= 视频帧尺寸 cfg.width x cfg.height）。
+    ///          按 cfg / CGDisplayBounds 比例换算到逻辑点空间，即便模式偏好未拨正也保持对齐。
     ///   - buttons: bit0 左键，bit1 右键，bit2 中键
     ///   - wheel: 滚动量，正数向下
-    func handle(x: Float, y: Float, buttons: UInt8, wheel: Int16, bounds: CGRect) {
-        let p = CGPoint(x: bounds.minX + CGFloat(x), y: bounds.minY + CGFloat(y))
+    func handle(x: Float, y: Float, buttons: UInt8, wheel: Int16, bounds: CGRect, videoW: Int, videoH: Int) {
+        let sx = bounds.width > 0 ? CGFloat(videoW) / bounds.width : 1.0
+        let sy = bounds.height > 0 ? CGFloat(videoH) / bounds.height : 1.0
+        let p = CGPoint(x: bounds.minX + CGFloat(x) / sx, y: bounds.minY + CGFloat(y) / sy)
+        // 复用键盘注入器维护的修饰键状态，让 Ctrl+点击、Shift+点击、Cmd+点击生效。
+        // 不设置 flags 时这些组合键在 Mac 上只会被当成普通单击。
+        let mods = gKeyboard?.currentFlags() ?? []
 
-        // 先移动指针，再处理按键，保证点击落在正确位置
-        if let mv = CGEvent(mouseEventSource: nil, mouseType: .mouseMoved,
-                            mouseCursorPosition: p, mouseButton: .left) {
+        // 先移动指针，再处理按键，保证点击落在正确位置。
+        // 按住键时必须投 *MouseDragged 而不是 mouseMoved：选文字、拖滑块、
+        // 拖窗口内容这些操作在 Mac 上只认 drag 类型，moved 会被当成纯移动。
+        // 判定用 lastButtons（本次之前的已按下态），这样事件顺序是原生顺序：
+        // 按下那一帧投 moved → down，抬起那一帧投 drag → up。
+        // 用 buttons 判定的话按下帧会先投一个 HID 侧还没按下的 drag。
+        let drag: (CGEventType, CGMouseButton)? =
+            (lastButtons & 0x1) != 0 ? (.leftMouseDragged, .left) :
+            (lastButtons & 0x2) != 0 ? (.rightMouseDragged, .right) :
+            (lastButtons & 0x4) != 0 ? (.otherMouseDragged, .center) : nil
+        if let mv = CGEvent(mouseEventSource: nil, mouseType: drag?.0 ?? .mouseMoved,
+                            mouseCursorPosition: p, mouseButton: drag?.1 ?? .left) {
+            mv.flags = mods
             mv.post(tap: .cghidEventTap)
         }
 
@@ -1718,11 +1982,17 @@ final class InputInjector {
             let was = (lastButtons & bit) != 0
             let now = (buttons & bit) != 0
             if now && !was {
-                CGEvent(mouseEventSource: nil, mouseType: downType,
-                        mouseCursorPosition: p, mouseButton: btn)?.post(tap: .cghidEventTap)
+                if let e = CGEvent(mouseEventSource: nil, mouseType: downType,
+                                   mouseCursorPosition: p, mouseButton: btn) {
+                    e.flags = mods
+                    e.post(tap: .cghidEventTap)
+                }
             } else if !now && was {
-                CGEvent(mouseEventSource: nil, mouseType: upType,
-                        mouseCursorPosition: p, mouseButton: btn)?.post(tap: .cghidEventTap)
+                if let e = CGEvent(mouseEventSource: nil, mouseType: upType,
+                                   mouseCursorPosition: p, mouseButton: btn) {
+                    e.flags = mods
+                    e.post(tap: .cghidEventTap)
+                }
             }
         }
         lastButtons = buttons
@@ -1732,10 +2002,255 @@ final class InputInjector {
             if let e = CGEvent(scrollWheelEvent2Source: nil, units: .pixel,
                                wheelCount: 1, wheel1: Int32(wheel), wheel2: 0, wheel3: 0) {
                 e.location = p
+                e.flags = mods
                 e.post(tap: .cghidEventTap)
             }
         }
         eventCount += 1
+    }
+}
+
+// MARK: - 键盘回放
+//
+// Windows 侧 0x09 包带来虚拟键码 + 扫描码 + 按下/抬起 + 修饰键标志。
+// 这里映射到 macOS 虚拟键码后用 CGEvent 注入。
+// 同样需要「辅助功能」权限，未授权时事件被系统静默丢弃。
+final class KeyboardInjector {
+    private var flags: CGEventFlags = []
+    /// 按下中的键，按 macOS 虚拟键码记录。
+    /// 用 keyCode 而不是 Windows VK：左右 Shift 在 VK 上都是 0x10，
+    /// 按 VK 去重会把两个物理键当成同一个，松开一个就整体抬起。
+    private var pressed: Set<CGKeyCode> = []
+    /// 按下中的修饰键 keyCode → 对应 mask。flags 由它取并集算出。
+    private var heldModifiers: [CGKeyCode: CGEventFlags] = [:]
+    /// 按下时的 Windows VK → 当时算出的 keyCode。
+    /// keyUp 报文里的 scan/扩展位可能与 keyDown 不一致，靠它把抬起配回同一个键。
+    private var pressedVK: [UInt16: CGKeyCode] = [:]
+    private let lock = NSLock()
+    private(set) var eventCount = 0
+
+    /// 重置所有按键状态，并补发 keyUp。
+    /// 只清内部记账是不够的：事件投到 .cghidEventTap 后系统 HID 层的按键状态
+    /// 由投出去的事件驱动，不补 keyUp 的话断连后 Ctrl/Cmd 会一直卡在按下态。
+    func reset() {
+        lock.lock()
+        let stuck = pressed
+        pressed.removeAll()
+        pressedVK.removeAll()
+        heldModifiers.removeAll()
+        flags = []
+        lock.unlock()
+
+        // 在锁外补发，避免与 handle 的锁重入
+        guard !stuck.isEmpty else { return }
+        let src = CGEventSource(stateID: .hidSystemState)
+        for keyCode in stuck {
+            if let ev = CGEvent(keyboardEventSource: src, virtualKey: keyCode, keyDown: false) {
+                ev.flags = []
+                ev.post(tap: .cghidEventTap)
+            }
+        }
+    }
+
+    /// 当前修饰键状态，供鼠标事件复用（Ctrl+点击、Shift+点击等组合键）。
+    func currentFlags() -> CGEventFlags {
+        lock.lock()
+        defer { lock.unlock() }
+        return flags
+    }
+
+    func handle(vk: UInt16, scan: UInt16, down: Bool, keyFlags: UInt8) {
+        lock.lock()
+        defer { lock.unlock() }
+
+        let extended = (keyFlags & 0x01) != 0
+        guard let keyCode = Self.keyCode(forVK: vk, extended: extended, scan: scan) else { return }
+        let mask = Self.modifierMask(forVK: vk)
+
+        if down {
+            // 长按重复必须继续投递：Windows 会把系统自动重复的 keyDown 一并转发，
+            // 而注入的 CGEvent 不会自己产生重复，直接 return 会让按住退格/方向键
+            // 只生效一次。这里只在首次按下时改修饰键记账，重复事件照常投递。
+            let isRepeat = pressed.contains(keyCode)
+            if !isRepeat {
+                pressed.insert(keyCode)
+                pressedVK[vk] = keyCode
+                if let mask {
+                    heldModifiers[keyCode] = mask
+                    rebuildFlags()
+                }
+            }
+            post(keyCode: keyCode, down: true, isRepeat: isRepeat)
+        } else {
+            // 抬起优先按 VK 查回按下时的 keyCode。
+            // down/up 两次报文的 scan 或扩展位未必一致（KVM、注入式输入把 scan 报成 0、
+            // 某些远程栈丢扩展位），只按 keyCode 配对会配不上，keyUp 被吞掉键就粘住了。
+            let kc = pressedVK.removeValue(forKey: vk) ?? keyCode
+            guard pressed.remove(kc) != nil else { return }
+            if mask != nil {
+                heldModifiers.removeValue(forKey: kc)
+                rebuildFlags()
+            }
+            post(keyCode: kc, down: false, isRepeat: false)
+        }
+    }
+
+    private func post(keyCode: CGKeyCode, down: Bool, isRepeat: Bool) {
+        let src = CGEventSource(stateID: .hidSystemState)
+        guard let ev = CGEvent(keyboardEventSource: src, virtualKey: keyCode, keyDown: down) else { return }
+        ev.flags = flags
+        if isRepeat {
+            ev.setIntegerValueField(.keyboardEventAutorepeat, value: 1)
+        }
+        ev.post(tap: .cghidEventTap)
+        eventCount += 1
+    }
+
+    /// flags 取所有按下中修饰键的并集。
+    /// 按 mask 计数在「同一 mask 有左右两个物理键」和「重复 keydown」两种情况下
+    /// 都会算错，改成按 keyCode 记账后两个问题都不存在。
+    private func rebuildFlags() {
+        var f: CGEventFlags = []
+        for (_, m) in heldModifiers { f.insert(m) }
+        flags = f
+    }
+
+    /// 修饰键 → CGEventFlags。返回 nil 表示不是修饰键。
+    static func modifierMask(forVK vk: UInt16) -> CGEventFlags? {
+        switch vk {
+        case 0x10, 0xA0, 0xA1: return .maskShift
+        case 0x11, 0xA2, 0xA3: return .maskControl
+        case 0x12, 0xA4, 0xA5: return .maskAlternate
+        case 0x5B, 0x5C:       return .maskCommand
+        default:               return nil
+        }
+    }
+
+    /// 左右修饰键在 Windows 的 wParam 里是同一个 generic VK（0x10/0x11/0x12），
+    /// 只能靠扫描码与扩展位区分。
+    static func keyCode(forVK vk: UInt16, extended: Bool, scan: UInt16) -> CGKeyCode? {
+        switch vk {
+        case 0x10: return scan == 0x36 ? 0x3C : 0x38   // 右 Shift 扫描码 0x36
+        case 0x11: return extended ? 0x3E : 0x3B       // 右 Ctrl 带扩展位
+        case 0x12: return extended ? 0x3D : 0x3A       // 右 Alt 带扩展位
+        default:   return keyCode(forVK: vk, extended: extended)
+        }
+    }
+
+    /// Windows 虚拟键码 → macOS 虚拟键码。返回 nil 表示不支持的键（忽略）。
+    static func keyCode(forVK vk: UInt16, extended: Bool) -> CGKeyCode? {
+        switch vk {
+        // 字母
+        case 0x41: return 0x00   // A
+        case 0x42: return 0x0B   // B
+        case 0x43: return 0x08   // C
+        case 0x44: return 0x02   // D
+        case 0x45: return 0x0E   // E
+        case 0x46: return 0x03   // F
+        case 0x47: return 0x05   // G
+        case 0x48: return 0x04   // H
+        case 0x49: return 0x22   // I
+        case 0x4A: return 0x26   // J
+        case 0x4B: return 0x28   // K
+        case 0x4C: return 0x25   // L
+        case 0x4D: return 0x2E   // M
+        case 0x4E: return 0x2D   // N
+        case 0x4F: return 0x1F   // O
+        case 0x50: return 0x23   // P
+        case 0x51: return 0x0C   // Q
+        case 0x52: return 0x0F   // R
+        case 0x53: return 0x01   // S
+        case 0x54: return 0x11   // T
+        case 0x55: return 0x20   // U
+        case 0x56: return 0x09   // V
+        case 0x57: return 0x0D   // W
+        case 0x58: return 0x07   // X
+        case 0x59: return 0x10   // Y
+        case 0x5A: return 0x06   // Z
+        // 数字行
+        case 0x30: return 0x1D   // 0
+        case 0x31: return 0x12   // 1
+        case 0x32: return 0x13   // 2
+        case 0x33: return 0x14   // 3
+        case 0x34: return 0x15   // 4
+        case 0x35: return 0x17   // 5
+        case 0x36: return 0x16   // 6
+        case 0x37: return 0x1A   // 7
+        case 0x38: return 0x1C   // 8
+        case 0x39: return 0x19   // 9
+        // 符号
+        case 0xBA: return 0x29   // ;
+        case 0xBB: return 0x18   // =
+        case 0xBC: return 0x2B   // ,
+        case 0xBD: return 0x1B   // -
+        case 0xBE: return 0x2F   // .
+        case 0xBF: return 0x2C   // /
+        case 0xC0: return 0x32   // `
+        case 0xDB: return 0x21   // [
+        case 0xDC: return 0x2A   // \
+        case 0xDD: return 0x1E   // ]
+        case 0xDE: return 0x27   // '
+        // 控制键
+        case 0x08: return 0x33   // Backspace
+        case 0x09: return 0x30   // Tab
+        case 0x0D: return extended ? 0x4C : 0x24   // 主 Enter / 小键盘 Enter
+        case 0x1B: return 0x35   // Esc
+        case 0x20: return 0x31   // Space
+        case 0x14: return 0x39   // CapsLock
+        case 0x2D: return 0x72   // Insert -> Help
+        case 0x2E: return 0x75   // Delete
+        case 0x24: return 0x73   // Home
+        case 0x23: return 0x77   // End
+        case 0x21: return 0x74   // PageUp
+        case 0x22: return 0x79   // PageDown
+        // 方向键
+        case 0x25: return 0x7B
+        case 0x26: return 0x7E
+        case 0x27: return 0x7C
+        case 0x28: return 0x7D
+        // 修饰键（左右分开）
+        case 0x10: return 0x38   // Shift
+        case 0xA0: return 0x38   // LShift
+        case 0xA1: return 0x3C   // RShift
+        case 0x11: return 0x3B   // Ctrl
+        case 0xA2: return 0x3B   // LCtrl
+        case 0xA3: return 0x3E   // RCtrl
+        case 0x12: return 0x3A   // Alt
+        case 0xA4: return 0x3A   // LAlt
+        case 0xA5: return 0x3D   // RAlt
+        case 0x5B: return 0x37   // LWin -> Command
+        case 0x5C: return 0x36   // RWin -> Right Command
+        // 功能键
+        case 0x70: return 0x7A   // F1
+        case 0x71: return 0x78   // F2
+        case 0x72: return 0x63   // F3
+        case 0x73: return 0x76   // F4
+        case 0x74: return 0x60   // F5
+        case 0x75: return 0x61   // F6
+        case 0x76: return 0x62   // F7
+        case 0x77: return 0x64   // F8
+        case 0x78: return 0x65   // F9
+        case 0x79: return 0x6D   // F10
+        case 0x7A: return 0x67   // F11
+        case 0x7B: return 0x6F   // F12
+        // 小键盘
+        case 0x60: return 0x52
+        case 0x61: return 0x53
+        case 0x62: return 0x54
+        case 0x63: return 0x55
+        case 0x64: return 0x56
+        case 0x65: return 0x57
+        case 0x66: return 0x58
+        case 0x67: return 0x59
+        case 0x68: return 0x5B
+        case 0x69: return 0x5C
+        case 0x6A: return 0x43   // *
+        case 0x6B: return 0x45   // +
+        case 0x6D: return 0x4E   // -
+        case 0x6E: return 0x41   // .
+        case 0x6F: return 0x4B   // /
+        default:   return nil
+        }
     }
 }
 
@@ -1762,9 +2277,12 @@ final class CursorTracker {
     /// 累计发出的光标包数量，用于统计展示
     private(set) var sentCount = 0
 
-    init(sender: Sender, bounds: @escaping () -> CGRect) {
+    private let videoSize: () -> (Int, Int)
+
+    init(sender: Sender, bounds: @escaping () -> CGRect, videoSize: @escaping () -> (Int, Int)) {
         self.sender = sender
         self.bounds = bounds
+        self.videoSize = videoSize
         // 目标发送频率。默认 90：接收端物理屏是 89Hz，光标若只按 60Hz 更新，
         // 每个位置会在屏上停留 1~2 个刷新周期，肉眼就是「鼠标一跳一跳」。
         // 与 89Hz 接近的 90Hz 基本一更新一刷新，光标跟手。用 SECDISPLAY_CURSOR_HZ 覆盖。
@@ -1840,12 +2358,21 @@ final class CursorTracker {
         let ry = Float(p.y - b.minY)
         let inside = rx >= 0 && ry >= 0 && rx < Float(b.width) && ry < Float(b.height)
 
-        let moved = !(abs(rx - lastX) < 0.5 && abs(ry - lastY) < 0.5)
+        // 线上协议与 Windows g_coordW/H 用的是「视频像素」基准（cfg.width x cfg.height）。
+        // 按 videoSize / CGDisplayBounds 比例换算，确保不管 1x 还是 2x Retina（或异常回退），
+        // 线上坐标永远与视频帧像素 1:1 对齐，Windows 端零改动。
+        let (vw, vh) = videoSize()
+        let sx = b.width > 0 ? Float(vw) / Float(b.width) : 1.0
+        let sy = b.height > 0 ? Float(vh) / Float(b.height) : 1.0
+        let ox = rx * sx
+        let oy = ry * sy
+
+        let moved = !(abs(ox - lastX) < 0.5 && abs(oy - lastY) < 0.5)
         guard moved || inside != lastVisible else { return }
 
-        lastX = rx; lastY = ry; lastVisible = inside
+        lastX = ox; lastY = oy; lastVisible = inside
         sentCount += 1
-        sender.sendCursor(x: rx, y: ry, visible: inside)
+        sender.sendCursor(x: ox, y: oy, visible: inside)
     }
 }
 
@@ -1885,6 +2412,13 @@ final class CursorImageTracker {
     func stop() { timer?.cancel(); timer = nil }
 
     private func tick() {
+        // 面板「发送真实光标图像」开关实时生效：关掉后不再发 0x05，
+        // 接收端回退 Windows 标准箭头。原来只在启动时读一次环境变量，
+        // 运行中拨开关没有任何效果。
+        guard !disableCursorImage else {
+            lastFingerprint = 0
+            return
+        }
         guard sender.connected else {
             // 断开时清指纹，下次连上强制重发（新接收端没有旧光标）
             lastFingerprint = 0
@@ -2003,23 +2537,23 @@ if presetName == nil, let rp = Bundle.main.resourcePath {
 }
 if let preset = presetName, !preset.isEmpty {
     switch preset {
-    case "sharp":       // 最清晰，帧率最低
-        cfg.width = 2880; cfg.height = 1800
-        cfg.logicalWidth = 1440; cfg.logicalHeight = 900
-        cfg.captureHz = 40
-    case "balanced":    // 默认
+    case "sharp":       // 2880×1800 真 2x Retina（1440×900 逻辑），画质最锐
         cfg.width = 2880; cfg.height = 1800
         cfg.logicalWidth = 1440; cfg.logicalHeight = 900
         cfg.captureHz = 45
-    case "smooth":      // 降分辨率换帧率
+    case "balanced":    // 默认：2880×1800 真 2x Retina（1440×900 逻辑），与 Windows 物理屏 1:1
+        cfg.width = 2880; cfg.height = 1800
+        cfg.logicalWidth = 1440; cfg.logicalHeight = 900
+        cfg.captureHz = 50
+    case "smooth":      // 2240×1400 真 2x Retina（1120×700 逻辑），流畅度优先
         cfg.width = 2240; cfg.height = 1400
         cfg.logicalWidth = 1120; cfg.logicalHeight = 700
         cfg.captureHz = 60
-    case "compact":     // 1x 小屏：物理=逻辑，适合 Sidecar 共存时用
+    case "compact":     // 1x 小屏（1600×1000），适合 Sidecar 共存或窗口模式
         cfg.width = 1600; cfg.height = 1000
         cfg.logicalWidth = 1600; cfg.logicalHeight = 1000
         cfg.captureHz = 60
-    case "fast":        // 最流畅，清晰度最差
+    case "fast":        // 1920×1200 真 2x Retina（960×600 逻辑）
         cfg.width = 1920; cfg.height = 1200
         cfg.logicalWidth = 960; cfg.logicalHeight = 600
         cfg.captureHz = 60
@@ -2033,13 +2567,12 @@ if let preset = presetName, !preset.isEmpty {
 if let w = Int(ProcessInfo.processInfo.environment["SECDISPLAY_W"] ?? ""),
    let h = Int(ProcessInfo.processInfo.environment["SECDISPLAY_H"] ?? "") {
     cfg.width = w; cfg.height = h
-    cfg.logicalWidth = w / 2; cfg.logicalHeight = h / 2
-    // 显式指定逻辑分辨率，绕开「逻辑 = 物理 / 2」的固定 2x 假设。
-    //
-    // 背景：macOS 27 上 CGVirtualDisplay 的 hiDPI 对虚拟屏不生效，
-    // 实测 NSScreen 与 CGDisplayMode 报的都是「逻辑 = 物理」，也就是 1x，
-    // 于是 2240x1400 的桌面元素偏小。把 LOGICAL 设成与 W/H 相同，
-    // 得到干净的 1x：物理 1600x1000、逻辑 1600x1000，元素随之变大。
+    // 未显式指定 LOGICAL 时：>=2000 宽默认开 2x Retina（w/2 × h/2），小分辨率保持 1x。
+    if w >= 2000 {
+        cfg.logicalWidth = w / 2; cfg.logicalHeight = h / 2
+    } else {
+        cfg.logicalWidth = w; cfg.logicalHeight = h
+    }
     if let lw = Int(ProcessInfo.processInfo.environment["SECDISPLAY_LOGICAL_W"] ?? ""),
        let lh = Int(ProcessInfo.processInfo.environment["SECDISPLAY_LOGICAL_H"] ?? ""),
        lw > 0, lh > 0 {
@@ -2057,16 +2590,16 @@ if let r = Double(ProcessInfo.processInfo.environment["SECDISPLAY_REFRESH"] ?? "
 } else {
     cfg.refreshRate = cfg.captureHz
 }
-// 码率：默认按像素率估算，约 0.35 bit/pixel/frame。
-// 1600x1000@60 约 34 Mbps，2240x1400@60 约 66 Mbps，2880x1800@45 约 82 Mbps。
-// 原先固定 180 Mbps 对多数档位都偏富余，除了压编码器，也会让自适应码率的
-// 下调幅度显得突兀（一降就是几十 Mbps）。需要更高画质时用 SECDISPLAY_MBPS 覆盖。
+// 码率按像素率估算，系数 0.6（2880x1800@50 约 155 Mbps，2240x1400@60 约 113 Mbps，
+// 1600x1000@60 约 58 Mbps；桌面文字边缘高频信息多，0.35 偏低容易糊）。
+// RateController 会按链路健康度在 [target/3, target] 之间自适应，
+// 上限 clamp 到 200；需要更高画质时用 SECDISPLAY_MBPS 覆盖。
 if let mbps = Int(ProcessInfo.processInfo.environment["SECDISPLAY_MBPS"] ?? ""),
    mbps >= 10, mbps <= 1000 {
     cfg.bitrateMbps = mbps
 } else {
     let pixelsPerSec = Double(cfg.width * cfg.height) * cfg.captureHz
-    cfg.bitrateMbps = max(20, min(200, Int(pixelsPerSec * 0.35 / 1_000_000)))
+    cfg.bitrateMbps = max(30, min(200, Int(pixelsPerSec * 0.6 / 1_000_000)))
 }
 let vd = VirtualDisplayManager()
 let encoder = Encoder(width: cfg.width, height: cfg.height, bitrateMbps: cfg.bitrateMbps, captureHz: cfg.captureHz)
@@ -2089,6 +2622,26 @@ if CommandLine.arguments.contains("--cleanup-orphan")
     if !residual.isEmpty {
         Log.info("启动前发现残留虚拟屏 \(residual.count) 块，执行显示重配置清理")
         reconfigureDisplays()
+    }
+}
+
+// 建屏前先确认雷雳链路 carrier 正常。
+// 虚拟屏只有在「Mac 发送端在跑 + 雷雳链路通」时才有意义：
+// 线没插时建屏会留下一块没人用的空屏，还会占住显示器排列。
+// 最多等 8 秒——等太久会让从 Finder 启动的 app 表现为「点了没反应、菜单栏没图标」。
+if LinkMonitor.probe() == false {
+    Log.info("雷雳链路未就绪（\(LinkMonitor.ifName) 无 carrier），最多等 8 秒…")
+    var waited = 0.0
+    while LinkMonitor.probe() == false && waited < 8.0 {
+        usleep(500_000); waited += 0.5
+    }
+    switch LinkMonitor.probe() {
+    case .some(true):
+        Log.info("雷雳链路已就绪，耗时 \(String(format: "%.1f", waited)) 秒")
+    case .some(false):
+        Log.info("链路仍未就绪，先建屏；接收端连上后仍可用")
+    case .none:
+        Log.info("未找到链路接口 \(LinkMonitor.ifName)，跳过等待")
     }
 }
 
@@ -2141,24 +2694,44 @@ sender.onKeyframeRequest = { encoder.forceEncodeLastFrame() }
 sender.listen(port: cfg.port)
 
 // 输入回传：Windows 侧的鼠标事件在 Mac 上重放
-// 需要「辅助功能」权限，没有的话事件会被系统静默丢弃
-if !AXIsProcessTrusted() {
+// 需要「辅助功能」权限，没有的话 CGEvent 注入会被系统静默丢弃
+// （表现为：光标能跟着动，但点击/滚轮完全不生效）。
+let axTrusted = AXIsProcessTrusted()
+if !axTrusted {
     Log.info("警告: 未获得辅助功能权限，副屏上的点击/滚轮无法生效")
-    Log.info("      系统设置 → 隐私与安全性 → 辅助功能，勾选运行本程序的终端")
+    Log.info("      系统设置 → 隐私与安全性 → 辅助功能，勾选 /Applications/SecDisplay.app")
+} else {
+    Log.info("辅助功能权限: 已授权，副屏点击与滚轮可正常回放")
 }
 let injector = InputInjector()
+gMouse = injector
 sender.onInput = { x, y, buttons, wheel in
+    // 这里不能再按「面板是否可见」整条丢弃输入。
+    // 早期为了防面板被光标劫持加过这个门控，但面板点不动的真正根因是
+    // NSEvent 全局监视器抢在 NSApplication 初始化前建立 SkyLight 会话
+    // （已由延迟到 app.run 后注册修复）。保留门控的后果是：只要面板开着，
+    // 点击事件被整条吞掉，而光标移动走 0x03 显示链路不受影响，
+    // 表现就是「鼠标能动、点不动」。因此回放始终生效。
     injector.handle(x: x, y: y, buttons: buttons, wheel: wheel,
-                    bounds: CGDisplayBounds(vd.displayID))
+                    bounds: CGDisplayBounds(vd.displayID),
+                    videoW: cfg.width, videoH: cfg.height)
 }
 
-// 光标转发：坐标是相对虚拟屏的值，与 CGEvent.location 同基准（实测
-// CGDisplayBounds 返回物理像素尺寸，随档位变化，如 2880x1800 / 2240x1400）。
-// 直接相减即可。Windows 端坐标基准必须与之相同（见接收端 g_coordW/H）。
+// 键盘回放：Windows 侧 0x09 包 → macOS CGEvent 键盘事件
+let keyboard = KeyboardInjector()
+gKeyboard = keyboard
+sender.onKey = { vk, scan, down, flags in
+    keyboard.handle(vk: vk, scan: scan, down: down, keyFlags: flags)
+}
+
+// 光标转发：CGEvent.location 与 CGDisplayBounds 处于逻辑点坐标系；
+// 2x Retina 时逻辑点为 1440x900，CursorTracker / InputInjector 会按 cfg/bounds 比例
+// 统一换算到线上物理像素基准（2880x1800），与 Windows 端 g_coordW/H 对齐。
 let vb = CGDisplayBounds(vd.displayID)
-Log.info("坐标基准: 逻辑点 \(Int(vb.width))x\(Int(vb.height))，原点 (\(Int(vb.minX)), \(Int(vb.minY)))")
-let cursor = CursorTracker(sender: sender, bounds: { CGDisplayBounds(vd.displayID) })
-cursor.start()
+Log.info("坐标基准: 逻辑点 \(Int(vb.width))x\(Int(vb.height)) * \(String(format: "%.2f", vdBackingScale))x → 线上 \(cfg.width)x\(cfg.height)，原点 (\(Int(vb.minX)), \(Int(vb.minY)))")
+let cursor = CursorTracker(sender: sender,
+                           bounds: { CGDisplayBounds(vd.displayID) },
+                           videoSize: { (cfg.width, cfg.height) })
 // 真实光标图像：形状变化时才发，让副屏显示 Mac 的光标而非固定 Windows 箭头
 // 真实光标图像（0x05）。SECDISPLAY_NOCURSORIMG=1 可整体关闭，
 // 用于 A/B 判断「光标卡顿是否由接收端反复重建光标引起」——关掉后回退 Windows 标准箭头。
@@ -2166,9 +2739,11 @@ let cursorImage = CursorImageTracker(sender: sender)
 var disableCursorImage = ProcessInfo.processInfo.environment["SECDISPLAY_NOCURSORIMG"] == "1"
 if disableCursorImage {
     Log.info("已关闭真实光标图像(0x05)，使用接收端标准箭头（SECDISPLAY_NOCURSORIMG=1）")
-} else {
-    cursorImage.start()
 }
+// 注意：cursor.start() 调 NSEvent.addGlobalMonitorForEvents，cursorImage.start() 读 NSCursor。
+// 必须在 statusApp = setupStatusBar() + statusApp.run() 初始化完 AppKit 事件会话之后再启动，
+// 否则 NSEvent 全局监视器会抢先初始化半残的 SkyLight 会话，导致本进程所有窗口完全收不到鼠标点击！
+// 实际启动已移至下方 statusApp.run() 前的 DispatchQueue.main.async。
 
 // 传入 id 获取闭包：虚拟屏重建后 id 会变，采集侧每次重建流都重新问
 let cap = ScreenshotCapture(encoder: encoder, cfg: cfg, displayID: { vd.displayID })
@@ -2629,8 +3204,7 @@ final class StatusMenuTarget: NSObject, NSMenuItemValidation {
         showControlPanel()
     }
 
-    /// 状态栏按钮点击：左键直接打开面板，右键（或 Control+左键）弹菜单。
-    /// 不再依赖菜单项派发：这个裸命令行进程里 status item 的菜单会话点不动。
+    /// 状态栏按钮点击：左键打开控制面板，右键（或 Control+左键）弹快捷菜单。
     @objc func handleClick(_ sender: Any?) {
         guard let button = statusItem?.button else { return }
         let ev = NSApp.currentEvent
@@ -2638,16 +3212,14 @@ final class StatusMenuTarget: NSObject, NSMenuItemValidation {
             || (ev?.modifierFlags.contains(.control) ?? false)
         if rightClick, let menu = statusMenu {
             Log.info("菜单栏右键，弹菜单")
-            NSApp.activate(ignoringOtherApps: true)
             button.highlight(true)
             menu.popUp(positioning: nil,
                        at: NSPoint(x: 0, y: button.bounds.height + 4),
                        in: button)
             button.highlight(false)
-            Log.info("菜单已关闭")
             return
         }
-        Log.info("菜单栏左键，直接打开面板")
+        Log.info("菜单栏左键，打开控制面板")
         showControlPanel()
     }
 
@@ -2673,8 +3245,28 @@ var statusItem: NSStatusItem?
 var statusInfoItem: NSMenuItem?
 var statusMenu: NSMenu?
 
+final class AppLifecycleDelegate: NSObject, NSApplicationDelegate {
+    func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool {
+        false
+    }
+
+    /// Dock 图标「退出」与 Cmd+Q 走 -[NSApplication terminate:]，默认直接 exit()，
+    /// 会绕过 shutdown()，把虚拟屏留在 WindowServer 里成为孤儿屏，下次启动建屏失败。
+    /// 这里先取消这次退出，回主队列走完整清理流程。
+    func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
+        Log.info("收到应用退出请求，开始清理")
+        DispatchQueue.main.async {
+            shutdown(signal: SIGTERM)
+        }
+        return .terminateCancel
+    }
+}
+
+let appLifecycleDelegate = AppLifecycleDelegate()
+
 func setupStatusBar() -> NSApplication {
     let app = NSApplication.shared
+    app.delegate = appLifecycleDelegate
     app.setActivationPolicy(.accessory)
 
     let item = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
@@ -2751,6 +3343,15 @@ if let rp = Bundle.main.resourcePath,
 } else {
     Log.info("构建标记: 无（命令行构建或旧包）")
 }
+// 等 statusApp.run() 启动主事件循环后再注册全局鼠标监视器与光标图像轮询，
+// 避免在 NSApplication 初始化之前抢先建立 SkyLight 事件通道导致窗口点击失灵。
+DispatchQueue.main.async {
+    cursor.start()
+    if !disableCursorImage {
+        cursorImage.start()
+    }
+}
+
 // 调试用：SECDISPLAY_SHOW_PANEL=1 启动后直接打开面板，便于不点菜单也能验证 UI。
 if ProcessInfo.processInfo.environment["SECDISPLAY_SHOW_PANEL"] == "1" {
     DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) {

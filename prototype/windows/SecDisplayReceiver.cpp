@@ -261,6 +261,14 @@ static const uint8_t TYPE_KEYFRAME_REQUEST = 0x02;
 // 载荷（全大端）：[version u8][width u16][height u16][fps u8][reserved u8]，共 7 字节
 static const uint8_t TYPE_SESSION = 0x06;
 static const size_t SESSION_PAYLOAD_BYTES = 7;
+// 0x09 键盘事件（接收端 → Mac）。
+// 载荷（全大端，6 字节）：[vk u16][scan u16][down u8][flags u8]
+//   vk    : Windows 虚拟键码
+//   scan  : 硬件扫描码（lParam bits 16-23），扩展键时区分左右 Ctrl/Alt
+//   down  : 1=按下 0=抬起
+//   flags : bit0 扩展键；bit1 系统键（Alt 组合）
+static const uint8_t TYPE_KEY = 0x09;
+static const size_t KEY_PAYLOAD_BYTES = 6;
 static const size_t HEADER_BYTES = 9;   // 类型 1 + 时间戳 8
 static const size_t MAX_PACKET = 64u * 1024u * 1024u;
 
@@ -356,6 +364,24 @@ static void QueueInputEvent(float x, float y, uint8_t buttons, int16_t wheel) {
     e.x = x; e.y = y; e.buttons = buttons; e.wheel = wheel;
     g_inputQ.push_back(e);
 }
+
+// 键盘事件独立队列：和鼠标事件分开，避免鼠标高频移动把按键挤掉。
+struct KeyEvent {
+    uint16_t vk = 0;
+    uint16_t scan = 0;
+    uint8_t down = 0;
+    uint8_t flags = 0;
+};
+static std::mutex g_keyQmtx;
+static std::deque<KeyEvent> g_keyQ;
+
+static void QueueKeyEvent(uint16_t vk, uint16_t scan, uint8_t down, uint8_t flags) {
+    std::lock_guard<std::mutex> lk(g_keyQmtx);
+    if (g_keyQ.size() > 256) g_keyQ.pop_front();
+    KeyEvent e;
+    e.vk = vk; e.scan = scan; e.down = down; e.flags = flags;
+    g_keyQ.push_back(e);
+}
 static const uint64_t INPUT_MOVE_INTERVAL_MS = 8;   // 约 120Hz
 static const uint64_t INPUT_TICK_MS           = 4;   // 线程轮询粒度
 
@@ -410,6 +436,24 @@ static void SendInputPacket(float vx, float vy, uint8_t buttons, int16_t wheel) 
     {
         std::lock_guard<std::mutex> lk(g_sendMtx);
         send(s, (const char*)pkt, 12, 0);
+    }
+    g_stats.inputSent++;
+}
+
+static void SendKeyPacket(uint16_t vk, uint16_t scan, uint8_t down, uint8_t flags) {
+    SOCKET s = g_sock.load();
+    if (s == INVALID_SOCKET) return;
+    uint8_t pkt[7];
+    pkt[0] = TYPE_KEY;
+    pkt[1] = (uint8_t)(vk >> 8);
+    pkt[2] = (uint8_t)(vk & 0xFF);
+    pkt[3] = (uint8_t)(scan >> 8);
+    pkt[4] = (uint8_t)(scan & 0xFF);
+    pkt[5] = down ? 1 : 0;
+    pkt[6] = flags;
+    {
+        std::lock_guard<std::mutex> lk(g_sendMtx);
+        send(s, (const char*)pkt, 7, 0);
     }
     g_stats.inputSent++;
 }
@@ -1417,9 +1461,7 @@ private:
     // 视频处理器视图按纹理指针缓存：每帧新建在 45fps 下是每秒 90 次 Create*View
     std::unordered_map<uint64_t, ComPtr<ID3D11VideoProcessorInputView>> inViewCache_;
     std::unordered_map<void*, ComPtr<ID3D11VideoProcessorOutputView>> outViewCache_;
-    // 黑边靠每帧清后缓冲实现，RTV 同样按纹理指针缓存
-    std::unordered_map<void*, ComPtr<ID3D11RenderTargetView>> rtvCache_;
-    // 交换链与三张缓存表会被呈现线程和 UI/网络线程同时碰：
+    // 交换链与视图缓存表会被呈现线程和 UI/网络线程同时碰：
     // 以前只有会话切档会改尺寸，窗口一拖 WM_SIZE 就频繁触发，必须串起来。
     std::mutex mtx_;
     bool tearing_ = false;
@@ -1472,8 +1514,19 @@ bool Presenter::Init(Graphics* gfx, HWND hwnd, int width, int height) {
                                                  nullptr, nullptr, &swap_);
     if (FAILED(hr)) { Log("交换链创建失败 %08X", hr); return false; }
 
-    gfx->device.As(&videoDevice_);
-    gfx->context.As(&videoCtx_);
+    // 视频设备/上下文拿不到时 CreateProcessor 会对空指针解引用直接崩溃，
+    // 这里先判空，让 Init 返回 false（main 里是直接退出并返回退出码 4，
+    // 不是重试），至少留下明确日志而不是闪退。
+    hr = gfx->device.As(&videoDevice_);
+    if (FAILED(hr) || !videoDevice_) {
+        Log("D3D11 视频设备接口不可用 %08X", hr);
+        return false;
+    }
+    hr = gfx->context.As(&videoCtx_);
+    if (FAILED(hr) || !videoCtx_) {
+        Log("D3D11 视频上下文接口不可用 %08X", hr);
+        return false;
+    }
 
     srcW_ = width;
     srcH_ = height;
@@ -1526,16 +1579,27 @@ bool Presenter::CreateProcessor() {
     videoCtx_->VideoProcessorSetStreamFrameFormat(processor_.Get(), 0,
                                                   D3D11_VIDEO_FRAME_FORMAT_PROGRESSIVE);
 
-    // 输入永远取整帧：硬解按宏块对齐多出的行(如 1808 vs 1800)交给输出矩形去处理，
-    // 不再从源上裁，否则缩放基准会跟着错。
-    RECT src{ 0, 0, srcW_, srcH_ };
+    // 裁掉 H.264 宏块对齐多出的边缘(如 2880x1808 里的底端 8 行)，否则会被当成有效画面
+    // 参与等比缩放，原本能 1:1 满幅的 2880x1800 被迫缩到 2867x1800。
+    int cropW = srcW_, cropH = srcH_;
+    const int dispW = g_displayW.load(), dispH = g_displayH.load();
+    if (dispW > 0 && dispH > 0 &&
+        srcW_ >= dispW && srcH_ >= dispH &&
+        srcW_ - dispW <= 16 && srcH_ - dispH <= 16) {
+        cropW = dispW;
+        cropH = dispH;
+    }
+    RECT src{ 0, 0, cropW, cropH };
     videoCtx_->VideoProcessorSetStreamSourceRect(processor_.Get(), 0, TRUE, &src);
 
-    // 输出按等比装进交换链，装不满的地方留黑边。
-    // 交换链尺寸现在恒等于窗口客户区，所以这里缩完就是最终像素，
-    // DWM 不会再拉第二次。之前交换链按流尺寸建、客户区又是另一个尺寸，
-    // 等于被 VideoProcessor 和 DWM 各双线性一次，文字就是这么糊掉的。
-    RECT dst = FitRect(srcW_, srcH_, width_, height_);
+    // 用 VideoProcessor 原生背景色画黑边，不再每帧在 3D 管线调 ClearRenderTargetView
+    // 去和 VideoProcessorBlt 混写同一个 FLIP 后缓冲。
+    D3D11_VIDEO_COLOR bgColor{};
+    bgColor.RGBA.R = 0.0f; bgColor.RGBA.G = 0.0f; bgColor.RGBA.B = 0.0f; bgColor.RGBA.A = 1.0f;
+    videoCtx_->VideoProcessorSetOutputBackgroundColor(processor_.Get(), FALSE, &bgColor);
+
+    // 输出按等比装进交换链，装不满的地方由 VideoProcessor 用背景色填黑边。
+    RECT dst = FitRect(cropW, cropH, width_, height_);
     const bool letterbox = dst.left > 0 || dst.top > 0 ||
                            dst.right < width_ || dst.bottom < height_;
     if (letterbox) {
@@ -1543,8 +1607,8 @@ bool Presenter::CreateProcessor() {
     } else {
         videoCtx_->VideoProcessorSetOutputTargetRect(processor_.Get(), FALSE, nullptr);
     }
-    Log("呈现器: 输入 %dx%d → 输出 %dx%d，画面矩形 %d,%d - %d,%d%s",
-        srcW_, srcH_, width_, height_,
+    Log("呈现器: 输入 %dx%d(裁 %dx%d) → 输出 %dx%d，画面矩形 %d,%d - %d,%d%s",
+        srcW_, srcH_, cropW, cropH, width_, height_,
         (int)dst.left, (int)dst.top, (int)dst.right, (int)dst.bottom,
         letterbox ? "（留黑边）" : "（满幅）");
     return true;
@@ -1554,9 +1618,18 @@ bool Presenter::SetSourceSize(int w, int h) {
     if (w <= 0 || h <= 0) return false;
     std::lock_guard<std::mutex> lk(mtx_);
     if (w == srcW_ && h == srcH_) return true;
+    const int prevW = srcW_, prevH = srcH_;
     srcW_ = w;
     srcH_ = h;
-    return CreateProcessor();
+    if (!CreateProcessor()) {
+        // 重建失败（设备繁忙/内存抖动）时回滚尺寸。
+        // 不回滚的话 srcW_ 已等于新值，下次进来会因「尺寸相同」早退 true，
+        // 处理器永远不再重建，呈现器就此永久黑屏。
+        srcW_ = prevW;
+        srcH_ = prevH;
+        return false;
+    }
+    return true;
 }
 
 bool Presenter::Resize(int width, int height) {
@@ -1565,21 +1638,37 @@ bool Presenter::Resize(int width, int height) {
     if (width == width_ && height == height_) return true;
     if (!swap_) { width_ = width; height_ = height; return true; }
 
+    const int prevW = width_, prevH = height_;
+
     // 输入/输出视图都缓存了后缓冲指针，改尺寸后必须全部失效
     inViewCache_.clear();
     outViewCache_.clear();
-    rtvCache_.clear();
 
     UINT flags = tearing_ ? DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING : 0;
     HRESULT hr = swap_->ResizeBuffers(0, (UINT)width, (UINT)height,
                                       DXGI_FORMAT_UNKNOWN, flags);
     if (FAILED(hr)) {
-        Log("交换链改尺寸失败 %08X（保持 %dx%d）", hr, width_, height_);
+        Log("交换链改尺寸失败 %08X（保持 %dx%d）", hr, prevW, prevH);
         return false;
     }
     width_ = width;
     height_ = height;
-    if (!CreateProcessor()) return false;
+    if (!CreateProcessor()) {
+        // 同上：处理器重建失败时把交换链尺寸也回滚，
+        // 否则下次 Resize 会因「尺寸相同」早退，永久不再重建。
+        if (FAILED(swap_->ResizeBuffers(0, (UINT)prevW, (UINT)prevH,
+                                        DXGI_FORMAT_UNKNOWN, flags))) {
+            // 回滚交换链失败：真实尺寸仍是 width×height。
+            // 此时不能把 width_/height_ 改回旧值，否则记账与后缓冲不一致，
+            // 自愈分支会按错误尺寸重建处理器，VideoProcessorBlt 持续失败。
+            // 保留新尺寸，让 PresentSample 按真实尺寸重建。
+            Log("交换链回滚到 %dx%d 失败，保留新尺寸 %dx%d", prevW, prevH, width, height);
+            return false;
+        }
+        width_ = prevW;
+        height_ = prevH;
+        return false;
+    }
     Log("呈现器已切换到 %dx%d", width_, height_);
     return true;
 }
@@ -1604,7 +1693,21 @@ bool Presenter::PresentSample(IMFSample* sample) {
 
     if (!sample) return fail("空样本", E_POINTER);
     if (!swap_) return fail("交换链为空", E_UNEXPECTED);
-    if (!processor_) return fail("视频处理器未就绪", E_UNEXPECTED);
+    if (!processor_) {
+        // 处理器缺失说明之前 CreateProcessor 失败过（设备繁忙/内存抖动）。
+        // 这里限流重试，避免呈现器永久残废：每帧都重建会拖垮主循环，
+        // 2 秒一次足够自愈，又不会刷屏。
+        static double lastRetryMs = 0.0;
+        const double nowMs = QpcNowMs();
+        if (nowMs - lastRetryMs > 2000.0) {
+            lastRetryMs = nowMs;
+            Log("视频处理器缺失，尝试重建（输入 %dx%d 输出 %dx%d）", srcW_, srcH_, width_, height_);
+            if (!CreateProcessor()) {
+                Log("视频处理器重建仍失败，2 秒后再试");
+            }
+        }
+        if (!processor_) return fail("视频处理器未就绪", E_UNEXPECTED);
+    }
 
     // FLIP 模型下交换链有多个物理缓冲随 Present 轮转，且每次 GetBuffer 拿到的
     // 可能是不同的表面。必须每帧重新获取，缓存指针会画到错误或不可写的缓冲上，
@@ -1613,25 +1716,6 @@ bool Presenter::PresentSample(IMFSample* sample) {
     HRESULT hr = swap_->GetBuffer(0, IID_PPV_ARGS(&backTex));
     if (FAILED(hr)) return fail("交换链 GetBuffer(0)", hr);
     if (!backTex) return fail("交换链 GetBuffer(0) 返回空纹理", E_POINTER);
-
-    // 黑边每帧都要重画：FLIP 交换链的后缓冲内容在 Present 之后即失效，
-    // 上一帧留下的黑边不会自己保留。这里只清一次全屏，代价远低于一次缩放。
-    {
-        ComPtr<ID3D11RenderTargetView> rtv;
-        void* rtvKey = (void*)backTex.Get();
-        auto itRtv = rtvCache_.find(rtvKey);
-        if (itRtv != rtvCache_.end()) {
-            rtv = itRtv->second;
-        } else {
-            if (rtvCache_.size() > 8) rtvCache_.clear();
-            if (SUCCEEDED(gfx_->device->CreateRenderTargetView(backTex.Get(), nullptr, &rtv)) && rtv)
-                rtvCache_[rtvKey] = rtv;
-        }
-        if (rtv) {
-            const float bg[4] = { 0.0f, 0.0f, 0.0f, 1.0f };
-            gfx_->context->ClearRenderTargetView(rtv.Get(), bg);
-        }
-    }
 
     // 取解码输出的纹理
     ComPtr<IMFMediaBuffer> buf;
@@ -1760,7 +1844,6 @@ void Presenter::Shutdown() {
     std::lock_guard<std::mutex> lk(mtx_);
     inViewCache_.clear();
     outViewCache_.clear();
-    rtvCache_.clear();
     processor_.Reset();
     enum_.Reset();
     videoCtx_.Reset();
@@ -1894,6 +1977,24 @@ static void EnterFullscreen() {
 
 static void ExitFullscreen() {
     if (!g_hwnd || !g_isFullscreen) return;
+    // 以 --fullscreen / config fullscreen=1 直接全屏启动时，没走过 EnterFullscreen()，
+    // g_savedStyle / g_savedRect 可能是 0；退回合理的默认窗口矩形，避免缩成 2x2 黑窗。
+    if (g_savedStyle == 0 || (g_savedRect.right - g_savedRect.left) < 160 ||
+        (g_savedRect.bottom - g_savedRect.top) < 100) {
+        g_savedStyle = WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX | WS_MAXIMIZEBOX | WS_VISIBLE;
+        g_savedExStyle = WS_EX_APPWINDOW;
+        HMONITOR mon = MonitorFromWindow(g_hwnd, MONITOR_DEFAULTTONEAREST);
+        MONITORINFO mi{}; mi.cbSize = sizeof(mi);
+        int ww = 1280, wh = 800;
+        int mx = 0, my = 0;
+        if (GetMonitorInfoW(mon, &mi)) {
+            ww = (mi.rcWork.right - mi.rcWork.left) * 3 / 4;
+            wh = (mi.rcWork.bottom - mi.rcWork.top) * 3 / 4;
+            mx = mi.rcWork.left + ((mi.rcWork.right - mi.rcWork.left) - ww) / 2;
+            my = mi.rcWork.top + ((mi.rcWork.bottom - mi.rcWork.top) - wh) / 2;
+        }
+        g_savedRect = RECT{ mx, my, mx + ww, my + wh };
+    }
     SetWindowLongPtr(g_hwnd, GWL_STYLE, g_savedStyle);
     SetWindowLongPtr(g_hwnd, GWL_EXSTYLE, g_savedExStyle);
     SetWindowPos(g_hwnd, HWND_NOTOPMOST,
@@ -2500,11 +2601,20 @@ static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
         // 客户区变了就把交换链跟过去。不跟的话 DWM 会把按流尺寸建的交换链
         // 双线性拉伸到窗口大小，文字边缘就是这么糊的。
         // 拖动时 WM_SIZE 连发，攒 120ms 只改一次，避免和呈现线程抢后缓冲。
-        if (w != SIZE_MINIMIZED) {
-            g_pendingClientW = LOWORD(l);
-            g_pendingClientH = HIWORD(l);
-            g_syncSwapRetry = 0;
-            SetTimer(h, TIMER_SYNC_SWAP, 120, nullptr);
+        // 最小化/还原过渡期间 Windows 偶尔会发 2x2 的瞬态客户区，低于 64px 一律忽略并取消定时器，
+        // 否则交换链被切成 2x2 会直接黑屏。
+        if (w == SIZE_MINIMIZED) {
+            KillTimer(h, TIMER_SYNC_SWAP);
+        } else {
+            const int cw = LOWORD(l), ch = HIWORD(l);
+            if (cw >= 64 && ch >= 64) {
+                g_pendingClientW = cw;
+                g_pendingClientH = ch;
+                g_syncSwapRetry = 0;
+                SetTimer(h, TIMER_SYNC_SWAP, 120, nullptr);
+            } else {
+                KillTimer(h, TIMER_SYNC_SWAP);
+            }
         }
         return 0;
     case WM_TIMER:
@@ -2515,13 +2625,17 @@ static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
         }
         if (w == TIMER_SYNC_SWAP) {
             KillTimer(h, TIMER_SYNC_SWAP);
-            if (g_presenter && g_pendingClientW > 0 && g_pendingClientH > 0) {
-                if (!g_presenter->Resize(g_pendingClientW, g_pendingClientH)) {
+            RECT cur{};
+            if (g_presenter && !IsIconic(h) && GetClientRect(h, &cur) &&
+                cur.right - cur.left >= 64 && cur.bottom - cur.top >= 64) {
+                const int tw = cur.right - cur.left;
+                const int th = cur.bottom - cur.top;
+                if (!g_presenter->Resize(tw, th)) {
                     // 后缓冲还被呈现线程占着，隔一轮再试，最多 8 次
                     if (++g_syncSwapRetry < 8) {
                         SetTimer(h, TIMER_SYNC_SWAP, 150, nullptr);
                     } else {
-                        Log("交换链同步放弃: 目标 %dx%d 连续失败", g_pendingClientW, g_pendingClientH);
+                        Log("交换链同步放弃: 目标 %dx%d 连续失败", tw, th);
                         g_syncSwapRetry = 0;
                     }
                 }
@@ -2620,18 +2734,44 @@ static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
         else if (w == HOTKEY_HIDE_ID) ToggleMinimize();
         return 0;
     case WM_KEYDOWN:
+    case WM_KEYUP:
+    case WM_SYSKEYDOWN:
+    case WM_SYSKEYUP: {
+        const bool down = (m == WM_KEYDOWN || m == WM_SYSKEYDOWN);
+        const bool sysKey = (m == WM_SYSKEYDOWN || m == WM_SYSKEYUP);
+        // lParam bit30 = 前一次状态已按下，用来识别系统自动重复。
+        // 不区分的话按住 Esc 会先退出全屏、再被重复事件当成「再按一次」而直接退出进程。
+        const bool repeat = (l & 0x40000000) != 0;
+        // 本地快捷键只保留「退出」和「全屏」两个，且不转发，避免误触。
+        // 原来还有 'F' 切全屏——键盘转发接入后按 F 会把远端画面放大，已移除。
+        // 按下与抬起必须成对消费：只吞 keyDown 会向 Mac 投出无配对的 keyUp。
         if (w == VK_ESCAPE) {
-            // 全屏时 Esc 先回到窗口，避免想退出放大却直接把程序关掉；
-            // 已经在窗口模式时 Esc 才退出程序。
-            if (g_isFullscreen) ExitFullscreen(); else RequestQuit();
+            if (down && !repeat) {
+                if (g_isFullscreen) ExitFullscreen(); else RequestQuit();
+            }
             return 0;
         }
-        // F11 或 F 切换全屏，方便窗口模式下按一下变全屏
-        if (w == VK_F11 || w == 'F') {
-            if (g_isFullscreen) ExitFullscreen(); else EnterFullscreen();
+        if (w == VK_F11) {
+            if (down && !repeat) {
+                if (g_isFullscreen) ExitFullscreen(); else EnterFullscreen();
+            }
             return 0;
         }
+        // Alt+F4 交给系统走 SC_CLOSE。本分支接管了 WM_SYSKEYDOWN，若直接 return 0
+        // 就吞掉了系统默认的关闭路径（窗口与全屏都退不出去）。
+        if (sysKey && w == VK_F4) {
+            if (down && !repeat) SendMessageW(h, WM_SYSCOMMAND, SC_CLOSE, 0);
+            return 0;
+        }
+        // 其余按键全部转发给 Mac
+        const uint16_t scan = (uint16_t)((l >> 16) & 0xFF);
+        const bool extended = ((l >> 24) & 0x1) != 0;
+        uint8_t flags = 0;
+        if (extended) flags |= 0x01;
+        if (sysKey)   flags |= 0x02;
+        QueueKeyEvent((uint16_t)(w & 0xFFFF), scan, down ? 1 : 0, flags);
         return 0;
+    }
     case WM_MOUSEMOVE: {
         // 只过滤程序自己 SetCursorPos 产生的那一次移动：时间接近且落点等于目标点。
         // 不能只看时间窗，否则 Mac 光标高频移动时，真实本地移动会被一直吞掉，
@@ -3723,6 +3863,17 @@ int main(int argc, char** argv) {
                 SendInputPacket(e.x, e.y, e.buttons, e.wheel);
                 lastMoveMs = GetTickCount64();
                 g_moveDirty = false;   // 事件包已带最新位置
+            }
+            // 键盘事件按顺序逐条发
+            for (;;) {
+                KeyEvent k;
+                {
+                    std::lock_guard<std::mutex> lk(g_keyQmtx);
+                    if (g_keyQ.empty()) break;
+                    k = g_keyQ.front();
+                    g_keyQ.pop_front();
+                }
+                SendKeyPacket(k.vk, k.scan, k.down, k.flags);
             }
             if (g_moveDirty.load()) {
                 uint64_t now = GetTickCount64();

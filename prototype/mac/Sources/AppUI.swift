@@ -20,6 +20,7 @@ final class AppModel: ObservableObject {
     @Published var skipped = 0
     @Published var width = 0
     @Published var height = 0
+    @Published var scale: Double = 1.0
     @Published var cursorHz: Double = 0
     @Published var presetName = "-"
     @Published var cursorImageOn = true
@@ -28,12 +29,19 @@ final class AppModel: ObservableObject {
     /// 刷新时置位，避免程序化改选中项触发重启
     var suppressResolutionChange = false
 
-    static let resolutions: [(label: String, w: Int, h: Int)] = [
-        ("1600 × 1000", 1600, 1000),
-        ("1920 × 1200", 1920, 1200),
-        ("2240 × 1400", 2240, 1400),
-        ("2560 × 1600", 2560, 1600),
-        ("2880 × 1800", 2880, 1800),
+    static let resolutions: [(label: String, w: Int, h: Int, lw: Int, lh: Int)] = [
+        ("1600 × 1000 (1x)", 1600, 1000, 1600, 1000),
+        ("1920 × 1200 (2x Retina)", 1920, 1200, 960, 600),
+        ("2240 × 1400 (2x Retina)", 2240, 1400, 1120, 700),
+        ("2560 × 1600 (2x Retina)", 2560, 1600, 1280, 800),
+        // 真 2x Retina（1440×900 逻辑 / 2880×1800 物理）：
+        // 与 Windows 2880×1800 物理屏 1:1 像素对齐，同时 Mac 端按 2x 渲染字体与正常桌面比例。
+        ("2880 × 1800 (2x Retina · 推荐)", 2880, 1800, 1440, 900),
+        ("2880 × 1800 (1x)", 2880, 1800, 2880, 1800),
+        // 16:9 档位：Windows 显示器为 16:9 时选对应的，全屏才能 1:1
+        ("1920 × 1080 (1x)", 1920, 1080, 1920, 1080),
+        ("2560 × 1440 (2x Retina)", 2560, 1440, 1280, 720),
+        ("3840 × 2160 (2x Retina)", 3840, 2160, 1920, 1080),
     ]
 
     private init() {}
@@ -50,14 +58,22 @@ final class AppModel: ObservableObject {
         skipped = cap.staticSkipCount
         width = cfg.width
         height = cfg.height
+        scale = vdBackingScale
         cursorHz = cursor.targetHz
         cursorImageOn = !disableCursorImage
-        presetName = ProcessInfo.processInfo.environment["SECDISPLAY_PRESET"] ?? "自定义"
+        presetName = mainPresetLabel()
         logLine = Log.currentPath
         suppressResolutionChange = true
-        resolutionIndex = AppModel.resolutions.firstIndex { $0.w == cfg.width && $0.h == cfg.height } ?? -1
+        resolutionIndex = AppModel.resolutions.firstIndex { $0.w == cfg.width && $0.h == cfg.height && $0.lw == cfg.logicalWidth && $0.lh == cfg.logicalHeight } ?? -1
         suppressResolutionChange = false
     }
+}
+
+private func mainPresetLabel() -> String {
+    if ProcessInfo.processInfo.environment["SECDISPLAY_W"] != nil {
+        return "自定义"
+    }
+    return presetName ?? "自定义"
 }
 
 private let accent = Color(red: 0.22, green: 0.55, blue: 0.96)
@@ -90,7 +106,9 @@ struct StatusView: View {
                 Text(model.connected ? "已连接" : "等待接收端")
                     .font(.headline)
                 Spacer()
-                Text("\(model.width)×\(model.height)")
+                Text(model.scale > 1.5
+                     ? "\(model.width)×\(model.height) · 2x"
+                     : "\(model.width)×\(model.height) · 1x")
                     .font(.system(.subheadline, design: .monospaced))
                     .foregroundStyle(.secondary)
             }
@@ -117,7 +135,7 @@ struct StatusView: View {
                             guard !model.suppressResolutionChange, idx >= 0,
                                   idx < AppModel.resolutions.count else { return }
                             let r = AppModel.resolutions[idx]
-                            restartWithResolution(r.w, r.h)
+                            restartWithResolution(r.w, r.h, r.lw, r.lh)
                         })) {
                         ForEach(Array(AppModel.resolutions.enumerated()), id: \.offset) { i, r in
                             Text(r.label).tag(i)
@@ -152,6 +170,10 @@ struct StatusView: View {
                         openLogsFolder()
                     }
                     Spacer()
+                    Button("隐藏") {
+                        hideControlPanel()
+                    }
+                    .keyboardShortcut(.cancelAction)
                     Button("退出") {
                         // 退出清理里有嵌套 RunLoop 等待，放回主队列执行，避免卡在动画/事件循环里
                         DispatchQueue.main.async { shutdown(signal: SIGTERM) }
@@ -175,18 +197,20 @@ struct StatusView: View {
 
 /// 切换分辨率：虚拟屏和编码器都在启动时按尺寸建好，改尺寸只能重建进程。
 /// 命令行启动走 run.sh restart；.app 启动时没有 run.sh，直接重启自身。
-func restartWithResolution(_ w: Int, _ h: Int) {
+func restartWithResolution(_ w: Int, _ h: Int, _ lw: Int, _ lh: Int) {
     let dir = FileManager.default.currentDirectoryPath
     Log.info("面板切换分辨率 \(w)x\(h)，准备重启")
     let p = Process()
     p.executableURL = URL(fileURLWithPath: "/bin/zsh")
     if FileManager.default.fileExists(atPath: dir + "/run.sh") {
-        p.arguments = ["-c", "sleep 9; cd \"\(dir)\" && SECDISPLAY_W=\(w) SECDISPLAY_H=\(h) ./run.sh restart"]
+        p.arguments = ["-c", "sleep 9; cd \"$1\" && SECDISPLAY_W=\"$2\" SECDISPLAY_H=\"$3\" SECDISPLAY_LOGICAL_W=\"$4\" SECDISPLAY_LOGICAL_H=\"$5\" ./run.sh restart",
+                       "restart", dir, "\(w)", "\(h)", "\(lw)", "\(lh)"]
     } else {
         // .app 场景：用 open 重新拉起 bundle，保持 TCC 归属在 bundle 上。
         // 直接跑 Contents/MacOS/SecDisplay 会被当成裸二进制，权限可能对不上。
         let appPath = Bundle.main.bundlePath
-        p.arguments = ["-c", "sleep 9; open -n \"\(appPath)\" --env SECDISPLAY_W=\(w) --env SECDISPLAY_H=\(h)"]
+        p.arguments = ["-c", "sleep 9; open -n \"$1\" --env SECDISPLAY_W=\"$2\" --env SECDISPLAY_H=\"$3\" --env SECDISPLAY_LOGICAL_W=\"$4\" --env SECDISPLAY_LOGICAL_H=\"$5\"",
+                       "restart", appPath, "\(w)", "\(h)", "\(lw)", "\(lh)"]
     }
     p.standardOutput = FileHandle.nullDevice
     p.standardError = FileHandle.nullDevice
@@ -195,8 +219,6 @@ func restartWithResolution(_ w: Int, _ h: Int) {
         shutdown(signal: SIGTERM)
     }
 }
-
-private var panelWindow: NSWindow?
 
 /// 打开日志目录。命令行运行时日志在 ./logs，打包成 app 后在 ~/Library/Logs/SecDisplay。
 func openLogsFolder() {
@@ -214,35 +236,100 @@ func openLogsFolder() {
     }
 }
 
+private let panelStateLock = NSLock()
+nonisolated(unsafe) private var panelVisibleFlag = false
+
+private func setPanelVisible(_ v: Bool) {
+    panelStateLock.lock()
+    panelVisibleFlag = v
+    panelStateLock.unlock()
+}
+
+/// 面板可见标志。保留供 UI 侧查询，输入回放已不再依赖它
+/// （面板点不动的真根因是 NSEvent 全局监视器抢在 NSApplication 初始化前
+/// 建立 SkyLight 会话，已由延迟注册修复）。
+var isControlPanelVisible: Bool {
+    panelStateLock.lock()
+    let v = panelVisibleFlag
+    panelStateLock.unlock()
+    return v
+}
+
+private var panelWindow: NSWindow?
+
+private final class PanelWindowDelegate: NSObject, NSWindowDelegate {
+    func windowWillClose(_ notification: Notification) {
+        setPanelVisible(false)
+        NSApp.setActivationPolicy(.accessory)
+        Log.info("面板通过关闭按钮隐藏")
+    }
+}
+
+private let panelWindowDelegate = PanelWindowDelegate()
+
+/// 隐藏面板但保留进程。面板只是个查看窗口，关掉不该影响推流。
+func hideControlPanel() {
+    setPanelVisible(false)
+    panelWindow?.orderOut(nil)
+    NSApp.setActivationPolicy(.accessory)
+    Log.info("面板已隐藏")
+}
+
+/// 把面板固定放到内建主屏，不跟随鼠标所在屏。
+/// 用 NSEvent.mouseLocation 选屏时，一旦光标被输入回放 warp 到虚拟屏，
+/// 面板就会跟着跑到扩展桌面那侧，用户在 Mac 上根本看不到。
+private func placeOnUserScreen(_ w: NSWindow) {
+    let screen = NSScreen.screens.first { s in
+        // 主屏：frame 原点在 (0,0)。虚拟屏 origin.x 通常 > 0，Sidecar 在负 x。
+        abs(s.frame.origin.x) < 1 && abs(s.frame.origin.y) < 1
+    } ?? NSScreen.screens.first
+    guard let s = screen else { w.center(); return }
+    let vf = s.visibleFrame
+    let size = w.frame.size
+    w.setFrameOrigin(NSPoint(x: vf.midX - size.width / 2,
+                             y: vf.midY - size.height / 2))
+}
+
 /// 打开/前置控制面板
 func showControlPanel() {
-    // .accessory 进程不会自动激活，窗口只 makeKeyAndOrderFront 有可能被别的 App
-    // 压在后面，看起来像「点了没反应」。先激活，再置前，最后兜底 orderFrontRegardless。
+    // 平时以 .accessory 常驻菜单栏；打开面板时切成 .regular 让 App 可成为前台，
+    // 并在下一个主循环轮次补一次 activate，等 WindowServer 完成策略切换后再聚焦。
     Log.info("打开控制面板请求")
+    setPanelVisible(true)
+    NSApp.setActivationPolicy(.regular)
     NSApp.activate(ignoringOtherApps: true)
 
+    let targetWindow: NSWindow
     if let w = panelWindow {
-        Log.info("复用已有面板 isVisible=\(w.isVisible)")
+        placeOnUserScreen(w)
         w.makeKeyAndOrderFront(nil)
         w.orderFrontRegardless()
-        Log.info("面板已前置 key=\(w.isKeyWindow) visible=\(w.isVisible)")
-        return
+        targetWindow = w
+        Log.info("面板已前置 key=\(w.isKeyWindow) visible=\(w.isVisible) frame=\(w.frame)")
+    } else {
+        let host = NSHostingView(rootView: StatusView())
+        let w = NSWindow(
+            contentRect: NSRect(x: 0, y: 0, width: 380, height: 520),
+            styleMask: [.titled, .closable, .miniaturizable, .fullSizeContentView],
+            backing: .buffered,
+            defer: false)
+        w.title = "SecDisplay 发送端"
+        w.titlebarAppearsTransparent = true
+        w.isReleasedWhenClosed = false
+        w.hidesOnDeactivate = false
+        w.delegate = panelWindowDelegate
+        w.contentView = host
+        placeOnUserScreen(w)
+        w.makeKeyAndOrderFront(nil)
+        w.orderFrontRegardless()
+        panelWindow = w
+        targetWindow = w
+        Log.info("面板已创建 frame=\(w.frame) key=\(w.isKeyWindow) visible=\(w.isVisible)")
     }
 
-    let host = NSHostingView(rootView: StatusView())
-    let w = NSWindow(
-        contentRect: NSRect(x: 0, y: 0, width: 380, height: 520),
-        styleMask: [.titled, .closable, .miniaturizable, .fullSizeContentView],
-        backing: .buffered,
-        defer: false)
-    w.title = "SecDisplay 发送端"
-    w.titlebarAppearsTransparent = true
-    w.isReleasedWhenClosed = false
-    w.hidesOnDeactivate = false
-    w.contentView = host
-    w.center()
-    w.makeKeyAndOrderFront(nil)
-    w.orderFrontRegardless()
-    panelWindow = w
-    Log.info("面板已创建 frame=\(w.frame) key=\(w.isKeyWindow) visible=\(w.isVisible)")
+    DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) {
+        guard isControlPanelVisible else { return }
+        NSApp.activate(ignoringOtherApps: true)
+        targetWindow.makeKeyAndOrderFront(nil)
+    }
 }
