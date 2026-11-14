@@ -1514,8 +1514,18 @@ bool Presenter::Init(Graphics* gfx, HWND hwnd, int width, int height) {
                                                  nullptr, nullptr, &swap_);
     if (FAILED(hr)) { Log("交换链创建失败 %08X", hr); return false; }
 
-    gfx->device.As(&videoDevice_);
-    gfx->context.As(&videoCtx_);
+    // 视频设备/上下文拿不到时 CreateProcessor 会对空指针解引用直接崩溃，
+    // 这里先判空，退回「创建失败 → 上层重试」的黑屏路径。
+    hr = gfx->device.As(&videoDevice_);
+    if (FAILED(hr) || !videoDevice_) {
+        Log("D3D11 视频设备接口不可用 %08X", hr);
+        return false;
+    }
+    hr = gfx->context.As(&videoCtx_);
+    if (FAILED(hr) || !videoCtx_) {
+        Log("D3D11 视频上下文接口不可用 %08X", hr);
+        return false;
+    }
 
     srcW_ = width;
     srcH_ = height;
@@ -2730,12 +2740,23 @@ static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
         const bool sysKey = (m == WM_SYSKEYDOWN || m == WM_SYSKEYUP);
         // 本地快捷键只保留「退出」和「全屏」两个，且不转发，避免误触。
         // 原来还有 'F' 切全屏——键盘转发接入后按 F 会把远端画面放大，已移除。
-        if (down && w == VK_ESCAPE) {
-            if (g_isFullscreen) ExitFullscreen(); else RequestQuit();
+        // 按下与抬起必须成对消费：只吞 keyDown 会向 Mac 投出无配对的 keyUp。
+        if (w == VK_ESCAPE) {
+            if (down) {
+                if (g_isFullscreen) ExitFullscreen(); else RequestQuit();
+            }
             return 0;
         }
-        if (down && w == VK_F11) {
-            if (g_isFullscreen) ExitFullscreen(); else EnterFullscreen();
+        if (w == VK_F11) {
+            if (down) {
+                if (g_isFullscreen) ExitFullscreen(); else EnterFullscreen();
+            }
+            return 0;
+        }
+        // Alt+F4 交给系统走 SC_CLOSE。本分支接管了 WM_SYSKEYDOWN，若直接 return 0
+        // 就吞掉了系统默认的关闭路径（窗口与全屏都退不出去）。
+        if (sysKey && w == VK_F4) {
+            if (down) SendMessageW(h, WM_SYSCOMMAND, SC_CLOSE, 0);
             return 0;
         }
         // 其余按键全部转发给 Mac
