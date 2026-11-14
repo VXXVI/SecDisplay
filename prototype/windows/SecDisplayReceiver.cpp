@@ -360,7 +360,6 @@ static int g_shakeHead = 0;
 static bool g_shakeActive = false;
 static int64_t g_shakeLastMoveMs = 0;
 static double g_shakeZoom = 1.0;
-static int g_shakeCurPm = 1000;          // 当前实际应用的缩放（千分比），用于避免重复重建
 static bool g_shakeHolding = false;      // 已停止晃动、正在等待 hold 到期
 static int64_t g_shakeHoldUntil = 0;
 
@@ -2592,7 +2591,7 @@ static void ApplyCursorImage() {
     HCURSOR old = g_customCursor;
     g_customCursor = cur;
     g_cursorAppliedFp = fp;
-    g_cursorAppliedScalePm = scalePm;
+    g_cursorAppliedScalePm = scalePm;   // 唯一权威：当前实际应用的缩放
     if (g_cursorVisible.load()) SetCursor(cur);
     if (old) DestroyCursor(old);
 }
@@ -2816,16 +2815,10 @@ static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
             // 晃动停止后光标不再移动，就不会再有 WM_APP_REMOTE_CURSOR。
             // 这条定时器是唯一的收回路径：hold 到期后逐帧收缩，直到回到 1.0。
             const bool keep = TickShakeShrink(GetTickCount64());
-            // 缩放变了才重建 HCURSOR，否则每帧都在 CreateIconIndirect
-            const int want = DesiredCursorScalePm();
-            if (want != g_shakeCurPm) {
-                g_shakeCurPm = want;
-                RefreshCursorScale();
-            }
+            // ApplyCursorImage 内部按 g_cursorAppliedScalePm 判重，这里不必再维护副本，
+            // 直接调即可：缩放没变就是空转一次比较，变了才真的重建。
+            RefreshCursorScale();
             if (!keep) {
-                g_shakeZoom = 1.0;
-                g_shakeCurPm = DesiredCursorScalePm();
-                RefreshCursorScale();
                 Log("晃动结束，光标已恢复原尺寸");
                 KillTimer(h, kShakeTimer);
             }
@@ -2892,14 +2885,17 @@ static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
 
         // 晃动检测：放大状态变化时重建光标位图。放在 SetCursorPos 之后，
         // 用屏幕坐标参与判定（客户区坐标在窗口移动时会整体平移，容易误判）。
+        // 只在「本次真的发生状态切换」时重建，稳态下不产生额外 GDI 调用。
         {
             const bool wasActive = g_shakeActive;
             DetectShake(GetTickCount64(), sx, sy);
-            const int want = DesiredCursorScalePm();
-            if (g_shakeActive != wasActive || want != g_shakeCurPm) {
-                g_shakeCurPm = want;
-                RefreshCursorScale();
+            // 从收缩中途再次晃动时 DetectShake 只把 holding 置 false，
+            // 不会重新把 zoom 拉回满值，这里统一补齐，保证再晃一定回到最大。
+            if (wasActive && g_shakeActive && !g_shakeHolding
+                && g_shakeZoom < kShakeCursorZoom) {
+                g_shakeZoom = kShakeCursorZoom;
             }
+            if (g_shakeActive != wasActive) RefreshCursorScale();
         }
         return 0;
     }

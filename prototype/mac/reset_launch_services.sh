@@ -23,10 +23,19 @@ LSREGISTER="/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchS
 SIGN_ID="com.secdisplay.screensender"
 
 echo "=== 1. 检查硬盘上的 SecDisplay.app ==="
-FOUND=$(mdfind -name "SecDisplay.app" 2>/dev/null | grep -v "^/Applications/SecDisplay.app$" || true)
+# 两种来源都要查：
+#   mdfind 走 Spotlight 索引，快但可能漏掉未索引的目录（比如 .git 里的、刚拷进来的）
+#   find 直接扫文件系统，慢一些但可靠
+# 只保留 .app 目录本身，排除里面的可执行文件和嵌套路径。
+FOUND=$(
+    {
+        mdfind -name "SecDisplay.app" 2>/dev/null
+        find /Applications /Users/"$USER" -maxdepth 6 -name "SecDisplay.app" -type d 2>/dev/null
+    } | grep -E '\.app$' | grep -v "^/Applications/SecDisplay.app$" | sort -u || true
+)
 if [ -n "$FOUND" ]; then
     echo "发现多余副本（建议删除）:"
-    echo "$FOUND"
+    echo "$FOUND" | sed 's/^/  /'
     echo
     read -r -p "删除以上副本？[y/N] " ans
     if [ "$ans" = "y" ] || [ "$ans" = "Y" ]; then

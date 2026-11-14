@@ -23,9 +23,19 @@ SIGN_ID="com.secdisplay.screensender"
 # 即便构建完立刻 rm -rf，登记记录也不会跟着消失，只能靠 lsregister -kill -r 重建。
 # 放到 $TMPDIR 后，仓库里从头到尾不出现 .app，从根上断掉这条来源。
 WORK="$(mktemp -d "${TMPDIR:-/tmp}/secdisplay-build.XXXXXX")"
-trap 'rm -rf "$WORK"' EXIT
 APP="$WORK/SecDisplay.app"
 BIN="$APP/Contents/MacOS/SecDisplay"
+
+# --no-install 时要把产物留在原地给用户 open，所以不能删临时目录；
+# 默认安装模式下装完就删。
+INSTALL=1
+case "${1:-}" in
+    --no-install) INSTALL=0 ;;
+    --install)    INSTALL=1 ;;
+esac
+if [ "$INSTALL" = "1" ]; then
+    trap 'rm -rf "$WORK"' EXIT
+fi
 
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
 
@@ -117,13 +127,6 @@ fi
 
 echo "已生成 $APP"
 
-# 默认直接装到 /Applications。--no-install 才跳过。
-# --install 保留为兼容旧调用，效果与默认一致。
-INSTALL=1
-case "${1:-}" in
-    --no-install) INSTALL=0 ;;
-    --install)    INSTALL=1 ;;
-esac
 if [ "$INSTALL" = "1" ]; then
     rm -rf "/Applications/SecDisplay.app"
     cp -R "$APP" /Applications/
@@ -137,7 +140,9 @@ echo
 if [ "$INSTALL" = "1" ]; then
     echo "启动: open /Applications/SecDisplay.app"
 else
-    echo "启动: open \"$WORK/SecDisplay.app\"（在临时目录，退出后自动清理）"
+    echo "启动: open \"$WORK/SecDisplay.app\""
+    echo "  （未安装模式，产物在临时目录 $WORK，系统重启或手动清理后消失；"
+    echo "    想长期使用请不带 --no-install 运行一次，装到 /Applications）"
 fi
 echo "日志: ~/Library/Logs/SecDisplay/sender.log"
 echo "切档: echo sharp > $(pwd)/.preset && ./build_app.sh"
