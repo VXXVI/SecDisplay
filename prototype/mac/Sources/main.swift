@@ -1453,6 +1453,9 @@ final class ScreenshotCapture {
                     pb = buf
                 }
                 let now = CFAbsoluteTimeGetCurrent()
+                // 旧代次 worker 可能刚从一个长 await 里返回（单帧 60ms 甚至更久），
+                // 这里再确认一次代次/运行状态，避免逐个多发一帧干扰看护判断。
+                guard running && workerGen == gen else { return }
                 let fw = CVPixelBufferGetWidth(pb)
                 let fh = CVPixelBufferGetHeight(pb)
                 let actualFmt = CVPixelBufferGetPixelFormatType(pb)
@@ -1647,12 +1650,31 @@ final class Sender {
     private let maxInFlight = 2
     var dropped = 0
     var sent = 0
-    /// 累计发送帧数（不随 2 秒统计清零，给面板看总量）
-    private(set) var totalSent = 0
-    /// 对端地址描述，供面板显示
-    private(set) var peerDescription = "-"
+    /// 累计发送帧数（不随 2 秒统计清零，给面板看总量）。
+    /// 写方 net 队列、读方主线程，走锁。
+    private let totalLock = NSLock()
+    private var _totalSent = 0
+    var totalSent: Int {
+        totalLock.lock(); defer { totalLock.unlock() }
+        return _totalSent
+    }
+    func bumpTotalSent() {
+        totalLock.lock(); _totalSent += 1; totalLock.unlock()
+    }
     var sentBytes = 0
     var connected = false
+
+    /// 对端地址描述。写方是 net 队列（建连回调），读方是主线程（面板），
+    /// String 是引用计数的多字节值类型，跨线程裸读写是 UB，必须走锁。
+    private let peerLock = NSLock()
+    private var _peerDescription = "-"
+    var peerDescription: String {
+        peerLock.lock(); defer { peerLock.unlock() }
+        return _peerDescription
+    }
+    func setPeerDescription(_ s: String) {
+        peerLock.lock(); _peerDescription = s; peerLock.unlock()
+    }
 
     /// 会话头里通告的虚拟屏参数，由 main 在启动时写入。
     /// 接收端据此自动调整窗口尺寸与坐标基准，两端不再手工对齐分辨率。
@@ -1705,7 +1727,7 @@ final class Sender {
             // 误标成断开，表现为连上后一帧都发不出去。
             self.connEpoch &+= 1
             let epoch = self.connEpoch
-            self.peerDescription = String(describing: c.endpoint)
+            self.setPeerDescription(String(describing: c.endpoint))
 
             let old = self.conn
             self.conn = c
@@ -2040,7 +2062,7 @@ final class Sender {
         packet.append(frame)
 
         sent += 1
-        totalSent += 1
+        bumpTotalSent()
         sentBytes += packet.count
         // 捕获发起时的连接代数。重连时新连接先把 connected 置 true，
         // 旧连接上未完成的 send 随后会以错误回调；若不区分代数，这个迟到的
@@ -3053,6 +3075,9 @@ final class RateController {
         if s.captureFps < 10 {
             highRounds = 0
             lowRounds = 0
+            // 静止时没有编码负载，把健康度归零，否则面板会一直停在
+            // 最后一次非静止时的数值（可能长期红着），排障时误导。
+            lastHealth = 0
             // 静止时链路仍可能拥塞：在途积压或有丢帧就先不回升
             if s.inFlight >= 2 || s.droppedDelta > 0 {
                 idleRounds = 0

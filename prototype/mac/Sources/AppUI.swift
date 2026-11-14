@@ -289,6 +289,10 @@ struct StatusView: View {
                 }
             }
             .padding(18)
+            // 窗口是 .fullSizeContentView + 透明标题栏，ScrollView 会顶到
+            // 窗口最上沿，把「已连接」那一行压到红绿灯按钮底下。
+            // 额外让出标题栏高度。
+            .padding(.top, 6)
         }
         .frame(width: 400, height: 620)
     }

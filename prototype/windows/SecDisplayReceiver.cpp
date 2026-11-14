@@ -2206,6 +2206,22 @@ static void CopyDiagnostics() {
     if (dw <= 0 || dh <= 0) { dw = g_sessW.load(); dh = g_sessH.load(); }
     ULONGLONG start = g_connStartTick.load();
     unsigned long long up = start ? (GetTickCount64() - start) / 1000 : 0;
+    // 硬件与资源：排障时这几项和延迟数据一样关键
+    wchar_t decoderBuf[256] = L"--";
+    {
+        std::lock_guard<std::mutex> lk(g_decoderInfoMtx);
+        wcsncpy(decoderBuf, g_decoderInfo.c_str(), 255);
+    }
+    double wsMb = 0, privMb = 0;
+    {
+        PROCESS_MEMORY_COUNTERS_EX pmc{};
+        pmc.cb = sizeof(pmc);
+        if (GetProcessMemoryInfo(GetCurrentProcess(),
+                                 (PROCESS_MEMORY_COUNTERS*)&pmc, sizeof(pmc))) {
+            wsMb = pmc.WorkingSetSize / 1048576.0;
+            privMb = pmc.PrivateUsage / 1048576.0;
+        }
+    }
     wchar_t buf[2048];
     swprintf(buf, 2048,
         L"SecDisplay 诊断\r\n"
@@ -2218,6 +2234,8 @@ static void CopyDiagnostics() {
         L"呈现延迟: p50 %.1f / p95 %.1f ms\r\n"
         L"解码失败: %llu  呈现失败: %llu\r\n"
         L"同帧重复: %llu  丢弃: %llu\r\n"
+        L"解码器: %s\r\n"
+        L"进程内存: 工作集 %.0f MB / 私有 %.0f MB\r\n"
         L"日志: %hs\r\n"
         L"程序: %hs",
         g_sock.load() != INVALID_SOCKET ? L"已连接" : L"未连接",
@@ -2230,6 +2248,7 @@ static void CopyDiagnostics() {
         (unsigned long long)g_stats.presentFail.load(),
         (unsigned long long)g_stats.dupFrame.load(),
         (unsigned long long)g_stats.dropped.load(),
+        decoderBuf, wsMb, privMb,
         g_logPath.c_str(), exe);
     if (OpenClipboard(g_panel)) {
         EmptyClipboard();
@@ -2367,7 +2386,6 @@ static void UpdateControlPanel() {
         static IDXGIAdapter3* adapter3 = nullptr;
         static bool probed = false;
         if (!probed) {
-            probed = true;
             if (g_gfx && g_gfx->device) {
                 ComPtr<IDXGIDevice> dxgiDev;
                 if (SUCCEEDED(g_gfx->device.As(&dxgiDev)) && dxgiDev) {
@@ -2376,6 +2394,7 @@ static void UpdateControlPanel() {
                         ComPtr<IDXGIAdapter3> a3;
                         if (SUCCEEDED(ad.As(&a3))) {
                             adapter3 = a3.Detach();
+                            probed = true;   // 只在真的拿到时才锁定，失败下轮重试
                         }
                     }
                 }
@@ -2523,7 +2542,9 @@ static LRESULT CALLBACK PanelWndProc(HWND h, UINT msg, WPARAM w, LPARAM l) {
                 g_shakeActive = false;
                 g_shakeHolding = false;
                 g_shakeZoom = 1.0;
-                KillTimer(h, kShakeTimer);
+                // 定时器是建在主窗口上的（SetTimer(g_hwnd, ...)），
+                // 用面板句柄 KillTimer 杀不掉，必须用 g_hwnd。
+                if (g_hwnd) KillTimer(g_hwnd, kShakeTimer);
                 RefreshCursorScale();
             }
             Log("控制面板: 晃动找光标 %s", on ? "开" : "关");
@@ -2567,7 +2588,9 @@ static void ShowControlPanel() {
     }
 
     DWORD style = WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX;
-    RECT rc{ 0, 0, DpiScale(560), DpiScale(470) };
+    // 客户区宽 880：三列（连接 20..270、画面 290..540、硬件/资源 560..860）+ 右边距 20。
+    // 之前是 560，第三列整列落在客户区外，控件建出来但用户看不到也点不到。
+    RECT rc{ 0, 0, DpiScale(880), DpiScale(470) };
     AdjustWindowRect(&rc, style, FALSE);
     int w = rc.right - rc.left;
     int hgt = rc.bottom - rc.top;
