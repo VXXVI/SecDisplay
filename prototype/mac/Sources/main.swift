@@ -1959,10 +1959,13 @@ final class InputInjector {
         // 先移动指针，再处理按键，保证点击落在正确位置。
         // 按住键时必须投 *MouseDragged 而不是 mouseMoved：选文字、拖滑块、
         // 拖窗口内容这些操作在 Mac 上只认 drag 类型，moved 会被当成纯移动。
+        // 判定用 lastButtons（本次之前的已按下态），这样事件顺序是原生顺序：
+        // 按下那一帧投 moved → down，抬起那一帧投 drag → up。
+        // 用 buttons 判定的话按下帧会先投一个 HID 侧还没按下的 drag。
         let drag: (CGEventType, CGMouseButton)? =
-            (buttons & 0x1) != 0 ? (.leftMouseDragged, .left) :
-            (buttons & 0x2) != 0 ? (.rightMouseDragged, .right) :
-            (buttons & 0x4) != 0 ? (.otherMouseDragged, .center) : nil
+            (lastButtons & 0x1) != 0 ? (.leftMouseDragged, .left) :
+            (lastButtons & 0x2) != 0 ? (.rightMouseDragged, .right) :
+            (lastButtons & 0x4) != 0 ? (.otherMouseDragged, .center) : nil
         if let mv = CGEvent(mouseEventSource: nil, mouseType: drag?.0 ?? .mouseMoved,
                             mouseCursorPosition: p, mouseButton: drag?.1 ?? .left) {
             mv.flags = mods
@@ -2020,6 +2023,9 @@ final class KeyboardInjector {
     private var pressed: Set<CGKeyCode> = []
     /// 按下中的修饰键 keyCode → 对应 mask。flags 由它取并集算出。
     private var heldModifiers: [CGKeyCode: CGEventFlags] = [:]
+    /// 按下时的 Windows VK → 当时算出的 keyCode。
+    /// keyUp 报文里的 scan/扩展位可能与 keyDown 不一致，靠它把抬起配回同一个键。
+    private var pressedVK: [UInt16: CGKeyCode] = [:]
     private let lock = NSLock()
     private(set) var eventCount = 0
 
@@ -2030,6 +2036,7 @@ final class KeyboardInjector {
         lock.lock()
         let stuck = pressed
         pressed.removeAll()
+        pressedVK.removeAll()
         heldModifiers.removeAll()
         flags = []
         lock.unlock()
@@ -2067,6 +2074,7 @@ final class KeyboardInjector {
             let isRepeat = pressed.contains(keyCode)
             if !isRepeat {
                 pressed.insert(keyCode)
+                pressedVK[vk] = keyCode
                 if let mask {
                     heldModifiers[keyCode] = mask
                     rebuildFlags()
@@ -2074,12 +2082,16 @@ final class KeyboardInjector {
             }
             post(keyCode: keyCode, down: true, isRepeat: isRepeat)
         } else {
-            guard pressed.remove(keyCode) != nil else { return }
+            // 抬起优先按 VK 查回按下时的 keyCode。
+            // down/up 两次报文的 scan 或扩展位未必一致（KVM、注入式输入把 scan 报成 0、
+            // 某些远程栈丢扩展位），只按 keyCode 配对会配不上，keyUp 被吞掉键就粘住了。
+            let kc = pressedVK.removeValue(forKey: vk) ?? keyCode
+            guard pressed.remove(kc) != nil else { return }
             if mask != nil {
-                heldModifiers.removeValue(forKey: keyCode)
+                heldModifiers.removeValue(forKey: kc)
                 rebuildFlags()
             }
-            post(keyCode: keyCode, down: false, isRepeat: false)
+            post(keyCode: kc, down: false, isRepeat: false)
         }
     }
 
