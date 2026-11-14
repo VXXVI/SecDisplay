@@ -338,8 +338,24 @@ static std::atomic<int64_t> g_lastLocalInputMs{ 0 };
 static std::atomic<bool> g_moveDirty{ false };
 static std::atomic<float> g_moveX{ 0.0f };
 static std::atomic<float> g_moveY{ 0.0f };
-static std::atomic<bool> g_eventPending{ false };
-static std::atomic<int16_t> g_pendingWheel{ 0 };
+struct InputEvent {
+    float x = 0.0f, y = 0.0f;
+    uint8_t buttons = 0;
+    int16_t wheel = 0;
+};
+static std::mutex g_inputQmtx;
+static std::deque<InputEvent> g_inputQ;
+
+// 按键/滚轮必须逐条排队发送。旧实现用一个 eventPending 布尔量合并，
+// 快速点击的 down/up 落在同一个 4ms tick 时只会发出最终状态（up），
+// Mac 端收不到按下，表现就是「点击概率失灵」。
+static void QueueInputEvent(float x, float y, uint8_t buttons, int16_t wheel) {
+    std::lock_guard<std::mutex> lk(g_inputQmtx);
+    if (g_inputQ.size() > 128) g_inputQ.pop_front();
+    InputEvent e;
+    e.x = x; e.y = y; e.buttons = buttons; e.wheel = wheel;
+    g_inputQ.push_back(e);
+}
 static const uint64_t INPUT_MOVE_INTERVAL_MS = 8;   // 约 120Hz
 static const uint64_t INPUT_TICK_MS           = 4;   // 线程轮询粒度
 
@@ -1925,16 +1941,39 @@ static const int IDC_PANEL_EXIT     = 2013;
 static const int IDC_PANEL_VSYNC    = 2020;
 static const int IDC_PANEL_PACE     = 2021;
 static const int IDC_PANEL_FEEDBACK = 2022;
+static const int IDC_PANEL_UPTIME   = 2007;
+static const int IDC_PANEL_SRC      = 2008;
+static const int IDC_PANEL_PRES     = 2009;
+static const int IDC_PANEL_PFAIL    = 2014;
+static const int IDC_PANEL_DUP      = 2015;
+static const int IDC_PANEL_DROP     = 2016;
+static const int IDC_PANEL_TOP      = 2017;
+static const int IDC_PANEL_KEY      = 2018;
+static const int IDC_PANEL_CFG      = 2019;
+static const int IDC_PANEL_COPY     = 2023;
 
-static int DpiScale(int v) {
+static std::atomic<bool> g_panelTopmost{false};
+static std::atomic<ULONGLONG> g_connStartTick{0};
+static std::atomic<double> g_srcP50{0.0}, g_srcP95{0.0}, g_presP50{0.0}, g_presP95{0.0};
+static double g_uiFps = 0.0, g_uiMbps = 0.0;
+
+static int PanelDpi() {
     static int dpi = 0;
     if (dpi == 0) {
+        HMODULE u32 = GetModuleHandleA("user32.dll");
+        typedef UINT (WINAPI *GetDpiForWindowFn)(HWND);
         typedef UINT (WINAPI *GetDpiForSystemFn)(void);
-        auto fn = (GetDpiForSystemFn)GetProcAddress(GetModuleHandleA("user32.dll"), "GetDpiForSystem");
-        dpi = fn ? (int)fn() : 96;
+        auto fw = (GetDpiForWindowFn)GetProcAddress(u32, "GetDpiForWindow");
+        auto fs = (GetDpiForSystemFn)GetProcAddress(u32, "GetDpiForSystem");
+        if (fw && g_hwnd) dpi = (int)fw(g_hwnd);
+        if (dpi <= 0 && fs) dpi = (int)fs();
         if (dpi <= 0) dpi = 96;
     }
-    return MulDiv(v, dpi, 96);
+    return dpi;
+}
+
+static int DpiScale(int v) {
+    return MulDiv(v, PanelDpi(), 96);
 }
 
 static HFONT PanelFont() {
@@ -1943,11 +1982,96 @@ static HFONT PanelFont() {
         NONCLIENTMETRICSW ncm{};
         ncm.cbSize = sizeof(ncm);
         if (SystemParametersInfoW(SPI_GETNONCLIENTMETRICS, sizeof(ncm), &ncm, 0)) {
+            ncm.lfMessageFont.lfHeight = MulDiv(ncm.lfMessageFont.lfHeight, PanelDpi(), 96);
+            ncm.lfMessageFont.lfWidth = MulDiv(ncm.lfMessageFont.lfWidth, PanelDpi(), 96);
             font = CreateFontIndirectW(&ncm.lfMessageFont);
         }
         if (!font) font = (HFONT)GetStockObject(DEFAULT_GUI_FONT);
     }
     return font;
+}
+
+static void RequestKeyframe() {
+    SOCKET s = g_sock.load();
+    if (s == INVALID_SOCKET) {
+        Log("控制面板: 请求关键帧失败，当前未连接");
+        return;
+    }
+    uint8_t req = TYPE_KEYFRAME_REQUEST;
+    int sent = 0;
+    {
+        std::lock_guard<std::mutex> lk(g_sendMtx);
+        sent = send(s, (const char*)&req, 1, 0);
+    }
+    Log(sent == 1 ? "控制面板: 已请求关键帧（0x02）" : "控制面板: 请求关键帧失败");
+}
+
+static void OpenConfigFile() {
+    char exe[MAX_PATH] = {};
+    DWORD n = GetModuleFileNameA(nullptr, exe, MAX_PATH);
+    std::string dir = ".";
+    if (n > 0 && n < MAX_PATH) {
+        std::string p(exe, n);
+        size_t pos = p.find_last_of("\\/");
+        if (pos != std::string::npos) dir = p.substr(0, pos);
+    }
+    std::string cfg = dir + "\\config.ini";
+    std::wstring target = ToWide(cfg.c_str(), (int)cfg.size());
+    if (GetFileAttributesA(cfg.c_str()) == INVALID_FILE_ATTRIBUTES) {
+        std::wstring wd = ToWide(dir.c_str(), (int)dir.size());
+        ShellExecuteW(nullptr, L"open", wd.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
+        return;
+    }
+    ShellExecuteW(nullptr, L"open", target.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
+}
+
+static void CopyDiagnostics() {
+    char exe[MAX_PATH] = {};
+    GetModuleFileNameA(nullptr, exe, MAX_PATH);
+    int dw = g_displayW.load(), dh = g_displayH.load();
+    if (dw <= 0 || dh <= 0) { dw = g_sessW.load(); dh = g_sessH.load(); }
+    ULONGLONG start = g_connStartTick.load();
+    unsigned long long up = start ? (GetTickCount64() - start) / 1000 : 0;
+    wchar_t buf[2048];
+    swprintf(buf, 2048,
+        L"SecDisplay 诊断\r\n"
+        L"状态: %s\r\n"
+        L"对端: %hs:%d\r\n"
+        L"分辨率: %dx%d\r\n"
+        L"连接时长: %llu 秒\r\n"
+        L"帧率: %.1f fps  码率: %.1f Mbps\r\n"
+        L"源延迟: p50 %.1f / p95 %.1f ms\r\n"
+        L"呈现延迟: p50 %.1f / p95 %.1f ms\r\n"
+        L"解码失败: %llu  呈现失败: %llu\r\n"
+        L"同帧重复: %llu  丢弃: %llu\r\n"
+        L"日志: %hs\r\n"
+        L"程序: %hs",
+        g_sock.load() != INVALID_SOCKET ? L"已连接" : L"未连接",
+        g_peerHost.c_str(), g_peerPort,
+        dw, dh, up,
+        g_uiFps, g_uiMbps,
+        g_srcP50.load(), g_srcP95.load(),
+        g_presP50.load(), g_presP95.load(),
+        (unsigned long long)g_stats.decodeFail.load(),
+        (unsigned long long)g_stats.presentFail.load(),
+        (unsigned long long)g_stats.dupFrame.load(),
+        (unsigned long long)g_stats.dropped.load(),
+        g_logPath.c_str(), exe);
+    if (OpenClipboard(g_panel)) {
+        EmptyClipboard();
+        size_t bytes = (wcslen(buf) + 1) * sizeof(wchar_t);
+        HGLOBAL h = GlobalAlloc(GMEM_MOVEABLE, bytes);
+        if (h) {
+            void* dst = GlobalLock(h);
+            if (dst) {
+                memcpy(dst, buf, bytes);
+                GlobalUnlock(h);
+                SetClipboardData(CF_UNICODETEXT, h);
+            }
+        }
+        CloseClipboard();
+    }
+    Log("控制面板: 诊断信息已复制到剪贴板");
 }
 
 static void UpdateControlPanel() {
@@ -1988,11 +2112,34 @@ static void UpdateControlPanel() {
     swprintf(buf, 256, L"码率: %.1f Mbps", mbps);
     SetWindowTextW(GetDlgItem(g_panel, IDC_PANEL_MBPS), buf);
 
+    ULONGLONG start = g_connStartTick.load();
+    unsigned long long up = start ? (GetTickCount64() - start) / 1000 : 0;
+    swprintf(buf, 256, L"连接时长: %02llu:%02llu:%02llu",
+             up / 3600, (up / 60) % 60, up % 60);
+    SetWindowTextW(GetDlgItem(g_panel, IDC_PANEL_UPTIME), buf);
+
+    swprintf(buf, 256, L"源延迟: p50 %.1f / p95 %.1f ms", g_srcP50.load(), g_srcP95.load());
+    SetWindowTextW(GetDlgItem(g_panel, IDC_PANEL_SRC), buf);
+
+    swprintf(buf, 256, L"呈现延迟: p50 %.1f / p95 %.1f ms", g_presP50.load(), g_presP95.load());
+    SetWindowTextW(GetDlgItem(g_panel, IDC_PANEL_PRES), buf);
+
     swprintf(buf, 256, L"解码失败: %llu", (unsigned long long)g_stats.decodeFail.load());
     SetWindowTextW(GetDlgItem(g_panel, IDC_PANEL_FAIL), buf);
 
+    swprintf(buf, 256, L"呈现失败: %llu", (unsigned long long)g_stats.presentFail.load());
+    SetWindowTextW(GetDlgItem(g_panel, IDC_PANEL_PFAIL), buf);
+
+    swprintf(buf, 256, L"同帧重复: %llu", (unsigned long long)g_stats.dupFrame.load());
+    SetWindowTextW(GetDlgItem(g_panel, IDC_PANEL_DUP), buf);
+
+    swprintf(buf, 256, L"丢弃: %llu", (unsigned long long)g_stats.dropped.load());
+    SetWindowTextW(GetDlgItem(g_panel, IDC_PANEL_DROP), buf);
+
     SetWindowTextW(GetDlgItem(g_panel, IDC_PANEL_FULL),
                    g_isFullscreen ? L"回到窗口" : L"全屏");
+    SetWindowTextW(GetDlgItem(g_panel, IDC_PANEL_TOP),
+                   g_panelTopmost.load() ? L"取消置顶" : L"置顶");
 }
 
 static LRESULT CALLBACK PanelWndProc(HWND h, UINT msg, WPARAM w, LPARAM l) {
@@ -2008,27 +2155,39 @@ static LRESULT CALLBACK PanelWndProc(HWND h, UINT msg, WPARAM w, LPARAM l) {
             return c;
         };
 
-        mk(L"STATIC", L"连接状态", SS_LEFT, 20, 16, 200, 24, 0);
-        mk(L"STATIC", L"状态: --", SS_LEFT, 20, 48, 420, 24, IDC_PANEL_STATUS);
-        mk(L"STATIC", L"对端: --", SS_LEFT, 20, 80, 420, 24, IDC_PANEL_PEER);
-        mk(L"STATIC", L"分辨率: --", SS_LEFT, 20, 112, 420, 24, IDC_PANEL_SIZE);
-        mk(L"STATIC", L"帧率: --", SS_LEFT, 20, 144, 420, 24, IDC_PANEL_FPS);
-        mk(L"STATIC", L"码率: --", SS_LEFT, 20, 176, 420, 24, IDC_PANEL_MBPS);
-        mk(L"STATIC", L"解码失败: --", SS_LEFT, 20, 208, 420, 24, IDC_PANEL_FAIL);
+        mk(L"STATIC", L"连接", SS_LEFT, 20, 16, 200, 24, 0);
+        mk(L"STATIC", L"状态: --", SS_LEFT, 20, 48, 250, 24, IDC_PANEL_STATUS);
+        mk(L"STATIC", L"对端: --", SS_LEFT, 20, 76, 250, 24, IDC_PANEL_PEER);
+        mk(L"STATIC", L"分辨率: --", SS_LEFT, 20, 104, 250, 24, IDC_PANEL_SIZE);
+        mk(L"STATIC", L"连接时长: --", SS_LEFT, 20, 132, 250, 24, IDC_PANEL_UPTIME);
+        mk(L"STATIC", L"帧率: --", SS_LEFT, 20, 160, 250, 24, IDC_PANEL_FPS);
+        mk(L"STATIC", L"码率: --", SS_LEFT, 20, 188, 250, 24, IDC_PANEL_MBPS);
 
-        mk(L"BUTTON", L"全屏", BS_PUSHBUTTON, 20, 252, 130, 36, IDC_PANEL_FULL);
-        mk(L"BUTTON", L"重新连接", BS_PUSHBUTTON, 165, 252, 130, 36, IDC_PANEL_RECONN);
-        mk(L"BUTTON", L"打开日志", BS_PUSHBUTTON, 310, 252, 130, 36, IDC_PANEL_LOG);
-        mk(L"BUTTON", L"退出 SecDisplay", BS_PUSHBUTTON, 20, 300, 130, 36, IDC_PANEL_EXIT);
+        mk(L"STATIC", L"画面", SS_LEFT, 290, 16, 200, 24, 0);
+        mk(L"STATIC", L"源延迟: --", SS_LEFT, 290, 48, 250, 24, IDC_PANEL_SRC);
+        mk(L"STATIC", L"呈现延迟: --", SS_LEFT, 290, 76, 250, 24, IDC_PANEL_PRES);
+        mk(L"STATIC", L"解码失败: --", SS_LEFT, 290, 104, 250, 24, IDC_PANEL_FAIL);
+        mk(L"STATIC", L"呈现失败: --", SS_LEFT, 290, 132, 250, 24, IDC_PANEL_PFAIL);
+        mk(L"STATIC", L"同帧重复: --", SS_LEFT, 290, 160, 250, 24, IDC_PANEL_DUP);
+        mk(L"STATIC", L"丢弃: --", SS_LEFT, 290, 188, 250, 24, IDC_PANEL_DROP);
 
-        HWND vs = mk(L"BUTTON", L"垂直同步", BS_AUTOCHECKBOX, 20, 360, 220, 28, IDC_PANEL_VSYNC);
-        HWND pc = mk(L"BUTTON", L"抖动缓冲", BS_AUTOCHECKBOX, 20, 396, 220, 28, IDC_PANEL_PACE);
-        HWND fb = mk(L"BUTTON", L"反馈", BS_AUTOCHECKBOX, 20, 432, 220, 28, IDC_PANEL_FEEDBACK);
+        mk(L"BUTTON", L"全屏", BS_PUSHBUTTON, 20, 236, 160, 36, IDC_PANEL_FULL);
+        mk(L"BUTTON", L"置顶", BS_PUSHBUTTON, 200, 236, 160, 36, IDC_PANEL_TOP);
+        mk(L"BUTTON", L"强制关键帧", BS_PUSHBUTTON, 380, 236, 160, 36, IDC_PANEL_KEY);
+        mk(L"BUTTON", L"重新连接", BS_PUSHBUTTON, 20, 280, 160, 36, IDC_PANEL_RECONN);
+        mk(L"BUTTON", L"打开日志", BS_PUSHBUTTON, 200, 280, 160, 36, IDC_PANEL_LOG);
+        mk(L"BUTTON", L"打开配置", BS_PUSHBUTTON, 380, 280, 160, 36, IDC_PANEL_CFG);
+        mk(L"BUTTON", L"复制诊断", BS_PUSHBUTTON, 20, 324, 160, 36, IDC_PANEL_COPY);
+        mk(L"BUTTON", L"退出 SecDisplay", BS_PUSHBUTTON, 200, 324, 340, 36, IDC_PANEL_EXIT);
+
+        HWND vs = mk(L"BUTTON", L"垂直同步", BS_AUTOCHECKBOX, 20, 376, 160, 28, IDC_PANEL_VSYNC);
+        HWND pc = mk(L"BUTTON", L"抖动缓冲", BS_AUTOCHECKBOX, 200, 376, 160, 28, IDC_PANEL_PACE);
+        HWND fb = mk(L"BUTTON", L"反馈", BS_AUTOCHECKBOX, 380, 376, 160, 28, IDC_PANEL_FEEDBACK);
         if (vs) SendMessageW(vs, BM_SETCHECK, g_vsyncEnabled.load() ? BST_CHECKED : BST_UNCHECKED, 0);
         if (pc) SendMessageW(pc, BM_SETCHECK, g_paceEnabled.load() ? BST_CHECKED : BST_UNCHECKED, 0);
         if (fb) SendMessageW(fb, BM_SETCHECK, g_feedbackEnabled.load() ? BST_CHECKED : BST_UNCHECKED, 0);
 
-        mk(L"STATIC", L"Esc 退出    Ctrl+Alt+H 让位    F11 全屏", SS_LEFT, 20, 490, 420, 24, 0);
+        mk(L"STATIC", L"Esc 退出    Ctrl+Alt+H 让位    F11 全屏", SS_LEFT, 20, 416, 520, 24, 0);
         SetTimer(h, 1, 1000, nullptr);
         return 0;
     }
@@ -2065,6 +2224,24 @@ static LRESULT CALLBACK PanelWndProc(HWND h, UINT msg, WPARAM w, LPARAM l) {
             return 0;
         case IDC_PANEL_EXIT:
             if (g_hwnd) PostMessageW(g_hwnd, WM_CLOSE, 0, 0);
+            return 0;
+        case IDC_PANEL_TOP: {
+            bool top = !g_panelTopmost.load();
+            g_panelTopmost = top;
+            SetWindowPos(h, top ? HWND_TOPMOST : HWND_NOTOPMOST, 0, 0, 0, 0,
+                         SWP_NOMOVE | SWP_NOSIZE);
+            SetWindowTextW(GetDlgItem(h, IDC_PANEL_TOP), top ? L"取消置顶" : L"置顶");
+            Log("控制面板: 置顶 %s", top ? "开" : "关");
+            return 0;
+        }
+        case IDC_PANEL_KEY:
+            RequestKeyframe();
+            return 0;
+        case IDC_PANEL_CFG:
+            OpenConfigFile();
+            return 0;
+        case IDC_PANEL_COPY:
+            CopyDiagnostics();
             return 0;
         case IDC_PANEL_VSYNC:
             g_vsyncEnabled = (SendMessageW((HWND)l, BM_GETCHECK, 0, 0) == BST_CHECKED);
@@ -2117,7 +2294,7 @@ static void ShowControlPanel() {
     }
 
     DWORD style = WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX;
-    RECT rc{ 0, 0, DpiScale(470), DpiScale(540) };
+    RECT rc{ 0, 0, DpiScale(560), DpiScale(470) };
     AdjustWindowRect(&rc, style, FALSE);
     int w = rc.right - rc.left;
     int hgt = rc.bottom - rc.top;
@@ -2487,10 +2664,10 @@ static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
         g_lastLocalInputMs = GetTickCount64();
         float vx, vy;
         if (ClientToVideo(GET_X_LPARAM(l), GET_Y_LPARAM(l), &vx, &vy)) {
-            // 更新位置并标记事件，inputThread 下一轮（约 4ms 内）立即发，保证点击落点准
+            // 按键事件逐条排队：down 和 up 各自成包，不再合并成最终状态。
             g_moveX = vx;
             g_moveY = vy;
-            g_eventPending = true;
+            QueueInputEvent(vx, vy, b, 0);
         }
         return 0;
     }
@@ -2503,12 +2680,10 @@ static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
             g_lastLocalInputMs = GetTickCount64();
             g_moveX = vx;
             g_moveY = vy;
-            // 两次滚轮落在同一个 4ms 窗口时累加，避免高精度滚轮丢格
-            int acc = (int)g_pendingWheel.load() - delta;
-            if (acc > 32767) acc = 32767;
-            if (acc < -32768) acc = -32768;
-            g_pendingWheel = (int16_t)acc;
-            g_eventPending = true;   // 滚轮事件由 inputThread 立即发
+            // 每个滚轮消息单独排队，保留原来的方向翻转（Windows 正值向上）。
+            if (delta > 32767) delta = 32767;
+            if (delta < -32768) delta = -32768;
+            QueueInputEvent(vx, vy, g_buttons.load(), (int16_t)(-delta));
         }
         return 0;
     }
@@ -2843,6 +3018,7 @@ static void NetworkLoop(RunConfig cfg, Graphics* gfx, Presenter* presenter) {
         ResetDecodeRing();
         g_lastDecodeMs = 0.0;
         g_stats.lastLatencyUs = 0;
+        g_connStartTick.store(GetTickCount64());
         ResetTimestampBase();
 
         // 立刻请求关键帧，否则解码器拿不到 SPS/PPS，黑屏
@@ -3122,6 +3298,8 @@ static void NetworkLoop(RunConfig cfg, Graphics* gfx, Presenter* presenter) {
                 TakeDecodeIntervals(divs);
                 double d50 = PercentileMs(divs, 0.50);
                 double d95 = PercentileMs(divs, 0.95);
+                g_srcP50.store(d50); g_srcP95.store(d95);
+                g_presP50.store(p50); g_presP95.store(p95);
 
                 // 节拍目标吸附到刷新周期整数倍，避免垂直同步再量化一次。
                 // 只在源帧率稳定落在刷新率 25%~60% 区间时启用；
@@ -3533,12 +3711,18 @@ int main(int argc, char** argv) {
             if (g_feedbackEnabled.load() && g_feedbackPending.exchange(false)) {
                 SendFeedbackPacket();
             }
-            if (g_eventPending.exchange(false)) {
-                SendInputPacket(g_moveX.load(), g_moveY.load(), g_buttons.load(),
-                                g_pendingWheel.exchange(0));
+            // 按键/滚轮事件按顺序逐条发，绝不合并。
+            for (;;) {
+                InputEvent e;
+                {
+                    std::lock_guard<std::mutex> lk(g_inputQmtx);
+                    if (g_inputQ.empty()) break;
+                    e = g_inputQ.front();
+                    g_inputQ.pop_front();
+                }
+                SendInputPacket(e.x, e.y, e.buttons, e.wheel);
                 lastMoveMs = GetTickCount64();
                 g_moveDirty = false;   // 事件包已带最新位置
-                continue;
             }
             if (g_moveDirty.load()) {
                 uint64_t now = GetTickCount64();
