@@ -2061,26 +2061,35 @@ final class KeyboardInjector {
         let mask = Self.modifierMask(forVK: vk)
 
         if down {
-            // 重复按下只放行第一次，避免长按产生大量冗余事件。
-            // 去重必须放在改状态之前：先计数再去重的话，重复 keydown 会把
-            // 修饰键计数抬高，而 keyup 只减一次，mask 永远清不掉。
-            if pressed.contains(keyCode) { return }
-            pressed.insert(keyCode)
-            if let mask {
-                heldModifiers[keyCode] = mask
-                rebuildFlags()
+            // 长按重复必须继续投递：Windows 会把系统自动重复的 keyDown 一并转发，
+            // 而注入的 CGEvent 不会自己产生重复，直接 return 会让按住退格/方向键
+            // 只生效一次。这里只在首次按下时改修饰键记账，重复事件照常投递。
+            let isRepeat = pressed.contains(keyCode)
+            if !isRepeat {
+                pressed.insert(keyCode)
+                if let mask {
+                    heldModifiers[keyCode] = mask
+                    rebuildFlags()
+                }
             }
+            post(keyCode: keyCode, down: true, isRepeat: isRepeat)
         } else {
             guard pressed.remove(keyCode) != nil else { return }
             if mask != nil {
                 heldModifiers.removeValue(forKey: keyCode)
                 rebuildFlags()
             }
+            post(keyCode: keyCode, down: false, isRepeat: false)
         }
+    }
 
+    private func post(keyCode: CGKeyCode, down: Bool, isRepeat: Bool) {
         let src = CGEventSource(stateID: .hidSystemState)
         guard let ev = CGEvent(keyboardEventSource: src, virtualKey: keyCode, keyDown: down) else { return }
         ev.flags = flags
+        if isRepeat {
+            ev.setIntegerValueField(.keyboardEventAutorepeat, value: 1)
+        }
         ev.post(tap: .cghidEventTap)
         eventCount += 1
     }
@@ -3227,6 +3236,17 @@ var statusMenu: NSMenu?
 final class AppLifecycleDelegate: NSObject, NSApplicationDelegate {
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool {
         false
+    }
+
+    /// Dock 图标「退出」与 Cmd+Q 走 -[NSApplication terminate:]，默认直接 exit()，
+    /// 会绕过 shutdown()，把虚拟屏留在 WindowServer 里成为孤儿屏，下次启动建屏失败。
+    /// 这里先取消这次退出，回主队列走完整清理流程。
+    func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
+        Log.info("收到应用退出请求，开始清理")
+        DispatchQueue.main.async {
+            shutdown(signal: SIGTERM)
+        }
+        return .terminateCancel
     }
 }
 
