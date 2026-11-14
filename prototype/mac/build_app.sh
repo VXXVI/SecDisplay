@@ -15,11 +15,18 @@
 set -euo pipefail
 cd "$(dirname "$0")"
 
-APP="SecDisplay.app"
-BIN="$APP/Contents/MacOS/SecDisplay"
 SIGN_ID="com.secdisplay.screensender"
 
-rm -rf "$APP"
+# 在系统临时目录里构建 bundle，不要放在仓库目录内。
+# 原因：只要 .app 在仓库路径下短暂存在过，LaunchServices 就会把它登记成一条
+# 独立记录（Spotlight / 启动台 / 系统设置的权限页都会多出一个空白图标条目）。
+# 即便构建完立刻 rm -rf，登记记录也不会跟着消失，只能靠 lsregister -kill -r 重建。
+# 放到 $TMPDIR 后，仓库里从头到尾不出现 .app，从根上断掉这条来源。
+WORK="$(mktemp -d "${TMPDIR:-/tmp}/secdisplay-build.XXXXXX")"
+trap 'rm -rf "$WORK"' EXIT
+APP="$WORK/SecDisplay.app"
+BIN="$APP/Contents/MacOS/SecDisplay"
+
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
 
 echo "编译中..."
@@ -120,10 +127,7 @@ esac
 if [ "$INSTALL" = "1" ]; then
     rm -rf "/Applications/SecDisplay.app"
     cp -R "$APP" /Applications/
-    # 清理本地构建暂存 bundle，确保全盘只保留 /Applications/SecDisplay.app，
-    # 避免启动台/Spotlight/系统权限页同时出现多个 SecDisplay.app 造成混淆。
-    rm -rf "$APP"
-    echo "已安装到 /Applications/SecDisplay.app（已清理构建目录冗余副本）"
+    echo "已安装到 /Applications/SecDisplay.app"
     if pgrep -f "/Applications/SecDisplay.app/Contents/MacOS/SecDisplay" >/dev/null 2>&1; then
         echo "提示: 检测到旧实例正在运行，先退出旧实例后再重新 open /Applications/SecDisplay.app"
     fi
@@ -133,7 +137,7 @@ echo
 if [ "$INSTALL" = "1" ]; then
     echo "启动: open /Applications/SecDisplay.app"
 else
-    echo "启动: open \"$(pwd)/SecDisplay.app\""
+    echo "启动: open \"$WORK/SecDisplay.app\"（在临时目录，退出后自动清理）"
 fi
 echo "日志: ~/Library/Logs/SecDisplay/sender.log"
 echo "切档: echo sharp > $(pwd)/.preset && ./build_app.sh"

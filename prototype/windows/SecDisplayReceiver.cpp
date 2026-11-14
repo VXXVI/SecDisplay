@@ -331,6 +331,25 @@ static HCURSOR g_customCursor = nullptr;   // 仅 UI 线程访问
 static uint64_t g_cursorAppliedFp = 0;     // 仅 UI 线程访问
 static int g_cursorAppliedScalePm = 0;     // 仅 UI 线程访问
 
+// ---- 快速晃动放大光标（模仿 macOS 的「晃动找光标」）----
+// 在副屏上快速左右/上下晃动光标时，Mac 那边看不到你自己的手，容易找不到指针。
+// 这里在接收端本地检测晃动：把最近一小段时间的远程光标轨迹存进环形缓冲，
+// 统计方向反转次数与横向摆幅，达到阈值就把光标放大若干倍，停下后自动恢复。
+// 全部在 UI 线程（WM_APP_REMOTE_CURSOR）里做，不额外开线程。
+static const int kShakeWinMs = 700;      // 观察窗口
+static const int kShakeMinReversals = 3; // 至少 3 次方向反转才算晃动
+static const int kShakeMinSpanPx = 180;  // 横向/纵向累计摆幅下限，防止细微抖动误触
+static const double kShakeCursorZoom = 2.5;  // 晃动时的放大倍数
+static const int64_t kShakeHoldMs = 900;     // 松手后维持放大的时间
+static const UINT_PTR kShakeTimer = 4004;
+struct ShakeSample { int64_t t; int x; int y; };
+static ShakeSample g_shakeBuf[64];
+static int g_shakeCount = 0;
+static int g_shakeHead = 0;
+static bool g_shakeActive = false;
+static int64_t g_shakeStartMs = 0;
+static int64_t g_shakeLastMoveMs = 0;
+
 // 输入回传：把窗口内的鼠标位置和按键状态发给 Mac，由它重放事件。
 // 不再用 SetCursorPos 搬本机光标——那会和用户自己的鼠标抢位置，
 // 表现就是「点这里，菜单出现在别处」。
@@ -2473,7 +2492,8 @@ static void ApplyCursorImage() {
     // 全屏时系数恒为 1，又完全不补偿 DPI，在高 DPI 屏上同样偏小。
     // 指针是给用户直接看的，按屏幕物理像素绘制，只乘本显示器的 DPI 缩放。
     // 1600x1000 客户区铺满 1600x1000 流、DPI 100% 时系数正好是 1。
-    const double scale = WindowDpiScale(g_hwnd);
+    // 晃动放大在这里乘上去：放大倍数变化会走「重建 HCURSOR」这条路径。
+    const double scale = WindowDpiScale(g_hwnd) * (g_shakeActive ? kShakeCursorZoom : 1.0);
     const int scalePm = (int)(scale * 1000.0 + 0.5);
     if (g_customCursor && fp == g_cursorAppliedFp && scalePm == g_cursorAppliedScalePm) {
         return;   // 同一张图同一缩放，沿用现有 HCURSOR
@@ -2551,6 +2571,95 @@ static void ApplyCursorImage() {
     g_cursorAppliedScalePm = scalePm;
     if (g_cursorVisible.load()) SetCursor(cur);
     if (old) DestroyCursor(old);
+}
+
+// 晃动检测。返回 true 表示当前应处于「放大」状态。
+// 只看最近 kShakeWinMs 的轨迹，求 x（或 y）方向的符号反转次数与总摆幅。
+// 用「反转次数 + 摆幅」双条件：单靠摆幅会把慢速大范围拖动误判成晃动。
+static bool DetectShake(int64_t now, int x, int y) {
+    // 采样入环
+    if (g_shakeCount > 0) {
+        // 同一毫秒内多次移动只取最后一次，避免轨迹点重复导致方向判定噪音
+        int prevIdx = (g_shakeHead - 1 + 64) % 64;
+        if (g_shakeBuf[prevIdx].t == now) {
+            g_shakeBuf[prevIdx].x = x;
+            g_shakeBuf[prevIdx].y = y;
+            return g_shakeActive;
+        }
+    }
+    g_shakeBuf[g_shakeHead] = ShakeSample{ now, x, y };
+    g_shakeHead = (g_shakeHead + 1) % 64;
+    if (g_shakeCount < 64) ++g_shakeCount;
+
+    // 收集窗口内的采样（按时间顺序）
+    int n = 0;
+    ShakeSample win[64];
+    for (int i = 0; i < g_shakeCount; ++i) {
+        int idx = (g_shakeHead - g_shakeCount + i + 64) % 64;
+        if (now - g_shakeBuf[idx].t <= kShakeWinMs) win[n++] = g_shakeBuf[idx];
+    }
+    if (n < 4) return g_shakeActive;
+
+    // 位移方向序列（用相邻点差值，忽略 <4px 的抖动）
+    int reversalsX = 0, reversalsY = 0;
+    int spanX = 0, spanY = 0;
+    int minX = win[0].x, maxX = win[0].x, minY = win[0].y, maxY = win[0].y;
+    int lastDirX = 0, lastDirY = 0;
+    for (int i = 1; i < n; ++i) {
+        int dx = win[i].x - win[i - 1].x;
+        int dy = win[i].y - win[i - 1].y;
+        if (win[i].x < minX) minX = win[i].x;
+        if (win[i].x > maxX) maxX = win[i].x;
+        if (win[i].y < minY) minY = win[i].y;
+        if (win[i].y > maxY) maxY = win[i].y;
+        if (dx > 4 || dx < -4) {
+            int d = dx > 0 ? 1 : -1;
+            if (lastDirX != 0 && d != lastDirX) ++reversalsX;
+            lastDirX = d;
+        }
+        if (dy > 4 || dy < -4) {
+            int d = dy > 0 ? 1 : -1;
+            if (lastDirY != 0 && d != lastDirY) ++reversalsY;
+            lastDirY = d;
+        }
+    }
+    spanX = maxX - minX;
+    spanY = maxY - minY;
+
+    const bool shakeX = reversalsX >= kShakeMinReversals && spanX >= kShakeMinSpanPx;
+    const bool shakeY = reversalsY >= kShakeMinReversals && spanY >= kShakeMinSpanPx;
+    const bool shaking = shakeX || shakeY;
+
+    if (shaking) {
+        g_shakeLastMoveMs = now;
+        if (!g_shakeActive) {
+            g_shakeActive = true;
+            g_shakeStartMs = now;
+            Log("检测到快速晃动（反转 x%d y%d，摆幅 x%dp y%dp），放大光标 %.1fx",
+                reversalsX, reversalsY, spanX, spanY, kShakeCursorZoom);
+            // 起一个定时器负责「停下后收回放大」：光标停住就没有新位置包了
+            SetTimer(g_hwnd, kShakeTimer, 120, nullptr);
+        }
+        return true;
+    }
+    // 不再晃动：维持 kShakeHoldMs 再恢复，避免抖一下又缩回去
+    if (g_shakeActive) {
+        if (now - g_shakeLastMoveMs < kShakeHoldMs) return true;
+        g_shakeActive = false;
+        Log("晃动结束，光标恢复原尺寸");
+    }
+    return false;
+}
+
+// 放大状态变化后重建 HCURSOR。缩放参与指纹，所以改 g_shakeActive 后
+// 只要重新置 pending 再走 ApplyCursorImage 就能重建。
+static void RefreshCursorScale() {
+    {
+        std::lock_guard<std::mutex> lk(g_cursorImage.mtx);
+        if (g_cursorImage.bgra.empty()) return;
+        g_cursorImage.pending = true;
+    }
+    ApplyCursorImage();
 }
 
 // 查询窗口所在显示器的当前刷新率。启动、显示模式变化、窗口跨屏移动时都用它。
@@ -2642,6 +2751,18 @@ static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
             }
             return 0;
         }
+        if (w == kShakeTimer) {
+            // 晃动停止后光标不再移动，就不会再有 WM_APP_REMOTE_CURSOR，
+            // 靠这个定时器把放大状态收回来。
+            if (g_shakeActive &&
+                GetTickCount64() - g_shakeLastMoveMs >= kShakeHoldMs) {
+                g_shakeActive = false;
+                Log("晃动结束，光标恢复原尺寸");
+                RefreshCursorScale();
+            }
+            if (!g_shakeActive) KillTimer(h, kShakeTimer);
+            return 0;
+        }
         break;
     case WM_APP_HIDE_HINT:
         HideFullscreenHint();
@@ -2700,6 +2821,14 @@ static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
         g_lastRemoteCursorY = sy;
         g_lastRemoteCursorMoveMs = GetTickCount64();
         SetCursorPos(sx, sy);
+
+        // 晃动检测：放大状态变化时重建光标位图。放在 SetCursorPos 之后，
+        // 用屏幕坐标参与判定（客户区坐标在窗口移动时会整体平移，容易误判）。
+        {
+            const bool wasActive = g_shakeActive;
+            const bool nowActive = DetectShake(GetTickCount64(), sx, sy);
+            if (nowActive != wasActive) RefreshCursorScale();
+        }
         return 0;
     }
     case WM_TRAY:
