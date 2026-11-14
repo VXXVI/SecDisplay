@@ -107,6 +107,9 @@ func listSecDisplays() -> [(id: CGDirectDisplayID, old: Bool)] {
 /// 由建屏处统一写入一次即可。
 nonisolated(unsafe) var vdBackingScale: Double = 1.0
 
+/// 键盘注入器。连接重建时从这里 reset，避免 Ctrl/Cmd 卡在按下态。
+nonisolated(unsafe) var gKeyboard: KeyboardInjector?
+
 struct Config {
     // 对应 Lenovo Yoga Slim 7 Pro 14IHU5（82NC）2880x1800 高刷版，
     // 系统 200% 缩放：物理 2880x1800，逻辑 1440x900。
@@ -351,7 +354,10 @@ final class VirtualDisplayManager {
             return
         }
         var c: CGDisplayConfigRef?
-        guard CGBeginDisplayConfiguration(&c) == .success, let cfgRef = c else { return }
+        guard CGBeginDisplayConfiguration(&c) == .success, let cfgRef = c else {
+            Log.info("CGS 兜底: 无法开始显示配置，跳过模式切换")
+            return
+        }
         let rc = cfgMode(cfgRef, displayID, targetMode)
         if rc != .success {
             CGCancelDisplayConfiguration(cfgRef)
@@ -455,6 +461,10 @@ enum MirrorGuard {
         let done = CGCompleteDisplayConfiguration(cfg, .permanently)
         if done != .success {
             Log.info("解除镜像未生效(\(reason)): CGCompleteDisplayConfiguration err=\(done.rawValue)")
+        } else {
+            // 解镜像后必须让采集侧丢掉旧的 SCDisplay 绑定，否则流仍绑在镜像源上，
+            // 画面继续是旧内容（这是「先开 SecDisplay 再连 Sidecar 被镜像」的直接原因之一）。
+            gCaptureRebuildRequested = true
         }
     }
 
@@ -1284,6 +1294,7 @@ final class ScreenshotCapture {
     private var lastSupervisorCount = -1
     private var lastSupervisorAt: CFAbsoluteTime = 0
     private var loggedFirstFrame = false
+    private var lastSizeWarnAt: CFAbsoluteTime = 0
 
     init(encoder: Encoder, cfg: Config, displayID: @escaping () -> CGDirectDisplayID) {
         self.encoder = encoder
@@ -1362,7 +1373,10 @@ final class ScreenshotCapture {
                     if !loggedFirstFrame {
                         loggedFirstFrame = true
                         Log.info("采集首帧实测: \(img.width)x\(img.height) (期望 \(cfg.width)x\(cfg.height))")
-                    } else if img.width != cfg.width || img.height != cfg.height {
+                    } else if (img.width != cfg.width || img.height != cfg.height)
+                                && now - lastSizeWarnAt > 2.0 {
+                        // 限流：尺寸偏移时每帧都打会淹日志并拖慢 encodeQueue 临界区
+                        lastSizeWarnAt = now
                         Log.info("警告: 采集帧尺寸偏移 \(img.width)x\(img.height) != \(cfg.width)x\(cfg.height)")
                     }
                     captured += 1
@@ -1396,6 +1410,14 @@ final class ScreenshotCapture {
 
     private func currentContent() async throws -> SCShareableContent {
         let now = CFAbsoluteTimeGetCurrent()
+        // 显示排列变化（Sidecar 接入/拔线、镜像关系变动）时强制刷新一次共享内容，
+        // 否则会继续用旧的 SCDisplay 绑定，抓到的是镜像源画面。
+        if gCaptureRebuildRequested {
+            gCaptureRebuildRequested = false
+            cachedContent = nil
+            cachedAt = 0
+            Log.info("显示排列变化，刷新采集共享内容")
+        }
         if let c = cachedContent, now - cachedAt < 2.0 { return c }
         let c = try await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: false)
         cachedContent = c
@@ -1507,6 +1529,8 @@ final class Sender {
             self.resetInFlight()          // 上一轮可能残留未完成的发送，必须清零
             // 旧连接可能留下半个控制包，新连接数据接在残包后会把 0x07 误解析成 0x04。
             self.ctrlBuf.removeAll()
+            // 新连接可能换了接收端，旧的修饰键状态必须清掉，否则 Cmd/Ctrl 会卡住
+            gKeyboard?.reset()
             // 丢掉上个连接的残留帧：那可能是依赖旧参考帧的 P 帧，
             // 新接收端没有参考帧，解出来是花的。等新的 IDR。
             self.counterLock.lock()
@@ -1638,6 +1662,17 @@ final class Sender {
                 let wheel = Int16(bitPattern: (UInt16(b[o + 10]) << 8) | UInt16(b[o + 11]))
                 onInput?(x, y, buttons, wheel)
                 ctrlBuf.removeFirst(12)
+            } else if t == 0x09 {
+                // [0x09][vk u16][scan u16][down u8][flags u8] = 7 字节，全大端
+                guard ctrlBuf.count >= 7 else { return }
+                let b = ctrlBuf
+                let o = b.startIndex
+                let vk = (UInt16(b[o + 1]) << 8) | UInt16(b[o + 2])
+                let scan = (UInt16(b[o + 3]) << 8) | UInt16(b[o + 4])
+                let down = b[o + 5] != 0
+                let flags = b[o + 6]
+                onKey?(vk, scan, down, flags)
+                ctrlBuf.removeFirst(7)
             } else if t == 0x07 {
                 // [0x07][presentP95 u16][sourceP95 u16][decodeFps*10 u16]
                 // [presentDrop u16][pacedDrop u16][reserved u16] = 13 字节，全大端
@@ -1673,6 +1708,8 @@ final class Sender {
     var onKeyframeRequest: (() -> Void)?
     /// 收到对端 0x04 输入事件：(x, y, buttons, wheel)
     var onInput: ((Float, Float, UInt8, Int16) -> Void)?
+    /// 收到对端 0x09 键盘事件：(vk, scan, down, flags)
+    var onKey: ((UInt16, UInt16, Bool, UInt8) -> Void)?
 
     private let counterLock = NSLock()
 
@@ -1887,10 +1924,14 @@ final class InputInjector {
         let sx = bounds.width > 0 ? CGFloat(videoW) / bounds.width : 1.0
         let sy = bounds.height > 0 ? CGFloat(videoH) / bounds.height : 1.0
         let p = CGPoint(x: bounds.minX + CGFloat(x) / sx, y: bounds.minY + CGFloat(y) / sy)
+        // 复用键盘注入器维护的修饰键状态，让 Ctrl+点击、Shift+点击、Cmd+点击生效。
+        // 不设置 flags 时这些组合键在 Mac 上只会被当成普通单击。
+        let mods = gKeyboard?.currentFlags() ?? []
 
         // 先移动指针，再处理按键，保证点击落在正确位置
         if let mv = CGEvent(mouseEventSource: nil, mouseType: .mouseMoved,
                             mouseCursorPosition: p, mouseButton: .left) {
+            mv.flags = mods
             mv.post(tap: .cghidEventTap)
         }
 
@@ -1922,6 +1963,183 @@ final class InputInjector {
             }
         }
         eventCount += 1
+    }
+}
+
+// MARK: - 键盘回放
+//
+// Windows 侧 0x09 包带来虚拟键码 + 扫描码 + 按下/抬起 + 修饰键标志。
+// 这里映射到 macOS 虚拟键码后用 CGEvent 注入。
+// 同样需要「辅助功能」权限，未授权时事件被系统静默丢弃。
+final class KeyboardInjector {
+    private var flags: CGEventFlags = []
+    private var pressed: Set<UInt16> = []
+    private let lock = NSLock()
+    private(set) var eventCount = 0
+
+    /// 重置所有修饰键状态（断连或失焦时调用，避免 Ctrl/Cmd 卡住）
+    func reset() {
+        lock.lock()
+        flags = []
+        pressed.removeAll()
+        lock.unlock()
+    }
+
+    /// 当前修饰键状态，供鼠标事件复用（Ctrl+点击、Shift+点击等组合键）。
+    func currentFlags() -> CGEventFlags {
+        lock.lock()
+        defer { lock.unlock() }
+        return flags
+    }
+
+    func handle(vk: UInt16, scan: UInt16, down: Bool, keyFlags: UInt8) {
+        lock.lock()
+        defer { lock.unlock() }
+
+        updateModifierState(vk: vk, down: down)
+
+        guard let keyCode = Self.keyCode(forVK: vk, extended: (keyFlags & 0x01) != 0) else { return }
+        // 重复按下只放行第一次，避免长按产生大量冗余事件
+        if down {
+            if pressed.contains(vk) { return }
+            pressed.insert(vk)
+        } else {
+            pressed.remove(vk)
+        }
+
+        let src = CGEventSource(stateID: .hidSystemState)
+        guard let ev = CGEvent(keyboardEventSource: src, virtualKey: keyCode, keyDown: down) else { return }
+        ev.flags = flags
+        ev.post(tap: .cghidEventTap)
+        eventCount += 1
+    }
+
+    private func updateModifierState(vk: UInt16, down: Bool) {
+        let mask: CGEventFlags
+        switch vk {
+        case 0x10, 0xA0, 0xA1: mask = .maskShift
+        case 0x11, 0xA2, 0xA3: mask = .maskControl
+        case 0x12, 0xA4, 0xA5: mask = .maskAlternate
+        case 0x5B, 0x5C:       mask = .maskCommand
+        default: return
+        }
+        if down { flags.insert(mask) } else { flags.remove(mask) }
+    }
+
+    /// Windows 虚拟键码 → macOS 虚拟键码。返回 nil 表示不支持的键（忽略）。
+    static func keyCode(forVK vk: UInt16, extended: Bool) -> CGKeyCode? {
+        switch vk {
+        // 字母
+        case 0x41: return 0x00   // A
+        case 0x42: return 0x0B   // B
+        case 0x43: return 0x08   // C
+        case 0x44: return 0x02   // D
+        case 0x45: return 0x0E   // E
+        case 0x46: return 0x03   // F
+        case 0x47: return 0x05   // G
+        case 0x48: return 0x04   // H
+        case 0x49: return 0x22   // I
+        case 0x4A: return 0x26   // J
+        case 0x4B: return 0x28   // K
+        case 0x4C: return 0x25   // L
+        case 0x4D: return 0x2E   // M
+        case 0x4E: return 0x2D   // N
+        case 0x4F: return 0x1F   // O
+        case 0x50: return 0x23   // P
+        case 0x51: return 0x0C   // Q
+        case 0x52: return 0x0F   // R
+        case 0x53: return 0x01   // S
+        case 0x54: return 0x11   // T
+        case 0x55: return 0x20   // U
+        case 0x56: return 0x09   // V
+        case 0x57: return 0x0D   // W
+        case 0x58: return 0x07   // X
+        case 0x59: return 0x10   // Y
+        case 0x5A: return 0x06   // Z
+        // 数字行
+        case 0x30: return 0x1D   // 0
+        case 0x31: return 0x12   // 1
+        case 0x32: return 0x13   // 2
+        case 0x33: return 0x14   // 3
+        case 0x34: return 0x15   // 4
+        case 0x35: return 0x17   // 5
+        case 0x36: return 0x16   // 6
+        case 0x37: return 0x1A   // 7
+        case 0x38: return 0x1C   // 8
+        case 0x39: return 0x19   // 9
+        // 符号
+        case 0xBA: return 0x29   // ;
+        case 0xBB: return 0x18   // =
+        case 0xBC: return 0x2B   // ,
+        case 0xBD: return 0x1B   // -
+        case 0xBE: return 0x2F   // .
+        case 0xBF: return 0x2C   // /
+        case 0xC0: return 0x32   // `
+        case 0xDB: return 0x21   // [
+        case 0xDC: return 0x2A   // \
+        case 0xDD: return 0x1E   // ]
+        case 0xDE: return 0x27   // '
+        // 控制键
+        case 0x08: return 0x33   // Backspace
+        case 0x09: return 0x30   // Tab
+        case 0x0D: return extended ? 0x4C : 0x24   // 主 Enter / 小键盘 Enter
+        case 0x1B: return 0x35   // Esc
+        case 0x20: return 0x31   // Space
+        case 0x14: return 0x39   // CapsLock
+        case 0x2D: return 0x72   // Insert -> Help
+        case 0x2E: return 0x75   // Delete
+        case 0x24: return 0x73   // Home
+        case 0x23: return 0x77   // End
+        case 0x21: return 0x74   // PageUp
+        case 0x22: return 0x79   // PageDown
+        // 方向键
+        case 0x25: return 0x7B
+        case 0x26: return 0x7E
+        case 0x27: return 0x7C
+        case 0x28: return 0x7D
+        // 修饰键（左右分开）
+        case 0x10: return 0x38   // Shift
+        case 0xA0: return 0x38   // LShift
+        case 0xA1: return 0x3C   // RShift
+        case 0x11: return 0x3B   // Ctrl
+        case 0xA2: return 0x3B   // LCtrl
+        case 0xA3: return 0x3E   // RCtrl
+        case 0x12: return 0x3A   // Alt
+        case 0xA4: return 0x3A   // LAlt
+        case 0xA5: return 0x3D   // RAlt
+        case 0x5B: return 0x37   // LWin -> Command
+        case 0x5C: return 0x36   // RWin -> Right Command
+        // 功能键
+        case 0x70: return 0x7A   // F1
+        case 0x71: return 0x78   // F2
+        case 0x72: return 0x63   // F3
+        case 0x73: return 0x76   // F4
+        case 0x74: return 0x60   // F5
+        case 0x75: return 0x61   // F6
+        case 0x76: return 0x62   // F7
+        case 0x77: return 0x64   // F8
+        case 0x78: return 0x65   // F9
+        case 0x79: return 0x6D   // F10
+        case 0x7A: return 0x67   // F11
+        case 0x7B: return 0x6F   // F12
+        // 小键盘
+        case 0x60: return 0x52
+        case 0x61: return 0x53
+        case 0x62: return 0x54
+        case 0x63: return 0x55
+        case 0x64: return 0x56
+        case 0x65: return 0x57
+        case 0x66: return 0x58
+        case 0x67: return 0x59
+        case 0x68: return 0x5B
+        case 0x69: return 0x5C
+        case 0x6A: return 0x43   // *
+        case 0x6B: return 0x45   // +
+        case 0x6D: return 0x4E   // -
+        case 0x6E: return 0x41   // .
+        case 0x6F: return 0x4B   // /
+        default:   return nil
+        }
     }
 }
 
@@ -2083,6 +2301,13 @@ final class CursorImageTracker {
     func stop() { timer?.cancel(); timer = nil }
 
     private func tick() {
+        // 面板「发送真实光标图像」开关实时生效：关掉后不再发 0x05，
+        // 接收端回退 Windows 标准箭头。原来只在启动时读一次环境变量，
+        // 运行中拨开关没有任何效果。
+        guard !disableCursorImage else {
+            lastFingerprint = 0
+            return
+        }
         guard sender.connected else {
             // 断开时清指纹，下次连上强制重发（新接收端没有旧光标）
             lastFingerprint = 0
@@ -2289,6 +2514,23 @@ if CommandLine.arguments.contains("--cleanup-orphan")
     }
 }
 
+// 建屏前先确认雷雳链路 carrier 正常。
+// 虚拟屏只有在「Mac 发送端在跑 + 雷雳链路通」时才有意义：
+// 线没插时建屏会留下一块没人用的空屏，还会占住显示器排列。
+// 等最多 60 秒；超时仍建屏（保持原有可用性），只打警告。
+if LinkMonitor.probe() == false {
+    Log.info("雷雳链路未就绪（\(LinkMonitor.ifName) 无 carrier），等待连接…")
+    var waited = 0.0
+    while LinkMonitor.probe() == false && waited < 60.0 {
+        usleep(500_000); waited += 0.5
+    }
+    if LinkMonitor.probe() == false {
+        Log.info("等待 60 秒仍未检测到链路，先建屏（接收端连上后仍可用）")
+    } else {
+        Log.info("雷雳链路已就绪，耗时 \(String(format: "%.1f", waited)) 秒")
+    }
+}
+
 do {
     try vd.create(cfg)
 } catch VirtualDisplayManager.Err.initFailed {
@@ -2338,23 +2580,33 @@ sender.onKeyframeRequest = { encoder.forceEncodeLastFrame() }
 sender.listen(port: cfg.port)
 
 // 输入回传：Windows 侧的鼠标事件在 Mac 上重放
-// 需要「辅助功能」权限，没有的话事件会被系统静默丢弃
-if !AXIsProcessTrusted() {
+// 需要「辅助功能」权限，没有的话 CGEvent 注入会被系统静默丢弃
+// （表现为：光标能跟着动，但点击/滚轮完全不生效）。
+let axTrusted = AXIsProcessTrusted()
+if !axTrusted {
     Log.info("警告: 未获得辅助功能权限，副屏上的点击/滚轮无法生效")
-    Log.info("      系统设置 → 隐私与安全性 → 辅助功能，勾选运行本程序的终端")
+    Log.info("      系统设置 → 隐私与安全性 → 辅助功能，勾选 /Applications/SecDisplay.app")
+} else {
+    Log.info("辅助功能权限: 已授权，副屏点击与滚轮可正常回放")
 }
 let injector = InputInjector()
 sender.onInput = { x, y, buttons, wheel in
-    // 面板可见时暂停回放：否则 InputInjector 每个输入包都 post 一个
-    // .mouseMoved 把本机光标 warp 到虚拟屏，用户点面板的鼠标会被瞬间拽走。
-    // 面板关掉后自动恢复，副屏操作不受影响。
-    if isControlPanelVisible {
-        injector.resetButtons()
-        return
-    }
+    // 这里不能再按「面板是否可见」整条丢弃输入。
+    // 早期为了防面板被光标劫持加过这个门控，但面板点不动的真正根因是
+    // NSEvent 全局监视器抢在 NSApplication 初始化前建立 SkyLight 会话
+    // （已由延迟到 app.run 后注册修复）。保留门控的后果是：只要面板开着，
+    // 点击事件被整条吞掉，而光标移动走 0x03 显示链路不受影响，
+    // 表现就是「鼠标能动、点不动」。因此回放始终生效。
     injector.handle(x: x, y: y, buttons: buttons, wheel: wheel,
                     bounds: CGDisplayBounds(vd.displayID),
                     videoW: cfg.width, videoH: cfg.height)
+}
+
+// 键盘回放：Windows 侧 0x09 包 → macOS CGEvent 键盘事件
+let keyboard = KeyboardInjector()
+gKeyboard = keyboard
+sender.onKey = { vk, scan, down, flags in
+    keyboard.handle(vk: vk, scan: scan, down: down, keyFlags: flags)
 }
 
 // 光标转发：CGEvent.location 与 CGDisplayBounds 处于逻辑点坐标系；
