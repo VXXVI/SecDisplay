@@ -261,6 +261,14 @@ static const uint8_t TYPE_KEYFRAME_REQUEST = 0x02;
 // 载荷（全大端）：[version u8][width u16][height u16][fps u8][reserved u8]，共 7 字节
 static const uint8_t TYPE_SESSION = 0x06;
 static const size_t SESSION_PAYLOAD_BYTES = 7;
+// 0x09 键盘事件（接收端 → Mac）。
+// 载荷（全大端，6 字节）：[vk u16][scan u16][down u8][flags u8]
+//   vk    : Windows 虚拟键码
+//   scan  : 硬件扫描码（lParam bits 16-23），扩展键时区分左右 Ctrl/Alt
+//   down  : 1=按下 0=抬起
+//   flags : bit0 扩展键；bit1 系统键（Alt 组合）
+static const uint8_t TYPE_KEY = 0x09;
+static const size_t KEY_PAYLOAD_BYTES = 6;
 static const size_t HEADER_BYTES = 9;   // 类型 1 + 时间戳 8
 static const size_t MAX_PACKET = 64u * 1024u * 1024u;
 
@@ -356,6 +364,24 @@ static void QueueInputEvent(float x, float y, uint8_t buttons, int16_t wheel) {
     e.x = x; e.y = y; e.buttons = buttons; e.wheel = wheel;
     g_inputQ.push_back(e);
 }
+
+// 键盘事件独立队列：和鼠标事件分开，避免鼠标高频移动把按键挤掉。
+struct KeyEvent {
+    uint16_t vk = 0;
+    uint16_t scan = 0;
+    uint8_t down = 0;
+    uint8_t flags = 0;
+};
+static std::mutex g_keyQmtx;
+static std::deque<KeyEvent> g_keyQ;
+
+static void QueueKeyEvent(uint16_t vk, uint16_t scan, uint8_t down, uint8_t flags) {
+    std::lock_guard<std::mutex> lk(g_keyQmtx);
+    if (g_keyQ.size() > 256) g_keyQ.pop_front();
+    KeyEvent e;
+    e.vk = vk; e.scan = scan; e.down = down; e.flags = flags;
+    g_keyQ.push_back(e);
+}
 static const uint64_t INPUT_MOVE_INTERVAL_MS = 8;   // 约 120Hz
 static const uint64_t INPUT_TICK_MS           = 4;   // 线程轮询粒度
 
@@ -410,6 +436,24 @@ static void SendInputPacket(float vx, float vy, uint8_t buttons, int16_t wheel) 
     {
         std::lock_guard<std::mutex> lk(g_sendMtx);
         send(s, (const char*)pkt, 12, 0);
+    }
+    g_stats.inputSent++;
+}
+
+static void SendKeyPacket(uint16_t vk, uint16_t scan, uint8_t down, uint8_t flags) {
+    SOCKET s = g_sock.load();
+    if (s == INVALID_SOCKET) return;
+    uint8_t pkt[7];
+    pkt[0] = TYPE_KEY;
+    pkt[1] = (uint8_t)(vk >> 8);
+    pkt[2] = (uint8_t)(vk & 0xFF);
+    pkt[3] = (uint8_t)(scan >> 8);
+    pkt[4] = (uint8_t)(scan & 0xFF);
+    pkt[5] = down ? 1 : 0;
+    pkt[6] = flags;
+    {
+        std::lock_guard<std::mutex> lk(g_sendMtx);
+        send(s, (const char*)pkt, 7, 0);
     }
     g_stats.inputSent++;
 }
@@ -1563,9 +1607,18 @@ bool Presenter::SetSourceSize(int w, int h) {
     if (w <= 0 || h <= 0) return false;
     std::lock_guard<std::mutex> lk(mtx_);
     if (w == srcW_ && h == srcH_) return true;
+    const int prevW = srcW_, prevH = srcH_;
     srcW_ = w;
     srcH_ = h;
-    return CreateProcessor();
+    if (!CreateProcessor()) {
+        // 重建失败（设备繁忙/内存抖动）时回滚尺寸。
+        // 不回滚的话 srcW_ 已等于新值，下次进来会因「尺寸相同」早退 true，
+        // 处理器永远不再重建，呈现器就此永久黑屏。
+        srcW_ = prevW;
+        srcH_ = prevH;
+        return false;
+    }
+    return true;
 }
 
 bool Presenter::Resize(int width, int height) {
@@ -1573,6 +1626,8 @@ bool Presenter::Resize(int width, int height) {
     std::lock_guard<std::mutex> lk(mtx_);
     if (width == width_ && height == height_) return true;
     if (!swap_) { width_ = width; height_ = height; return true; }
+
+    const int prevW = width_, prevH = height_;
 
     // 输入/输出视图都缓存了后缓冲指针，改尺寸后必须全部失效
     inViewCache_.clear();
@@ -1582,12 +1637,22 @@ bool Presenter::Resize(int width, int height) {
     HRESULT hr = swap_->ResizeBuffers(0, (UINT)width, (UINT)height,
                                       DXGI_FORMAT_UNKNOWN, flags);
     if (FAILED(hr)) {
-        Log("交换链改尺寸失败 %08X（保持 %dx%d）", hr, width_, height_);
+        Log("交换链改尺寸失败 %08X（保持 %dx%d）", hr, prevW, prevH);
         return false;
     }
     width_ = width;
     height_ = height;
-    if (!CreateProcessor()) return false;
+    if (!CreateProcessor()) {
+        // 同上：处理器重建失败时把交换链尺寸也回滚，
+        // 否则下次 Resize 会因「尺寸相同」早退，永久不再重建。
+        width_ = prevW;
+        height_ = prevH;
+        if (FAILED(swap_->ResizeBuffers(0, (UINT)prevW, (UINT)prevH,
+                                        DXGI_FORMAT_UNKNOWN, flags))) {
+            Log("交换链回滚到 %dx%d 失败", prevW, prevH);
+        }
+        return false;
+    }
     Log("呈现器已切换到 %dx%d", width_, height_);
     return true;
 }
@@ -1612,7 +1677,21 @@ bool Presenter::PresentSample(IMFSample* sample) {
 
     if (!sample) return fail("空样本", E_POINTER);
     if (!swap_) return fail("交换链为空", E_UNEXPECTED);
-    if (!processor_) return fail("视频处理器未就绪", E_UNEXPECTED);
+    if (!processor_) {
+        // 处理器缺失说明之前 CreateProcessor 失败过（设备繁忙/内存抖动）。
+        // 这里限流重试，避免呈现器永久残废：每帧都重建会拖垮主循环，
+        // 2 秒一次足够自愈，又不会刷屏。
+        static double lastRetryMs = 0.0;
+        const double nowMs = QpcNowMs();
+        if (nowMs - lastRetryMs > 2000.0) {
+            lastRetryMs = nowMs;
+            Log("视频处理器缺失，尝试重建（输入 %dx%d 输出 %dx%d）", srcW_, srcH_, width_, height_);
+            if (!CreateProcessor()) {
+                Log("视频处理器重建仍失败，2 秒后再试");
+            }
+        }
+        if (!processor_) return fail("视频处理器未就绪", E_UNEXPECTED);
+    }
 
     // FLIP 模型下交换链有多个物理缓冲随 Present 轮转，且每次 GetBuffer 拿到的
     // 可能是不同的表面。必须每帧重新获取，缓存指针会画到错误或不可写的缓冲上，
@@ -2639,18 +2718,30 @@ static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
         else if (w == HOTKEY_HIDE_ID) ToggleMinimize();
         return 0;
     case WM_KEYDOWN:
-        if (w == VK_ESCAPE) {
-            // 全屏时 Esc 先回到窗口，避免想退出放大却直接把程序关掉；
-            // 已经在窗口模式时 Esc 才退出程序。
+    case WM_KEYUP:
+    case WM_SYSKEYDOWN:
+    case WM_SYSKEYUP: {
+        const bool down = (m == WM_KEYDOWN || m == WM_SYSKEYDOWN);
+        const bool sysKey = (m == WM_SYSKEYDOWN || m == WM_SYSKEYUP);
+        // 本地快捷键只保留「退出」和「全屏」两个，且不转发，避免误触。
+        // 原来还有 'F' 切全屏——键盘转发接入后按 F 会把远端画面放大，已移除。
+        if (down && w == VK_ESCAPE) {
             if (g_isFullscreen) ExitFullscreen(); else RequestQuit();
             return 0;
         }
-        // F11 或 F 切换全屏，方便窗口模式下按一下变全屏
-        if (w == VK_F11 || w == 'F') {
+        if (down && w == VK_F11) {
             if (g_isFullscreen) ExitFullscreen(); else EnterFullscreen();
             return 0;
         }
+        // 其余按键全部转发给 Mac
+        const uint16_t scan = (uint16_t)((l >> 16) & 0xFF);
+        const bool extended = ((l >> 24) & 0x1) != 0;
+        uint8_t flags = 0;
+        if (extended) flags |= 0x01;
+        if (sysKey)   flags |= 0x02;
+        QueueKeyEvent((uint16_t)(w & 0xFFFF), scan, down ? 1 : 0, flags);
         return 0;
+    }
     case WM_MOUSEMOVE: {
         // 只过滤程序自己 SetCursorPos 产生的那一次移动：时间接近且落点等于目标点。
         // 不能只看时间窗，否则 Mac 光标高频移动时，真实本地移动会被一直吞掉，
@@ -3742,6 +3833,17 @@ int main(int argc, char** argv) {
                 SendInputPacket(e.x, e.y, e.buttons, e.wheel);
                 lastMoveMs = GetTickCount64();
                 g_moveDirty = false;   // 事件包已带最新位置
+            }
+            // 键盘事件按顺序逐条发
+            for (;;) {
+                KeyEvent k;
+                {
+                    std::lock_guard<std::mutex> lk(g_keyQmtx);
+                    if (g_keyQ.empty()) break;
+                    k = g_keyQ.front();
+                    g_keyQ.pop_front();
+                }
+                SendKeyPacket(k.vk, k.scan, k.down, k.flags);
             }
             if (g_moveDirty.load()) {
                 uint64_t now = GetTickCount64();
