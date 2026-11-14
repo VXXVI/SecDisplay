@@ -159,8 +159,13 @@ final class VirtualDisplayManager {
         d.setValue("SecDisplay", forKey: "name")
         d.setValue(NSNumber(value: cfg.width), forKey: "maxPixelsWide")
         d.setValue(NSNumber(value: cfg.height), forKey: "maxPixelsHigh")
-        d.setValue(NSValue(size: NSSize(width: 25.4 * Double(cfg.width) / 110.0,
-                                        height: 25.4 * Double(cfg.height) / 110.0)),
+        // 关键：macOS 按 EDID 物理尺寸算 PPI，约 192~200 PPI 以上才默认为 Retina 2x。
+        // 110 PPI 虽然也会在后台合成 HiDPI 模式，但系统默认挑 1x 原生模式跑。
+        // 2x 档位设 220 PPI，让系统首次上线即默认选中 2x Retina 模式；1x 档位保持 110 PPI。
+        let wantHiDPI = cfg.logicalWidth * 2 <= cfg.width
+        let ppi = wantHiDPI ? 220.0 : 110.0
+        d.setValue(NSValue(size: NSSize(width: 25.4 * Double(cfg.width) / ppi,
+                                        height: 25.4 * Double(cfg.height) / ppi)),
                    forKey: "sizeInMillimeters")
         d.setValue(NSValue(point: NSPoint(x: 0.6797, y: 0.3203)), forKey: "redPrimary")
         d.setValue(NSValue(point: NSPoint(x: 0.2559, y: 0.6983)), forKey: "greenPrimary")
@@ -172,17 +177,36 @@ final class VirtualDisplayManager {
         guard let disp = allocObj.perform(NSSelectorFromString("initWithDescriptor:"), with: d)?
                 .takeUnretainedValue() as? NSObject else { throw Err.initFailed }
 
-        let modeAlloc = modeCls.perform(NSSelectorFromString("alloc"))!.takeUnretainedValue() as! NSObject
         typealias ModeInit = @convention(c) (AnyObject, Selector, UInt, UInt, Double) -> AnyObject?
         let modeSel = NSSelectorFromString("initWithWidth:height:refreshRate:")
-        let modeInit = unsafeBitCast(modeAlloc.method(for: modeSel), to: ModeInit.self)
-        guard let mode = modeInit(modeAlloc, modeSel,
-                                  UInt(cfg.logicalWidth), UInt(cfg.logicalHeight),
-                                  cfg.refreshRate) as? NSObject else { throw Err.modeFailed }
+        func makeMode(_ w: Int, _ h: Int) -> NSObject? {
+            let a = modeCls.perform(NSSelectorFromString("alloc"))!.takeUnretainedValue() as! NSObject
+            let imp = unsafeBitCast(a.method(for: modeSel), to: ModeInit.self)
+            return imp(a, modeSel, UInt(w), UInt(h), cfg.refreshRate) as? NSObject
+        }
+
+        // HiDPI 需先声明物理背板模式让系统知道高密度面板能力，再列出逻辑模式与缩放档位；
+        // 非 HiDPI 声明单个 1x 模式即可。
+        var rawPairs: [(Int, Int)] = []
+        if wantHiDPI {
+            rawPairs.append((cfg.width, cfg.height))
+            rawPairs.append((cfg.logicalWidth, cfg.logicalHeight))
+            rawPairs.append((cfg.logicalWidth / 2, cfg.logicalHeight / 2))
+        } else {
+            rawPairs.append((cfg.logicalWidth, cfg.logicalHeight))
+        }
+        var modes: [NSObject] = []
+        var seenPairs = Set<String>()
+        for (mw, mh) in rawPairs where mw > 0 && mh > 0 {
+            let key = "\(mw)x\(mh)"
+            guard seenPairs.insert(key).inserted else { continue }
+            guard let m = makeMode(mw, mh) else { throw Err.modeFailed }
+            modes.append(m)
+        }
 
         let settings = setCls.init()
-        settings.setValue(cfg.logicalWidth * 2 <= cfg.width, forKey: "hiDPI")
-        settings.setValue([mode], forKey: "modes")
+        settings.setValue(wantHiDPI, forKey: "hiDPI")
+        settings.setValue(modes, forKey: "modes")
 
         // BOOL 返回值必须直接调用
         let applySel = NSSelectorFromString("applySettings:")
@@ -203,35 +227,122 @@ final class VirtualDisplayManager {
             if ids.contains(displayID) { break }
             usleep(20_000); waited += 0.02
         }
+        // 刚上线时 CGDisplayCopyDisplayMode 可能短暂返回 nil，等模式表就绪再自检/切换
+        var modeWait = 0.0
+        while modeWait < 1.5 {
+            if CGDisplayCopyDisplayMode(displayID) != nil { break }
+            usleep(20_000); modeWait += 0.02
+        }
 
-        // HiDPI 自检：读实际备份比例，别只看 hiDPI 开关返回值。
-        //
-        // 2026-11-14 实测（本机 macOS 27）：CGVirtualDisplay 的 HiDPI 拿不到。
-        // 试过 220 PPI、单/多 mode、物理 anchor 放第一/放第二、hiDPI=true，
-        // 一律 scale=1.00、HiDPI 模式 0 个；多 mode 还让背板塌到逻辑尺寸。
-        // 结论：不是本文件参数写死，是这台系统的私有 API 行为挡住了。
-        // 仍有可能突破的两条路（都不属于「配置改对就行」，本次未做）：
-        //   1) 换 productID：模式偏好按 vendor+product id 缓存，固定的
-        //      0x5344 可能一直套用旧的 1x 偏好（见 hidpi-mirror 的实测结论）
-        //   2) CGSConfigureDisplayMode 按 modeNumber 强制切 GPU 合成的 HiDPI
-        //      模式（见 Crisp 的 CGS 头文件逆向），绕开「虚拟屏忽略程序化改模式」
-        // 保留自检，系统升级或换机后重启一次看日志即可复测。
-        let wantHiDPI = cfg.logicalWidth * 2 <= cfg.width
-        let pw = CGDisplayPixelsWide(displayID)
-        let ph = CGDisplayPixelsHigh(displayID)
-        let bw = Int(CGDisplayBounds(displayID).width)
-        let bh = Int(CGDisplayBounds(displayID).height)
-        let s = (bw > 0 && pw > 0) ? Double(pw) / Double(bw) : 1.0
+        // 若系统缓存的偏好（比如之前选过 1x）导致当前模式没落到目标 (logical, physical)，
+        // 主动切一次：先走公开 CGConfigureDisplayWithDisplayMode，不成再走 CGS 私有兜底。
+        enforceTargetModeIfNeeded(cfg)
+
+        // HiDPI 自检：不能用 CGDisplayPixelsWide！
+        // macOS 27 上 CGDisplayPixelsWide 连内建 Retina 屏都返回逻辑点宽（1512 而非 3024），
+        // 之前拿 CGDisplayPixelsWide / CGDisplayBounds 算 scale 永远得到 1.00 是误判。
+        // 真正反映背板与缩放的是 CGDisplayCopyDisplayMode 的 pixelWidth/width，
+        // 以及带 kCGDisplayShowDuplicateLowResolutionModes=true 的模式枚举。
+        let cur = CGDisplayCopyDisplayMode(displayID)
+        let pw = cur?.pixelWidth ?? Int(CGDisplayPixelsWide(displayID))
+        let ph = cur?.pixelHeight ?? Int(CGDisplayPixelsHigh(displayID))
+        let lw = cur?.width ?? Int(CGDisplayBounds(displayID).width)
+        let lh = cur?.height ?? Int(CGDisplayBounds(displayID).height)
+        let s = (lw > 0 && pw > 0) ? Double(pw) / Double(lw) : 1.0
         vdBackingScale = s
-        Log.info("HiDPI 自检: 背板 \(pw)x\(ph) 逻辑 \(bw)x\(bh) scale=\(String(format: "%.2f", s)) 期望=\(wantHiDPI ? 2.0 : 1.0)")
-        if let all = CGDisplayCopyAllDisplayModes(displayID, nil) as? [CGDisplayMode] {
+        Log.info("HiDPI 自检: 背板 \(pw)x\(ph) 逻辑 \(lw)x\(lh)@\(Int(cur?.refreshRate ?? 0))Hz scale=\(String(format: "%.2f", s)) 期望=\(wantHiDPI ? 2.0 : 1.0)")
+        let opts = [kCGDisplayShowDuplicateLowResolutionModes as String: true] as CFDictionary
+        if let all = CGDisplayCopyAllDisplayModes(displayID, opts) as? [CGDisplayMode] {
             let hi = all.filter { $0.pixelWidth > $0.width }
             Log.info("HiDPI 自检: 模式 \(all.count) 个，其中 HiDPI \(hi.count) 个")
-            for m in all.prefix(6) {
-                Log.info("   模式 \(m.width)x\(m.height) 背板 \(m.pixelWidth)x\(m.pixelHeight)\(m.pixelWidth > m.width ? " [HiDPI]" : "")")
+            for m in all.filter({ $0.width == lw && $0.height == lh }).prefix(4) {
+                Log.info("   匹配模式 \(m.width)x\(m.height) 背板 \(m.pixelWidth)x\(m.pixelHeight)@\(Int(m.refreshRate))Hz\(m.pixelWidth > m.width ? " [HiDPI]" : "")")
             }
         }
-        Log.info("虚拟屏就绪 id=\(displayID) \(cfg.width)x\(cfg.height) scale=\(String(format: "%.2f", s))")
+        Log.info("虚拟屏就绪 id=\(displayID) \(cfg.width)x\(cfg.height) 逻辑=\(lw)x\(lh) scale=\(String(format: "%.2f", s))")
+    }
+
+    /// 当系统默认模式与配置期望 (logicalWidth/Height, width/height) 不一致时强制切换。
+    /// macOS 会按 vendor+product id 记住上次模式偏好，如果之前在同 ID 上用过 1x，
+    /// 再切回 2x 时就需要主动把模式拨正。
+    private func enforceTargetModeIfNeeded(_ cfg: Config) {
+        func matches(_ m: CGDisplayMode) -> Bool {
+            m.width == cfg.logicalWidth && m.height == cfg.logicalHeight
+                && m.pixelWidth == cfg.width && m.pixelHeight == cfg.height
+        }
+        if let cur = CGDisplayCopyDisplayMode(displayID), matches(cur) {
+            return
+        }
+
+        let opts = [kCGDisplayShowDuplicateLowResolutionModes as String: true] as CFDictionary
+        if let all = CGDisplayCopyAllDisplayModes(displayID, opts) as? [CGDisplayMode] {
+            let target = all.first(where: { matches($0) && abs($0.refreshRate - cfg.refreshRate) < 1.0 })
+                ?? all.first(where: matches)
+            if let target {
+                var c: CGDisplayConfigRef?
+                if CGBeginDisplayConfiguration(&c) == .success, let cfgRef = c {
+                    let rc = CGConfigureDisplayWithDisplayMode(cfgRef, displayID, target, nil)
+                    let done = (rc == .success) ? CGCompleteDisplayConfiguration(cfgRef, .forSession) : .failure
+                    if rc != .success { CGCancelDisplayConfiguration(cfgRef) }
+                    if done == .success {
+                        usleep(250_000)
+                        if let cur = CGDisplayCopyDisplayMode(displayID), matches(cur) {
+                            Log.info("公开 API 已纠正虚拟屏模式为 \(cur.width)x\(cur.height) (背板 \(cur.pixelWidth)x\(cur.pixelHeight))")
+                            return
+                        }
+                    }
+                }
+            }
+        }
+
+        // 兜底：公开枚举漏掉的 GPU 缩放 HiDPI 模式，通过 CGS 私有模式表按 modeNumber 切换。
+        // 全部走 dlsym 弱查找，不依赖编译期私有符号。
+        let rtld = UnsafeMutableRawPointer(bitPattern: -2)
+        typealias CGSGetNumFn = @convention(c) (CGDirectDisplayID, UnsafeMutablePointer<Int32>) -> CGError
+        typealias CGSGetDescFn = @convention(c) (CGDirectDisplayID, Int32, UnsafeMutableRawPointer, Int32) -> CGError
+        typealias CGSConfigFn = @convention(c) (CGDisplayConfigRef?, CGDirectDisplayID, Int32) -> CGError
+        guard let gnSym = dlsym(rtld, "CGSGetNumberOfDisplayModes"),
+              let gdSym = dlsym(rtld, "CGSGetDisplayModeDescriptionOfLength"),
+              let cmSym = dlsym(rtld, "CGSConfigureDisplayMode") else { return }
+        let getNum = unsafeBitCast(gnSym, to: CGSGetNumFn.self)
+        let getDesc = unsafeBitCast(gdSym, to: CGSGetDescFn.self)
+        let cfgMode = unsafeBitCast(cmSym, to: CGSConfigFn.self)
+
+        var cnt: Int32 = 0
+        guard getNum(displayID, &cnt) == .success, cnt > 0 else { return }
+        let wantDensity = Float(cfg.width) / Float(max(1, cfg.logicalWidth))
+        var buf = [UInt8](repeating: 0, count: 256)
+        var picked: Int32 = -1
+        for idx in 0..<cnt {
+            buf.withUnsafeMutableBytes { raw in
+                guard let base = raw.baseAddress,
+                      getDesc(displayID, idx, base, 212) == .success else { return }
+                let modeNum = base.load(fromByteOffset: 0, as: UInt32.self)
+                let flags = base.load(fromByteOffset: 4, as: UInt32.self)
+                let w = Int(base.load(fromByteOffset: 8, as: UInt32.self))
+                let h = Int(base.load(fromByteOffset: 12, as: UInt32.self))
+                let freq = Int(base.load(fromByteOffset: 190, as: UInt16.self))
+                let density = base.load(fromByteOffset: 208, as: Float.self)
+                let unusable = (flags & 0x4000_0000) != 0
+                if !unusable && w == cfg.logicalWidth && h == cfg.logicalHeight && abs(density - wantDensity) < 0.1 {
+                    if picked < 0 || abs(Double(freq) - cfg.refreshRate) < 1.0 {
+                        picked = Int32(bitPattern: modeNum)
+                    }
+                }
+            }
+        }
+        guard picked >= 0 else { return }
+        var c: CGDisplayConfigRef?
+        guard CGBeginDisplayConfiguration(&c) == .success, let cfgRef = c else { return }
+        let rc = cfgMode(cfgRef, displayID, picked)
+        if rc != .success {
+            CGCancelDisplayConfiguration(cfgRef)
+            return
+        }
+        if CGCompleteDisplayConfiguration(cfgRef, .forSession) == .success {
+            usleep(250_000)
+            Log.info("CGS 私有模式已切换到 modeNumber=\(picked)")
+        }
     }
 
     /// 正确销毁：取出 CGVirtualDisplay 内部的 _client 指针，交给 CDVirtualDisplayDestroy。
@@ -1150,6 +1261,7 @@ final class ScreenshotCapture {
     private var supervisor: DispatchSourceTimer?
     private var lastSupervisorCount = -1
     private var lastSupervisorAt: CFAbsoluteTime = 0
+    private var loggedFirstFrame = false
 
     init(encoder: Encoder, cfg: Config, displayID: @escaping () -> CGDirectDisplayID) {
         self.encoder = encoder
@@ -1217,10 +1329,18 @@ final class ScreenshotCapture {
                 c.width = cfg.width
                 c.height = cfg.height
                 c.showsCursor = false
+                // 2x HiDPI 下显式要最高清晰度采样，避免 automatic 在负载时降到逻辑分辨率放大
+                if #available(macOS 14.0, *) {
+                    c.captureResolution = .best
+                }
                 let img = try await SCScreenshotManager.captureImage(contentFilter: filter, configuration: c)
                 guard let pb = makePixelBuffer(from: img) else { continue }
                 let now = CFAbsoluteTimeGetCurrent()
                 encodeQueue.sync {
+                    if !loggedFirstFrame {
+                        loggedFirstFrame = true
+                        Log.info("采集首帧实测: \(img.width)x\(img.height) (期望 \(cfg.width)x\(cfg.height))")
+                    }
                     captured += 1
                     lastFrameTime = now
                     let delay = (now - t0) * 1000
@@ -2046,25 +2166,25 @@ if presetName == nil, let rp = Bundle.main.resourcePath {
 }
 if let preset = presetName, !preset.isEmpty {
     switch preset {
-    case "sharp":       // 2880×1800 干净 1x，帧率稍低换画质
+    case "sharp":       // 2880×1800 真 2x Retina（1440×900 逻辑），画质最锐
         cfg.width = 2880; cfg.height = 1800
-        cfg.logicalWidth = 2880; cfg.logicalHeight = 1800
+        cfg.logicalWidth = 1440; cfg.logicalHeight = 900
         cfg.captureHz = 45
-    case "balanced":    // 默认：与 Windows 物理屏 2880×1800 1:1
+    case "balanced":    // 默认：2880×1800 真 2x Retina（1440×900 逻辑），与 Windows 物理屏 1:1
         cfg.width = 2880; cfg.height = 1800
-        cfg.logicalWidth = 2880; cfg.logicalHeight = 1800
+        cfg.logicalWidth = 1440; cfg.logicalHeight = 900
         cfg.captureHz = 50
-    case "smooth":      // 降分辨率换帧率
+    case "smooth":      // 2240×1400 真 2x Retina（1120×700 逻辑），流畅度优先
         cfg.width = 2240; cfg.height = 1400
-        cfg.logicalWidth = 2240; cfg.logicalHeight = 1400
+        cfg.logicalWidth = 1120; cfg.logicalHeight = 700
         cfg.captureHz = 60
-    case "compact":     // 1x 小屏，适合 Sidecar 共存时用
+    case "compact":     // 1x 小屏（1600×1000），适合 Sidecar 共存或窗口模式
         cfg.width = 1600; cfg.height = 1000
         cfg.logicalWidth = 1600; cfg.logicalHeight = 1000
         cfg.captureHz = 60
-    case "fast":        // 最流畅，清晰度最差
+    case "fast":        // 1920×1200 真 2x Retina（960×600 逻辑）
         cfg.width = 1920; cfg.height = 1200
-        cfg.logicalWidth = 1920; cfg.logicalHeight = 1200
+        cfg.logicalWidth = 960; cfg.logicalHeight = 600
         cfg.captureHz = 60
     default:
         break
@@ -2076,11 +2196,12 @@ if let preset = presetName, !preset.isEmpty {
 if let w = Int(ProcessInfo.processInfo.environment["SECDISPLAY_W"] ?? ""),
    let h = Int(ProcessInfo.processInfo.environment["SECDISPLAY_H"] ?? "") {
     cfg.width = w; cfg.height = h
-    cfg.logicalWidth = w; cfg.logicalHeight = h
-    // 干净 1x：物理 = 逻辑。本机 macOS 27 的 CGVirtualDisplay 拿不到 HiDPI
-    // （见 VirtualDisplayManager.create 的 HiDPI 自检注释），所有 2x 假设
-    // 都只会退化成「逻辑=物理」的 1x 桌面，还让元素偏小、比例怪。
-    // 显式指定逻辑分辨率与 W/H 相同，得到可控的 1x。
+    // 未显式指定 LOGICAL 时：>=2000 宽默认开 2x Retina（w/2 × h/2），小分辨率保持 1x。
+    if w >= 2000 {
+        cfg.logicalWidth = w / 2; cfg.logicalHeight = h / 2
+    } else {
+        cfg.logicalWidth = w; cfg.logicalHeight = h
+    }
     if let lw = Int(ProcessInfo.processInfo.environment["SECDISPLAY_LOGICAL_W"] ?? ""),
        let lh = Int(ProcessInfo.processInfo.environment["SECDISPLAY_LOGICAL_H"] ?? ""),
        lw > 0, lh > 0 {
@@ -2199,11 +2320,11 @@ sender.onInput = { x, y, buttons, wheel in
                     bounds: CGDisplayBounds(vd.displayID))
 }
 
-// 光标转发：坐标是相对虚拟屏的值，与 CGEvent.location 同基准（实测
-// CGDisplayBounds 返回物理像素尺寸，随档位变化，如 2880x1800 / 2240x1400）。
-// 直接相减即可。Windows 端坐标基准必须与之相同（见接收端 g_coordW/H）。
+// 光标转发：CGEvent.location 与 CGDisplayBounds 处于逻辑点坐标系；
+// 2x Retina 时逻辑点为 1440x900，CursorTracker / InputInjector 会乘/除 vdBackingScale
+// 统一换算到线上物理像素基准（2880x1800），与 Windows 端 g_coordW/H 对齐。
 let vb = CGDisplayBounds(vd.displayID)
-Log.info("坐标基准: 逻辑点 \(Int(vb.width))x\(Int(vb.height))，原点 (\(Int(vb.minX)), \(Int(vb.minY)))")
+Log.info("坐标基准: 逻辑点 \(Int(vb.width))x\(Int(vb.height)) * \(String(format: "%.2f", vdBackingScale))x → 线上 \(cfg.width)x\(cfg.height)，原点 (\(Int(vb.minX)), \(Int(vb.minY)))")
 let cursor = CursorTracker(sender: sender, bounds: { CGDisplayBounds(vd.displayID) })
 cursor.start()
 // 真实光标图像：形状变化时才发，让副屏显示 Mac 的光标而非固定 Windows 箭头

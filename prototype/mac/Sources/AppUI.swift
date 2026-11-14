@@ -20,6 +20,7 @@ final class AppModel: ObservableObject {
     @Published var skipped = 0
     @Published var width = 0
     @Published var height = 0
+    @Published var scale: Double = 1.0
     @Published var cursorHz: Double = 0
     @Published var presetName = "-"
     @Published var cursorImageOn = true
@@ -29,18 +30,18 @@ final class AppModel: ObservableObject {
     var suppressResolutionChange = false
 
     static let resolutions: [(label: String, w: Int, h: Int, lw: Int, lh: Int)] = [
-        ("1600 × 1000", 1600, 1000, 1600, 1000),
-        ("1920 × 1200", 1920, 1200, 1920, 1200),
-        ("2240 × 1400", 2240, 1400, 2240, 1400),
-        ("2560 × 1600", 2560, 1600, 2560, 1600),
-        // 与 Windows 物理屏 2880×1800 完全 1:1，全屏不缩放，文字最锐。
-        // 本机 macOS 27 拿不到 HiDPI（见 main.swift 的 HiDPI 自检），
-        // 所有档位都是物理=逻辑的干净 1x，不再有 2x 伪装。
-        ("2880 × 1800（推荐）", 2880, 1800, 2880, 1800),
+        ("1600 × 1000 (1x)", 1600, 1000, 1600, 1000),
+        ("1920 × 1200 (2x Retina)", 1920, 1200, 960, 600),
+        ("2240 × 1400 (2x Retina)", 2240, 1400, 1120, 700),
+        ("2560 × 1600 (2x Retina)", 2560, 1600, 1280, 800),
+        // 真 2x Retina（1440×900 逻辑 / 2880×1800 物理）：
+        // 与 Windows 2880×1800 物理屏 1:1 像素对齐，同时 Mac 端按 2x 渲染字体与正常桌面比例。
+        ("2880 × 1800 (2x Retina · 推荐)", 2880, 1800, 1440, 900),
+        ("2880 × 1800 (1x)", 2880, 1800, 2880, 1800),
         // 16:9 档位：Windows 显示器为 16:9 时选对应的，全屏才能 1:1
-        ("1920 × 1080", 1920, 1080, 1920, 1080),
-        ("2560 × 1440", 2560, 1440, 2560, 1440),
-        ("3840 × 2160", 3840, 2160, 3840, 2160),
+        ("1920 × 1080 (1x)", 1920, 1080, 1920, 1080),
+        ("2560 × 1440 (2x Retina)", 2560, 1440, 1280, 720),
+        ("3840 × 2160 (2x Retina)", 3840, 2160, 1920, 1080),
     ]
 
     private init() {}
@@ -57,14 +58,22 @@ final class AppModel: ObservableObject {
         skipped = cap.staticSkipCount
         width = cfg.width
         height = cfg.height
+        scale = vdBackingScale
         cursorHz = cursor.targetHz
         cursorImageOn = !disableCursorImage
-        presetName = ProcessInfo.processInfo.environment["SECDISPLAY_PRESET"] ?? "自定义"
+        presetName = mainPresetLabel()
         logLine = Log.currentPath
         suppressResolutionChange = true
         resolutionIndex = AppModel.resolutions.firstIndex { $0.w == cfg.width && $0.h == cfg.height && $0.lw == cfg.logicalWidth && $0.lh == cfg.logicalHeight } ?? -1
         suppressResolutionChange = false
     }
+}
+
+private func mainPresetLabel() -> String {
+    if ProcessInfo.processInfo.environment["SECDISPLAY_W"] != nil {
+        return "自定义"
+    }
+    return presetName ?? "自定义"
 }
 
 private let accent = Color(red: 0.22, green: 0.55, blue: 0.96)
@@ -97,7 +106,9 @@ struct StatusView: View {
                 Text(model.connected ? "已连接" : "等待接收端")
                     .font(.headline)
                 Spacer()
-                Text("\(model.width)×\(model.height)")
+                Text(model.scale > 1.5
+                     ? "\(model.width)×\(model.height) · 2x"
+                     : "\(model.width)×\(model.height) · 1x")
                     .font(.system(.subheadline, design: .monospaced))
                     .foregroundStyle(.secondary)
             }
