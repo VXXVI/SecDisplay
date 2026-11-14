@@ -25,7 +25,7 @@ mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
 echo "编译中..."
 swiftc -O Sources/main.swift Sources/AppUI.swift -o "$BIN"
 
-# 默认档位 balanced = 2880x1800 干净 1x，与 Windows 物理屏 1:1。
+# 默认档位 balanced = 2880x1800 真 2x Retina（1440x900 逻辑），与 Windows 物理屏 1:1。
 # .preset 是本地运行状态（gitignore），存在时仍优先，方便临时切档。
 # 想固定用某个档位就写 .preset，例如 echo sharp > .preset
 DEFAULT_PRESET="balanced"
@@ -111,7 +111,13 @@ esac
 if [ "$INSTALL" = "1" ]; then
     rm -rf "/Applications/SecDisplay.app"
     cp -R "$APP" /Applications/
-    echo "已安装到 /Applications/SecDisplay.app"
+    # 清理本地构建暂存 bundle，确保全盘只保留 /Applications/SecDisplay.app，
+    # 避免启动台/Spotlight/系统权限页同时出现多个 SecDisplay.app 造成混淆。
+    rm -rf "$APP"
+    echo "已安装到 /Applications/SecDisplay.app（已清理构建目录冗余副本）"
+    if pgrep -f "/Applications/SecDisplay.app/Contents/MacOS/SecDisplay" >/dev/null 2>&1; then
+        echo "提示: 检测到旧实例正在运行，先退出旧实例后再重新 open /Applications/SecDisplay.app"
+    fi
 fi
 
 echo

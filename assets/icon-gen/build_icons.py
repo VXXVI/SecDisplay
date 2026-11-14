@@ -17,12 +17,11 @@ import subprocess
 import sys
 
 import numpy as np
-from PIL import Image, ImageDraw, ImageFilter
+from PIL import Image, ImageFilter
 
 CANVAS = 1024
 BODY = 824
 MARGIN = (CANVAS - BODY) // 2
-RADIUS_RATIO = 0.225
 SQUIRCLE_N = 5.0
 
 PNG_SIZES = [512, 256, 128, 64, 32, 16]
@@ -100,11 +99,10 @@ def compose_canvas(body: Image.Image) -> Image.Image:
 
 
 def with_shadow(master: Image.Image, bg=(236, 238, 241)) -> Image.Image:
-    pad = 0
     shadow = Image.new("RGBA", master.size, (0, 0, 0, 0))
     alpha = master.getchannel("A").filter(ImageFilter.GaussianBlur(18))
     shadow.putalpha(alpha.point(lambda v: int(v * 0.42)))
-    out = Image.new("RGB", (master.width + pad, master.height + pad), bg)
+    out = Image.new("RGB", master.size, bg)
     out.paste(shadow, (0, 8), shadow)
     out.paste(master, (0, 0), master)
     return out

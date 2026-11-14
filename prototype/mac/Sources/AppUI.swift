@@ -203,12 +203,14 @@ func restartWithResolution(_ w: Int, _ h: Int, _ lw: Int, _ lh: Int) {
     let p = Process()
     p.executableURL = URL(fileURLWithPath: "/bin/zsh")
     if FileManager.default.fileExists(atPath: dir + "/run.sh") {
-        p.arguments = ["-c", "sleep 9; cd \"\(dir)\" && SECDISPLAY_W=\(w) SECDISPLAY_H=\(h) SECDISPLAY_LOGICAL_W=\(lw) SECDISPLAY_LOGICAL_H=\(lh) ./run.sh restart"]
+        p.arguments = ["-c", "sleep 9; cd \"$1\" && SECDISPLAY_W=\"$2\" SECDISPLAY_H=\"$3\" SECDISPLAY_LOGICAL_W=\"$4\" SECDISPLAY_LOGICAL_H=\"$5\" ./run.sh restart",
+                       "restart", dir, "\(w)", "\(h)", "\(lw)", "\(lh)"]
     } else {
         // .app 场景：用 open 重新拉起 bundle，保持 TCC 归属在 bundle 上。
         // 直接跑 Contents/MacOS/SecDisplay 会被当成裸二进制，权限可能对不上。
         let appPath = Bundle.main.bundlePath
-        p.arguments = ["-c", "sleep 9; open -n \"\(appPath)\" --env SECDISPLAY_W=\(w) --env SECDISPLAY_H=\(h) --env SECDISPLAY_LOGICAL_W=\(lw) --env SECDISPLAY_LOGICAL_H=\(lh)"]
+        p.arguments = ["-c", "sleep 9; open -n \"$1\" --env SECDISPLAY_W=\"$2\" --env SECDISPLAY_H=\"$3\" --env SECDISPLAY_LOGICAL_W=\"$4\" --env SECDISPLAY_LOGICAL_H=\"$5\"",
+                       "restart", appPath, "\(w)", "\(h)", "\(lw)", "\(lh)"]
     }
     p.standardOutput = FileHandle.nullDevice
     p.standardError = FileHandle.nullDevice
@@ -234,23 +236,41 @@ func openLogsFolder() {
     }
 }
 
+private let panelStateLock = NSLock()
+nonisolated(unsafe) private var panelVisibleFlag = false
+
+private func setPanelVisible(_ v: Bool) {
+    panelStateLock.lock()
+    panelVisibleFlag = v
+    panelStateLock.unlock()
+}
+
+/// 面板可见期间暂停 Windows 输入回放（线程安全，供网络线程无风险读取，不跨线程碰 AppKit）。
+var isControlPanelVisible: Bool {
+    panelStateLock.lock()
+    let v = panelVisibleFlag
+    panelStateLock.unlock()
+    return v
+}
+
+private var panelWindow: NSWindow?
+
+private final class PanelWindowDelegate: NSObject, NSWindowDelegate {
+    func windowWillClose(_ notification: Notification) {
+        setPanelVisible(false)
+        NSApp.setActivationPolicy(.accessory)
+        Log.info("面板通过关闭按钮隐藏")
+    }
+}
+
+private let panelWindowDelegate = PanelWindowDelegate()
+
 /// 隐藏面板但保留进程。面板只是个查看窗口，关掉不该影响推流。
 func hideControlPanel() {
+    setPanelVisible(false)
     panelWindow?.orderOut(nil)
     NSApp.setActivationPolicy(.accessory)
     Log.info("面板已隐藏")
-}
-private var panelWindow: NSWindow?
-
-/// 面板可见期间暂停 Windows 输入回放。
-///
-/// InputInjector.handle 每个输入包都会 post 一个 .mouseMoved，把 Mac 光标
-/// warp 到虚拟屏坐标。Windows 端持续发包时，用户去点本机面板的鼠标会被
-/// 瞬间拽走，表现为「面板画得出来、所有按钮点不动」。
-/// 用显式开关而不是「判断当前光标位置」：后者一旦光标被拽进虚拟屏就会
-/// 自我放行、把光标钉死，且会在副屏操作时误丢事件。
-var isControlPanelVisible: Bool {
-    (panelWindow?.isVisible ?? false)
 }
 
 /// 把面板固定放到内建主屏，不跟随鼠标所在屏。
@@ -270,36 +290,44 @@ private func placeOnUserScreen(_ w: NSWindow) {
 
 /// 打开/前置控制面板
 func showControlPanel() {
-    // 这个进程平时是 .accessory（LSUIElement），菜单栏常驻、不进 Dock。
-    // 但 LSUIElement 应用里 activate(ignoringOtherApps:) 通常不会让它真正 active，
-    // 面板窗口能画出来、按钮却收不到鼠标事件，表现就是「全都点不动」。
-    // 显示面板时临时切成 .regular 让 App 能拿到前台与 key；关面板再切回去。
+    // 平时以 .accessory 常驻菜单栏；打开面板时切成 .regular 让 App 可成为前台，
+    // 并在下一个主循环轮次补一次 activate，等 WindowServer 完成策略切换后再聚焦。
     Log.info("打开控制面板请求")
+    setPanelVisible(true)
     NSApp.setActivationPolicy(.regular)
     NSApp.activate(ignoringOtherApps: true)
 
+    let targetWindow: NSWindow
     if let w = panelWindow {
         placeOnUserScreen(w)
         w.makeKeyAndOrderFront(nil)
         w.orderFrontRegardless()
+        targetWindow = w
         Log.info("面板已前置 key=\(w.isKeyWindow) visible=\(w.isVisible) frame=\(w.frame)")
-        return
+    } else {
+        let host = NSHostingView(rootView: StatusView())
+        let w = NSWindow(
+            contentRect: NSRect(x: 0, y: 0, width: 380, height: 520),
+            styleMask: [.titled, .closable, .miniaturizable, .fullSizeContentView],
+            backing: .buffered,
+            defer: false)
+        w.title = "SecDisplay 发送端"
+        w.titlebarAppearsTransparent = true
+        w.isReleasedWhenClosed = false
+        w.hidesOnDeactivate = false
+        w.delegate = panelWindowDelegate
+        w.contentView = host
+        placeOnUserScreen(w)
+        w.makeKeyAndOrderFront(nil)
+        w.orderFrontRegardless()
+        panelWindow = w
+        targetWindow = w
+        Log.info("面板已创建 frame=\(w.frame) key=\(w.isKeyWindow) visible=\(w.isVisible)")
     }
 
-    let host = NSHostingView(rootView: StatusView())
-    let w = NSWindow(
-        contentRect: NSRect(x: 0, y: 0, width: 380, height: 520),
-        styleMask: [.titled, .closable, .miniaturizable, .fullSizeContentView],
-        backing: .buffered,
-        defer: false)
-    w.title = "SecDisplay 发送端"
-    w.titlebarAppearsTransparent = true
-    w.isReleasedWhenClosed = false
-    w.hidesOnDeactivate = false
-    w.contentView = host
-    placeOnUserScreen(w)
-    w.makeKeyAndOrderFront(nil)
-    w.orderFrontRegardless()
-    panelWindow = w
-    Log.info("面板已创建 frame=\(w.frame) key=\(w.isKeyWindow) visible=\(w.isVisible)")
+    DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) {
+        guard isControlPanelVisible else { return }
+        NSApp.activate(ignoringOtherApps: true)
+        targetWindow.makeKeyAndOrderFront(nil)
+    }
 }

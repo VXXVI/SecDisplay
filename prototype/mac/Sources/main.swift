@@ -251,6 +251,9 @@ final class VirtualDisplayManager {
         let s = (lw > 0 && pw > 0) ? Double(pw) / Double(lw) : 1.0
         vdBackingScale = s
         Log.info("HiDPI 自检: 背板 \(pw)x\(ph) 逻辑 \(lw)x\(lh)@\(Int(cur?.refreshRate ?? 0))Hz scale=\(String(format: "%.2f", s)) 期望=\(wantHiDPI ? 2.0 : 1.0)")
+        if wantHiDPI && abs(s - 2.0) > 0.1 {
+            Log.info("警告: 期望 2x HiDPI 但当前 scale=\(String(format: "%.2f", s))，坐标仍按 cfg.width/bounds 比例对齐")
+        }
         let opts = [kCGDisplayShowDuplicateLowResolutionModes as String: true] as CFDictionary
         if let all = CGDisplayCopyAllDisplayModes(displayID, opts) as? [CGDisplayMode] {
             let hi = all.filter { $0.pixelWidth > $0.width }
@@ -282,13 +285,19 @@ final class VirtualDisplayManager {
                 var c: CGDisplayConfigRef?
                 if CGBeginDisplayConfiguration(&c) == .success, let cfgRef = c {
                     let rc = CGConfigureDisplayWithDisplayMode(cfgRef, displayID, target, nil)
-                    let done = (rc == .success) ? CGCompleteDisplayConfiguration(cfgRef, .forSession) : .failure
-                    if rc != .success { CGCancelDisplayConfiguration(cfgRef) }
-                    if done == .success {
-                        usleep(250_000)
-                        if let cur = CGDisplayCopyDisplayMode(displayID), matches(cur) {
-                            Log.info("公开 API 已纠正虚拟屏模式为 \(cur.width)x\(cur.height) (背板 \(cur.pixelWidth)x\(cur.pixelHeight))")
-                            return
+                    if rc != .success {
+                        CGCancelDisplayConfiguration(cfgRef)
+                        Log.info("公开 API 配置虚拟屏模式失败: \(rc.rawValue)")
+                    } else {
+                        let done = CGCompleteDisplayConfiguration(cfgRef, .forSession)
+                        if done == .success {
+                            usleep(250_000)
+                            if let cur = CGDisplayCopyDisplayMode(displayID), matches(cur) {
+                                Log.info("公开 API 已纠正虚拟屏模式为 \(cur.width)x\(cur.height) (背板 \(cur.pixelWidth)x\(cur.pixelHeight))")
+                                return
+                            }
+                        } else {
+                            Log.info("公开 API 提交虚拟屏模式失败: \(done.rawValue)")
                         }
                     }
                 }
@@ -303,7 +312,10 @@ final class VirtualDisplayManager {
         typealias CGSConfigFn = @convention(c) (CGDisplayConfigRef?, CGDirectDisplayID, Int32) -> CGError
         guard let gnSym = dlsym(rtld, "CGSGetNumberOfDisplayModes"),
               let gdSym = dlsym(rtld, "CGSGetDisplayModeDescriptionOfLength"),
-              let cmSym = dlsym(rtld, "CGSConfigureDisplayMode") else { return }
+              let cmSym = dlsym(rtld, "CGSConfigureDisplayMode") else {
+            Log.info("CGS 私有模式符号不可用，跳过兜底切换")
+            return
+        }
         let getNum = unsafeBitCast(gnSym, to: CGSGetNumFn.self)
         let getDesc = unsafeBitCast(gdSym, to: CGSGetDescFn.self)
         let cfgMode = unsafeBitCast(cmSym, to: CGSConfigFn.self)
@@ -312,7 +324,8 @@ final class VirtualDisplayManager {
         guard getNum(displayID, &cnt) == .success, cnt > 0 else { return }
         let wantDensity = Float(cfg.width) / Float(max(1, cfg.logicalWidth))
         var buf = [UInt8](repeating: 0, count: 256)
-        var picked: Int32 = -1
+        var picked: Int32? = nil
+        var bestDiff = Double.greatestFiniteMagnitude
         for idx in 0..<cnt {
             buf.withUnsafeMutableBytes { raw in
                 guard let base = raw.baseAddress,
@@ -325,23 +338,32 @@ final class VirtualDisplayManager {
                 let density = base.load(fromByteOffset: 208, as: Float.self)
                 let unusable = (flags & 0x4000_0000) != 0
                 if !unusable && w == cfg.logicalWidth && h == cfg.logicalHeight && abs(density - wantDensity) < 0.1 {
-                    if picked < 0 || abs(Double(freq) - cfg.refreshRate) < 1.0 {
+                    let diff = abs(Double(freq) - cfg.refreshRate)
+                    if picked == nil || diff < bestDiff {
+                        bestDiff = diff
                         picked = Int32(bitPattern: modeNum)
                     }
                 }
             }
         }
-        guard picked >= 0 else { return }
-        var c: CGDisplayConfigRef?
-        guard CGBeginDisplayConfiguration(&c) == .success, let cfgRef = c else { return }
-        let rc = cfgMode(cfgRef, displayID, picked)
-        if rc != .success {
-            CGCancelDisplayConfiguration(cfgRef)
+        guard let targetMode = picked else {
+            Log.info("CGS 模式表未找到匹配模式 \(cfg.logicalWidth)x\(cfg.logicalHeight) density=\(wantDensity)")
             return
         }
-        if CGCompleteDisplayConfiguration(cfgRef, .forSession) == .success {
+        var c: CGDisplayConfigRef?
+        guard CGBeginDisplayConfiguration(&c) == .success, let cfgRef = c else { return }
+        let rc = cfgMode(cfgRef, displayID, targetMode)
+        if rc != .success {
+            CGCancelDisplayConfiguration(cfgRef)
+            Log.info("CGS 私有模式切换失败: \(rc.rawValue)")
+            return
+        }
+        let done = CGCompleteDisplayConfiguration(cfgRef, .forSession)
+        if done == .success {
             usleep(250_000)
-            Log.info("CGS 私有模式已切换到 modeNumber=\(picked)")
+            Log.info("CGS 私有模式已切换到 modeNumber=\(targetMode)")
+        } else {
+            Log.info("CGS 私有模式提交失败: \(done.rawValue)")
         }
     }
 
@@ -1340,6 +1362,8 @@ final class ScreenshotCapture {
                     if !loggedFirstFrame {
                         loggedFirstFrame = true
                         Log.info("采集首帧实测: \(img.width)x\(img.height) (期望 \(cfg.width)x\(cfg.height))")
+                    } else if img.width != cfg.width || img.height != cfg.height {
+                        Log.info("警告: 采集帧尺寸偏移 \(img.width)x\(img.height) != \(cfg.width)x\(cfg.height)")
                     }
                     captured += 1
                     lastFrameTime = now
@@ -1673,7 +1697,7 @@ final class Sender {
     var keepAliveGap: CFAbsoluteTime = 0.08
 
     /// 光标位置。不走视频帧，独立小包，不占用在途帧配额。
-    /// 坐标是相对虚拟屏左上角的逻辑点值（与 CGDisplayBounds / CGEvent.location 同基准）。
+    /// 坐标是相对虚拟屏左上角的视频像素基准（cfg.width x cfg.height，与 Windows g_coordW/H 对齐）。
     func sendCursor(x: Float, y: Float, visible: Bool) {
         guard connected, let c = conn else { return }
         var packet = Data(capacity: 19)
@@ -1849,14 +1873,20 @@ final class InputInjector {
     private var lastButtons: UInt8 = 0
     private(set) var eventCount = 0
 
+    /// 面板开启期间暂停回放时清零本地记录的按键态，防止跨开关按住状态卡死。
+    func resetButtons() {
+        lastButtons = 0
+    }
+
     /// - Parameters:
-    ///   - x/y: Windows 回传的坐标，基准是「物理像素」（= 视频帧尺寸）。
-    ///          2x HiDPI 下要除以 backing scale 才能落到 CGDisplayBounds 的逻辑点空间。
+    ///   - x/y: Windows 回传的坐标，基准是「物理像素」（= 视频帧尺寸 cfg.width x cfg.height）。
+    ///          按 cfg / CGDisplayBounds 比例换算到逻辑点空间，即便模式偏好未拨正也保持对齐。
     ///   - buttons: bit0 左键，bit1 右键，bit2 中键
     ///   - wheel: 滚动量，正数向下
-    func handle(x: Float, y: Float, buttons: UInt8, wheel: Int16, bounds: CGRect) {
-        let s = CGFloat(vdBackingScale)
-        let p = CGPoint(x: bounds.minX + CGFloat(x) / s, y: bounds.minY + CGFloat(y) / s)
+    func handle(x: Float, y: Float, buttons: UInt8, wheel: Int16, bounds: CGRect, videoW: Int, videoH: Int) {
+        let sx = bounds.width > 0 ? CGFloat(videoW) / bounds.width : 1.0
+        let sy = bounds.height > 0 ? CGFloat(videoH) / bounds.height : 1.0
+        let p = CGPoint(x: bounds.minX + CGFloat(x) / sx, y: bounds.minY + CGFloat(y) / sy)
 
         // 先移动指针，再处理按键，保证点击落在正确位置
         if let mv = CGEvent(mouseEventSource: nil, mouseType: .mouseMoved,
@@ -1918,9 +1948,12 @@ final class CursorTracker {
     /// 累计发出的光标包数量，用于统计展示
     private(set) var sentCount = 0
 
-    init(sender: Sender, bounds: @escaping () -> CGRect) {
+    private let videoSize: () -> (Int, Int)
+
+    init(sender: Sender, bounds: @escaping () -> CGRect, videoSize: @escaping () -> (Int, Int)) {
         self.sender = sender
         self.bounds = bounds
+        self.videoSize = videoSize
         // 目标发送频率。默认 90：接收端物理屏是 89Hz，光标若只按 60Hz 更新，
         // 每个位置会在屏上停留 1~2 个刷新周期，肉眼就是「鼠标一跳一跳」。
         // 与 89Hz 接近的 90Hz 基本一更新一刷新，光标跟手。用 SECDISPLAY_CURSOR_HZ 覆盖。
@@ -1996,12 +2029,14 @@ final class CursorTracker {
         let ry = Float(p.y - b.minY)
         let inside = rx >= 0 && ry >= 0 && rx < Float(b.width) && ry < Float(b.height)
 
-        // 线上协议与 Windows g_coordW/H 用的是「物理像素」基准（= 视频帧尺寸）。
-        // 2x HiDPI 下 CGDisplayBounds 变成逻辑点（如 1440x900），这里把点坐标
-        // 乘回 backing scale，保证发出去的仍是 2880x1800 基准，Windows 端不用改。
-        let s = Float(vdBackingScale)
-        let ox = rx * s
-        let oy = ry * s
+        // 线上协议与 Windows g_coordW/H 用的是「视频像素」基准（cfg.width x cfg.height）。
+        // 按 videoSize / CGDisplayBounds 比例换算，确保不管 1x 还是 2x Retina（或异常回退），
+        // 线上坐标永远与视频帧像素 1:1 对齐，Windows 端零改动。
+        let (vw, vh) = videoSize()
+        let sx = b.width > 0 ? Float(vw) / Float(b.width) : 1.0
+        let sy = b.height > 0 ? Float(vh) / Float(b.height) : 1.0
+        let ox = rx * sx
+        let oy = ry * sy
 
         let moved = !(abs(ox - lastX) < 0.5 && abs(oy - lastY) < 0.5)
         guard moved || inside != lastVisible else { return }
@@ -2219,10 +2254,8 @@ if let r = Double(ProcessInfo.processInfo.environment["SECDISPLAY_REFRESH"] ?? "
 } else {
     cfg.refreshRate = cfg.captureHz
 }
-// 码率：默认按像素率估算，约 0.35 bit/pixel/frame。
-// 码率按像素率估算。1x 桌面文字边缘高频信息多，系数给到 0.6：
-// 2880x1800@50 约 155 Mbps，2240x1400@60 约 113 Mbps，1600x1000@60 约 58 Mbps。
-// 之前 0.35 对 1x 桌面文字偏低，滚动/拖动时边缘发糊。
+// 码率按像素率估算，系数 0.6（2880x1800@50 约 155 Mbps，2240x1400@60 约 113 Mbps，
+// 1600x1000@60 约 58 Mbps；桌面文字边缘高频信息多，0.35 偏低容易糊）。
 // RateController 会按链路健康度在 [target/3, target] 之间自适应，
 // 上限 clamp 到 200；需要更高画质时用 SECDISPLAY_MBPS 覆盖。
 if let mbps = Int(ProcessInfo.processInfo.environment["SECDISPLAY_MBPS"] ?? ""),
@@ -2315,18 +2348,23 @@ sender.onInput = { x, y, buttons, wheel in
     // 面板可见时暂停回放：否则 InputInjector 每个输入包都 post 一个
     // .mouseMoved 把本机光标 warp 到虚拟屏，用户点面板的鼠标会被瞬间拽走。
     // 面板关掉后自动恢复，副屏操作不受影响。
-    guard !isControlPanelVisible else { return }
+    if isControlPanelVisible {
+        injector.resetButtons()
+        return
+    }
     injector.handle(x: x, y: y, buttons: buttons, wheel: wheel,
-                    bounds: CGDisplayBounds(vd.displayID))
+                    bounds: CGDisplayBounds(vd.displayID),
+                    videoW: cfg.width, videoH: cfg.height)
 }
 
 // 光标转发：CGEvent.location 与 CGDisplayBounds 处于逻辑点坐标系；
-// 2x Retina 时逻辑点为 1440x900，CursorTracker / InputInjector 会乘/除 vdBackingScale
+// 2x Retina 时逻辑点为 1440x900，CursorTracker / InputInjector 会按 cfg/bounds 比例
 // 统一换算到线上物理像素基准（2880x1800），与 Windows 端 g_coordW/H 对齐。
 let vb = CGDisplayBounds(vd.displayID)
 Log.info("坐标基准: 逻辑点 \(Int(vb.width))x\(Int(vb.height)) * \(String(format: "%.2f", vdBackingScale))x → 线上 \(cfg.width)x\(cfg.height)，原点 (\(Int(vb.minX)), \(Int(vb.minY)))")
-let cursor = CursorTracker(sender: sender, bounds: { CGDisplayBounds(vd.displayID) })
-cursor.start()
+let cursor = CursorTracker(sender: sender,
+                           bounds: { CGDisplayBounds(vd.displayID) },
+                           videoSize: { (cfg.width, cfg.height) })
 // 真实光标图像：形状变化时才发，让副屏显示 Mac 的光标而非固定 Windows 箭头
 // 真实光标图像（0x05）。SECDISPLAY_NOCURSORIMG=1 可整体关闭，
 // 用于 A/B 判断「光标卡顿是否由接收端反复重建光标引起」——关掉后回退 Windows 标准箭头。
@@ -2334,9 +2372,11 @@ let cursorImage = CursorImageTracker(sender: sender)
 var disableCursorImage = ProcessInfo.processInfo.environment["SECDISPLAY_NOCURSORIMG"] == "1"
 if disableCursorImage {
     Log.info("已关闭真实光标图像(0x05)，使用接收端标准箭头（SECDISPLAY_NOCURSORIMG=1）")
-} else {
-    cursorImage.start()
 }
+// 注意：cursor.start() 调 NSEvent.addGlobalMonitorForEvents，cursorImage.start() 读 NSCursor。
+// 必须在 statusApp = setupStatusBar() + statusApp.run() 初始化完 AppKit 事件会话之后再启动，
+// 否则 NSEvent 全局监视器会抢先初始化半残的 SkyLight 会话，导致本进程所有窗口完全收不到鼠标点击！
+// 实际启动已移至下方 statusApp.run() 前的 DispatchQueue.main.async。
 
 // 传入 id 获取闭包：虚拟屏重建后 id 会变，采集侧每次重建流都重新问
 let cap = ScreenshotCapture(encoder: encoder, cfg: cfg, displayID: { vd.displayID })
@@ -2838,8 +2878,17 @@ var statusItem: NSStatusItem?
 var statusInfoItem: NSMenuItem?
 var statusMenu: NSMenu?
 
+final class AppLifecycleDelegate: NSObject, NSApplicationDelegate {
+    func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool {
+        false
+    }
+}
+
+let appLifecycleDelegate = AppLifecycleDelegate()
+
 func setupStatusBar() -> NSApplication {
     let app = NSApplication.shared
+    app.delegate = appLifecycleDelegate
     app.setActivationPolicy(.accessory)
 
     let item = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
@@ -2916,6 +2965,15 @@ if let rp = Bundle.main.resourcePath,
 } else {
     Log.info("构建标记: 无（命令行构建或旧包）")
 }
+// 等 statusApp.run() 启动主事件循环后再注册全局鼠标监视器与光标图像轮询，
+// 避免在 NSApplication 初始化之前抢先建立 SkyLight 事件通道导致窗口点击失灵。
+DispatchQueue.main.async {
+    cursor.start()
+    if !disableCursorImage {
+        cursorImage.start()
+    }
+}
+
 // 调试用：SECDISPLAY_SHOW_PANEL=1 启动后直接打开面板，便于不点菜单也能验证 UI。
 if ProcessInfo.processInfo.environment["SECDISPLAY_SHOW_PANEL"] == "1" {
     DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) {
