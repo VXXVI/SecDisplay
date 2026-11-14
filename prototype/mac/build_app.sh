@@ -7,9 +7,11 @@
 #   3. 菜单栏常驻，面板可控。
 #
 # 用法：
-#   ./build_app.sh                 # 编译并打包到 prototype/mac/SecDisplay.app
-#   ./build_app.sh --install       # 打包后复制到 /Applications
-#   open SecDisplay.app            # 启动
+#   ./build_app.sh                  # 编译、打包、直接安装到 /Applications
+#   ./build_app.sh --no-install     # 只打包到 prototype/mac/SecDisplay.app，不安装
+#
+# 默认每次编译完就装到 /Applications：运行中的实例是 /Applications 那份，
+# 只改 prototype/mac/SecDisplay.app 不生效，曾多次因此「改了没反应」。
 set -euo pipefail
 cd "$(dirname "$0")"
 
@@ -23,11 +25,14 @@ mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
 echo "编译中..."
 swiftc -O Sources/main.swift Sources/AppUI.swift -o "$BIN"
 
-# 把当前档位写进 bundle，从 Finder 启动时按这个档位建屏
+# 默认档位 balanced = 2880x1800 干净 1x，与 Windows 物理屏 1:1。
+# .preset 是本地运行状态（gitignore），存在时仍优先，方便临时切档。
+# 想固定用某个档位就写 .preset，例如 echo sharp > .preset
+DEFAULT_PRESET="balanced"
 if [ -f .preset ]; then
     cp .preset "$APP/Contents/Resources/preset"
 else
-    echo "smooth" > "$APP/Contents/Resources/preset"
+    echo "$DEFAULT_PRESET" > "$APP/Contents/Resources/preset"
 fi
 
 # 图标。源文件在 assets/app-icon，由 assets/icon-gen/build_icons.py 生成。
@@ -96,13 +101,21 @@ fi
 
 echo "已生成 $APP"
 
-if [ "${1:-}" = "--install" ]; then
+# 默认直接装到 /Applications。--no-install 才跳过。
+# --install 保留为兼容旧调用，效果与默认一致。
+INSTALL=1
+case "${1:-}" in
+    --no-install) INSTALL=0 ;;
+    --install)    INSTALL=1 ;;
+esac
+if [ "$INSTALL" = "1" ]; then
     rm -rf "/Applications/SecDisplay.app"
     cp -R "$APP" /Applications/
     echo "已安装到 /Applications/SecDisplay.app"
 fi
 
 echo
-echo "启动: open $APP"
+echo "启动: open /Applications/SecDisplay.app"
 echo "日志: ~/Library/Logs/SecDisplay/sender.log"
+echo "切档: echo sharp > $(pwd)/.preset && ./build_app.sh"
 echo "首次启动若黑屏, 到 系统设置 > 隐私与安全 > 屏幕录制 勾选 SecDisplay 后重开"

@@ -205,11 +205,17 @@ final class VirtualDisplayManager {
         }
 
         // HiDPI 自检：读实际备份比例，别只看 hiDPI 开关返回值。
-        // 2026-11-14 实测（macOS 27）：CGVirtualDisplay 无论怎么配
-        // （220 PPI、单/多 mode、物理 anchor 前/后、hiDPI=true）
-        // 都拿不到 HiDPI 模式，恒 scale=1.00、HiDPI 模式 0 个。
-        // 保留这段自检，系统升级后可一键复测；坐标链路按实际 s 换算，
-        // 万一哪天 2x 生效也不用再改代码。
+        //
+        // 2026-11-14 实测（本机 macOS 27）：CGVirtualDisplay 的 HiDPI 拿不到。
+        // 试过 220 PPI、单/多 mode、物理 anchor 放第一/放第二、hiDPI=true，
+        // 一律 scale=1.00、HiDPI 模式 0 个；多 mode 还让背板塌到逻辑尺寸。
+        // 结论：不是本文件参数写死，是这台系统的私有 API 行为挡住了。
+        // 仍有可能突破的两条路（都不属于「配置改对就行」，本次未做）：
+        //   1) 换 productID：模式偏好按 vendor+product id 缓存，固定的
+        //      0x5344 可能一直套用旧的 1x 偏好（见 hidpi-mirror 的实测结论）
+        //   2) CGSConfigureDisplayMode 按 modeNumber 强制切 GPU 合成的 HiDPI
+        //      模式（见 Crisp 的 CGS 头文件逆向），绕开「虚拟屏忽略程序化改模式」
+        // 保留自检，系统升级或换机后重启一次看日志即可复测。
         let wantHiDPI = cfg.logicalWidth * 2 <= cfg.width
         let pw = CGDisplayPixelsWide(displayID)
         let ph = CGDisplayPixelsHigh(displayID)
@@ -2040,25 +2046,25 @@ if presetName == nil, let rp = Bundle.main.resourcePath {
 }
 if let preset = presetName, !preset.isEmpty {
     switch preset {
-    case "sharp":       // 最清晰，帧率最低
+    case "sharp":       // 2880×1800 干净 1x，帧率稍低换画质
         cfg.width = 2880; cfg.height = 1800
-        cfg.logicalWidth = 1440; cfg.logicalHeight = 900
-        cfg.captureHz = 40
-    case "balanced":    // 默认
-        cfg.width = 2880; cfg.height = 1800
-        cfg.logicalWidth = 1440; cfg.logicalHeight = 900
+        cfg.logicalWidth = 2880; cfg.logicalHeight = 1800
         cfg.captureHz = 45
+    case "balanced":    // 默认：与 Windows 物理屏 2880×1800 1:1
+        cfg.width = 2880; cfg.height = 1800
+        cfg.logicalWidth = 2880; cfg.logicalHeight = 1800
+        cfg.captureHz = 50
     case "smooth":      // 降分辨率换帧率
         cfg.width = 2240; cfg.height = 1400
-        cfg.logicalWidth = 1120; cfg.logicalHeight = 700
+        cfg.logicalWidth = 2240; cfg.logicalHeight = 1400
         cfg.captureHz = 60
-    case "compact":     // 1x 小屏：物理=逻辑，适合 Sidecar 共存时用
+    case "compact":     // 1x 小屏，适合 Sidecar 共存时用
         cfg.width = 1600; cfg.height = 1000
         cfg.logicalWidth = 1600; cfg.logicalHeight = 1000
         cfg.captureHz = 60
     case "fast":        // 最流畅，清晰度最差
         cfg.width = 1920; cfg.height = 1200
-        cfg.logicalWidth = 960; cfg.logicalHeight = 600
+        cfg.logicalWidth = 1920; cfg.logicalHeight = 1200
         cfg.captureHz = 60
     default:
         break
@@ -2070,13 +2076,11 @@ if let preset = presetName, !preset.isEmpty {
 if let w = Int(ProcessInfo.processInfo.environment["SECDISPLAY_W"] ?? ""),
    let h = Int(ProcessInfo.processInfo.environment["SECDISPLAY_H"] ?? "") {
     cfg.width = w; cfg.height = h
-    cfg.logicalWidth = w / 2; cfg.logicalHeight = h / 2
-    // 显式指定逻辑分辨率，绕开「逻辑 = 物理 / 2」的固定 2x 假设。
-    //
-    // 背景：macOS 27 上 CGVirtualDisplay 的 hiDPI 对虚拟屏不生效，
-    // 实测 NSScreen 与 CGDisplayMode 报的都是「逻辑 = 物理」，也就是 1x，
-    // 于是 2240x1400 的桌面元素偏小。把 LOGICAL 设成与 W/H 相同，
-    // 得到干净的 1x：物理 1600x1000、逻辑 1600x1000，元素随之变大。
+    cfg.logicalWidth = w; cfg.logicalHeight = h
+    // 干净 1x：物理 = 逻辑。本机 macOS 27 的 CGVirtualDisplay 拿不到 HiDPI
+    // （见 VirtualDisplayManager.create 的 HiDPI 自检注释），所有 2x 假设
+    // 都只会退化成「逻辑=物理」的 1x 桌面，还让元素偏小、比例怪。
+    // 显式指定逻辑分辨率与 W/H 相同，得到可控的 1x。
     if let lw = Int(ProcessInfo.processInfo.environment["SECDISPLAY_LOGICAL_W"] ?? ""),
        let lh = Int(ProcessInfo.processInfo.environment["SECDISPLAY_LOGICAL_H"] ?? ""),
        lw > 0, lh > 0 {
@@ -2095,15 +2099,17 @@ if let r = Double(ProcessInfo.processInfo.environment["SECDISPLAY_REFRESH"] ?? "
     cfg.refreshRate = cfg.captureHz
 }
 // 码率：默认按像素率估算，约 0.35 bit/pixel/frame。
-// 1600x1000@60 约 34 Mbps，2240x1400@60 约 66 Mbps，2880x1800@45 约 82 Mbps。
-// 原先固定 180 Mbps 对多数档位都偏富余，除了压编码器，也会让自适应码率的
-// 下调幅度显得突兀（一降就是几十 Mbps）。需要更高画质时用 SECDISPLAY_MBPS 覆盖。
+// 码率按像素率估算。1x 桌面文字边缘高频信息多，系数给到 0.6：
+// 2880x1800@50 约 155 Mbps，2240x1400@60 约 113 Mbps，1600x1000@60 约 58 Mbps。
+// 之前 0.35 对 1x 桌面文字偏低，滚动/拖动时边缘发糊。
+// RateController 会按链路健康度在 [target/3, target] 之间自适应，
+// 上限 clamp 到 200；需要更高画质时用 SECDISPLAY_MBPS 覆盖。
 if let mbps = Int(ProcessInfo.processInfo.environment["SECDISPLAY_MBPS"] ?? ""),
    mbps >= 10, mbps <= 1000 {
     cfg.bitrateMbps = mbps
 } else {
     let pixelsPerSec = Double(cfg.width * cfg.height) * cfg.captureHz
-    cfg.bitrateMbps = max(20, min(200, Int(pixelsPerSec * 0.35 / 1_000_000)))
+    cfg.bitrateMbps = max(30, min(200, Int(pixelsPerSec * 0.6 / 1_000_000)))
 }
 let vd = VirtualDisplayManager()
 let encoder = Encoder(width: cfg.width, height: cfg.height, bitrateMbps: cfg.bitrateMbps, captureHz: cfg.captureHz)
