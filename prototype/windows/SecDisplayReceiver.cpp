@@ -2377,8 +2377,15 @@ static void AdjustRectDpi(RECT* rc, DWORD style, DWORD exStyle, int dpi) {
     }
 }
 
-// 面板主题与字体资源（按当前窗口 DPI 创建，不走 SPI_GETNONCLIENTMETRICS 避免二次放大切字）
+// 面板主题与字体资源：按 DPI 分组缓存，避免跨屏混合 DPI 下切换绘制时删除另一窗口仍在使用的 HFONT
 struct PanelTheme {
+    struct FontSet {
+        HFONT title = nullptr;
+        HFONT section = nullptr;
+        HFONT body = nullptr;
+        HFONT value = nullptr;
+        HFONT smallFont = nullptr;
+    };
     int dpi = 0;
     HFONT fontTitle = nullptr;
     HFONT fontSection = nullptr;
@@ -2387,10 +2394,11 @@ struct PanelTheme {
     HFONT fontSmall = nullptr;
     HBRUSH canvasBrush = nullptr;
     HBRUSH cardBrush = nullptr;
+    std::unordered_map<int, FontSet> sets;
 
-    static HFONT MakeFont(int pt, int weight, int dpi) {
+    static HFONT MakeFont(int pt, int weight, int targetDpi) {
         return CreateFontW(
-            -MulDiv(pt, dpi, 72), 0, 0, 0, weight, FALSE, FALSE, FALSE,
+            -MulDiv(pt, targetDpi, 72), 0, 0, 0, weight, FALSE, FALSE, FALSE,
             DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
             CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_SWISS, L"Microsoft YaHei UI");
     }
@@ -2399,21 +2407,34 @@ struct PanelTheme {
         if (!canvasBrush) canvasBrush = CreateSolidBrush(RGB(243, 245, 249));
         if (!cardBrush)   cardBrush   = CreateSolidBrush(RGB(255, 255, 255));
         if (dpi == targetDpi && fontBody) return;
-        ReleaseFonts();
-        dpi = targetDpi;
-        fontTitle   = MakeFont(12, FW_SEMIBOLD, dpi);
-        fontSection = MakeFont(9,  FW_SEMIBOLD, dpi);
-        fontBody    = MakeFont(9,  FW_NORMAL,   dpi);
-        fontValue   = MakeFont(9,  FW_SEMIBOLD, dpi);
-        fontSmall   = MakeFont(8,  FW_NORMAL,   dpi);
+        auto it = sets.find(targetDpi);
+        if (it == sets.end()) {
+            FontSet fs;
+            fs.title     = MakeFont(12, FW_SEMIBOLD, targetDpi);
+            fs.section   = MakeFont(9,  FW_SEMIBOLD, targetDpi);
+            fs.body      = MakeFont(9,  FW_NORMAL,   targetDpi);
+            fs.value     = MakeFont(9,  FW_SEMIBOLD, targetDpi);
+            fs.smallFont = MakeFont(8,  FW_NORMAL,   targetDpi);
+            it = sets.emplace(targetDpi, fs).first;
+        }
+        dpi         = targetDpi;
+        fontTitle   = it->second.title;
+        fontSection = it->second.section;
+        fontBody    = it->second.body;
+        fontValue   = it->second.value;
+        fontSmall   = it->second.smallFont;
     }
 
     void ReleaseFonts() {
-        if (fontTitle)   { DeleteObject(fontTitle);   fontTitle = nullptr; }
-        if (fontSection) { DeleteObject(fontSection); fontSection = nullptr; }
-        if (fontBody)    { DeleteObject(fontBody);    fontBody = nullptr; }
-        if (fontValue)   { DeleteObject(fontValue);   fontValue = nullptr; }
-        if (fontSmall)   { DeleteObject(fontSmall);   fontSmall = nullptr; }
+        for (auto& kv : sets) {
+            if (kv.second.title)     DeleteObject(kv.second.title);
+            if (kv.second.section)   DeleteObject(kv.second.section);
+            if (kv.second.body)      DeleteObject(kv.second.body);
+            if (kv.second.value)     DeleteObject(kv.second.value);
+            if (kv.second.smallFont) DeleteObject(kv.second.smallFont);
+        }
+        sets.clear();
+        fontTitle = fontSection = fontBody = fontValue = fontSmall = nullptr;
         dpi = 0;
     }
 
@@ -3355,7 +3376,9 @@ static void ApplyDropBoxRoundCorners(HWND h, int dpi) {
     if (!dwmOk && w > 0 && ch > 0) {
         int rad = DpiPx(16, dpi);
         HRGN rgn = CreateRoundRectRgn(0, 0, w + 1, ch + 1, rad * 2, rad * 2);
-        if (rgn) SetWindowRgn(h, rgn, TRUE);
+        if (rgn && SetWindowRgn(h, rgn, TRUE) == 0) {
+            DeleteObject(rgn);
+        }
     }
 }
 
@@ -3448,21 +3471,28 @@ static void PaintDropBox(HWND h) {
     };
     drawCircleBtn(rcPin, g_dbHot == 1 ? RGB(228, 236, 254) : RGB(246, 245, 250));
     {
-        // 矢量图钉图标
+        // 斜向矢量图钉图标（pin 顶帽 + 底座 + 针尖），辨识度更高
         int cx = (rcPin.left + rcPin.right) / 2;
         int cy = (rcPin.top + rcPin.bottom) / 2;
         COLORREF pc = pinned ? RGB(37, 99, 235) : RGB(115, 118, 132);
         HPEN pp = CreatePen(PS_SOLID, std::max(1, S(2)), pc);
-        HGDIOBJ op = SelectObject(hdc, pp);
-        MoveToEx(hdc, cx - S(4), cy - S(4), nullptr);
-        LineTo(hdc, cx + S(4), cy - S(4));
-        MoveToEx(hdc, cx, cy - S(4), nullptr);
-        LineTo(hdc, cx, cy + S(1));
+        HBRUSH pb = CreateSolidBrush(pinned ? pc : RGB(246, 245, 250));
+        HGDIOBJ op = SelectObject(hdc, pp), ob = SelectObject(hdc, pb);
+        // 顶帽（小圆角块）+ 底座横线 + 针尖
+        POINT head[4] = {
+            { cx - S(2), cy - S(6) },
+            { cx + S(5), cy - S(6) },
+            { cx + S(3), cy },
+            { cx - S(4), cy }
+        };
+        Polygon(hdc, head, 4);
         MoveToEx(hdc, cx - S(5), cy + S(1), nullptr);
-        LineTo(hdc, cx + S(5), cy + S(1));
-        MoveToEx(hdc, cx, cy + S(1), nullptr);
-        LineTo(hdc, cx, cy + S(6));
+        LineTo(hdc, cx + S(4), cy + S(1));
+        MoveToEx(hdc, cx - S(1), cy + S(1), nullptr);
+        LineTo(hdc, cx - S(3), cy + S(6));
+        SelectObject(hdc, ob);
         SelectObject(hdc, op);
+        DeleteObject(pb);
         DeleteObject(pp);
     }
     drawCircleBtn(rcClose, g_dbHot == 2 ? RGB(254, 226, 226) : RGB(246, 245, 250));
@@ -3632,6 +3662,7 @@ static LRESULT CALLBACK DropBoxWndProc(HWND h, UINT msg, WPARAM w, LPARAM l) {
             return 0;
         }
         if (PtInRect(&rcClose, pt)) {
+            g_dbHot = 0;
             ShowWindow(h, SW_HIDE);
             return 0;
         }
@@ -3690,6 +3721,7 @@ static LRESULT CALLBACK DropBoxWndProc(HWND h, UINT msg, WPARAM w, LPARAM l) {
         return 0;
     }
     case WM_CLOSE:
+        g_dbHot = 0;
         ShowWindow(h, SW_HIDE);
         return 0;
     }
@@ -3734,7 +3766,9 @@ static void ShowDropBoxWindow() {
         const int realDpi = PanelWindowDpi(h);
         if (realDpi != dpi) {
             int rw = DpiPx(248, realDpi), rh = DpiPx(266, realDpi);
-            SetWindowPos(h, nullptr, 0, 0, rw, rh, SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE);
+            int rx = (wa.right > wa.left) ? (wa.right - rw - DpiPx(24, realDpi)) : (GetSystemMetrics(SM_CXSCREEN) - rw - 24);
+            int ry = (wa.bottom > wa.top) ? (wa.bottom - rh - DpiPx(24, realDpi)) : (GetSystemMetrics(SM_CYSCREEN) - rh - 48);
+            SetWindowPos(h, nullptr, rx, ry, rw, rh, SWP_NOZORDER | SWP_NOACTIVATE);
             ApplyDropBoxRoundCorners(h, realDpi);
         }
         ShowWindow(h, SW_SHOWNOACTIVATE);

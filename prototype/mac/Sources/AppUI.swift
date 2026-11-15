@@ -610,20 +610,26 @@ func showControlPanel() {
 
 private func openTransferFilePicker() {
     let wasAccessory = NSApp.activationPolicy() == .accessory
+    let runPicker = {
+        let panel = NSOpenPanel()
+        panel.title = "选择要发送到 Windows 的文件"
+        panel.canChooseFiles = true
+        panel.canChooseDirectories = false
+        panel.allowsMultipleSelection = true
+        if panel.runModal() == .OK {
+            transferService.enqueue(urls: panel.urls)
+        }
+        if wasAccessory && !isControlPanelVisible {
+            NSApp.setActivationPolicy(.accessory)
+        }
+    }
     if wasAccessory {
         NSApp.setActivationPolicy(.regular)
         NSApp.activate(ignoringOtherApps: true)
-    }
-    let panel = NSOpenPanel()
-    panel.title = "选择要发送到 Windows 的文件"
-    panel.canChooseFiles = true
-    panel.canChooseDirectories = false
-    panel.allowsMultipleSelection = true
-    if panel.runModal() == .OK {
-        transferService.enqueue(urls: panel.urls)
-    }
-    if wasAccessory && !isControlPanelVisible {
-        NSApp.setActivationPolicy(.accessory)
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) { runPicker() }
+    } else {
+        NSApp.activate(ignoringOtherApps: true)
+        runPicker()
     }
 }
 
@@ -728,6 +734,17 @@ struct DropBoxView: View {
                     .frame(width: 146, height: 118)
                 }
                 .buttonStyle(.plain)
+                // 仅在投递区接收拖放，避免从下方已收文件胶囊拖出未出窗口时被自身误接回传
+                .onDrop(of: [.fileURL], isTargeted: $model.dropBoxHoverTargeted) { providers in
+                    var accepted = false
+                    for p in providers where p.canLoadObject(ofClass: URL.self) {
+                        accepted = true
+                        _ = p.loadObject(ofClass: URL.self) { url, _ in
+                            if let url { transferService.enqueue(urls: [url]) }
+                        }
+                    }
+                    return accepted
+                }
 
                 if let recvURL = model.transferLastRecvURL, !model.transferLastRecvName.isEmpty {
                     HStack(spacing: 4) {
@@ -768,16 +785,6 @@ struct DropBoxView: View {
             RoundedRectangle(cornerRadius: 18, style: .continuous)
                 .stroke(Color.black.opacity(0.08), lineWidth: 1)
         )
-        .onDrop(of: [.fileURL], isTargeted: $model.dropBoxHoverTargeted) { providers in
-            var accepted = false
-            for p in providers where p.canLoadObject(ofClass: URL.self) {
-                accepted = true
-                _ = p.loadObject(ofClass: URL.self) { url, _ in
-                    if let url { transferService.enqueue(urls: [url]) }
-                }
-            }
-            return accepted
-        }
     }
 }
 
@@ -786,6 +793,7 @@ private var dropBoxPanel: NSPanel?
 func toggleDropBoxPin() {
     let next = !AppModel.shared.dropBoxPinned
     AppModel.shared.dropBoxPinned = next
+    dropBoxPanel?.isFloatingPanel = next
     dropBoxPanel?.level = next ? .floating : .normal
     Log.info("Mac 投递盒置顶: \(next ? "开" : "关")")
 }

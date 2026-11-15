@@ -2892,6 +2892,9 @@ final class FileTransferService {
         stateLock.lock()
         _connected = true
         activeEpoch = epoch
+        activeBusy = false
+        activeProgress = 0
+        activeSpeedText = ""
         activeStatus = "已连接（端口 \(listenPort)）· 可拖入文件直传"
         stateLock.unlock()
         notifyUI()
@@ -2930,6 +2933,9 @@ final class FileTransferService {
         cleanupActiveRecvs()
         stateLock.lock()
         _connected = false
+        activeBusy = false
+        activeProgress = 0
+        activeSpeedText = ""
         activeStatus = outQueue.isEmpty ? "等待接收端" : "连接断开，\(outQueue.count) 个文件等待重连"
         stateLock.unlock()
         notifyUI()
