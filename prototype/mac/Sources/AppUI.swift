@@ -74,8 +74,14 @@ final class AppModel: ObservableObject {
     // ---- 角色模式与 Mac 副屏接收状态 ----
     @Published var isReceiverMode = false
     @Published var winHost = "10.10.10.2"
+    @Published var winHostDraft = ""
+    @Published var allowedHostsDraft = ""
+    @Published var localIPsSummary = "-"
     @Published var recvConnected = false
     @Published var recvStreaming = false
+    @Published var recvListening = false
+    @Published var recvListenerError: String? = nil
+    @Published var recvRejectedPeer: String? = nil
     @Published var recvPeer = "-"
     @Published var recvWidth = 0
     @Published var recvHeight = 0
@@ -86,10 +92,12 @@ final class AppModel: ObservableObject {
     @Published var recvPresentP95: Double = 0
     @Published var recvDecoded: UInt64 = 0
     @Published var recvErrors: UInt64 = 0
+    @Published var recvDropped: UInt64 = 0
     @Published var recvCursor: UInt64 = 0
     @Published var recvInput: UInt64 = 0
     @Published var recvUptimeSec: Double = 0
     @Published var recvDecoderName = "VideoToolbox (H.264 硬件)"
+    private var draftsInitialized = false
 
     static let resolutions: [(label: String, w: Int, h: Int, lw: Int, lh: Int)] = [
         ("1600 × 1000 (1x)", 1600, 1000, 1600, 1000),
@@ -111,15 +119,25 @@ final class AppModel: ObservableObject {
     /// 主线程每秒调用
     func refresh() {
         isReceiverMode = (appRole == .receiver)
-        if winHost != winHostAddress && !isReceiverMode {
+        if winHost != winHostAddress {
             winHost = winHostAddress
+        }
+        if !draftsInitialized {
+            draftsInitialized = true
+            winHostDraft = winHostAddress
+            allowedHostsDraft = UserDefaults.standard.string(forKey: "SecDisplayAllowedHost") ?? ""
         }
         logLine = Log.currentPath
 
         if appRole == .receiver {
-            if let snap = macReceiverClient?.snapshot(sampleRates: true) {
+            let ips = MacReceiverClient.localIPv4Summaries()
+            localIPsSummary = ips.isEmpty ? "-" : ips.prefix(2).map { "\($0.ip) (\($0.label))" }.joined(separator: " / ")
+            if let snap = macReceiverClient?.snapshot() {
                 recvConnected = snap.connected
                 recvStreaming = snap.streaming
+                recvListening = snap.listening
+                recvListenerError = snap.listenerError
+                recvRejectedPeer = snap.rejectedPeer
                 recvPeer = snap.peer
                 recvWidth = snap.width
                 recvHeight = snap.height
@@ -130,6 +148,7 @@ final class AppModel: ObservableObject {
                 recvPresentP95 = snap.presentP95
                 recvDecoded = snap.decodedFrames
                 recvErrors = snap.decodeErrors
+                recvDropped = snap.droppedFrames
                 recvCursor = snap.cursorRecv
                 recvInput = snap.inputSent
                 recvUptimeSec = snap.uptimeSec
@@ -328,8 +347,41 @@ struct StatusView: View {
                 if model.isReceiverMode {
                     SectionHeader(title: "副屏连接（Windows 主控）")
                     VStack(spacing: 6) {
-                        StatRow(label: "监听端口", value: "\(cfg.port) / \(cfg.port &+ 1) (等待 Windows 连入)")
+                        if let err = model.recvListenerError {
+                            StatRow(label: "监听状态", value: err, mono: false, warn: .red)
+                        } else {
+                            StatRow(label: "监听端口", value: "\(cfg.port) / \(cfg.port &+ 1) (\(model.recvListening ? "监听中" : "启动中"))")
+                        }
+                        HStack {
+                            Text("本机 IP").foregroundStyle(.secondary)
+                            Spacer()
+                            Text(model.localIPsSummary)
+                                .font(.system(size: 11, design: .monospaced))
+                                .lineLimit(1)
+                                .truncationMode(.middle)
+                            Button("复制") {
+                                let pb = NSPasteboard.general
+                                pb.clearContents()
+                                let firstIP = MacReceiverClient.localIPv4Summaries().first?.ip ?? "10.10.10.1"
+                                pb.setString(firstIP, forType: .string)
+                            }
+                            .controlSize(.mini)
+                        }
                         StatRow(label: "对端", value: model.recvPeer)
+                        if let rej = model.recvRejectedPeer {
+                            StatRow(label: "已拦截", value: rej, mono: false, warn: .orange)
+                        }
+                        HStack(spacing: 6) {
+                            Text("允许主控 IP").foregroundStyle(.secondary)
+                            Spacer()
+                            TextField("自动(私有网段+防抢占)", text: $model.allowedHostsDraft)
+                                .textFieldStyle(.roundedBorder)
+                                .font(.system(size: 11, design: .monospaced))
+                                .frame(width: 175)
+                                .onSubmit { applyAllowedHosts() }
+                            Button("应用") { applyAllowedHosts() }
+                                .controlSize(.small)
+                        }
                         StatRow(label: "连接时长", value: fmtUptime(model.recvUptimeSec))
                         StatRow(label: "已解码帧", value: "\(model.recvDecoded) 帧")
                     }
@@ -340,7 +392,8 @@ struct StatusView: View {
                         StatRow(label: "解码帧率", value: String(format: "%.1f fps", model.recvDecodeFps))
                         StatRow(label: "接收码率", value: String(format: "%.1f Mbps", model.recvMbps))
                         StatRow(label: "源 / 呈现 p95", value: String(format: "%.1f / %.1f ms", model.recvSourceP95, model.recvPresentP95))
-                        StatRow(label: "解码错误", value: "\(model.recvErrors)", warn: model.recvErrors > 0 ? .red : nil)
+                        StatRow(label: "错误 / 丢帧", value: "\(model.recvErrors) / \(model.recvDropped)",
+                                warn: (model.recvErrors > 0 || model.recvDropped > 0) ? .orange : nil)
                         StatRow(label: "光标 / 输入", value: "\(model.recvCursor) / \(model.recvInput)")
                     }
 
@@ -354,6 +407,17 @@ struct StatusView: View {
                     SectionHeader(title: "连接")
                     VStack(spacing: 6) {
                         StatRow(label: "对端", value: model.peer)
+                        HStack(spacing: 6) {
+                            Text("Windows IP").foregroundStyle(.secondary)
+                            Spacer()
+                            TextField("10.10.10.2", text: $model.winHostDraft)
+                                .textFieldStyle(.roundedBorder)
+                                .font(.system(size: 11, design: .monospaced))
+                                .frame(width: 145)
+                                .onSubmit { applyWinHostSetting() }
+                            Button("保存") { applyWinHostSetting() }
+                                .controlSize(.small)
+                        }
                         StatRow(label: "运行时长", value: fmtUptime(model.uptimeSec))
                         StatRow(label: "累计发送", value: "\(model.totalSent) 帧")
                     }
@@ -560,6 +624,24 @@ struct StatusView: View {
             return accepted
         }
     }
+
+    private func applyAllowedHosts() {
+        let trimmed = model.allowedHostsDraft.trimmingCharacters(in: .whitespacesAndNewlines)
+        UserDefaults.standard.set(trimmed, forKey: "SecDisplayAllowedHost")
+        UserDefaults.standard.synchronize()
+        macReceiverClient?.setAllowedHosts(trimmed)
+        model.refresh()
+    }
+
+    private func applyWinHostSetting() {
+        let trimmed = model.winHostDraft.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return }
+        winHostAddress = trimmed
+        model.winHost = trimmed
+        UserDefaults.standard.set(trimmed, forKey: "SecDisplayWinHost")
+        UserDefaults.standard.synchronize()
+        Log.info("面板: 已保存 Windows IP -> \(trimmed)")
+    }
 }
 
 /// 复制诊断信息到剪贴板。排障时比让人截图快得多。
@@ -570,14 +652,17 @@ func copyDiagnostics() {
         text = """
         SecDisplay Mac 副屏诊断 (Win→Mac)
         ================================
+        监听: \(m.recvListening ? "监听中" : "未就绪") \(m.recvListenerError ?? "")
+        本机 IP: \(m.localIPsSummary)
         连接: \(m.recvConnected ? "已连接" : "未连接")  流状态: \(m.recvStreaming ? "正常" : "等待")
-        主控端: \(m.recvPeer)
+        主控端: \(m.recvPeer)  拦截: \(m.recvRejectedPeer ?? "无")
         分辨率: \(m.recvWidth)x\(m.recvHeight) @ \(m.recvFps)Hz
         解码器: \(m.recvDecoderName)
         解码帧率: \(String(format: "%.1f", m.recvDecodeFps)) fps  码率: \(String(format: "%.1f", m.recvMbps)) Mbps
         源p95 / 呈现p95: \(String(format: "%.1f / %.1f", m.recvSourceP95, m.recvPresentP95)) ms
-        已解码: \(m.recvDecoded) 帧  解码错误: \(m.recvErrors)
+        已解码: \(m.recvDecoded) 帧  解码错误: \(m.recvErrors)  丢帧: \(m.recvDropped)
         光标 / 输入: \(m.recvCursor) / \(m.recvInput)  运行 \(fmtUptime(m.recvUptimeSec))
+        中转站(9923): \(m.transferConnected ? "已连接" : "等待") (\(m.transferStatus))
         日志: \(m.logLine)
         """
     } else {
@@ -586,7 +671,7 @@ func copyDiagnostics() {
         SecDisplay 发送端诊断
         ==================
         连接: \(m.connected ? "已连接" : "未连接")
-        对端: \(m.peer)
+        对端: \(m.peer)  记录WindowsIP: \(m.winHost)
         分辨率: \(m.width)x\(m.height)  scale=\(String(format: "%.2f", m.scale))
         采集通道: \(m.capturePath)
         采集峰值: \(String(format: "%.0f", m.fps)) fps
@@ -596,9 +681,10 @@ func copyDiagnostics() {
         健康度: \(String(format: "%.2f", m.health))
         在途/丢弃: \(m.inFlight)/\(m.dropped)
         对端解码: \(String(format: "%.1f", m.clientFps)) fps  呈现p95 \(String(format: "%.1f", m.clientPresentP95)) ms
-        对端额外排队: \(String(format: "%.1f", m.clientQueueMs)) ms  非节拍丢帧 \(m.clientPresentDrop)
-        源码率p95: \(String(format: "%.1f", fb.sourceP95)) ms  节拍丢帧 \(fb.pacedDrop)
+        对端额外排队: \(String(format: "%.1f", m.clientQueueMs)) ms  非节拍丢帧 \(fb.presentDrop)  节拍丢帧 \(fb.pacedDrop)
+        源码率p95: \(String(format: "%.1f", fb.sourceP95)) ms
         累计发送: \(m.totalSent) 帧  运行 \(fmtUptime(m.uptimeSec))
+        中转站(9923): \(m.transferConnected ? "已连接" : "等待") (\(m.transferStatus))
         日志: \(m.logLine)
         """
     }

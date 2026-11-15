@@ -15,7 +15,7 @@
 set -u
 cd "$(dirname "$0")"
 
-BIN=./screensender
+BIN="$PWD/screensender"
 LOGDIR=logs
 PIDFILE=/tmp/secdisplay-sender.pid
 SIGN_ID=com.secdisplay.screensender
@@ -100,7 +100,7 @@ find_pid() {
             return
         fi
     fi
-    pgrep -f "screensender" | head -1
+    pgrep -f "$(pwd)/screensender" | head -1
 }
 
 case "${1:-start}" in

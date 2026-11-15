@@ -36,7 +36,9 @@ echo       成功
 
 echo.
 echo   [2/2] SecDisplayReceiver.exe
-g++ %CXXFLAGS% SecDisplayReceiver.cpp -o SecDisplayReceiver.exe %LIBS%
+windres SecDisplayReceiver.rc -O coff -o SecDisplayReceiver.res
+if errorlevel 1 goto :failed
+g++ %CXXFLAGS% SecDisplayReceiver.cpp SecDisplayReceiver.res -o SecDisplayReceiver.exe %LIBS%
 if errorlevel 1 goto :failed
 echo       成功
 

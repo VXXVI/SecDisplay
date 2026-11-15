@@ -26,6 +26,10 @@ enum SecDisplayRole: String {
 struct MacReceiverSnapshot {
     var connected = false
     var streaming = false
+    var listening = false
+    var listenerError: String? = nil
+    var rejectedPeer: String? = nil
+    var allowedHosts = ""
     var peer = "-"
     var width = 0
     var height = 0
@@ -199,6 +203,7 @@ final class VideoToolboxDecoder {
 
     var onDecodedFrame: ((CVPixelBuffer, Int, Int) -> Void)?
     var onDecodeError: (() -> Void)?
+    var onFrameDropped: (() -> Void)?
     var onNeedKeyframe: (() -> Void)?
 
     func reset() {
@@ -317,6 +322,10 @@ final class VideoToolboxDecoder {
             infoFlagsOut: &infoFlags
         )
 
+        if st3 == noErr && pendingDecodedPB == nil && infoFlags.contains(.asynchronous) {
+            VTDecompressionSessionWaitForAsynchronousFrames(session)
+        }
+
         if st3 == noErr, let pb = pendingDecodedPB {
             pendingDecodedPB = nil
             decodedFrames &+= 1
@@ -325,6 +334,10 @@ final class VideoToolboxDecoder {
             videoWidth = w
             videoHeight = h
             onDecodedFrame?(pb, w, h)
+        } else if st3 == noErr && infoFlags.contains(.frameDropped) {
+            pendingDecodedPB = nil
+            onFrameDropped?()
+            onNeedKeyframe?()
         } else {
             pendingDecodedPB = nil
             decodeErrors &+= 1
@@ -433,6 +446,14 @@ final class MacReceiverClient {
 
     private var _connected = false
     private var _streaming = false
+    private var _listening = false
+    private var _listenerError: String? = nil
+    private var _rejectedPeer: String? = nil
+    private var _allowedHostsRaw = ""
+    private var _allowedHosts = Set<String>()
+    private var _allowAnyHost = false
+    private var _activePeerHost = ""
+    private var _latestEpoch = 0
     private var _sessW = 0
     private var _sessH = 0
     private var _sessFps = 0
@@ -461,6 +482,7 @@ final class MacReceiverClient {
     var onCursorMove: ((Float, Float, Bool) -> Void)?
     var onCursorImage: ((CGImage, Int, Int) -> Void)?
     var onSessionChanged: ((Int, Int, Int) -> Void)?
+    var onDisconnected: (() -> Void)?
 
     init() {
         decoder.onDecodedFrame = { [weak self] pb, w, h in
@@ -473,8 +495,14 @@ final class MacReceiverClient {
             self._videoWidth = w
             self._videoHeight = h
             if self._lastPresentAt > 0 {
-                self._presIntervalsMs.append((now - self._lastPresentAt) * 1000.0)
-                if self._presIntervalsMs.count > 120 { self._presIntervalsMs.removeFirst() }
+                let dtMs = (now - self._lastPresentAt) * 1000.0
+                if dtMs > 250.0 {
+                    // 静止桌面恢复出画时清空陈旧采样窗口，避免把停顿时间计入呈现 p95
+                    self._presIntervalsMs.removeAll()
+                } else if dtMs > 0 {
+                    self._presIntervalsMs.append(dtMs)
+                    if self._presIntervalsMs.count > 120 { self._presIntervalsMs.removeFirst() }
+                }
             }
             self._lastPresentAt = now
             self.stateLock.unlock()
@@ -486,9 +514,36 @@ final class MacReceiverClient {
             self._decodeErrors &+= 1
             self.stateLock.unlock()
         }
+        decoder.onFrameDropped = { [weak self] in
+            guard let self else { return }
+            self.stateLock.lock()
+            self._droppedFrames &+= 1
+            self.stateLock.unlock()
+        }
         decoder.onNeedKeyframe = { [weak self] in
             self?.sendKeyframeRequest(throttled: true)
         }
+    }
+
+    func setAllowedHosts(_ raw: String) {
+        let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        let lower = trimmed.lowercased()
+        let allowAny = (lower == "any" || lower == "*")
+        var parsed = Set<String>()
+        if !trimmed.isEmpty && !allowAny {
+            let parts = trimmed.split { $0 == "," || $0 == " " || $0 == ";" }
+            for p in parts {
+                let s = Self.normalizeIP(String(p).trimmingCharacters(in: .whitespacesAndNewlines))
+                if !s.isEmpty { parsed.insert(s) }
+            }
+        }
+        stateLock.lock()
+        _allowedHostsRaw = trimmed
+        _allowedHosts = parsed
+        _allowAnyHost = allowAny
+        _rejectedPeer = nil
+        stateLock.unlock()
+        Log.info("MacReceiver: 访问控制策略 -> \(allowAny ? "允许任意来源" : (parsed.isEmpty ? "自动(私有/桥接网段+防抢占)" : parsed.sorted().joined(separator: ",")))")
     }
 
     func listen(port: UInt16) {
@@ -507,11 +562,19 @@ final class MacReceiverClient {
         stopped = true
         _connected = false
         _streaming = false
+        _listening = false
+        _listenerError = nil
+        _activePeerHost = ""
+        _latestEpoch &+= 1
         peerDesc = "-"
         stateLock.unlock()
         netQueue.async { [weak self] in
             guard let self else { return }
             self.connEpoch &+= 1
+            let e = self.connEpoch
+            self.stateLock.lock()
+            self._latestEpoch = e
+            self.stateLock.unlock()
             self.feedbackTimer?.cancel()
             self.feedbackTimer = nil
             self.conn?.cancel()
@@ -528,7 +591,7 @@ final class MacReceiverClient {
         }
     }
 
-    func snapshot(sampleRates: Bool = false) -> MacReceiverSnapshot {
+    func snapshot(sampleRates: Bool = true) -> MacReceiverSnapshot {
         stateLock.lock()
         defer { stateLock.unlock() }
         let now = CFAbsoluteTimeGetCurrent()
@@ -546,11 +609,16 @@ final class MacReceiverClient {
         }
         let w = _videoWidth > 0 ? _videoWidth : _sessW
         let h = _videoHeight > 0 ? _videoHeight : _sessH
-        let p95Src = Self.percentile95(_srcIntervalsMs)
-        let p95Pres = Self.percentile95(_presIntervalsMs)
+        let idle = (_lastFrameRecvAt > 0 && now - _lastFrameRecvAt > 3.0)
+        let p95Src = idle ? 0.0 : Self.percentile95(_srcIntervalsMs)
+        let p95Pres = idle ? 0.0 : Self.percentile95(_presIntervalsMs)
         return MacReceiverSnapshot(
             connected: _connected,
             streaming: _streaming,
+            listening: _listening,
+            listenerError: _listenerError,
+            rejectedPeer: _rejectedPeer,
+            allowedHosts: _allowedHostsRaw,
             peer: _connected ? peerDesc : "-",
             width: w,
             height: h,
@@ -576,6 +644,70 @@ final class MacReceiverClient {
         return s[idx]
     }
 
+    private static func normalizeIP(_ raw: String) -> String {
+        var s = raw
+        if let pct = s.firstIndex(of: "%") { s = String(s[..<pct]) }
+        if s.hasPrefix("::ffff:") { s = String(s.dropFirst(7)) }
+        return s
+    }
+
+    private static func extractHost(from endpoint: NWEndpoint) -> String {
+        if case let .hostPort(host, _) = endpoint {
+            return normalizeIP("\(host)")
+        }
+        let s = "\(endpoint)"
+        if let idx = s.lastIndex(of: ":") {
+            return normalizeIP(String(s[..<idx]))
+        }
+        return normalizeIP(s)
+    }
+
+    private static func isPrivateOrLinkLocal(_ ip: String) -> Bool {
+        if ip == "127.0.0.1" || ip == "::1" || ip.hasPrefix("fe80:") || ip.hasPrefix("fc") || ip.hasPrefix("fd") {
+            return true
+        }
+        let parts = ip.split(separator: ".").compactMap { Int($0) }
+        guard parts.count == 4 else { return false }
+        let (a, b) = (parts[0], parts[1])
+        if a == 10 || a == 127 { return true }
+        if a == 169 && b == 254 { return true }
+        if a == 172 && b >= 16 && b <= 31 { return true }
+        if a == 192 && b == 168 { return true }
+        if a == 100 && b >= 64 && b <= 127 { return true } // Tailscale CGNAT
+        return false
+    }
+
+    static func localIPv4Summaries() -> [(iface: String, label: String, ip: String)] {
+        var out: [(iface: String, label: String, ip: String)] = []
+        var ifap: UnsafeMutablePointer<ifaddrs>?
+        guard getifaddrs(&ifap) == 0, let first = ifap else { return out }
+        defer { freeifaddrs(ifap) }
+        var cur: UnsafeMutablePointer<ifaddrs>? = first
+        while let p = cur {
+            cur = p.pointee.ifa_next
+            guard let addr = p.pointee.ifa_addr, addr.pointee.sa_family == UInt8(AF_INET) else { continue }
+            let flags = Int32(p.pointee.ifa_flags)
+            guard (flags & IFF_UP) != 0, (flags & IFF_LOOPBACK) == 0 else { continue }
+            var hostBuf = [CChar](repeating: 0, count: Int(NI_MAXHOST))
+            let r = getnameinfo(addr, socklen_t(addr.pointee.sa_len), &hostBuf, socklen_t(hostBuf.count), nil, 0, NI_NUMERICHOST)
+            guard r == 0 else { continue }
+            let ip = String(cString: hostBuf)
+            let iface = String(cString: p.pointee.ifa_name)
+            let label: String
+            if ip.hasPrefix("10.10.10.") || iface.hasPrefix("bridge") {
+                label = "雷电网桥"
+            } else if iface.hasPrefix("utun") || ip.hasPrefix("100.") {
+                label = "Tailscale"
+            } else if iface == "en0" {
+                label = "Wi-Fi/有线"
+            } else {
+                label = iface
+            }
+            out.append((iface: iface, label: label, ip: ip))
+        }
+        return out
+    }
+
     private func startListener() {
         stateLock.lock()
         let isStopped = stopped
@@ -594,6 +726,10 @@ final class MacReceiverClient {
         do {
             l = try NWListener(using: params, on: nwPort)
         } catch {
+            stateLock.lock()
+            _listening = false
+            _listenerError = "监听端口 \(port) 失败: \(error.localizedDescription)"
+            stateLock.unlock()
             Log.info("MacReceiver: 监听端口 \(port) 失败 \(error)")
             scheduleListenerRestart()
             return
@@ -613,12 +749,28 @@ final class MacReceiverClient {
                 self.listenerRestartWorkItem?.cancel()
                 self.listenerRestartWorkItem = nil
                 self.listenerRestartScheduled = false
+                self.stateLock.lock()
+                self._listening = true
+                self._listenerError = nil
+                self.stateLock.unlock()
                 Log.info("MacReceiver: 已监听端口 \(port)，等待 Windows 主控端连接")
+            case .waiting(let e):
+                self.stateLock.lock()
+                self._listening = false
+                self._listenerError = "等待接口或本地网络权限: \(e.localizedDescription)"
+                self.stateLock.unlock()
+                Log.info("MacReceiver: 监听等待中 \(e)")
             case .failed(let e):
+                self.stateLock.lock()
+                self._listening = false
+                self._listenerError = "监听异常: \(e.localizedDescription)"
+                self.stateLock.unlock()
                 Log.info("MacReceiver: 监听异常 \(e)")
                 self.scheduleListenerRestart()
             case .cancelled:
-                break
+                self.stateLock.lock()
+                self._listening = false
+                self.stateLock.unlock()
             default:
                 break
             }
@@ -645,16 +797,52 @@ final class MacReceiverClient {
     }
 
     private func acceptConnection(_ c: NWConnection) {
+        let peerHost = Self.extractHost(from: c.endpoint)
         stateLock.lock()
         let isStopped = stopped
+        let allowAny = _allowAnyHost
+        let wl = _allowedHosts
+        let curConnected = _connected
+        let curHost = _activePeerHost
         stateLock.unlock()
         if isStopped {
             c.cancel()
             return
         }
 
+        // 访问控制与防抢占：
+        // 1) 若配置了白名单，仅允许白名单 IP
+        // 2) 未配置白名单时，仅放行私有/链路本地/Tailscale 网段，且已有活跃会话时不许不同 IP 抢占
+        var rejectReason: String? = nil
+        if !allowAny {
+            if !wl.isEmpty {
+                if !wl.contains(peerHost) {
+                    rejectReason = "不在允许主控 IP 白名单"
+                }
+            } else {
+                if !Self.isPrivateOrLinkLocal(peerHost) {
+                    rejectReason = "非本地/私有网段来源"
+                } else if !curHost.isEmpty && curHost != peerHost && (curConnected || self.conn != nil) {
+                    rejectReason = "已有主控 \(curHost) 在线，拒绝异地抢占"
+                }
+            }
+        }
+        if let reason = rejectReason {
+            stateLock.lock()
+            _rejectedPeer = "\(peerHost) (\(reason))"
+            stateLock.unlock()
+            Log.info("MacReceiver: 已拒绝来自 \(peerHost) 的连接 (\(reason))")
+            c.cancel()
+            return
+        }
+
         connEpoch &+= 1
         let epoch = connEpoch
+        stateLock.lock()
+        _latestEpoch = epoch
+        _activePeerHost = peerHost
+        _rejectedPeer = nil
+        stateLock.unlock()
         feedbackTimer?.cancel()
         feedbackTimer = nil
         let old = self.conn
@@ -671,6 +859,7 @@ final class MacReceiverClient {
                 self.stateLock.lock()
                 self._connected = true
                 self._streaming = false
+                self._activePeerHost = peerHost
                 self._sessW = 0
                 self._sessH = 0
                 self._sessFps = 0
@@ -703,20 +892,28 @@ final class MacReceiverClient {
     private func handleDisconnect(epoch: Int) {
         guard connEpoch == epoch else { return }
         connEpoch &+= 1
+        let nextEpoch = connEpoch
         feedbackTimer?.cancel()
         feedbackTimer = nil
         conn?.cancel()
         conn = nil
         recvBuf.removeAll()
         stateLock.lock()
+        _latestEpoch = nextEpoch
         _connected = false
         _streaming = false
+        _activePeerHost = ""
         _decodeInFlight = 0
+        _lastDecodeFps = 0
+        _lastMbps = 0
+        _srcIntervalsMs.removeAll()
+        _presIntervalsMs.removeAll()
         peerDesc = "-"
         stateLock.unlock()
         decodeQueue.async { [weak self] in
             self?.decoder.reset()
         }
+        onDisconnected?()
     }
 
     private func startFeedbackTimer(epoch: Int) {
@@ -783,9 +980,16 @@ final class MacReceiverClient {
             let now = CFAbsoluteTimeGetCurrent()
             let hasIdr = Self.avccContainsIDR(payload)
             stateLock.lock()
+            let epoch = _latestEpoch
             if _lastFrameRecvAt > 0 {
-                _srcIntervalsMs.append((now - _lastFrameRecvAt) * 1000.0)
-                if _srcIntervalsMs.count > 120 { _srcIntervalsMs.removeFirst() }
+                let dtMs = (now - _lastFrameRecvAt) * 1000.0
+                if dtMs > 250.0 {
+                    // 静止桌面恢复出画时清空陈旧采样窗口，避免把停顿时间计入源端 p95 并误导 0x07 降码率
+                    _srcIntervalsMs.removeAll()
+                } else if dtMs > 0 {
+                    _srcIntervalsMs.append(dtMs)
+                    if _srcIntervalsMs.count > 120 { _srcIntervalsMs.removeFirst() }
+                }
             }
             _lastFrameRecvAt = now
             // 解码队列背压：在途帧数 >= 3 时丢弃非关键帧防止延迟堆积
@@ -799,7 +1003,7 @@ final class MacReceiverClient {
             decodeQueue.async { [weak self] in
                 guard let self else { return }
                 self.stateLock.lock()
-                let alive = !self.stopped && self._connected
+                let alive = !self.stopped && self._connected && self._latestEpoch == epoch
                 self.stateLock.unlock()
                 if alive {
                     self.decoder.decodeAvccFrame(payload)
@@ -1104,6 +1308,23 @@ final class ReceiverCanvasView: NSView {
 
     func updateWaitingText(_ text: String) {
         waitLabel.stringValue = text
+        waitLabel.isHidden = false
+    }
+
+    func showDisconnected(_ text: String = "连接已断开，等待 Windows 主控重连…") {
+        releaseAllInputs()
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        videoLayer.contents = nil
+        cursorLayer.contents = nil
+        cursorLayer.isHidden = true
+        CATransaction.commit()
+        currentPixelBuffer = nil
+        cursorVisible = false
+        hasReceivedFrame = false
+        waitLabel.stringValue = text
+        waitLabel.isHidden = false
+        window?.invalidateCursorRects(for: self)
     }
 
     func displayFrame(_ pb: CVPixelBuffer, width: Int, height: Int) {
@@ -1223,6 +1444,13 @@ final class ReceiverCanvasView: NSView {
     }
 
     override func mouseMoved(with event: NSEvent) { forwardMouseMove(event) }
+    override func mouseExited(with event: NSEvent) {
+        cursorVisible = false
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        cursorLayer.isHidden = true
+        CATransaction.commit()
+    }
     override func mouseDragged(with event: NSEvent) { forwardMouseMove(event) }
     override func rightMouseDragged(with event: NSEvent) { forwardMouseMove(event) }
     override func otherMouseDragged(with event: NSEvent) { forwardMouseMove(event) }
@@ -1398,6 +1626,12 @@ final class ReceiverWindowController: NSObject, NSWindowDelegate {
                     )
                     win.setFrame(centered, display: true)
                 }
+            }
+        }
+        client.onDisconnected = { [weak view, weak win] in
+            DispatchQueue.main.async {
+                view?.showDisconnected("连接已断开，等待 Windows 主控重连…")
+                win?.title = "SecDisplay 副屏 (等待重连) · Ctrl+Cmd+F 全屏"
             }
         }
     }
