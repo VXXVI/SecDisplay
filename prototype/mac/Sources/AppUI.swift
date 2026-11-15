@@ -71,6 +71,26 @@ final class AppModel: ObservableObject {
     @Published var dropBoxPinned = true
     @Published var dropBoxHoverTargeted = false
 
+    // ---- 角色模式与 Mac 副屏接收状态 ----
+    @Published var isReceiverMode = false
+    @Published var winHost = "10.10.10.2"
+    @Published var recvConnected = false
+    @Published var recvStreaming = false
+    @Published var recvPeer = "-"
+    @Published var recvWidth = 0
+    @Published var recvHeight = 0
+    @Published var recvFps = 0
+    @Published var recvDecodeFps: Double = 0
+    @Published var recvMbps: Double = 0
+    @Published var recvSourceP95: Double = 0
+    @Published var recvPresentP95: Double = 0
+    @Published var recvDecoded: UInt64 = 0
+    @Published var recvErrors: UInt64 = 0
+    @Published var recvCursor: UInt64 = 0
+    @Published var recvInput: UInt64 = 0
+    @Published var recvUptimeSec: Double = 0
+    @Published var recvDecoderName = "VideoToolbox (H.264 硬件)"
+
     static let resolutions: [(label: String, w: Int, h: Int, lw: Int, lh: Int)] = [
         ("1600 × 1000 (1x)", 1600, 1000, 1600, 1000),
         ("1920 × 1200 (2x Retina)", 1920, 1200, 960, 600),
@@ -90,30 +110,58 @@ final class AppModel: ObservableObject {
 
     /// 主线程每秒调用
     func refresh() {
-        connected = sender.connected
+        isReceiverMode = (appRole == .receiver)
+        if winHost != winHostAddress && !isReceiverMode {
+            winHost = winHostAddress
+        }
+        logLine = Log.currentPath
+
+        if appRole == .receiver {
+            if let snap = macReceiverClient?.snapshot() {
+                recvConnected = snap.connected
+                recvStreaming = snap.streaming
+                recvPeer = snap.peer
+                recvWidth = snap.width
+                recvHeight = snap.height
+                recvFps = snap.sessionFps
+                recvDecodeFps = snap.decodeFps
+                recvMbps = snap.mbps
+                recvSourceP95 = snap.sourceP95
+                recvPresentP95 = snap.presentP95
+                recvDecoded = snap.decodedFrames
+                recvErrors = snap.decodeErrors
+                recvCursor = snap.cursorRecv
+                recvInput = snap.inputSent
+                recvUptimeSec = snap.uptimeSec
+                recvDecoderName = snap.decoderName
+            }
+            refreshTransferOnly()
+            return
+        }
+
+        connected = sender?.connected ?? false
         fps = peakFps
         encMs = lastEncAvgMs
         capMs = lastCapAvgMs
         mbps = lastMbps
-        inFlight = sender.inFlight
-        dropped = sender.dropped
+        inFlight = sender?.inFlight ?? 0
+        dropped = sender?.dropped ?? 0
         let snap = currentVideoSizeSnapshot()
         width = snap.w
         height = snap.h
         scale = vdBackingScale
-        cursorHz = cursor.targetHz
+        cursorHz = cursor?.targetHz ?? 0
         cursorImageOn = !disableCursorImage
         presetName = mainPresetLabel()
-        logLine = Log.currentPath
         suppressResolutionChange = true
         resolutionIndex = AppModel.resolutions.firstIndex { $0.w == snap.w && $0.h == snap.h && $0.lw == snap.lw && $0.lh == snap.lh } ?? -1
         suppressResolutionChange = false
 
         // 链路与对端
-        bitrateNow = rateCtl.currentBitrate
+        bitrateNow = rateCtl?.currentBitrate ?? cfg.bitrateMbps
         bitrateTarget = cfg.bitrateMbps
-        health = rateCtl.lastHealth
-        let fb = sender.latestFeedback()
+        health = rateCtl?.lastHealth ?? 0
+        let fb = sender?.latestFeedback() ?? FeedbackSignals()
         clientFps = fb.decodeFps
         clientPresentP95 = fb.presentP95
         clientQueueMs = max(0, fb.presentP95 - fb.sourceP95)
@@ -122,7 +170,7 @@ final class AppModel: ObservableObject {
         // 这时显示配置值会骗人（日志里那条「内存收益失效」的警告就白打了）。
         // 还没采到帧时显示请求值加问号，提示尚未确认。
         let wantName = pixelFormatChoice == "420v" ? "420v" : "BGRA"
-        let code = cap.actualFormatCode
+        let code = cap?.actualFormatCode ?? 0
         // 四字符码还原成可读名：420v / BGRA / 未知
         let actual: String
         switch code {
@@ -134,12 +182,12 @@ final class AppModel: ObservableObject {
             actual = String(bytes: b, encoding: .ascii) ?? "未知"
         }
         capturePath = actual + " · 4 路"
-        captureRestarts = cap.captureRestartCount
-        totalSent = UInt64(max(0, sender.totalSent))
+        captureRestarts = cap?.captureRestartCount ?? 0
+        totalSent = UInt64(max(0, sender?.totalSent ?? 0))
         uptimeSec = CFAbsoluteTimeGetCurrent() - appStartTime
-        peer = sender.peerDescription
-        cursorPosSent = cursor.sentCount
-        cursorImgSent = cursorImage.sentCount
+        peer = sender?.peerDescription ?? "-"
+        cursorPosSent = cursor?.sentCount ?? 0
+        cursorImgSent = cursorImage?.sentCount ?? 0
         refreshTransferOnly()
     }
 
@@ -233,69 +281,137 @@ struct StatusView: View {
                 VStack(alignment: .leading, spacing: 14) {
                 // 头部
                 HStack(spacing: 10) {
-                    Circle()
-                        .fill(model.connected ? Color.green : Color.orange)
-                        .frame(width: 10, height: 10)
-                    Text(model.connected ? "已连接" : "等待接收端")
-                        .font(.headline)
+                    if model.isReceiverMode {
+                        Circle()
+                            .fill(model.recvStreaming ? Color.green : (model.recvConnected ? Color.yellow : Color.orange))
+                            .frame(width: 10, height: 10)
+                        Text(model.recvStreaming ? "副屏接收中" : (model.recvConnected ? "已连 Windows" : "等待主控端"))
+                            .font(.headline)
+                        Spacer()
+                        Text(model.recvWidth > 0 ? "\(model.recvWidth)×\(model.recvHeight) @ \(model.recvFps)Hz" : "Win→Mac")
+                            .font(.system(.subheadline, design: .monospaced))
+                            .foregroundStyle(.secondary)
+                    } else {
+                        Circle()
+                            .fill(model.connected ? Color.green : Color.orange)
+                            .frame(width: 10, height: 10)
+                        Text(model.connected ? "已连接" : "等待接收端")
+                            .font(.headline)
+                        Spacer()
+                        Text(model.scale > 1.5
+                             ? "\(model.width)×\(model.height) · 2x"
+                             : "\(model.width)×\(model.height) · 1x")
+                            .font(.system(.subheadline, design: .monospaced))
+                            .foregroundStyle(.secondary)
+                    }
+                }
+
+                // 角色切换（Mac 当主屏 <-> Mac 当副屏）
+                HStack(spacing: 8) {
+                    Text("角色模式").foregroundStyle(.secondary)
                     Spacer()
-                    Text(model.scale > 1.5
-                         ? "\(model.width)×\(model.height) · 2x"
-                         : "\(model.width)×\(model.height) · 1x")
-                        .font(.system(.subheadline, design: .monospaced))
-                        .foregroundStyle(.secondary)
+                    Picker("", selection: Binding(
+                        get: { model.isReceiverMode ? 1 : 0 },
+                        set: { idx in
+                            let target: SecDisplayRole = (idx == 1) ? .receiver : .sender
+                            if target != appRole {
+                                restartWithRole(target, host: model.winHost)
+                            }
+                        })) {
+                        Text("Mac 当主屏").tag(0)
+                        Text("Mac 当副屏").tag(1)
+                    }
+                    .pickerStyle(.segmented)
+                    .frame(width: 210)
                 }
 
-                // 连接
-                SectionHeader(title: "连接")
-                VStack(spacing: 6) {
-                    StatRow(label: "对端", value: model.peer)
-                    StatRow(label: "运行时长", value: fmtUptime(model.uptimeSec))
-                    StatRow(label: "累计发送", value: "\(model.totalSent) 帧")
-                }
+                if model.isReceiverMode {
+                    SectionHeader(title: "副屏连接（Windows 主控）")
+                    VStack(spacing: 6) {
+                        HStack(spacing: 6) {
+                            Text("主控 IP").foregroundStyle(.secondary)
+                            TextField("10.10.10.2", text: $model.winHost)
+                                .textFieldStyle(.roundedBorder)
+                                .font(.system(size: 11, design: .monospaced))
+                            Button("重连") {
+                                let host = model.winHost.trimmingCharacters(in: .whitespacesAndNewlines)
+                                guard !host.isEmpty else { return }
+                                winHostAddress = host
+                                UserDefaults.standard.set(host, forKey: "SecDisplayWinHost")
+                                macReceiverClient?.start(host: host, port: cfg.port)
+                                transferService.connect(host: host, port: cfg.port &+ 1)
+                            }
+                        }
+                        StatRow(label: "对端", value: model.recvPeer)
+                        StatRow(label: "连接时长", value: fmtUptime(model.recvUptimeSec))
+                        StatRow(label: "已解码帧", value: "\(model.recvDecoded) 帧")
+                    }
 
-                // 采集与编码（发送端本地）
-                SectionHeader(title: "采集 / 编码")
-                VStack(spacing: 6) {
-                    StatRow(label: "采集峰值", value: String(format: "%.0f fps", model.fps))
-                    StatRow(label: "采集通道", value: model.capturePath)
-                    StatRow(label: "采集延迟", value: String(format: "%.1f ms", model.capMs))
-                    StatRow(label: "编码延迟", value: String(format: "%.1f ms", model.encMs))
-                    StatRow(label: "画质档位", value: model.presetName)
-                    // 采集重启次数：>0 说明 SCK 采集不达标、看护已经重建过工作线程。
-                    // 原来这行显示「静止跳过」，但那个计数只存在于死代码里恒为 0。
-                    StatRow(label: "采集重启", value: model.captureRestarts == 0
-                            ? "无" : "\(model.captureRestarts) 次",
-                            warn: model.captureRestarts > 0 ? .orange : nil)
-                }
+                    SectionHeader(title: "解码 / 呈现（VideoToolbox）")
+                    VStack(spacing: 6) {
+                        StatRow(label: "解码器", value: model.recvDecoderName)
+                        StatRow(label: "解码帧率", value: String(format: "%.1f fps", model.recvDecodeFps))
+                        StatRow(label: "接收码率", value: String(format: "%.1f Mbps", model.recvMbps))
+                        StatRow(label: "源 / 呈现 p95", value: String(format: "%.1f / %.1f ms", model.recvSourceP95, model.recvPresentP95))
+                        StatRow(label: "解码错误", value: "\(model.recvErrors)", warn: model.recvErrors > 0 ? .red : nil)
+                        StatRow(label: "光标 / 输入", value: "\(model.recvCursor) / \(model.recvInput)")
+                    }
 
-                // 码率控制
-                SectionHeader(title: "码率控制")
-                VStack(spacing: 6) {
-                    StatRow(label: "当前 / 目标",
-                            value: "\(model.bitrateNow) / \(model.bitrateTarget) Mbps")
-                    StatRow(label: "实际发送", value: String(format: "%.1f Mbps", model.mbps))
-                    StatRow(label: "健康度", value: healthText, warn: healthColor)
-                    StatRow(label: "在途 / 丢弃", value: "\(model.inFlight) / \(model.dropped)",
-                            warn: model.dropped > 0 ? .orange : nil)
-                }
+                    HStack(spacing: 8) {
+                        Button("打开副屏窗口") { macReceiverWindow?.show() }
+                        Button("切换全屏") { macReceiverWindow?.toggleFullscreen() }
+                        Button("请求关键帧") { macReceiverClient?.sendKeyframeRequest(throttled: false) }
+                    }
+                } else {
+                    // 连接
+                    SectionHeader(title: "连接")
+                    VStack(spacing: 6) {
+                        StatRow(label: "对端", value: model.peer)
+                        StatRow(label: "运行时长", value: fmtUptime(model.uptimeSec))
+                        StatRow(label: "累计发送", value: "\(model.totalSent) 帧")
+                    }
 
-                // Windows 侧观测（0x07 反馈）
-                SectionHeader(title: "接收端（Windows）")
-                VStack(spacing: 6) {
-                    StatRow(label: "解码帧率", value: String(format: "%.1f fps", model.clientFps))
-                    StatRow(label: "呈现 p95", value: String(format: "%.1f ms", model.clientPresentP95))
-                    StatRow(label: "额外排队", value: String(format: "%.1f ms", model.clientQueueMs),
-                            warn: model.clientQueueMs >= 15 ? .orange : nil)
-                    StatRow(label: "非节拍丢帧", value: "\(model.clientPresentDrop)",
-                            warn: model.clientPresentDrop > 0 ? .orange : nil)
-                }
+                    // 采集与编码（发送端本地）
+                    SectionHeader(title: "采集 / 编码")
+                    VStack(spacing: 6) {
+                        StatRow(label: "采集峰值", value: String(format: "%.0f fps", model.fps))
+                        StatRow(label: "采集通道", value: model.capturePath)
+                        StatRow(label: "采集延迟", value: String(format: "%.1f ms", model.capMs))
+                        StatRow(label: "编码延迟", value: String(format: "%.1f ms", model.encMs))
+                        StatRow(label: "画质档位", value: model.presetName)
+                        StatRow(label: "采集重启", value: model.captureRestarts == 0
+                                ? "无" : "\(model.captureRestarts) 次",
+                                warn: model.captureRestarts > 0 ? .orange : nil)
+                    }
 
-                // 光标
-                SectionHeader(title: "光标")
-                VStack(spacing: 6) {
-                    StatRow(label: "采样频率", value: String(format: "%.0f Hz", model.cursorHz))
-                    StatRow(label: "位置 / 图像", value: "\(model.cursorPosSent) / \(model.cursorImgSent)")
+                    // 码率控制
+                    SectionHeader(title: "码率控制")
+                    VStack(spacing: 6) {
+                        StatRow(label: "当前 / 目标",
+                                value: "\(model.bitrateNow) / \(model.bitrateTarget) Mbps")
+                        StatRow(label: "实际发送", value: String(format: "%.1f Mbps", model.mbps))
+                        StatRow(label: "健康度", value: healthText, warn: healthColor)
+                        StatRow(label: "在途 / 丢弃", value: "\(model.inFlight) / \(model.dropped)",
+                                warn: model.dropped > 0 ? .orange : nil)
+                    }
+
+                    // Windows 侧观测（0x07 反馈）
+                    SectionHeader(title: "接收端（Windows）")
+                    VStack(spacing: 6) {
+                        StatRow(label: "解码帧率", value: String(format: "%.1f fps", model.clientFps))
+                        StatRow(label: "呈现 p95", value: String(format: "%.1f ms", model.clientPresentP95))
+                        StatRow(label: "额外排队", value: String(format: "%.1f ms", model.clientQueueMs),
+                                warn: model.clientQueueMs >= 15 ? .orange : nil)
+                        StatRow(label: "非节拍丢帧", value: "\(model.clientPresentDrop)",
+                                warn: model.clientPresentDrop > 0 ? .orange : nil)
+                    }
+
+                    // 光标
+                    SectionHeader(title: "光标")
+                    VStack(spacing: 6) {
+                        StatRow(label: "采样频率", value: String(format: "%.0f Hz", model.cursorHz))
+                        StatRow(label: "位置 / 图像", value: "\(model.cursorPosSent) / \(model.cursorImgSent)")
+                    }
                 }
 
                 // 雷电文件中转站
@@ -379,45 +495,46 @@ struct StatusView: View {
 
                 Divider()
 
-                // 设置
-                HStack {
-                    Text("分辨率").foregroundStyle(.secondary)
-                    Spacer()
-                    Picker("", selection: Binding(
-                        get: { model.resolutionIndex },
-                        set: { idx in
-                            guard !model.suppressResolutionChange, idx >= 0,
-                                  idx < AppModel.resolutions.count else { return }
-                            let r = AppModel.resolutions[idx]
-                            restartWithResolution(r.w, r.h, r.lw, r.lh)
-                        })) {
-                        ForEach(Array(AppModel.resolutions.enumerated()), id: \.offset) { i, r in
-                            Text(r.label).tag(i)
+                if !model.isReceiverMode {
+                    // 设置
+                    HStack {
+                        Text("分辨率").foregroundStyle(.secondary)
+                        Spacer()
+                        Picker("", selection: Binding(
+                            get: { model.resolutionIndex },
+                            set: { idx in
+                                guard !model.suppressResolutionChange, idx >= 0,
+                                      idx < AppModel.resolutions.count else { return }
+                                let r = AppModel.resolutions[idx]
+                                restartWithResolution(r.w, r.h, r.lw, r.lh)
+                            })) {
+                            ForEach(Array(AppModel.resolutions.enumerated()), id: \.offset) { i, r in
+                                Text(r.label).tag(i)
+                            }
+                            if model.resolutionIndex < 0 {
+                                Text("自定义").tag(-1)
+                            }
                         }
-                        if model.resolutionIndex < 0 {
-                            Text("自定义").tag(-1)
-                        }
+                        .labelsHidden()
+                        .frame(width: 190)
                     }
-                    .labelsHidden()
-                    .frame(width: 190)
+
+                    Toggle("发送真实光标图像", isOn: Binding(
+                        get: { model.cursorImageOn },
+                        set: { on in
+                            disableCursorImage = !on
+                            if on { cursorImage?.start() }
+                            Log.info(on ? "面板开启光标图像(0x05)" : "面板关闭光标图像(0x05)")
+                        }))
+                        .toggleStyle(.switch)
                 }
 
-                Toggle("发送真实光标图像", isOn: Binding(
-                    get: { model.cursorImageOn },
-                    set: { on in
-                        disableCursorImage = !on
-                        // 启动时若带 SECDISPLAY_NOCURSORIMG=1，CursorImageTracker 的
-                        // 定时器从未创建；只改标志位会让开关显示 ON 却一帧都不发。
-                        // 打开时补一次 start()（内部幂等）。
-                        if on { cursorImage.start() }
-                        Log.info(on ? "面板开启光标图像(0x05)" : "面板关闭光标图像(0x05)")
-                    }))
-                    .toggleStyle(.switch)
-
                 HStack(spacing: 8) {
-                    Button("强制关键帧") {
-                        encoder.forceEncodeLastFrame()
-                        Log.info("面板请求强制关键帧")
+                    if !model.isReceiverMode {
+                        Button("强制关键帧") {
+                            encoder?.forceEncodeLastFrame()
+                            Log.info("面板请求强制关键帧")
+                        }
                     }
                     Button("打开日志") { openLogsFolder() }
                     Button("复制诊断") { copyDiagnostics() }
@@ -461,26 +578,43 @@ struct StatusView: View {
 /// 复制诊断信息到剪贴板。排障时比让人截图快得多。
 func copyDiagnostics() {
     let m = AppModel.shared
-    let fb = sender.latestFeedback()
-    let text = """
-    SecDisplay 发送端诊断
-    ==================
-    连接: \(m.connected ? "已连接" : "未连接")
-    对端: \(m.peer)
-    分辨率: \(m.width)x\(m.height)  scale=\(String(format: "%.2f", m.scale))
-    采集通道: \(m.capturePath)
-    采集峰值: \(String(format: "%.0f", m.fps)) fps
-    采集延迟: \(String(format: "%.1f", m.capMs)) ms
-    编码延迟: \(String(format: "%.1f", m.encMs)) ms
-    码率: \(m.bitrateNow)/\(m.bitrateTarget) Mbps  实际 \(String(format: "%.1f", m.mbps)) Mbps
-    健康度: \(String(format: "%.2f", m.health))
-    在途/丢弃: \(m.inFlight)/\(m.dropped)
-    对端解码: \(String(format: "%.1f", m.clientFps)) fps  呈现p95 \(String(format: "%.1f", m.clientPresentP95)) ms
-    对端额外排队: \(String(format: "%.1f", m.clientQueueMs)) ms  非节拍丢帧 \(m.clientPresentDrop)
-    源码率p95: \(String(format: "%.1f", fb.sourceP95)) ms  节拍丢帧 \(fb.pacedDrop)
-    累计发送: \(m.totalSent) 帧  运行 \(fmtUptime(m.uptimeSec))
-    日志: \(m.logLine)
-    """
+    let text: String
+    if m.isReceiverMode {
+        text = """
+        SecDisplay Mac 副屏诊断 (Win→Mac)
+        ================================
+        连接: \(m.recvConnected ? "已连接" : "未连接")  流状态: \(m.recvStreaming ? "正常" : "等待")
+        主控端: \(m.recvPeer)
+        分辨率: \(m.recvWidth)x\(m.recvHeight) @ \(m.recvFps)Hz
+        解码器: \(m.recvDecoderName)
+        解码帧率: \(String(format: "%.1f", m.recvDecodeFps)) fps  码率: \(String(format: "%.1f", m.recvMbps)) Mbps
+        源p95 / 呈现p95: \(String(format: "%.1f / %.1f", m.recvSourceP95, m.recvPresentP95)) ms
+        已解码: \(m.recvDecoded) 帧  解码错误: \(m.recvErrors)
+        光标 / 输入: \(m.recvCursor) / \(m.recvInput)  运行 \(fmtUptime(m.recvUptimeSec))
+        日志: \(m.logLine)
+        """
+    } else {
+        let fb = sender?.latestFeedback() ?? FeedbackSignals()
+        text = """
+        SecDisplay 发送端诊断
+        ==================
+        连接: \(m.connected ? "已连接" : "未连接")
+        对端: \(m.peer)
+        分辨率: \(m.width)x\(m.height)  scale=\(String(format: "%.2f", m.scale))
+        采集通道: \(m.capturePath)
+        采集峰值: \(String(format: "%.0f", m.fps)) fps
+        采集延迟: \(String(format: "%.1f", m.capMs)) ms
+        编码延迟: \(String(format: "%.1f", m.encMs)) ms
+        码率: \(m.bitrateNow)/\(m.bitrateTarget) Mbps  实际 \(String(format: "%.1f", m.mbps)) Mbps
+        健康度: \(String(format: "%.2f", m.health))
+        在途/丢弃: \(m.inFlight)/\(m.dropped)
+        对端解码: \(String(format: "%.1f", m.clientFps)) fps  呈现p95 \(String(format: "%.1f", m.clientPresentP95)) ms
+        对端额外排队: \(String(format: "%.1f", m.clientQueueMs)) ms  非节拍丢帧 \(m.clientPresentDrop)
+        源码率p95: \(String(format: "%.1f", fb.sourceP95)) ms  节拍丢帧 \(fb.pacedDrop)
+        累计发送: \(m.totalSent) 帧  运行 \(fmtUptime(m.uptimeSec))
+        日志: \(m.logLine)
+        """
+    }
     let pb = NSPasteboard.general
     pb.clearContents()
     pb.setString(text, forType: .string)
@@ -488,6 +622,36 @@ func copyDiagnostics() {
 }
 
 private var isRestartingResolution = false
+
+func restartWithRole(_ role: SecDisplayRole, host: String) {
+    guard !isRestartingResolution else { return }
+    isRestartingResolution = true
+    let trimmedHost = host.trimmingCharacters(in: .whitespacesAndNewlines)
+    let targetHost = trimmedHost.isEmpty ? winHostAddress : trimmedHost
+    UserDefaults.standard.set(role.rawValue, forKey: "SecDisplayRole")
+    UserDefaults.standard.set(targetHost, forKey: "SecDisplayWinHost")
+    UserDefaults.standard.synchronize()
+
+    let dir = FileManager.default.currentDirectoryPath
+    let pid = ProcessInfo.processInfo.processIdentifier
+    Log.info("面板切换角色 -> \(role.rawValue) (winHost=\(targetHost))，准备重启")
+    let p = Process()
+    p.executableURL = URL(fileURLWithPath: "/bin/zsh")
+    if FileManager.default.fileExists(atPath: dir + "/run.sh") {
+        p.arguments = ["-c", "while kill -0 \(pid) 2>/dev/null; do sleep 0.15; done; sleep 0.3; cd \"$1\" && SECDISPLAY_MODE=\"$2\" SECDISPLAY_HOST=\"$3\" ./run.sh restart",
+                       "restart", dir, role.rawValue, targetHost]
+    } else {
+        let appPath = Bundle.main.bundlePath
+        p.arguments = ["-c", "while kill -0 \(pid) 2>/dev/null; do sleep 0.15; done; sleep 0.3; open -n \"$1\" --env SECDISPLAY_MODE=\"$2\" --env SECDISPLAY_HOST=\"$3\" --args --mode \"$2\" --host \"$3\" --wait-lock 3000",
+                       "restart", appPath, role.rawValue, targetHost]
+    }
+    p.standardOutput = FileHandle.nullDevice
+    p.standardError = FileHandle.nullDevice
+    try? p.run()
+    DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
+        shutdown(signal: SIGTERM)
+    }
+}
 
 /// 切换分辨率：虚拟屏和编码器都在启动时按尺寸建好，改尺寸只能重建进程。
 /// 命令行启动走 run.sh restart；.app 启动时没有 run.sh，直接重启自身。

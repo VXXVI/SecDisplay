@@ -40,7 +40,7 @@ fi
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
 
 echo "编译中..."
-swiftc -O Sources/main.swift Sources/AppUI.swift -o "$BIN"
+swiftc -O Sources/main.swift Sources/AppUI.swift Sources/MacReceiver.swift -o "$BIN"
 
 # 默认档位 balanced = 2880x1800 真 2x Retina（1440x900 逻辑），与 Windows 物理屏 1:1。
 # .preset 是本地运行状态（gitignore），存在时仍优先，方便临时切档。
