@@ -69,15 +69,17 @@ sign_ok() {
 
 # 是否还有 SecDisplay 虚拟屏残留在线（按 EDID 三元组识别，不误伤 Sidecar）。
 # 用一个签了稳定身份的小探针查询，探针只在存在时编译一次并缓存。
-VDPROBE="$LOGDIR/.vdprobe"
+VDPROBE="$LOGDIR/.vdprobe.v2"
 vd_stale() {
-    if [ ! -x "$VDPROBE" ]; then
+    if [ ! -x "$VDPROBE" ] || [ "./run.sh" -nt "$VDPROBE" ]; then
+        rm -f "$LOGDIR/.vdprobe"
         cat > "$VDPROBE.swift" <<'SWIFT'
 import CoreGraphics
 var n:UInt32=0; CGGetOnlineDisplayList(0,nil,&n)
 var ids=[CGDirectDisplayID](repeating:0,count:Int(n)); CGGetOnlineDisplayList(n,&ids,&n)
 for id in ids.prefix(Int(n)) {
-    if CGDisplayVendorNumber(id)==0xEEEE && CGDisplayModelNumber(id)==0x5344 {
+    let v = CGDisplayVendorNumber(id), m = CGDisplayModelNumber(id), s = CGDisplaySerialNumber(id)
+    if (v==0x0610 && m==0x9221 && s==0x53445344) || (v==0xEEEE && m==0x5344) {
         print("STALE"); exit(0)
     }
 }

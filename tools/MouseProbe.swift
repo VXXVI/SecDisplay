@@ -50,8 +50,9 @@ func secDisplayBounds() -> CGRect? {
     CGGetOnlineDisplayList(0, nil, &n)
     var ids = [CGDirectDisplayID](repeating: 0, count: Int(n))
     CGGetOnlineDisplayList(n, &ids, &n)
-    for id in ids.prefix(Int(n)) where CGDisplayVendorNumber(id) == 0xEEEE
-        && CGDisplayModelNumber(id) == 0x5344 {
+    for id in ids.prefix(Int(n)) where
+        (CGDisplayVendorNumber(id) == 0x0610 && CGDisplayModelNumber(id) == 0x9221 && CGDisplaySerialNumber(id) == 0x53445344) ||
+        (CGDisplayVendorNumber(id) == 0xEEEE && CGDisplayModelNumber(id) == 0x5344) {
         return CGDisplayBounds(id)
     }
     return nil
