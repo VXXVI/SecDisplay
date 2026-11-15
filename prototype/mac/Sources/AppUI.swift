@@ -17,8 +17,7 @@ final class AppModel: ObservableObject {
     @Published var mbps: Double = 0
     @Published var inFlight = 0
     @Published var dropped = 0
-    @Published var skipped = 0
-    /// 采集连续重启次数。>0 表示 SCK 采集异常、看护正在重试。
+    /// 采集连续异常次数。>0 表示 SCK 采集异常、看护正在重试。
     @Published var captureRestarts = 0
     @Published var width = 0
     @Published var height = 0
@@ -79,7 +78,6 @@ final class AppModel: ObservableObject {
         mbps = lastMbps
         inFlight = sender.inFlight
         dropped = sender.dropped
-        skipped = cap.staticSkipCount
         width = cfg.width
         height = cfg.height
         scale = vdBackingScale
@@ -104,8 +102,18 @@ final class AppModel: ObservableObject {
         // 这时显示配置值会骗人（日志里那条「内存收益失效」的警告就白打了）。
         // 还没采到帧时显示请求值加问号，提示尚未确认。
         let wantName = pixelFormatChoice == "420v" ? "420v" : "BGRA"
-        let actual = cap.actualFormat
-        capturePath = (actual.isEmpty ? "\(wantName)?" : actual) + " · 4 路"
+        let code = cap.actualFormatCode
+        // 四字符码还原成可读名：420v / BGRA / 未知
+        let actual: String
+        switch code {
+        case 0:                 actual = "\(wantName)?"
+        case 0x34323076:        actual = "420v"     // '420v'
+        case 0x42475241:        actual = "BGRA"     // 'BGRA'
+        default:
+            let b = [24, 16, 8, 0].map { UInt8((code >> UInt32($0)) & 0xFF) }
+            actual = String(bytes: b, encoding: .ascii) ?? "未知"
+        }
+        capturePath = actual + " · 4 路"
         captureRestarts = cap.captureRestartStreak
         totalSent = UInt64(max(0, sender.totalSent))
         uptimeSec = CFAbsoluteTimeGetCurrent() - appStartTime
@@ -163,6 +171,10 @@ private func fmtUptime(_ s: Double) -> String {
 
 struct StatusView: View {
     @ObservedObject var model = AppModel.shared
+    /// 标题栏遮挡的高度，由 showControlPanel 按窗口实际 contentLayoutRect 算出。
+    /// 写死 28pt 不可靠：SwiftUI 自己可能已经从 NSHostingView 拿到安全区，
+    /// 再叠一个 28 就变成 56pt 空白；反过来若没拿到，24pt 又不够。
+    var topInset: CGFloat = 28
 
     private var healthText: String {
         String(format: "%.2f", model.health)
@@ -177,8 +189,9 @@ struct StatusView: View {
         // 窗口是 .fullSizeContentView + 透明标题栏，内容会从窗口最上沿开始画，
         // 正好压在红绿灯按钮上。用一个固定高度的占位把标题栏高度让出来 ——
         // 放在 ScrollView 外面，不会跟着滚走。
+        // ignoresSafeArea 是为了让高度可控：否则 SwiftUI 可能再加一次安全区。
         VStack(spacing: 0) {
-            Color.clear.frame(height: 28)
+            Color.clear.frame(height: topInset)
             ScrollView {
                 VStack(alignment: .leading, spacing: 14) {
                 // 头部
@@ -313,6 +326,8 @@ struct StatusView: View {
             }
             .frame(maxWidth: .infinity, maxHeight: .infinity)
         }
+        // 自己管顶部让位，就不要 SwiftUI 再叠一次安全区
+        .ignoresSafeArea(.container, edges: .top)
         .frame(width: 400, height: 620)
     }
 }
@@ -458,7 +473,6 @@ func showControlPanel() {
         targetWindow = w
         Log.info("面板已前置 key=\(w.isKeyWindow) visible=\(w.isVisible) frame=\(w.frame)")
     } else {
-        let host = NSHostingView(rootView: StatusView())
         let w = NSWindow(
             contentRect: NSRect(x: 0, y: 0, width: 400, height: 620),
             styleMask: [.titled, .closable, .miniaturizable, .fullSizeContentView],
@@ -469,6 +483,13 @@ func showControlPanel() {
         w.isReleasedWhenClosed = false
         w.hidesOnDeactivate = false
         w.delegate = panelWindowDelegate
+        // 标题栏遮挡高度按窗口实际布局算，不写死 28pt。
+        // fullSizeContentView 下 contentView 铺满整个窗口，contentLayoutRect
+        // 才是扣掉标题栏之后的可布局区域，两者之差就是需要让出的高度。
+        let topInset = max(0, w.frame.height - w.contentLayoutRect.height)
+        Log.info(String(format: "面板顶部让位 %.0fpt（窗口 %.0f / 可布局 %.0f）",
+                        topInset, w.frame.height, w.contentLayoutRect.height))
+        let host = NSHostingView(rootView: StatusView(topInset: topInset))
         w.contentView = host
         placeOnUserScreen(w)
         w.makeKeyAndOrderFront(nil)
