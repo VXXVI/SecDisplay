@@ -151,18 +151,12 @@ public:
 
     void Stop() {
         alive_.store(false);
-        // 先 shutdown 唤醒阻塞中的 send/recv，再按 sendMtx_ -> sockMtx_ 顺序关闭 clientSock_，
-        // 避免 SendRawPacket 仍在 send(s) 时句柄被关闭复用；listenSock_ 等 acceptThread_ join 后关闭。
-        SOCKET oldClient = INVALID_SOCKET;
-        {
-            std::lock_guard<std::mutex> lk(sockMtx_);
-            oldClient = clientSock_;
-        }
-        if (oldClient != INVALID_SOCKET) shutdown(oldClient, SD_BOTH);
+        // 按 sendMtx_ -> sockMtx_ 顺序校验身份并一起 shutdown+closesocket，彻底消除锁外句柄复用竞态
         {
             std::lock_guard<std::mutex> slk(sendMtx_);
             std::lock_guard<std::mutex> lk(sockMtx_);
             if (clientSock_ != INVALID_SOCKET) {
+                shutdown(clientSock_, SD_BOTH);
                 closesocket(clientSock_);
                 clientSock_ = INVALID_SOCKET;
             }
@@ -315,7 +309,6 @@ private:
 
     void DisconnectClient(SOCKET expected) {
         if (expected == INVALID_SOCKET) return;
-        shutdown(expected, SD_BOTH);
         std::lock_guard<std::mutex> slk(sendMtx_);
         CloseClientUnderSendLock(expected);
     }
@@ -421,13 +414,6 @@ private:
             inet_ntop(AF_INET, &cliAddr.sin_addr, ipStr, sizeof(ipStr));
             std::string peer = std::string(ipStr) + ":" + std::to_string(ntohs(cliAddr.sin_port));
 
-            SOCKET prevSock = INVALID_SOCKET;
-            {
-                std::lock_guard<std::mutex> lk(sockMtx_);
-                prevSock = clientSock_;
-            }
-            if (prevSock != INVALID_SOCKET) shutdown(prevSock, SD_BOTH);
-
             uint64_t epoch = 0;
             {
                 std::lock_guard<std::mutex> slk(sendMtx_);
@@ -436,6 +422,7 @@ private:
                 clientSock_ = cs;
                 epoch = ++connEpoch_;
                 if (oldSock != INVALID_SOCKET) {
+                    shutdown(oldSock, SD_BOTH);
                     closesocket(oldSock);
                 }
             }

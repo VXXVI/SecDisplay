@@ -476,8 +476,9 @@ private:
             dm.dmPosition.y = 0;
             LONG r1 = ChangeDisplaySettingsExW(devName.c_str(), &dm, nullptr,
                                                CDS_UPDATEREGISTRY | CDS_NORESET, nullptr);
+            if (r1 != DISP_CHANGE_SUCCESSFUL) return false;
             LONG r2 = ChangeDisplaySettingsExW(nullptr, nullptr, nullptr, 0, nullptr);
-            return (r1 == DISP_CHANGE_SUCCESSFUL && r2 == DISP_CHANGE_SUCCESSFUL);
+            return (r2 == DISP_CHANGE_SUCCESSFUL);
         };
 
         if (tryMode((DWORD)w, (DWORD)h, (DWORD)hz)) return;
