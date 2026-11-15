@@ -733,9 +733,14 @@ func pasteClipboardToTransfer() {
         Log.info("剪贴板粘贴 NSImage 截图 (\(png.count) B)")
         return
     }
+    if let text = pb.string(forType: .string), !text.isEmpty {
+        transferService.enqueueClipboardText(text)
+        Log.info("剪贴板粘贴文本 (\(text.utf8.count) B)")
+        return
+    }
     let avail = pb.types?.map(\.rawValue).joined(separator: ", ") ?? "空"
-    Log.info("剪贴板粘贴无可用图片/文件，当前类型: [\(avail)]")
-    transferService.showFeedback(kind: -1, title: "剪贴板无内容", detail: "请先复制文件或截图")
+    Log.info("剪贴板粘贴无可用内容，当前类型: [\(avail)]")
+    transferService.showFeedback(kind: -1, title: "剪贴板无内容", detail: "请先复制文件、截图或文字")
 }
 
 private var pasteKeyMonitor: Any?
@@ -796,7 +801,7 @@ struct DropBoxView: View {
                         .background(Circle().fill(Color.white.opacity(0.85)))
                 }
                 .buttonStyle(.plain)
-                .help("粘贴剪贴板截图/文件发送 (⌘V)")
+                .help("粘贴剪贴板文件/截图/文字发送 (⌘V)")
 
                 Button(action: { toggleDropBoxPin() }) {
                     Image(systemName: model.dropBoxPinned ? "pin.fill" : "pin")
@@ -921,7 +926,7 @@ struct DropBoxView: View {
                     .help("点击在 Finder 中定位，或直接拖出到其他应用")
                 } else {
                     Text((model.transferConnected && model.transferStatus.hasPrefix("已连接"))
-                         ? "⌃⌥B 呼出 · ⌘V 粘贴截图"
+                         ? "⌃⌥B 呼出 · ⌘V 粘贴截图/文字"
                          : model.transferStatus)
                         .font(.system(size: 10))
                         .foregroundStyle(Color.secondary)
