@@ -30,12 +30,13 @@ jobs:
     runs-on: macos-15
     steps:
       - uses: actions/checkout@v4
-      - name: 编译 Mac 发送端
+      - name: 编译 Mac 端与权限探测工具
         run: |
           cd prototype/mac
           swiftc -O Sources/main.swift Sources/AppUI.swift Sources/MacReceiver.swift -o screensender
+          swiftc -O Sources/RequestPermission.swift -o reqperm
       - name: 产物检查
-        run: test -f prototype/mac/screensender && echo "Mac 编译通过"
+        run: test -f prototype/mac/screensender && test -f prototype/mac/reqperm && echo "Mac 编译通过"
 
   build-windows:
     runs-on: windows-2022
@@ -43,14 +44,16 @@ jobs:
       - uses: actions/checkout@v4
       - name: 配置 MSVC 环境
         uses: ilammy/msvc-dev-cmd@v1
-      - name: 编译 Windows 接收端
+      - name: 编译 Windows 端与自检工具
         shell: cmd
         run: |
           cd prototype\windows
-          cl /nologo /EHsc /std:c++17 /O2 /utf-8 SecDisplayReceiver.cpp /Fe:SecDisplayReceiver.exe
+          rc /nologo /fo SecDisplayReceiver.res SecDisplayReceiver.rc
+          cl /nologo /EHsc /std:c++17 /O2 /utf-8 SelfCheck.cpp /Fe:SelfCheck.exe
+          cl /nologo /EHsc /std:c++17 /O2 /utf-8 SecDisplayReceiver.cpp SecDisplayReceiver.res /Fe:SecDisplayReceiver.exe
       - name: 产物检查
         shell: cmd
-        run: if not exist prototype\windows\SecDisplayReceiver.exe exit /b 1
+        run: if not exist prototype\windows\SecDisplayReceiver.exe (exit /b 1) else if not exist prototype\windows\SelfCheck.exe (exit /b 1)
 
   telemetry-consistency:
     runs-on: ubuntu-latest

@@ -111,10 +111,9 @@ echo ============================================================
 echo   完成
 echo ============================================================
 echo.
-echo   把上面的「当前分辨率」填进 Mac 端 ScreenSender.swift：
-echo     var width  = 上面显示的宽度
-echo     var height = 上面显示的高度
-echo     var logicalWidth  = 与 width 相同（1:1 最清晰）
-echo     var logicalHeight = 与 height 相同
+echo   可将上面的「当前分辨率」在 Mac 菜单栏面板直接选择，
+echo   或通过环境变量 / preset.sh 设置：
+echo     SECDISPLAY_W=上面显示的宽度  SECDISPLAY_H=上面显示的高度
+echo     （建议 Mac 端物理像素匹配，或在主控模式 config.ini 中设置 hostwidth/hostheight）
 echo.
 pause

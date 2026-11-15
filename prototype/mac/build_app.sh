@@ -8,7 +8,7 @@
 #
 # 用法：
 #   ./build_app.sh                  # 编译、打包、直接安装到 /Applications
-#   ./build_app.sh --no-install     # 只打包到 prototype/mac/SecDisplay.app，不安装
+#   ./build_app.sh --no-install     # 只打包到临时目录 ($TMPDIR)，不安装到 /Applications
 #
 # 默认每次编译完就装到 /Applications：运行中的实例是 /Applications 那份，
 # 只改 prototype/mac/SecDisplay.app 不生效，曾多次因此「改了没反应」。
