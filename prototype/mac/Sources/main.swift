@@ -1556,7 +1556,11 @@ final class Sender {
         totalLock.lock(); _totalSent += 1; totalLock.unlock()
     }
     var sentBytes = 0
-    var connected = false
+    private var _connected = false
+    var connected: Bool {
+        get { peerLock.lock(); defer { peerLock.unlock() }; return _connected }
+        set { peerLock.lock(); _connected = newValue; peerLock.unlock() }
+    }
 
     /// 对端地址描述。写方是 net 队列（建连回调），读方是主线程（面板），
     /// String 是引用计数的多字节值类型，跨线程裸读写是 UB，必须走锁。
@@ -2022,19 +2026,23 @@ final class InputInjector {
     private var lastButtons: UInt8 = 0
     private(set) var eventCount = 0
     private let injectLock = NSLock()
-    private var lastInjectedAt: CFAbsoluteTime = 0
-    private var lastInjectedPoint: CGPoint = .zero
+    private var injectedRing: [(at: CFAbsoluteTime, pt: CGPoint)] = []
+    private var injectedHead = 0
 
-    /// 刚刚由 Windows 0x04 回放过移动的位置，用于避免 CursorTracker
-    /// 立刻把这次自己注入的移动当成用户移动再发回 Windows，形成双向自激震荡。
+    /// 刚刚由 Windows 0x04 回放过移动的位置（8 槽位历史环），用于避免 CursorTracker
+    /// 把自己注入的移动或前一跳滞后位置当成用户移动再发回 Windows，形成双向自激震荡。
     func isEchoOfInjected(_ p: CGPoint) -> Bool {
+        let now = CFAbsoluteTimeGetCurrent()
         injectLock.lock()
-        let dt = CFAbsoluteTimeGetCurrent() - lastInjectedAt
-        let pt = lastInjectedPoint
+        let snap = injectedRing
         injectLock.unlock()
-        guard dt >= 0 && dt < 0.08 else { return false }
-        let dx = p.x - pt.x, dy = p.y - pt.y
-        return (dx * dx + dy * dy) < 9.0
+        for item in snap {
+            let dt = now - item.at
+            guard dt >= 0 && dt < 0.08 else { continue }
+            let dx = p.x - item.pt.x, dy = p.y - item.pt.y
+            if (dx * dx + dy * dy) < 16.0 { return true }
+        }
+        return false
     }
 
     /// 断连时补发残留的 mouseUp。
@@ -2083,8 +2091,13 @@ final class InputInjector {
                             mouseCursorPosition: p, mouseButton: drag?.1 ?? .left) {
             mv.flags = mods
             injectLock.lock()
-            lastInjectedAt = CFAbsoluteTimeGetCurrent()
-            lastInjectedPoint = p
+            let nowInj = CFAbsoluteTimeGetCurrent()
+            if injectedRing.count < 8 {
+                injectedRing.append((nowInj, p))
+            } else {
+                injectedRing[injectedHead] = (nowInj, p)
+                injectedHead = (injectedHead + 1) % 8
+            }
             injectLock.unlock()
             mv.post(tap: .cghidEventTap)
         }

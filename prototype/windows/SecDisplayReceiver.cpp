@@ -3617,7 +3617,9 @@ static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
         //   3. 本机物理鼠标最近 250ms 内有活动时，本地输入优先
         if (IsIconic(g_hwnd)) return 0;
         if (!g_isFullscreen && GetForegroundWindow() != g_hwnd) return 0;
-        if (GetTickCount64() - (uint64_t)g_lastLocalInputMs.load() < 250) return 0;
+        const uint64_t gateNow = GetTickCount64();
+        if (gateNow - (uint64_t)g_lastLocalInputMs.load() < 250 ||
+            gateNow - (uint64_t)g_lastHardwareMouseMs.load() < 250) return 0;
         double cx = g_cursorX.load(), cy = g_cursorY.load();
         if (cx < 0 || cy < 0) return 0;
         int vw = g_coordW.load(), vh = g_coordH.load();
