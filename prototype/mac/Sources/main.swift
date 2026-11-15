@@ -2785,7 +2785,10 @@ final class FileTransferService {
     private var _connected = false
     private var recvBuf = Data()
     private var listenPort: UInt16 = 9923
+    private var clientMode = false
+    private var targetHost = "10.10.10.2"
     private var listenerRestartScheduled = false
+    private var clientReconnectScheduled = false
     private var stopped = false
 
     let inboxURL: URL
@@ -2882,8 +2885,24 @@ final class FileTransferService {
 
     func listen(port: UInt16) {
         listenPort = port
+        clientMode = false
         netQueue.async { [weak self] in
             self?.startListener()
+        }
+    }
+
+    func connect(host: String, port: UInt16) {
+        listenPort = port
+        targetHost = host
+        clientMode = true
+        stateLock.lock()
+        activeStatus = "正在连接中转站 \(host):\(port)…"
+        stateLock.unlock()
+        notifyUI()
+        netQueue.async { [weak self] in
+            guard let self else { return }
+            self.clientReconnectScheduled = false
+            self.startClientConnection()
         }
     }
 
@@ -2902,6 +2921,7 @@ final class FileTransferService {
         for u in toDelete { try? FileManager.default.removeItem(at: u) }
         netQueue.async { [weak self] in
             guard let self else { return }
+            self.connEpoch &+= 1
             self.keepAliveTimer?.cancel()
             self.keepAliveTimer = nil
             self.cleanupActiveRecvs()
@@ -3045,6 +3065,10 @@ final class FileTransferService {
             tcp.enableKeepalive = true
             tcp.keepaliveIdle = 5
         }
+        if clientMode {
+            startClientConnection()
+            return
+        }
         let l: NWListener
         do {
             guard let nwPort = NWEndpoint.Port(rawValue: listenPort) else { return }
@@ -3088,6 +3112,78 @@ final class FileTransferService {
             self.listener?.cancel()
             self.listener = nil
             self.startListener()
+        }
+    }
+
+    private func startClientConnection() {
+        stateLock.lock()
+        let isStopped = stopped
+        stateLock.unlock()
+        guard clientMode, !isStopped else { return }
+
+        guard let nwPort = NWEndpoint.Port(rawValue: listenPort) else { return }
+        let params = NWParameters.tcp
+        if let tcp = params.defaultProtocolStack.transportProtocol as? NWProtocolTCP.Options {
+            tcp.noDelay = true
+            tcp.connectionTimeout = 3
+            tcp.enableKeepalive = true
+            tcp.keepaliveIdle = 5
+        }
+        let c = NWConnection(host: NWEndpoint.Host(targetHost), port: nwPort, using: params)
+        connEpoch &+= 1
+        let epoch = connEpoch
+        let old = self.conn
+        self.conn = c
+        self.recvBuf.removeAll()
+        self.cleanupActiveRecvs()
+        old?.cancel()
+
+        c.stateUpdateHandler = { [weak self] st in
+            guard let self, self.connEpoch == epoch else { return }
+            switch st {
+            case .ready:
+                self.clientReconnectScheduled = false
+                self.stateLock.lock()
+                self._connected = true
+                self.activeEpoch = epoch
+                self.activeBusy = false
+                self.activeProgress = 0
+                self.activeSpeedText = ""
+                self.activeStatus = "已连接 \(self.targetHost):\(self.listenPort) · 可拖入文件直传"
+                self.stateLock.unlock()
+                self.notifyUI()
+                Log.info("中转站已连接 Windows 服务端 \(self.targetHost):\(self.listenPort)")
+                self.startKeepAlive(epoch: epoch)
+                self.receiveLoop(epoch: epoch)
+                self.stateLock.lock()
+                let hasPending = !self.outQueue.isEmpty && !self.isSending
+                if hasPending { self.isSending = true }
+                self.stateLock.unlock()
+                if hasPending {
+                    self.sendQueue.async { [weak self] in self?.drainSendQueue() }
+                }
+            case .failed(let e):
+                Log.info("中转站连接失败/断开: \(e)")
+                self.onDisconnected()
+            case .cancelled:
+                self.onDisconnected()
+            default:
+                break
+            }
+        }
+        c.start(queue: netQueue)
+    }
+
+    private func scheduleClientReconnect() {
+        stateLock.lock()
+        let isStopped = stopped
+        stateLock.unlock()
+        guard clientMode, !isStopped, !clientReconnectScheduled else { return }
+        clientReconnectScheduled = true
+        netQueue.asyncAfter(deadline: .now() + 2.0) { [weak self] in
+            guard let self else { return }
+            self.clientReconnectScheduled = false
+            self.startClientConnection()
         }
     }
 
@@ -3147,9 +3243,14 @@ final class FileTransferService {
         activeBusy = false
         activeProgress = 0
         activeSpeedText = ""
-        activeStatus = outQueue.isEmpty ? "等待接收端" : "连接断开，\(outQueue.count) 项等待重连"
+        activeStatus = outQueue.isEmpty
+            ? (clientMode ? "等待 Windows 中转端 (\(listenPort))" : "等待接收端")
+            : "连接断开，\(outQueue.count) 项等待重连"
         stateLock.unlock()
         notifyUI()
+        if clientMode {
+            scheduleClientReconnect()
+        }
     }
 
     private func startKeepAlive(epoch: Int) {
@@ -3740,6 +3841,51 @@ func reconfigureDisplays() {
 
 var cfg = Config()
 
+nonisolated(unsafe) var appRole: SecDisplayRole = {
+    let args = CommandLine.arguments
+    if args.contains("--receiver") { return .receiver }
+    if args.contains("--sender") { return .sender }
+    if let i = args.firstIndex(of: "--mode"), i + 1 < args.count {
+        let m = args[i + 1].lowercased()
+        if m == "receiver" || m == "client" { return .receiver }
+        if m == "sender" || m == "host" { return .sender }
+    }
+    if let env = ProcessInfo.processInfo.environment["SECDISPLAY_MODE"]?.lowercased() {
+        if env == "receiver" || env == "client" { return .receiver }
+        if env == "sender" || env == "host" { return .sender }
+    }
+    if let saved = UserDefaults.standard.string(forKey: "SecDisplayRole"),
+       let r = SecDisplayRole(rawValue: saved) {
+        return r
+    }
+    return .sender
+}()
+
+nonisolated(unsafe) var winHostAddress: String = {
+    let args = CommandLine.arguments
+    if let i = args.firstIndex(of: "--host"), i + 1 < args.count {
+        let h = args[i + 1].trimmingCharacters(in: .whitespacesAndNewlines)
+        if !h.isEmpty { return h }
+    }
+    if let env = ProcessInfo.processInfo.environment["SECDISPLAY_HOST"]?.trimmingCharacters(in: .whitespacesAndNewlines),
+       !env.isEmpty {
+        return env
+    }
+    if let saved = UserDefaults.standard.string(forKey: "SecDisplayWinHost")?.trimmingCharacters(in: .whitespacesAndNewlines),
+       !saved.isEmpty {
+        return saved
+    }
+    return "10.10.10.2"
+}()
+
+private let waitLockMs: Int = {
+    let args = CommandLine.arguments
+    if let i = args.firstIndex(of: "--wait-lock"), i + 1 < args.count, let v = Int(args[i + 1]) {
+        return max(0, v)
+    }
+    return 0
+}()
+
 // 单实例：两个发送端会各建一块虚拟屏，还会抢 9922 端口，表现为画面来回跳。
 // 用 flock 而不是 pid 文件：锁在进程退出时由内核释放，不存在 pid 被回收后的误判。
 do {
@@ -3747,9 +3893,16 @@ do {
     try? FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true)
     let lockPath = (dir as NSString).appendingPathComponent("sender.lock")
     let fd = open(lockPath, O_CREAT | O_RDWR, 0o644)
-    if fd >= 0 && flock(fd, LOCK_EX | LOCK_NB) != 0 {
-        Log.info("已有发送端在运行，本次启动退出。如需重启先结束旧进程。")
-        exit(0)
+    if fd >= 0 {
+        var waited = 0
+        while flock(fd, LOCK_EX | LOCK_NB) != 0 {
+            if waited >= waitLockMs {
+                Log.info("已有 SecDisplay 实例在运行，本次启动退出。如需重启先结束旧进程。")
+                exit(0)
+            }
+            usleep(50_000)
+            waited += 50
+        }
     }
     // fd 故意不关闭，锁随进程存活
 }
@@ -3843,117 +3996,23 @@ if let mbps = Int(ProcessInfo.processInfo.environment["SECDISPLAY_MBPS"] ?? ""),
     let pixelsPerSec = Double(cfg.width * cfg.height) * cfg.captureHz
     cfg.bitrateMbps = max(30, min(200, Int(pixelsPerSec * 0.6 / 1_000_000)))
 }
-let vd = VirtualDisplayManager()
-let encoder = Encoder(width: cfg.width, height: cfg.height, bitrateMbps: cfg.bitrateMbps, captureHz: cfg.captureHz)
-gEncoder = encoder
-let sender = Sender()
-sender.keepAliveGap = cfg.keepAliveGap
-sender.sessionWidth = cfg.width
-sender.sessionHeight = cfg.height
-sender.sessionFps = Int(cfg.captureHz.rounded())
+nonisolated(unsafe) var vd: VirtualDisplayManager?
+nonisolated(unsafe) var encoder: Encoder?
+nonisolated(unsafe) var sender: Sender?
+nonisolated(unsafe) var cap: ScreenshotCapture?
+nonisolated(unsafe) var injector: InputInjector?
+nonisolated(unsafe) var keyboard: KeyboardInjector?
+nonisolated(unsafe) var cursor: CursorTracker?
+nonisolated(unsafe) var cursorImage: CursorImageTracker?
+nonisolated(unsafe) var rateCtl: RateController?
+nonisolated(unsafe) var clientWatchdog: ClientWatchdog?
 
-guard encoder.start() else { exit(3) }
+nonisolated(unsafe) var macReceiverClient: MacReceiverClient?
+nonisolated(unsafe) var macReceiverWindow: ReceiverWindowController?
 
-encoder.onFrame = { data, isKey, ts in
-    sender.send(frame: data, captureTimeMicros: ts)
-}
-
-// 启动前检查残留虚拟屏。只有显式要求时才自动清理，避免每次启动都黑屏一下。
-if CommandLine.arguments.contains("--cleanup-orphan")
-    || ProcessInfo.processInfo.environment["SECDISPLAY_CLEANUP_ORPHAN"] == "1" {
-    let residual = listSecDisplays()
-    if !residual.isEmpty {
-        Log.info("启动前发现残留虚拟屏 \(residual.count) 块，执行显示重配置清理")
-        reconfigureDisplays()
-    }
-}
-
-// 建屏前先确认雷雳链路 carrier 正常。
-// 虚拟屏只有在「Mac 发送端在跑 + 雷雳链路通」时才有意义：
-// 线没插时建屏会留下一块没人用的空屏，还会占住显示器排列。
-// 最多等 8 秒——等太久会让从 Finder 启动的 app 表现为「点了没反应、菜单栏没图标」。
-if LinkMonitor.probe() == false {
-    Log.info("雷雳链路未就绪（\(LinkMonitor.ifName) 无 carrier），最多等 8 秒…")
-    var waited = 0.0
-    while LinkMonitor.probe() == false && waited < 8.0 {
-        usleep(500_000); waited += 0.5
-    }
-    switch LinkMonitor.probe() {
-    case .some(true):
-        Log.info("雷雳链路已就绪，耗时 \(String(format: "%.1f", waited)) 秒")
-    case .some(false):
-        Log.info("链路仍未就绪，先建屏；接收端连上后仍可用")
-    case .none:
-        Log.info("未找到链路接口 \(LinkMonitor.ifName)，跳过等待")
-    }
-}
-
-do {
-    try vd.create(cfg)
-} catch VirtualDisplayManager.Err.initFailed {
-    // 用身份三元组精确判断残留。不能再用「在线显示器 > 1」：
-    // Sidecar / 外接屏在线时本来就有多块屏，会被误报成残留虚拟屏。
-    Log.info("虚拟屏创建被拒绝（initWithDescriptor 返回 nil）")
-    let ours = listSecDisplays()
-    if !ours.isEmpty {
-        let desc = ours.map { "id=\($0.id)\($0.old ? "(旧身份)" : "")" }.joined(separator: " ")
-        Log.info("检测到残留的 SecDisplay 虚拟屏: \(desc)")
-        Log.info("原因：上一次运行异常退出，留下了虚拟屏占住了位置（Sidecar 共存不受影响）")
-        Log.info("处理：加 --cleanup-orphan 重启可自动清理；或注销重登")
-    } else {
-        var n: UInt32 = 0
-        CGGetOnlineDisplayList(32, nil, &n)
-        var ids = [CGDirectDisplayID](repeating: 0, count: Int(n))
-        CGGetOnlineDisplayList(n, &ids, &n)
-        Log.info("当前在线显示器: \(ids)（其中无 SecDisplay 残留屏）")
-        Log.info("原因不明，请检查系统日志")
-    }
-    exit(2)
-} catch {
-    Log.info("虚拟屏创建失败: \(error)")
-    exit(2)
-}
-
-// 建屏后立刻解除镜像。此时还没起采集，重配置不会打断视频流。
-MirrorGuard.install(vd.displayID)
-MirrorGuard.release("建屏后")
-
-// 打印在线显示器身份，便于现场确认选屏锚定命中正确、且 Sidecar 被正确排除
-var onN: UInt32 = 0
-CGGetOnlineDisplayList(32, nil, &onN)
-var onIDs = [CGDirectDisplayID](repeating: 0, count: Int(onN))
-CGGetOnlineDisplayList(onN, &onIDs, &onN)
-let idList = onIDs.prefix(Int(onN)).map { id -> String in
-    String(format: "id=%u:vendor=0x%x:model=0x%x%@",
-           id, CGDisplayVendorNumber(id), CGDisplayModelNumber(id),
-           isOurVirtualDisplay(id) ? "[SELF]" : "")
-}
-Log.info("在线显示器身份: \(idList.joined(separator: "  "))")
-
-// 接收端的 0x02 控制消息 → 让编码器下一帧强制 IDR
-// 接收端连上 / 请求关键帧时，用最后一帧强制补 IDR。
-// 不能只 requestKeyframe：静止画面没有下一帧，标志永远消费不掉，接收端一直黑屏。
-sender.onKeyframeRequest = { encoder.forceEncodeLastFrame() }
-sender.listen(port: cfg.port)
-
-// 雷电双向文件中转站（独立端口 9923，大文件传输不阻塞 9922 视频与光标）
 let transferService = FileTransferService()
-transferService.listen(port: cfg.port &+ 1)
+var disableCursorImage = ProcessInfo.processInfo.environment["SECDISPLAY_NOCURSORIMG"] == "1"
 
-// 输入回传：Windows 侧的鼠标事件在 Mac 上重放
-// 需要「辅助功能」权限，没有的话 CGEvent 注入会被系统静默丢弃
-// （表现为：光标能跟着动，但点击/滚轮完全不生效）。
-let axTrusted = AXIsProcessTrusted()
-if !axTrusted {
-    Log.info("警告: 未获得辅助功能权限，副屏上的点击/滚轮无法生效")
-    Log.info("      系统设置 → 隐私与安全性 → 辅助功能，勾选 /Applications/SecDisplay.app")
-} else {
-    Log.info("辅助功能权限: 已授权，副屏点击与滚轮可正常回放")
-}
-/// 虚拟屏在全局坐标系里的逻辑点矩形。
-/// 原点取 CGDisplayBounds.origin，宽高优先取 CGDisplayCopyDisplayMode 的逻辑点尺寸
-/// （2x Retina 下为 1440x900，而不是 pixelWidth 2880x1800），防止某版 macOS 下
-/// CGDisplayBounds.size 漂移成物理像素后导致光标被压缩到副屏左上角。
 func logicalDisplayBounds(_ id: CGDirectDisplayID) -> CGRect {
     let b = CGDisplayBounds(id)
     if let m = CGDisplayCopyDisplayMode(id), m.width > 0, m.height > 0 {
@@ -3971,57 +4030,152 @@ func currentVideoSizeSnapshot() -> (w: Int, h: Int, lw: Int, lh: Int) {
     return (cfg.width, cfg.height, cfg.logicalWidth, cfg.logicalHeight)
 }
 
-let injector = InputInjector()
-gMouse = injector
-sender.onInput = { x, y, buttons, wheel in
-    let snap = currentVideoSizeSnapshot()
-    injector.handle(x: x, y: y, buttons: buttons, wheel: wheel,
-                    bounds: logicalDisplayBounds(vd.displayID),
-                    videoW: snap.w, videoH: snap.h)
-}
+if appRole == .sender {
+    let vdInst = VirtualDisplayManager()
+    let encInst = Encoder(width: cfg.width, height: cfg.height, bitrateMbps: cfg.bitrateMbps, captureHz: cfg.captureHz)
+    let sndInst = Sender()
+    vd = vdInst
+    encoder = encInst
+    gEncoder = encInst
+    sender = sndInst
 
-// 键盘回放：Windows 侧 0x09 包 → macOS CGEvent 键盘事件
-let keyboard = KeyboardInjector()
-gKeyboard = keyboard
-sender.onKey = { vk, scan, down, flags in
-    keyboard.handle(vk: vk, scan: scan, down: down, keyFlags: flags)
-}
+    sndInst.keepAliveGap = cfg.keepAliveGap
+    sndInst.sessionWidth = cfg.width
+    sndInst.sessionHeight = cfg.height
+    sndInst.sessionFps = Int(cfg.captureHz.rounded())
 
-// 光标转发：CGEvent.location 处于逻辑点坐标系；
-// 2x Retina 时逻辑点为 1440x900，CursorTracker / InputInjector 会按 cfg/bounds 比例
-// 统一换算到线上物理像素基准（2880x1800），与 Windows 端 g_coordW/H 对齐。
-let vb = logicalDisplayBounds(vd.displayID)
-Log.info("坐标基准: 逻辑点 \(Int(vb.width))x\(Int(vb.height)) * \(String(format: "%.2f", vdBackingScale))x → 线上 \(cfg.width)x\(cfg.height)，原点 (\(Int(vb.minX)), \(Int(vb.minY)))")
-let cursor = CursorTracker(sender: sender,
-                           bounds: { logicalDisplayBounds(vd.displayID) },
-                           videoSize: {
-                               let snap = currentVideoSizeSnapshot()
-                               return (snap.w, snap.h)
-                           })
-// 真实光标图像：形状变化时才发，让副屏显示 Mac 的光标而非固定 Windows 箭头
-// 真实光标图像（0x05）。SECDISPLAY_NOCURSORIMG=1 可整体关闭，
-// 用于 A/B 判断「光标卡顿是否由接收端反复重建光标引起」——关掉后回退 Windows 标准箭头。
-let cursorImage = CursorImageTracker(sender: sender)
-var disableCursorImage = ProcessInfo.processInfo.environment["SECDISPLAY_NOCURSORIMG"] == "1"
-if disableCursorImage {
-    Log.info("已关闭真实光标图像(0x05)，使用接收端标准箭头（SECDISPLAY_NOCURSORIMG=1）")
-}
-// 注意：cursor.start() 调 NSEvent.addGlobalMonitorForEvents，cursorImage.start() 读 NSCursor。
-// 必须在 statusApp = setupStatusBar() + statusApp.run() 初始化完 AppKit 事件会话之后再启动，
-// 否则 NSEvent 全局监视器会抢先初始化半残的 SkyLight 会话，导致本进程所有窗口完全收不到鼠标点击！
-// 实际启动已移至下方 statusApp.run() 前的 DispatchQueue.main.async。
+    guard encInst.start() else { exit(3) }
 
-// 传入 id 获取闭包：虚拟屏重建后 id 会变，采集侧每次重建流都重新问
-let cap = ScreenshotCapture(encoder: encoder, cfg: cfg, displayID: { vd.displayID })
-Task {
-    do {
-        try await cap.start()
-    } catch {
-        Log.info("抓屏失败: \(error)")
-        Log.info("需要屏幕录制权限：系统设置 → 隐私与安全性 → 屏幕录制")
-        vd.destroy()
-        exit(4)
+    encInst.onFrame = { data, isKey, ts in
+        sndInst.send(frame: data, captureTimeMicros: ts)
     }
+
+    if CommandLine.arguments.contains("--cleanup-orphan")
+        || ProcessInfo.processInfo.environment["SECDISPLAY_CLEANUP_ORPHAN"] == "1" {
+        let residual = listSecDisplays()
+        if !residual.isEmpty {
+            Log.info("启动前发现残留虚拟屏 \(residual.count) 块，执行显示重配置清理")
+            reconfigureDisplays()
+        }
+    }
+
+    if LinkMonitor.probe() == false {
+        Log.info("雷雳链路未就绪（\(LinkMonitor.ifName) 无 carrier），最多等 8 秒…")
+        var waited = 0.0
+        while LinkMonitor.probe() == false && waited < 8.0 {
+            usleep(500_000); waited += 0.5
+        }
+        switch LinkMonitor.probe() {
+        case .some(true):
+            Log.info("雷雳链路已就绪，耗时 \(String(format: "%.1f", waited)) 秒")
+        case .some(false):
+            Log.info("链路仍未就绪，先建屏；接收端连上后仍可用")
+        case .none:
+            Log.info("未找到链路接口 \(LinkMonitor.ifName)，跳过等待")
+        }
+    }
+
+    do {
+        try vdInst.create(cfg)
+    } catch VirtualDisplayManager.Err.initFailed {
+        Log.info("虚拟屏创建被拒绝（initWithDescriptor 返回 nil）")
+        let ours = listSecDisplays()
+        if !ours.isEmpty {
+            let desc = ours.map { "id=\($0.id)\($0.old ? "(旧身份)" : "")" }.joined(separator: " ")
+            Log.info("检测到残留的 SecDisplay 虚拟屏: \(desc)")
+            Log.info("原因：上一次运行异常退出，留下了虚拟屏占住了位置（Sidecar 共存不受影响）")
+            Log.info("处理：加 --cleanup-orphan 重启可自动清理；或注销重登")
+        } else {
+            var n: UInt32 = 0
+            CGGetOnlineDisplayList(32, nil, &n)
+            var ids = [CGDirectDisplayID](repeating: 0, count: Int(n))
+            CGGetOnlineDisplayList(n, &ids, &n)
+            Log.info("当前在线显示器: \(ids)（其中无 SecDisplay 残留屏）")
+            Log.info("原因不明，请检查系统日志")
+        }
+        exit(2)
+    } catch {
+        Log.info("虚拟屏创建失败: \(error)")
+        exit(2)
+    }
+
+    MirrorGuard.install(vdInst.displayID)
+    MirrorGuard.release("建屏后")
+
+    var onN: UInt32 = 0
+    CGGetOnlineDisplayList(32, nil, &onN)
+    var onIDs = [CGDirectDisplayID](repeating: 0, count: Int(onN))
+    CGGetOnlineDisplayList(onN, &onIDs, &onN)
+    let idList = onIDs.prefix(Int(onN)).map { id -> String in
+        String(format: "id=%u:vendor=0x%x:model=0x%x%@",
+               id, CGDisplayVendorNumber(id), CGDisplayModelNumber(id),
+               isOurVirtualDisplay(id) ? "[SELF]" : "")
+    }
+    Log.info("在线显示器身份: \(idList.joined(separator: "  "))")
+
+    sndInst.onKeyframeRequest = { encInst.forceEncodeLastFrame() }
+    sndInst.listen(port: cfg.port)
+
+    transferService.listen(port: cfg.port &+ 1)
+
+    let axTrusted = AXIsProcessTrusted()
+    if !axTrusted {
+        Log.info("警告: 未获得辅助功能权限，副屏上的点击/滚轮无法生效")
+        Log.info("      系统设置 → 隐私与安全性 → 辅助功能，勾选 /Applications/SecDisplay.app")
+    } else {
+        Log.info("辅助功能权限: 已授权，副屏点击与滚轮可正常回放")
+    }
+
+    let injInst = InputInjector()
+    injector = injInst
+    gMouse = injInst
+    sndInst.onInput = { x, y, buttons, wheel in
+        let snap = currentVideoSizeSnapshot()
+        injInst.handle(x: x, y: y, buttons: buttons, wheel: wheel,
+                       bounds: logicalDisplayBounds(vdInst.displayID),
+                       videoW: snap.w, videoH: snap.h)
+    }
+
+    let kbInst = KeyboardInjector()
+    keyboard = kbInst
+    gKeyboard = kbInst
+    sndInst.onKey = { vk, scan, down, flags in
+        kbInst.handle(vk: vk, scan: scan, down: down, keyFlags: flags)
+    }
+
+    let vb = logicalDisplayBounds(vdInst.displayID)
+    Log.info("坐标基准: 逻辑点 \(Int(vb.width))x\(Int(vb.height)) * \(String(format: "%.2f", vdBackingScale))x → 线上 \(cfg.width)x\(cfg.height)，原点 (\(Int(vb.minX)), \(Int(vb.minY)))")
+    let curInst = CursorTracker(sender: sndInst,
+                                bounds: { logicalDisplayBounds(vdInst.displayID) },
+                                videoSize: {
+                                    let snap = currentVideoSizeSnapshot()
+                                    return (snap.w, snap.h)
+                                })
+    cursor = curInst
+    let curImgInst = CursorImageTracker(sender: sndInst)
+    cursorImage = curImgInst
+    if disableCursorImage {
+        Log.info("已关闭真实光标图像(0x05)，使用接收端标准箭头（SECDISPLAY_NOCURSORIMG=1）")
+    }
+
+    let capInst = ScreenshotCapture(encoder: encInst, cfg: cfg, displayID: { vdInst.displayID })
+    cap = capInst
+    Task {
+        do {
+            try await capInst.start()
+        } catch {
+            Log.info("抓屏失败: \(error)")
+            Log.info("需要屏幕录制权限：系统设置 → 隐私与安全性 → 屏幕录制")
+            vdInst.destroy()
+            exit(4)
+        }
+    }
+} else {
+    Log.info("SecDisplay 副屏模式启动: 连接 Windows 主控端 \(winHostAddress):\(cfg.port)/\(cfg.port &+ 1)")
+    let rc = MacReceiverClient()
+    macReceiverClient = rc
+    rc.start(host: winHostAddress, port: cfg.port)
+    transferService.connect(host: winHostAddress, port: cfg.port &+ 1)
 }
 
 // MARK: - 自适应码率
@@ -4202,7 +4356,10 @@ final class RateController {
     }
 }
 
-let rateCtl = RateController(encoder: encoder, targetMbps: cfg.bitrateMbps, captureHz: cfg.captureHz)
+if appRole == .sender, let enc = encoder {
+    let rc = RateController(encoder: enc, targetMbps: cfg.bitrateMbps, captureHz: cfg.captureHz)
+    rateCtl = rc
+}
 
 // 帧率峰值跟踪：每秒采一次完整帧数，保留最近 10 秒的最大值。
 // 用户操作往往很短暂，只看 2 秒瞬时值容易错过。
@@ -4213,19 +4370,20 @@ var peakFps: Double = 0
 var lastCursorCount = 0
 var lastCursorImageCount = 0
 
-Timer.scheduledTimer(withTimeInterval: 1.0, repeats: true) { _ in
-    let now = CFAbsoluteTimeGetCurrent()
-    let dt = now - lastCapTime
-    guard dt > 0.5 else { return }
-    let delta = cap.captured - lastCapCount
-    lastCapCount = cap.captured
-    lastCapTime = now
-    let fps = Double(delta) / dt
-    // 存真正的 fps 而不是「每个 tick 的帧数」：Timer 的间隔并不严格是 1 秒，
-    // 直接取帧数当 fps 会系统性偏高或偏低。
-    fpsWindow.append((now, fps))
-    fpsWindow.removeAll { now - $0.0 > 10 }
-    peakFps = fpsWindow.map { $0.1 }.max() ?? 0
+if appRole == .sender {
+    Timer.scheduledTimer(withTimeInterval: 1.0, repeats: true) { _ in
+        guard let cap else { return }
+        let now = CFAbsoluteTimeGetCurrent()
+        let dt = now - lastCapTime
+        guard dt > 0.5 else { return }
+        let delta = cap.captured - lastCapCount
+        lastCapCount = cap.captured
+        lastCapTime = now
+        let fps = Double(delta) / dt
+        fpsWindow.append((now, fps))
+        fpsWindow.removeAll { now - $0.0 > 10 }
+        peakFps = fpsWindow.map { $0.1 }.max() ?? 0
+    }
 }
 
 // 统计
@@ -4235,41 +4393,42 @@ var lastCapturedCount = 0
 var lastEncAvgMs: Double = 0
 var lastCapAvgMs: Double = 0
 var lastMbps: Double = 0
-Timer.scheduledTimer(withTimeInterval: 2.0, repeats: true) { _ in
-    let mbps = Double(sender.sentBytes) * 8 / 2.0 / 1_000_000
-    let encAvg = encoder.encLatCount > 0 ? encoder.encLatSum / Double(encoder.encLatCount) : 0
-    let capAvg = cap.capLatCount > 0 ? cap.capLatSum / Double(cap.capLatCount) : 0
-    lastEncAvgMs = encAvg
-    lastCapAvgMs = capAvg
-    lastMbps = mbps
-    let droppedDelta = sender.dropped - lastDroppedCount
-    lastDroppedCount = sender.dropped
-    let capturedDelta = cap.captured - lastCapturedCount
-    lastCapturedCount = cap.captured
-    let fb = sender.latestFeedback()
-    let winQueueMs = max(0, fb.presentP95 - fb.sourceP95)
-    rateCtl.tick(RateSignals(droppedDelta: droppedDelta,
-                             inFlight: sender.inFlight,
-                             encodeMs: encAvg,
-                             sentMbps: mbps,
-                             captureFps: Double(capturedDelta) / 2.0,
-                             winQueueMs: winQueueMs,
-                             presentDrop: fb.presentDrop,
-                             pacedDrop: fb.pacedDrop,
-                             clientFps: fb.decodeFps))
-    let cursorDelta = cursor.sentCount - lastCursorCount
-    lastCursorCount = cursor.sentCount
-    let imgDelta = cursorImage.sentCount - lastCursorImageCount
-    lastCursorImageCount = cursorImage.sentCount
-    // 已移除早期 SCStream 死代码里恒为 0 的「空闲 / 静跳」计数，
-    // 换成采集异常计数，和面板那一行对应。
-    Log.info(String(format: "采集 %d  峰值 %.0ffps  异常 %d  发送 %d  光标+%d  图像+%d  输入 %d  丢弃 %d  %.1f Mbps  在途 %d  采集延迟 %.1f  编码延迟 %.1f ms",
-                    cap.captured, peakFps, cap.captureRestartCount, sender.sent, cursorDelta, imgDelta,
-                    injector.eventCount, sender.dropped, mbps, sender.inFlight, capAvg, encAvg))
-    cap.capLatSum = 0; cap.capLatCount = 0; cap.capLatMax = 0
-    encoder.encLatSum = 0; encoder.encLatCount = 0; encoder.encLatMax = 0
-    sender.sentBytes = 0
-    sender.sent = 0
+if appRole == .sender {
+    Timer.scheduledTimer(withTimeInterval: 2.0, repeats: true) { _ in
+        guard let cap, let encoder, let sender, let rateCtl, let cursor, let cursorImage, let injector else { return }
+        let mbps = Double(sender.sentBytes) * 8 / 2.0 / 1_000_000
+        let encAvg = encoder.encLatCount > 0 ? encoder.encLatSum / Double(encoder.encLatCount) : 0
+        let capAvg = cap.capLatCount > 0 ? cap.capLatSum / Double(cap.capLatCount) : 0
+        lastEncAvgMs = encAvg
+        lastCapAvgMs = capAvg
+        lastMbps = mbps
+        let droppedDelta = sender.dropped - lastDroppedCount
+        lastDroppedCount = sender.dropped
+        let capturedDelta = cap.captured - lastCapturedCount
+        lastCapturedCount = cap.captured
+        let fb = sender.latestFeedback()
+        let winQueueMs = max(0, fb.presentP95 - fb.sourceP95)
+        rateCtl.tick(RateSignals(droppedDelta: droppedDelta,
+                                 inFlight: sender.inFlight,
+                                 encodeMs: encAvg,
+                                 sentMbps: mbps,
+                                 captureFps: Double(capturedDelta) / 2.0,
+                                 winQueueMs: winQueueMs,
+                                 presentDrop: fb.presentDrop,
+                                 pacedDrop: fb.pacedDrop,
+                                 clientFps: fb.decodeFps))
+        let cursorDelta = cursor.sentCount - lastCursorCount
+        lastCursorCount = cursor.sentCount
+        let imgDelta = cursorImage.sentCount - lastCursorImageCount
+        lastCursorImageCount = cursorImage.sentCount
+        Log.info(String(format: "采集 %d  峰值 %.0ffps  异常 %d  发送 %d  光标+%d  图像+%d  输入 %d  丢弃 %d  %.1f Mbps  在途 %d  采集延迟 %.1f  编码延迟 %.1f ms",
+                        cap.captured, peakFps, cap.captureRestartCount, sender.sent, cursorDelta, imgDelta,
+                        injector.eventCount, sender.dropped, mbps, sender.inFlight, capAvg, encAvg))
+        cap.capLatSum = 0; cap.capLatCount = 0; cap.capLatMax = 0
+        encoder.encLatSum = 0; encoder.encLatCount = 0; encoder.encLatMax = 0
+        sender.sentBytes = 0
+        sender.sent = 0
+    }
 }
 
 // 信号处理只置标志位，实际清理在主循环里做
@@ -4309,24 +4468,21 @@ func shutdown(signal sig: Int32) {
     shutdownLock.unlock()
 
     Log.info("收到信号 \(sig)，开始清理")
-    // cap.stop() 是同步的（只置标志 + 自增代次 + 取消看护定时器），
-    // 直接调用即可。原来放进 Task 里等调度，若调度不到就会在采集仍在跑时
-    // 走到 vd.destroy()，destroy 被静默拒绝，留下孤儿虚拟屏。
-    cap.stop()
+    if appRole == .receiver {
+        macReceiverWindow?.hide()
+        macReceiverClient?.stop()
+        transferService.stop()
+        exit(0)
+    }
+    cap?.stop()
     transferService.stop()
-    sender.conn?.cancel()
-    // 等采集停稳：worker 需要跑到下一次循环边界才会看到代次变化，
-    // 单帧采集约 60ms，给 1.5 秒足够；不再依赖跨线程的 stopped 标志。
+    sender?.conn?.cancel()
     let stopDeadline = Date().addingTimeInterval(1.5)
     while Date() < stopDeadline {
         RunLoop.current.run(mode: .default, before: Date().addingTimeInterval(0.05))
     }
-    // 采集停稳后再多等 1.2 秒，让 WindowServer 释放该虚拟屏的采集关联。
-    // 这步是必须的：采集还挂着时 CDVirtualDisplayDestroy 会被静默拒绝。
     RunLoop.current.run(mode: .default, before: Date().addingTimeInterval(1.2))
-    vd.destroy()
-    // 等 WindowServer 完成异步移除（不重复 destroy，避免对同一 client 二次释放）。
-    // 这里给足 5 秒：只等 2 秒时实测会误判「已清理」，随后留下孤儿屏。
+    vd?.destroy()
     var waited = 0.0
     while vdStillOnline() && waited < 5.0 {
         RunLoop.current.run(mode: .default, before: Date().addingTimeInterval(0.1))
@@ -4420,7 +4576,7 @@ final class ClientWatchdog {
         guard !fired else { return }
         let now = CFAbsoluteTimeGetCurrent()
         let link = currentLink()
-        let connected = sender.connected
+        let connected = sender?.connected ?? false
 
         if connected != lastLoggedConnected {
             lastLoggedConnected = connected
@@ -4484,16 +4640,15 @@ final class ClientWatchdog {
     }
 }
 
-let clientWatchdog = ClientWatchdog(
-    initialGrace: Double(ProcessInfo.processInfo.environment["SECDISPLAY_INITIAL_GRACE"] ?? "") ?? 180,
-    // 断开宽限不能太短。接收端重启（改配置、换分辨率、手动退出再开）通常要几十秒，
-    // 8 秒的宽限会让发送端在接收端重启期间自己退出，连带销毁虚拟屏，用户下次
-    // 还得手工重开。60 秒足够覆盖重启，又不会让孤儿屏长期挂着。
-    graceLinkUp: Double(ProcessInfo.processInfo.environment["SECDISPLAY_DISCONNECT_GRACE"] ?? "") ?? 60,
-    // 链路断（拔线）仍是快速判定：线都拔了就没必要留屏占显示器排列。
-    graceLinkDown: Double(ProcessInfo.processInfo.environment["SECDISPLAY_DISCONNECT_GRACE_LINKDOWN"] ?? "") ?? 5
-)
-clientWatchdog.start()
+if appRole == .sender {
+    let wd = ClientWatchdog(
+        initialGrace: Double(ProcessInfo.processInfo.environment["SECDISPLAY_INITIAL_GRACE"] ?? "") ?? 180,
+        graceLinkUp: Double(ProcessInfo.processInfo.environment["SECDISPLAY_DISCONNECT_GRACE"] ?? "") ?? 60,
+        graceLinkDown: Double(ProcessInfo.processInfo.environment["SECDISPLAY_DISCONNECT_GRACE_LINKDOWN"] ?? "") ?? 5
+    )
+    clientWatchdog = wd
+    wd.start()
+}
 
 // MARK: - 菜单栏图标
 //
@@ -4517,6 +4672,17 @@ final class StatusMenuTarget: NSObject, NSMenuItemValidation {
     @objc func openDropBox() {
         Log.info("菜单栏请求打开文件投递盒")
         showDropBoxPanel()
+    }
+
+    @objc func openReceiverWindow() {
+        Log.info("菜单栏请求打开副屏显示窗口")
+        macReceiverWindow?.show()
+    }
+
+    @objc func toggleRole() {
+        let next: SecDisplayRole = (appRole == .sender) ? .receiver : .sender
+        Log.info("菜单栏请求切换角色 -> \(next.rawValue)")
+        restartWithRole(next, host: winHostAddress)
     }
 
     /// 状态栏按钮点击：左键打开控制面板，右键（或 Control+左键）弹快捷菜单。
@@ -4588,7 +4754,7 @@ func setupStatusBar() -> NSApplication {
     if let button = item.button {
         button.image = NSImage(systemSymbolName: "display", accessibilityDescription: "SecDisplay")
         button.image?.isTemplate = true
-        button.toolTip = "SecDisplay 发送端"
+        button.toolTip = appRole == .receiver ? "SecDisplay 副屏 (Win→Mac)" : "SecDisplay 发送端"
     }
 
     let menu = NSMenu()
@@ -4602,6 +4768,13 @@ func setupStatusBar() -> NSApplication {
     menu.addItem(info)
     menu.addItem(.separator())
 
+    if appRole == .receiver {
+        let winItem = NSMenuItem(title: "显示副屏窗口…", action: #selector(StatusMenuTarget.openReceiverWindow), keyEquivalent: "d")
+        winItem.target = statusMenuTarget
+        winItem.isEnabled = true
+        menu.addItem(winItem)
+    }
+
     let open = NSMenuItem(title: "打开面板…", action: #selector(StatusMenuTarget.openPanel), keyEquivalent: "o")
     open.target = statusMenuTarget
     open.isEnabled = true
@@ -4611,6 +4784,15 @@ func setupStatusBar() -> NSApplication {
     box.target = statusMenuTarget
     box.isEnabled = true
     menu.addItem(box)
+
+    let roleItem = NSMenuItem(
+        title: appRole == .receiver ? "切回主控模式 (Mac→Win)" : "切到副屏模式 (Mac 当 Windows 副屏)",
+        action: #selector(StatusMenuTarget.toggleRole),
+        keyEquivalent: ""
+    )
+    roleItem.target = statusMenuTarget
+    roleItem.isEnabled = true
+    menu.addItem(roleItem)
     menu.addItem(.separator())
 
     let quit = NSMenuItem(title: "退出 SecDisplay", action: #selector(StatusMenuTarget.quit), keyEquivalent: "q")
@@ -4644,13 +4826,20 @@ func setupStatusBar() -> NSApplication {
 
 let statusApp = setupStatusBar()
 
-// 每秒刷新菜单栏文字：连接状态、帧率、编码延迟、在途
+// 每秒刷新菜单栏文字：连接状态、帧率、编码/解码指标
 Timer.scheduledTimer(withTimeInterval: 1.0, repeats: true) { _ in
     if let info = statusInfoItem {
-        let enc = encoder.encLatCount > 0 ? encoder.encLatSum / Double(encoder.encLatCount) : 0
-        let conn = sender.connected ? "已连接" : "等待连接"
-        info.title = String(format: "%@ · %.0f fps · 编码 %.0f ms · %d 在途",
-                            conn, peakFps, enc, sender.inFlight)
+        if appRole == .receiver {
+            if let snap = macReceiverClient?.snapshot() {
+                let st = snap.streaming ? "正在接收" : (snap.connected ? "已连接等待" : "等待 Windows 主控")
+                info.title = String(format: "%@ · %.0f fps · %.1f Mbps", st, snap.decodeFps, snap.mbps)
+            }
+        } else if let encoder, let sender {
+            let enc = encoder.encLatCount > 0 ? encoder.encLatSum / Double(encoder.encLatCount) : 0
+            let conn = sender.connected ? "已连接" : "等待连接"
+            info.title = String(format: "%@ · %.0f fps · 编码 %.0f ms · %d 在途",
+                                conn, peakFps, enc, sender.inFlight)
+        }
     }
     AppModel.shared.refresh()
 }
@@ -4725,6 +4914,16 @@ private func registerGlobalDropBoxHotKey() {
 // 等 statusApp.run() 启动主事件循环后再注册全局鼠标监视器与光标图像轮询，
 // 避免在 NSApplication 初始化之前抢先建立 SkyLight 事件通道导致窗口点击失灵。
 DispatchQueue.main.async {
+    if appRole == .receiver {
+        if let rc = macReceiverClient {
+            let rw = ReceiverWindowController(client: rc)
+            macReceiverWindow = rw
+            rw.show()
+        }
+        registerGlobalDropBoxHotKey()
+        return
+    }
+    guard let vd, let encoder, let sender, let rateCtl, let cursor, let cursorImage else { return }
     onDisplayModeReconfig = {
         guard vd.displayID != 0, let m = CGDisplayCopyDisplayMode(vd.displayID) else { return }
         let pw = m.pixelWidth, ph = m.pixelHeight
