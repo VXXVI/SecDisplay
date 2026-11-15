@@ -6,6 +6,7 @@
 import SwiftUI
 import AppKit
 import UniformTypeIdentifiers
+import ImageIO
 
 /// 面板共享状态
 final class AppModel: ObservableObject {
@@ -96,15 +97,16 @@ final class AppModel: ObservableObject {
         mbps = lastMbps
         inFlight = sender.inFlight
         dropped = sender.dropped
-        width = cfg.width
-        height = cfg.height
+        let snap = currentVideoSizeSnapshot()
+        width = snap.w
+        height = snap.h
         scale = vdBackingScale
         cursorHz = cursor.targetHz
         cursorImageOn = !disableCursorImage
         presetName = mainPresetLabel()
         logLine = Log.currentPath
         suppressResolutionChange = true
-        resolutionIndex = AppModel.resolutions.firstIndex { $0.w == cfg.width && $0.h == cfg.height && $0.lw == cfg.logicalWidth && $0.lh == cfg.logicalHeight } ?? -1
+        resolutionIndex = AppModel.resolutions.firstIndex { $0.w == snap.w && $0.h == snap.h && $0.lw == snap.lw && $0.lh == snap.lh } ?? -1
         suppressResolutionChange = false
 
         // 链路与对端
@@ -485,21 +487,25 @@ func copyDiagnostics() {
     Log.info("面板: 诊断信息已复制到剪贴板")
 }
 
+private var isRestartingResolution = false
+
 /// 切换分辨率：虚拟屏和编码器都在启动时按尺寸建好，改尺寸只能重建进程。
 /// 命令行启动走 run.sh restart；.app 启动时没有 run.sh，直接重启自身。
 func restartWithResolution(_ w: Int, _ h: Int, _ lw: Int, _ lh: Int) {
+    guard !isRestartingResolution else { return }
+    isRestartingResolution = true
     let dir = FileManager.default.currentDirectoryPath
+    let pid = ProcessInfo.processInfo.processIdentifier
     Log.info("面板切换分辨率 \(w)x\(h)，准备重启")
     let p = Process()
     p.executableURL = URL(fileURLWithPath: "/bin/zsh")
     if FileManager.default.fileExists(atPath: dir + "/run.sh") {
-        p.arguments = ["-c", "sleep 9; cd \"$1\" && SECDISPLAY_W=\"$2\" SECDISPLAY_H=\"$3\" SECDISPLAY_LOGICAL_W=\"$4\" SECDISPLAY_LOGICAL_H=\"$5\" ./run.sh restart",
+        p.arguments = ["-c", "while kill -0 \(pid) 2>/dev/null; do sleep 0.15; done; sleep 0.3; cd \"$1\" && SECDISPLAY_W=\"$2\" SECDISPLAY_H=\"$3\" SECDISPLAY_LOGICAL_W=\"$4\" SECDISPLAY_LOGICAL_H=\"$5\" ./run.sh restart",
                        "restart", dir, "\(w)", "\(h)", "\(lw)", "\(lh)"]
     } else {
-        // .app 场景：用 open 重新拉起 bundle，保持 TCC 归属在 bundle 上。
-        // 直接跑 Contents/MacOS/SecDisplay 会被当成裸二进制，权限可能对不上。
+        // .app 场景：等待旧进程退出后用 open 重新拉起 bundle，保持 TCC 归属在 bundle 上。
         let appPath = Bundle.main.bundlePath
-        p.arguments = ["-c", "sleep 9; open -n \"$1\" --env SECDISPLAY_W=\"$2\" --env SECDISPLAY_H=\"$3\" --env SECDISPLAY_LOGICAL_W=\"$4\" --env SECDISPLAY_LOGICAL_H=\"$5\"",
+        p.arguments = ["-c", "while kill -0 \(pid) 2>/dev/null; do sleep 0.15; done; sleep 0.3; open -n \"$1\" --env SECDISPLAY_W=\"$2\" --env SECDISPLAY_H=\"$3\" --env SECDISPLAY_LOGICAL_W=\"$4\" --env SECDISPLAY_LOGICAL_H=\"$5\"",
                        "restart", appPath, "\(w)", "\(h)", "\(lw)", "\(lh)"]
     }
     p.standardOutput = FileHandle.nullDevice
@@ -668,26 +674,67 @@ func pasteClipboardToTransfer() {
         Log.info("剪贴板粘贴文件: \(urls.count) 个")
         return
     }
-    if let png = pb.data(forType: .png) {
+    if let paths = pb.propertyList(forType: NSPasteboard.PasteboardType("NSFilenamesPboardType")) as? [String],
+       !paths.isEmpty {
+        let urls = paths.map { URL(fileURLWithPath: $0) }
+        transferService.enqueue(urls: urls)
+        Log.info("剪贴板粘贴文件(NSFilenames): \(urls.count) 个")
+        return
+    }
+    if let png = pb.data(forType: .png),
+       png.count >= 8,
+       png.prefix(8) == Data([0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A]) {
         transferService.enqueueClipboardImageData(png)
         Log.info("剪贴板粘贴 PNG 截图 (\(png.count) B)")
         return
     }
-    if let tiff = pb.data(forType: .tiff),
-       let rep = NSBitmapImageRep(data: tiff),
-       let png = rep.representation(using: .png, properties: [:]) {
-        transferService.enqueueClipboardImageData(png)
-        Log.info("剪贴板粘贴截图转 PNG (\(png.count) B)")
-        return
+    let encodeImageToPng: (NSImage) -> Data? = { img in
+        if let tiff = img.tiffRepresentation,
+           let rep = NSBitmapImageRep(data: tiff),
+           let png = rep.representation(using: .png, properties: [:]) {
+            return png
+        }
+        var r = NSRect(origin: .zero, size: img.size)
+        if let cg = img.cgImage(forProposedRect: &r, context: nil, hints: nil) {
+            let rep = NSBitmapImageRep(cgImage: cg)
+            return rep.representation(using: .png, properties: [:])
+        }
+        return nil
     }
-    if let img = NSImage(pasteboard: pb),
-       let tiff = img.tiffRepresentation,
-       let rep = NSBitmapImageRep(data: tiff),
-       let png = rep.representation(using: .png, properties: [:]) {
+    let imageTypes: [NSPasteboard.PasteboardType] = [
+        .tiff,
+        NSPasteboard.PasteboardType("public.jpeg"),
+        NSPasteboard.PasteboardType("public.heic"),
+        NSPasteboard.PasteboardType("public.webp"),
+        NSPasteboard.PasteboardType("com.compuserve.gif"),
+        .pdf,
+    ]
+    for tp in imageTypes {
+        if let data = pb.data(forType: tp) {
+            if let rep = NSBitmapImageRep(data: data),
+               let png = rep.representation(using: .png, properties: [:]) {
+                transferService.enqueueClipboardImageData(png)
+                Log.info("剪贴板粘贴图片(\(tp.rawValue)) 转 PNG (\(png.count) B)")
+                return
+            }
+            if let src = CGImageSourceCreateWithData(data as CFData, nil),
+               let cg = CGImageSourceCreateImageAtIndex(src, 0, nil) {
+                let rep = NSBitmapImageRep(cgImage: cg)
+                if let png = rep.representation(using: .png, properties: [:]) {
+                    transferService.enqueueClipboardImageData(png)
+                    Log.info("剪贴板粘贴图片(\(tp.rawValue)) ImageIO 转 PNG (\(png.count) B)")
+                    return
+                }
+            }
+        }
+    }
+    if let img = NSImage(pasteboard: pb), let png = encodeImageToPng(img) {
         transferService.enqueueClipboardImageData(png)
         Log.info("剪贴板粘贴 NSImage 截图 (\(png.count) B)")
         return
     }
+    let avail = pb.types?.map(\.rawValue).joined(separator: ", ") ?? "空"
+    Log.info("剪贴板粘贴无可用图片/文件，当前类型: [\(avail)]")
     transferService.showFeedback(kind: -1, title: "剪贴板无内容", detail: "请先复制文件或截图")
 }
 
@@ -935,6 +982,11 @@ struct DropBoxView: View {
     }
 }
 
+private final class DropBoxPanel: NSPanel {
+    override var canBecomeKey: Bool { true }
+    override var canBecomeMain: Bool { false }
+}
+
 private var dropBoxPanel: NSPanel?
 
 func toggleDropBoxPin() {
@@ -973,13 +1025,15 @@ func showDropBoxPanel() {
             }
         }
         p.level = AppModel.shared.dropBoxPinned ? .floating : .normal
+        NSApp.activate(ignoringOtherApps: true)
+        p.makeKeyAndOrderFront(nil)
         p.orderFrontRegardless()
         return
     }
     let host = NSHostingView(rootView: DropBoxView())
-    let p = NSPanel(
+    let p = DropBoxPanel(
         contentRect: NSRect(x: 0, y: 0, width: 244, height: 256),
-        styleMask: [.borderless, .nonactivatingPanel],
+        styleMask: [.borderless],
         backing: .buffered,
         defer: false)
     p.isFloatingPanel = true
@@ -1002,6 +1056,8 @@ func showDropBoxPanel() {
     } else {
         p.center()
     }
+    NSApp.activate(ignoringOtherApps: true)
+    p.makeKeyAndOrderFront(nil)
     p.orderFrontRegardless()
     dropBoxPanel = p
     Log.info("Mac 文件投递盒已打开")

@@ -683,7 +683,32 @@ static void TrayShowMenu(HWND hwnd) {
     DestroyMenu(menu);
 }
 
-/// 窗口客户区坐标 → 虚拟屏逻辑点坐标（0..coordW, 0..coordH）
+/// 把 sw×sh 等比装进 dw×dh，居中，返回目标矩形。
+/// 整数取整后可能差一两个像素，全部夹在输出范围内。
+static RECT FitRect(int sw, int sh, int dw, int dh) {
+    if (sw <= 0 || sh <= 0 || dw <= 0 || dh <= 0) return RECT{ 0, 0, dw, dh };
+    const double sx = (double)dw / sw;
+    const double sy = (double)dh / sh;
+    const double s = sx < sy ? sx : sy;
+    int w = (int)(sw * s + 0.5);
+    int h = (int)(sh * s + 0.5);
+    if (w > dw) w = dw;
+    if (h > dh) h = dh;
+    if (w < 1) w = 1;
+    if (h < 1) h = 1;
+    const int x = (dw - w) / 2;
+    const int y = (dh - h) / 2;
+    return RECT{ x, y, x + w, y + h };
+}
+
+static RECT VideoRectInClient(int cw, int ch) {
+    int dw = g_displayW.load(), dh = g_displayH.load();
+    if (dw <= 0 || dh <= 0) { dw = g_coordW.load(); dh = g_coordH.load(); }
+    if (dw <= 0 || dh <= 0) return RECT{ 0, 0, cw, ch };
+    return FitRect(dw, dh, cw, ch);
+}
+
+/// 窗口客户区坐标 → 虚拟屏逻辑点坐标（0..coordW, 0..coordH），按实际留黑边后的有效画面矩形换算
 static bool ClientToVideo(int cx, int cy, float* vx, float* vy) {
     if (!g_hwnd) return false;
     RECT rc{};
@@ -691,8 +716,17 @@ static bool ClientToVideo(int cx, int cy, float* vx, float* vy) {
     int cw = rc.right - rc.left, ch = rc.bottom - rc.top;
     int vw = g_coordW.load(), vh = g_coordH.load();
     if (cw <= 0 || ch <= 0 || vw <= 0 || vh <= 0) return false;
-    *vx = (float)cx / cw * vw;
-    *vy = (float)cy / ch * vh;
+    RECT vr = VideoRectInClient(cw, ch);
+    int rw = vr.right - vr.left, rh = vr.bottom - vr.top;
+    if (rw <= 0 || rh <= 0) return false;
+    int rx = cx - vr.left;
+    int ry = cy - vr.top;
+    if (rx < 0) rx = 0;
+    if (rx > rw) rx = rw;
+    if (ry < 0) ry = 0;
+    if (ry > rh) ry = rh;
+    *vx = (float)rx / rw * vw;
+    *vy = (float)ry / rh * vh;
     return true;
 }
 
@@ -1606,6 +1640,9 @@ public:
     // 否则 ResizeBuffers 会因后缓冲仍被引用而失败。
     bool Resize(int width, int height);
 
+    // 原子更新输出尺寸、源尺寸与逻辑显示尺寸，避免分步更新回滚不一致或同尺寸漏重建处理器
+    bool Configure(int outW, int outH, int srcW, int srcH, int dispW, int dispH);
+
 private:
     bool CreateProcessor();
 
@@ -1617,6 +1654,7 @@ private:
     ComPtr<ID3D11VideoProcessorEnumerator> enum_;
     int width_ = 0, height_ = 0;      // 交换链尺寸，恒等于窗口客户区物理像素
     int srcW_ = 0, srcH_ = 0;         // 解码器实际输出尺寸
+    int dispW_ = 0, dispH_ = 0;       // 当前流逻辑显示尺寸（用于裁剪 H.264 宏块对齐边缘）
     // 视频处理器视图按纹理指针缓存：每帧新建在 45fps 下是每秒 90 次 Create*View
     std::unordered_map<uint64_t, ComPtr<ID3D11VideoProcessorInputView>> inViewCache_;
     std::unordered_map<void*, ComPtr<ID3D11VideoProcessorOutputView>> outViewCache_;
@@ -1689,28 +1727,12 @@ bool Presenter::Init(Graphics* gfx, HWND hwnd, int width, int height) {
 
     srcW_ = width;
     srcH_ = height;
+    dispW_ = g_displayW.load();
+    dispH_ = g_displayH.load();
     if (!CreateProcessor()) return false;
 
     Log("呈现器就绪");
     return true;
-}
-
-/// 把 sw×sh 等比装进 dw×dh，居中，返回目标矩形。
-/// 整数取整后可能差一两个像素，全部夹在输出范围内。
-static RECT FitRect(int sw, int sh, int dw, int dh) {
-    if (sw <= 0 || sh <= 0 || dw <= 0 || dh <= 0) return RECT{ 0, 0, dw, dh };
-    const double sx = (double)dw / sw;
-    const double sy = (double)dh / sh;
-    const double s = sx < sy ? sx : sy;
-    int w = (int)(sw * s + 0.5);
-    int h = (int)(sh * s + 0.5);
-    if (w > dw) w = dw;
-    if (h > dh) h = dh;
-    if (w < 1) w = 1;
-    if (h < 1) h = 1;
-    const int x = (dw - w) / 2;
-    const int y = (dh - h) / 2;
-    return RECT{ x, y, x + w, y + h };
 }
 
 bool Presenter::CreateProcessor() {
@@ -1760,7 +1782,8 @@ bool Presenter::CreateProcessor() {
     // 裁掉 H.264 宏块对齐多出的边缘(如 2880x1808 里的底端 8 行)，否则会被当成有效画面
     // 参与等比缩放，原本能 1:1 满幅的 2880x1800 被迫缩到 2867x1800。
     int cropW = srcW_, cropH = srcH_;
-    const int dispW = g_displayW.load(), dispH = g_displayH.load();
+    const int dispW = (dispW_ > 0) ? dispW_ : g_displayW.load();
+    const int dispH = (dispH_ > 0) ? dispH_ : g_displayH.load();
     if (dispW > 0 && dispH > 0 &&
         srcW_ >= dispW && srcH_ >= dispH &&
         srcW_ - dispW <= 16 && srcH_ - dispH <= 16) {
@@ -1776,15 +1799,13 @@ bool Presenter::CreateProcessor() {
     bgColor.RGBA.R = 0.0f; bgColor.RGBA.G = 0.0f; bgColor.RGBA.B = 0.0f; bgColor.RGBA.A = 1.0f;
     videoCtx_->VideoProcessorSetOutputBackgroundColor(processor_.Get(), FALSE, &bgColor);
 
-    // 输出按等比装进交换链，装不满的地方由 VideoProcessor 用背景色填黑边。
+    // 始终让 OutputTargetRect 覆盖整张交换链后缓冲（传 FALSE），
+    // 只用 StreamDestRect 限定有效画面区域，确保留黑边区域也被背景色清黑不残留旧帧。
     RECT dst = FitRect(cropW, cropH, width_, height_);
+    videoCtx_->VideoProcessorSetStreamDestRect(processor_.Get(), 0, TRUE, &dst);
+    videoCtx_->VideoProcessorSetOutputTargetRect(processor_.Get(), FALSE, nullptr);
     const bool letterbox = dst.left > 0 || dst.top > 0 ||
                            dst.right < width_ || dst.bottom < height_;
-    if (letterbox) {
-        videoCtx_->VideoProcessorSetOutputTargetRect(processor_.Get(), TRUE, &dst);
-    } else {
-        videoCtx_->VideoProcessorSetOutputTargetRect(processor_.Get(), FALSE, nullptr);
-    }
     Log("呈现器: 输入 %dx%d(裁 %dx%d) → 输出 %dx%d，画面矩形 %d,%d - %d,%d%s",
         srcW_, srcH_, cropW, cropH, width_, height_,
         (int)dst.left, (int)dst.top, (int)dst.right, (int)dst.bottom,
@@ -1795,18 +1816,70 @@ bool Presenter::CreateProcessor() {
 bool Presenter::SetSourceSize(int w, int h) {
     if (w <= 0 || h <= 0) return false;
     std::lock_guard<std::mutex> lk(mtx_);
-    if (w == srcW_ && h == srcH_) return true;
-    const int prevW = srcW_, prevH = srcH_;
+    const int curDispW = g_displayW.load(), curDispH = g_displayH.load();
+    if (w == srcW_ && h == srcH_ && curDispW == dispW_ && curDispH == dispH_) return true;
+    const int prevW = srcW_, prevH = srcH_, prevDW = dispW_, prevDH = dispH_;
     srcW_ = w;
     srcH_ = h;
+    dispW_ = curDispW;
+    dispH_ = curDispH;
     if (!CreateProcessor()) {
-        // 重建失败（设备繁忙/内存抖动）时回滚尺寸。
-        // 不回滚的话 srcW_ 已等于新值，下次进来会因「尺寸相同」早退 true，
-        // 处理器永远不再重建，呈现器就此永久黑屏。
         srcW_ = prevW;
         srcH_ = prevH;
+        dispW_ = prevDW;
+        dispH_ = prevDH;
         return false;
     }
+    return true;
+}
+
+bool Presenter::Configure(int outW, int outH, int srcW, int srcH, int dispW, int dispH) {
+    if (outW <= 0 || outH <= 0 || srcW <= 0 || srcH <= 0) return false;
+    std::lock_guard<std::mutex> lk(mtx_);
+    const int prevOutW = width_, prevOutH = height_;
+    const int prevSrcW = srcW_, prevSrcH = srcH_;
+    const int prevDispW = dispW_, prevDispH = dispH_;
+
+    const bool needSwapResize = (outW != width_ || outH != height_);
+    const bool needProcRebuild = needSwapResize || (srcW != srcW_ || srcH != srcH_ || dispW != dispW_ || dispH != dispH_);
+    if (!needProcRebuild) return true;
+
+    if (needSwapResize && swap_) {
+        inViewCache_.clear();
+        outViewCache_.clear();
+        UINT flags = tearing_ ? DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING : 0;
+        HRESULT hr = swap_->ResizeBuffers(0, (UINT)outW, (UINT)outH, DXGI_FORMAT_UNKNOWN, flags);
+        if (FAILED(hr)) {
+            Log("交换链改尺寸失败 %08X（保持 %dx%d）", hr, prevOutW, prevOutH);
+            return false;
+        }
+    }
+
+    width_ = outW;
+    height_ = outH;
+    srcW_ = srcW;
+    srcH_ = srcH;
+    dispW_ = dispW;
+    dispH_ = dispH;
+    if (!swap_) return true;
+
+    if (!CreateProcessor()) {
+        if (needSwapResize) {
+            UINT flags = tearing_ ? DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING : 0;
+            if (FAILED(swap_->ResizeBuffers(0, (UINT)prevOutW, (UINT)prevOutH, DXGI_FORMAT_UNKNOWN, flags))) {
+                Log("交换链回滚到 %dx%d 失败，保留新尺寸 %dx%d", prevOutW, prevOutH, outW, outH);
+                return false;
+            }
+        }
+        width_ = prevOutW;
+        height_ = prevOutH;
+        srcW_ = prevSrcW;
+        srcH_ = prevSrcH;
+        dispW_ = prevDispW;
+        dispH_ = prevDispH;
+        return false;
+    }
+    Log("呈现器已切换到 %dx%d（源 %dx%d）", width_, height_, srcW_, srcH_);
     return true;
 }
 
@@ -2034,7 +2107,7 @@ void Presenter::Shutdown() {
 // ---------------------------------------------------------------------------
 
 // --- 全屏切换 ---
-static bool g_isFullscreen = false;      // 由 main 按 cfg.fullscreen 同步
+static std::atomic<bool> g_isFullscreen{false};      // 由 main 按 cfg.fullscreen 同步
 static LONG_PTR g_savedStyle = 0;
 static LONG_PTR g_savedExStyle = 0;
 static RECT g_savedRect{};
@@ -2393,52 +2466,118 @@ static void PasteClipboardToTransfer(HWND owner) {
             GlobalUnlock(hd);
         }
     } else {
-        // 检查剪贴板截图（CF_BITMAP / CF_DIB）并无损编码为 PNG 发送
-        std::unique_ptr<Gdiplus::Bitmap> bmp;
-        if (HBITMAP hbm = (HBITMAP)GetClipboardData(CF_BITMAP)) {
-            bmp.reset(Gdiplus::Bitmap::FromHBITMAP(hbm, nullptr));
-        } else if (HANDLE hdib = GetClipboardData(CF_DIB)) {
-            SIZE_T cb = GlobalSize(hdib);
-            if (cb >= sizeof(BITMAPINFOHEADER)) {
-                if (void* ptr = GlobalLock(hdib)) {
-                    const BITMAPINFO* bmi = (const BITMAPINFO*)ptr;
-                    DWORD hdrSize = bmi->bmiHeader.biSize;
-                    if (hdrSize >= sizeof(BITMAPINFOHEADER) && hdrSize <= cb) {
-                        size_t palBytes = 0;
-                        // 仅标准 40 字节 BITMAPINFOHEADER 在结构体外附加 3 个 DWORD 掩码；V4/V5 已内嵌
-                        if (hdrSize == sizeof(BITMAPINFOHEADER) && bmi->bmiHeader.biCompression == BI_BITFIELDS) {
-                            palBytes += 3 * sizeof(DWORD);
+        auto makeTmpPngPath = []() -> std::wstring {
+            wchar_t tmpDir[MAX_PATH] = {};
+            if (GetTempPathW(MAX_PATH, tmpDir) == 0) return {};
+            SYSTEMTIME st{};
+            GetLocalTime(&st);
+            wchar_t fname[96];
+            swprintf(fname, 96, L"Screenshot_%04d%02d%02d_%02d%02d%02d_%03d.png",
+                     st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute, st.wSecond, st.wMilliseconds);
+            return std::wstring(tmpDir) + fname;
+        };
+
+        // 1. 优先读取截图软件直写的原始 "PNG" / "image/png" 格式（Snipaste / PixPin / Win+Shift+S / 微信等）
+        static const UINT fmtPng = RegisterClipboardFormatW(L"PNG");
+        static const UINT fmtMimePng = RegisterClipboardFormatW(L"image/png");
+        UINT pngFmts[2] = { fmtPng, fmtMimePng };
+        for (UINT pf : pngFmts) {
+            if (!pf) continue;
+            if (HANDLE hp = GetClipboardData(pf)) {
+                SIZE_T cb = GlobalSize(hp);
+                if (cb >= 8) {
+                    if (const uint8_t* ptr = (const uint8_t*)GlobalLock(hp)) {
+                        static const uint8_t kPngSig[8] = { 0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A };
+                        if (memcmp(ptr, kPngSig, 8) == 0) {
+                            std::wstring cand = makeTmpPngPath();
+                            if (!cand.empty()) {
+                                HANDLE hf = CreateFileW(cand.c_str(), GENERIC_WRITE, 0, nullptr,
+                                                        CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+                                if (hf != INVALID_HANDLE_VALUE) {
+                                    DWORD wr = 0;
+                                    if (WriteFile(hf, ptr, (DWORD)cb, &wr, nullptr) && wr == (DWORD)cb) {
+                                        tempPngPath = cand;
+                                    } else {
+                                        CloseHandle(hf);
+                                        DeleteFileW(cand.c_str());
+                                        hf = INVALID_HANDLE_VALUE;
+                                    }
+                                    if (hf != INVALID_HANDLE_VALUE) CloseHandle(hf);
+                                }
+                            }
                         }
-                        if (bmi->bmiHeader.biBitCount <= 8) {
-                            DWORD nCol = bmi->bmiHeader.biClrUsed ? bmi->bmiHeader.biClrUsed : (1u << bmi->bmiHeader.biBitCount);
-                            palBytes += (size_t)nCol * sizeof(RGBQUAD);
-                        } else if (bmi->bmiHeader.biClrUsed > 0) {
-                            palBytes += (size_t)bmi->bmiHeader.biClrUsed * sizeof(RGBQUAD);
-                        }
-                        if ((size_t)hdrSize + palBytes <= cb) {
-                            const void* bits = (const uint8_t*)ptr + hdrSize + palBytes;
-                            bmp.reset(Gdiplus::Bitmap::FromBITMAPINFO(bmi, (void*)bits));
-                        }
+                        GlobalUnlock(hp);
                     }
-                    GlobalUnlock(hdib);
                 }
+                if (!tempPngPath.empty()) break;
             }
         }
-        CLSID pngClsid{};
-        if (bmp && bmp->GetLastStatus() == Gdiplus::Ok && GetPngEncoderClsid(&pngClsid)) {
-            wchar_t tmpDir[MAX_PATH] = {};
-            if (GetTempPathW(MAX_PATH, tmpDir) > 0) {
-                SYSTEMTIME st{};
-                GetLocalTime(&st);
-                wchar_t fname[96];
-                swprintf(fname, 96, L"Screenshot_%04d%02d%02d_%02d%02d%02d_%03d.png",
-                         st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute, st.wSecond, st.wMilliseconds);
-                std::wstring candidate = std::wstring(tmpDir) + fname;
-                if (bmp->Save(candidate.c_str(), &pngClsid, nullptr) == Gdiplus::Ok) {
+
+        // 2. 若无原始 PNG，优先按 CF_DIB / CF_DIBV5 读取（避开 FromHBITMAP 对 32bpp 透明位图的兼容坑）
+        if (tempPngPath.empty()) {
+            std::unique_ptr<Gdiplus::Bitmap> bmp;
+            UINT dibFmts[2] = { CF_DIB, CF_DIBV5 };
+            for (UINT df : dibFmts) {
+                if (HANDLE hdib = GetClipboardData(df)) {
+                    SIZE_T cb = GlobalSize(hdib);
+                    if (cb >= sizeof(BITMAPINFOHEADER)) {
+                        if (void* ptr = GlobalLock(hdib)) {
+                            const BITMAPINFO* bmi = (const BITMAPINFO*)ptr;
+                            DWORD hdrSize = bmi->bmiHeader.biSize;
+                            if (hdrSize >= sizeof(BITMAPINFOHEADER) && hdrSize <= cb) {
+                                size_t palBytes = 0;
+                                // 仅标准 40 字节 BITMAPINFOHEADER 在结构体外附加 3 个 DWORD 掩码；V4/V5 已内嵌
+                                if (hdrSize == sizeof(BITMAPINFOHEADER) && bmi->bmiHeader.biCompression == BI_BITFIELDS) {
+                                    palBytes += 3 * sizeof(DWORD);
+                                }
+                                if (bmi->bmiHeader.biBitCount <= 8) {
+                                    DWORD nCol = bmi->bmiHeader.biClrUsed ? bmi->bmiHeader.biClrUsed : (1u << bmi->bmiHeader.biBitCount);
+                                    palBytes += (size_t)nCol * sizeof(RGBQUAD);
+                                } else if (bmi->bmiHeader.biClrUsed > 0) {
+                                    palBytes += (size_t)bmi->bmiHeader.biClrUsed * sizeof(RGBQUAD);
+                                }
+                                if ((size_t)hdrSize + palBytes < cb) {
+                                    const void* bits = (const uint8_t*)ptr + hdrSize + palBytes;
+                                    std::unique_ptr<Gdiplus::Bitmap> candBmp(Gdiplus::Bitmap::FromBITMAPINFO(bmi, (void*)bits));
+                                    if (candBmp && candBmp->GetLastStatus() == Gdiplus::Ok) {
+                                        bmp = std::move(candBmp);
+                                    }
+                                }
+                            }
+                            GlobalUnlock(hdib);
+                        }
+                    }
+                    if (bmp) break;
+                }
+            }
+            if (!bmp) {
+                if (HBITMAP hbm = (HBITMAP)GetClipboardData(CF_BITMAP)) {
+                    std::unique_ptr<Gdiplus::Bitmap> candBmp(Gdiplus::Bitmap::FromHBITMAP(hbm, nullptr));
+                    if (candBmp && candBmp->GetLastStatus() == Gdiplus::Ok) {
+                        bmp = std::move(candBmp);
+                    }
+                }
+            }
+            CLSID pngClsid{};
+            if (bmp && bmp->GetLastStatus() == Gdiplus::Ok && GetPngEncoderClsid(&pngClsid)) {
+                std::wstring candidate = makeTmpPngPath();
+                if (!candidate.empty() && bmp->Save(candidate.c_str(), &pngClsid, nullptr) == Gdiplus::Ok) {
                     tempPngPath = candidate;
                 }
             }
         }
+    }
+    if (files.empty() && tempPngPath.empty()) {
+        std::string fmts;
+        UINT f = 0;
+        while ((f = EnumClipboardFormats(f)) != 0) {
+            if (!fmts.empty()) fmts += ",";
+            wchar_t fn[64] = {};
+            if (GetClipboardFormatNameW(f, fn, 64) > 0) fmts += ToUtf8(fn);
+            else fmts += std::to_string(f);
+            if (fmts.size() > 180) break;
+        }
+        Log("剪贴板粘贴无可用图片或文件，当前格式: [%s]", fmts.c_str());
     }
     CloseClipboard();
 
@@ -4258,6 +4397,9 @@ static void ToggleDropBoxWindow() {
         Log("悬浮投递盒已通过快捷键隐藏");
     } else {
         ShowDropBoxWindow();
+        if (HWND db = g_dropBox.load()) {
+            SetForegroundWindow(db);
+        }
     }
 }
 
@@ -4787,12 +4929,15 @@ static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
         if (cw <= 0 || ch <= 0) return 0;
         POINT tl{ rc.left, rc.top };
         ClientToScreen(g_hwnd, &tl);
-        int sx = tl.x + (int)(cx / vw * cw);
-        int sy = tl.y + (int)(cy / vh * ch);
-        if (sx < tl.x) sx = tl.x;
-        if (sx >= tl.x + cw) sx = tl.x + cw - 1;
-        if (sy < tl.y) sy = tl.y;
-        if (sy >= tl.y + ch) sy = tl.y + ch - 1;
+        RECT vr = VideoRectInClient(cw, ch);
+        int rw = vr.right - vr.left, rh = vr.bottom - vr.top;
+        if (rw <= 0 || rh <= 0) return 0;
+        int sx = tl.x + vr.left + (int)(cx / vw * rw);
+        int sy = tl.y + vr.top + (int)(cy / vh * rh);
+        if (sx < tl.x + vr.left) sx = tl.x + vr.left;
+        if (sx >= tl.x + vr.right) sx = tl.x + vr.right - 1;
+        if (sy < tl.y + vr.top) sy = tl.y + vr.top;
+        if (sy >= tl.y + vr.bottom) sy = tl.y + vr.bottom - 1;
         const uint64_t nowMoveMs = GetTickCount64();
         g_lastRemoteCursorX = sx;
         g_lastRemoteCursorY = sy;
@@ -5186,16 +5331,26 @@ static void NetworkLoop(RunConfig cfg, Graphics* gfx, Presenter* presenter) {
     // 交换链改尺寸失败过的尺寸，避免每次重连都反复尝试同一个值
     int failedW = 0, failedH = 0;
     while (g_alive) {
-        // 会话头切档：尺寸与当前管线不同就重建解码器、交换链与窗口
+        // 会话头切档：流尺寸变化时原子更新交换链与处理器；全屏模式下交换链保持显示器客户区尺寸不变，
+        // 由 VideoProcessorBlt 按 FitRect 等比铺满整屏，不再把交换链缩成小分辨率导致只占左上角。
         int sw = g_sessW.load(), sh = g_sessH.load();
         if (sw > 0 && sh > 0 && (sw != cfg.width || sh != cfg.height) &&
             !(sw == failedW && sh == failedH)) {
-            if (presenter->Resize(sw, sh)) {
+            const bool fs = g_isFullscreen.load();
+            int outW = sw, outH = sh;
+            if (fs && g_hwnd) {
+                RECT crc{};
+                if (GetClientRect(g_hwnd, &crc) && (crc.right - crc.left) >= 64 && (crc.bottom - crc.top) >= 64) {
+                    outW = crc.right - crc.left;
+                    outH = crc.bottom - crc.top;
+                }
+            }
+            if (presenter->Configure(outW, outH, sw, sh, sw, sh)) {
                 cfg.width = sw; cfg.height = sh;
                 g_displayW = sw; g_displayH = sh;
                 if (cfg.coordW <= 0) { g_coordW = sw; g_coordH = sh; }
-                ResizeWindowForVideo(sw, sh);
-                Log("按会话头切换管线尺寸: %dx%d", sw, sh);
+                if (!fs) ResizeWindowForVideo(sw, sh);
+                Log("按会话头切换管线尺寸: 流 %dx%d  输出 %dx%d", sw, sh, outW, outH);
             } else {
                 failedW = sw; failedH = sh;
             }
@@ -6412,6 +6567,8 @@ int main(int argc, char** argv) {
             wr.right - wr.left, wr.bottom - wr.top);
     }
 
+    g_displayW = cfg.width;
+    g_displayH = cfg.height;
     Presenter presenter;
     {
         // 交换链按客户区物理像素建，和窗口一一对应，DWM 不再二次拉伸。
@@ -6422,7 +6579,7 @@ int main(int argc, char** argv) {
         if (cw <= 0 || ch <= 0) { cw = cfg.width; ch = cfg.height; }
         if (!presenter.Init(&gfx, hwnd, cw, ch)) return 4;
         // 解码尺寸单独告诉呈现器，输入输出从此解耦
-        if (!presenter.SetSourceSize(cfg.width, cfg.height)) {
+        if (!presenter.Configure(cw, ch, cfg.width, cfg.height, cfg.width, cfg.height)) {
             Log("呈现器设置解码尺寸失败 %dx%d", cfg.width, cfg.height);
             return 4;
         }

@@ -496,6 +496,7 @@ enum MirrorGuard {
 
 /// C 回调：只处理「配置已完成」的那一轮（begin 标志清零），丢回主队列再改配置。
 nonisolated(unsafe) var gCaptureRebuildRequested = false
+nonisolated(unsafe) var onDisplayModeReconfig: (() -> Void)? = nil
 
 private func mirrorReconfigCallback(_ display: CGDirectDisplayID,
                                     _ flags: CGDisplayChangeSummaryFlags,
@@ -505,7 +506,10 @@ private func mirrorReconfigCallback(_ display: CGDirectDisplayID,
         gCaptureRebuildRequested = true
     }
     guard !flags.contains(.beginConfigurationFlag) else { return }
-    DispatchQueue.main.async { MirrorGuard.release("显示重配置") }
+    DispatchQueue.main.async {
+        MirrorGuard.release("显示重配置")
+        onDisplayModeReconfig?()
+    }
 }
 
 // MARK: - 雷雳链路检测
@@ -638,10 +642,10 @@ enum Log {
 
 final class Encoder {
     private var session: VTCompressionSession?
-    private let width: Int32
-    private let height: Int32
-    private let bitrate: Int
-    private let captureHz: Double
+    private var width: Int32
+    private var height: Int32
+    private var bitrate: Int
+    private var captureHz: Double
     var onFrame: ((Data, Bool, UInt64) -> Void)?
 
     private(set) var encoded = 0
@@ -658,13 +662,14 @@ final class Encoder {
     }
 
     func start() -> Bool {
-        // EnableLowLatencyRateControl 并非恒优。实测（tools/EncLatency.swift，M1 Pro）：
-        //   2240x1400@60  开=34~37ms 关=21~23ms（关更好）
-        //   2880x1800@45  开=44~50ms 关=35~36ms（关更好）
-        //   1920x1200@60  开=9ms     关=14ms   （开更好）
-        // 规律：分辨率接近编码器吞吐上限时该开关反而拖慢（同 Sunshine #5814）。
-        // 默认保持开启（低分辨率/未知场景收益确定）；高分辨率档可用
-        // SECDISPLAY_NOLOWLAT=1 关闭，供真机 A/B。
+        guard let s = createSession(width: width, height: height, bitrate: bitrate, captureHz: captureHz) else {
+            return false
+        }
+        session = s
+        return true
+    }
+
+    private func createSession(width w: Int32, height h: Int32, bitrate br: Int, captureHz hz: Double) -> VTCompressionSession? {
         var spec: [String: Any] = [:]
         let noLowLat = ProcessInfo.processInfo.environment["SECDISPLAY_NOLOWLAT"] == "1"
         if !noLowLat {
@@ -677,8 +682,8 @@ final class Encoder {
                 (pixelFormatChoice == "420v"
                     ? kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange
                     : kCVPixelFormatType_32BGRA),
-            kCVPixelBufferWidthKey as String: width,
-            kCVPixelBufferHeightKey as String: height,
+            kCVPixelBufferWidthKey as String: w,
+            kCVPixelBufferHeightKey as String: h,
             kCVPixelBufferIOSurfacePropertiesKey as String: [:],
         ]
         let cb: VTCompressionOutputCallback = { ref, sourceFrameRefcon, status, _, sample in
@@ -694,52 +699,44 @@ final class Encoder {
             }
             enc.emit(sample, refcon: sourceFrameRefcon)
         }
+        var newSession: VTCompressionSession?
         let st = VTCompressionSessionCreate(
-            allocator: kCFAllocatorDefault, width: width, height: height,
+            allocator: kCFAllocatorDefault, width: w, height: h,
             codecType: kCMVideoCodecType_H264,
             encoderSpecification: spec as CFDictionary,
             imageBufferAttributes: attrs as CFDictionary,
             compressedDataAllocator: nil, outputCallback: cb,
             refcon: Unmanaged.passUnretained(self).toOpaque(),
-            compressionSessionOut: &session)
-        guard st == noErr, let s = session else {
-            Log.info("编码器创建失败 \(st)"); return false
+            compressionSessionOut: &newSession)
+        guard st == noErr, let s = newSession else {
+            Log.info("编码器创建失败 \(st)"); return nil
         }
         let env = ProcessInfo.processInfo.environment
         let variant = env["SECDISPLAY_ENC"] ?? "A"
 
         VTSessionSetProperty(s, key: kVTCompressionPropertyKey_RealTime, value: kCFBooleanTrue)
         VTSessionSetProperty(s, key: kVTCompressionPropertyKey_ProfileLevel, value: kVTProfileLevel_H264_High_AutoLevel)
-        VTSessionSetProperty(s, key: kVTCompressionPropertyKey_ExpectedFrameRate, value: NSNumber(value: captureHz))
-        // GOP 长度。600 帧在 55fps 下约 11 秒，实测每 12 秒一次编码延迟尖峰
-        // (38~70ms)，表现为「间歇性卡一下」。TCP 不丢包，关键帧只在
-        // 新客户端连上时按 0x02 请求补发，所以可以拉长。用 SECDISPLAY_GOP 覆盖。
+        VTSessionSetProperty(s, key: kVTCompressionPropertyKey_ExpectedFrameRate, value: NSNumber(value: hz))
         let gop = Int(ProcessInfo.processInfo.environment["SECDISPLAY_GOP"] ?? "") ?? 3000
         VTSessionSetProperty(s, key: kVTCompressionPropertyKey_MaxKeyFrameInterval, value: gop as CFNumber)
 
         switch variant {
         case "B":
-            // 不设码率与帧延迟，交给低延迟 rate control
             break
         case "C":
             VTSessionSetProperty(s, key: kVTCompressionPropertyKey_MaxFrameDelayCount, value: 0 as CFNumber)
         case "D":
-            // 用 DataRateLimits 代替 AverageBitRate
-            let limits: [NSNumber] = [NSNumber(value: bitrate / 8), NSNumber(value: 1.0)]
+            let limits: [NSNumber] = [NSNumber(value: br / 8), NSNumber(value: 1.0)]
             VTSessionSetProperty(s, key: kVTCompressionPropertyKey_DataRateLimits, value: limits as CFArray)
         case "E":
             VTSessionSetProperty(s, key: kVTCompressionPropertyKey_AllowFrameReordering, value: kCFBooleanFalse)
             VTSessionSetProperty(s, key: kVTCompressionPropertyKey_PrioritizeEncodingSpeedOverQuality, value: kCFBooleanTrue)
-        default:  // A：原样
+        default:
             VTSessionSetProperty(s, key: kVTCompressionPropertyKey_AllowFrameReordering, value: kCFBooleanFalse)
-            VTSessionSetProperty(s, key: kVTCompressionPropertyKey_AverageBitRate, value: bitrate as CFNumber)
+            VTSessionSetProperty(s, key: kVTCompressionPropertyKey_AverageBitRate, value: br as CFNumber)
             VTSessionSetProperty(s, key: kVTCompressionPropertyKey_MaxFrameDelayCount, value: 1 as CFNumber)
         }
 
-        // 色彩三键 VUI 锚点（BT.709 色域与矩阵 + sRGB 传递函数）。
-        // 原来不设这些键时，H.264 SPS 里不带 colour_description，BGRA 由 VT 自选、
-        // 420v 采集设了 709，导致两端默认矩阵不一致时偏色。显式写进会话与 VUI，
-        // 配合 Windows 侧 D3D11 VideoProcessor 的 BT.709 设置对齐整条色彩链路。
         let stPrim = VTSessionSetProperty(s, key: kVTCompressionPropertyKey_ColorPrimaries,
                                           value: kCVImageBufferColorPrimaries_ITU_R_709_2)
         let stTrans = VTSessionSetProperty(s, key: kVTCompressionPropertyKey_TransferFunction,
@@ -752,7 +749,7 @@ final class Encoder {
 
         VTCompressionSessionPrepareToEncodeFrames(s)
         Log.info("编码参数方案 \(variant)")
-        return true
+        return s
     }
 
     /// 自增帧序号，用作编码 PTS。
@@ -766,10 +763,7 @@ final class Encoder {
     private let lastBufferLock = NSLock()
 
     func encode(_ pb: CVPixelBuffer, pts: CMTime, captureTimeMicros: UInt64) {
-        lastBufferLock.lock()
-        lastPixelBuffer = pb
-        lastBufferLock.unlock()
-        encodeInternal(pb, captureTimeMicros: captureTimeMicros)
+        encodeInternal(pb, captureTimeMicros: captureTimeMicros, updateLast: true)
     }
 
     /// 用最后一帧强制补一个 IDR。
@@ -787,7 +781,7 @@ final class Encoder {
             return
         }
         requestKeyframe()   // 让 encodeInternal 把这一帧编成 IDR
-        encodeInternal(pb, captureTimeMicros: UInt64(CFAbsoluteTimeGetCurrent() * 1_000_000))
+        encodeInternal(pb, captureTimeMicros: UInt64(CFAbsoluteTimeGetCurrent() * 1_000_000), updateLast: false)
     }
 
     /// 串行化编码调用。采集线程和关键帧补发可能并发进来，
@@ -802,10 +796,16 @@ final class Encoder {
         lastBufferLock.unlock()
     }
 
-    private func encodeInternal(_ pb: CVPixelBuffer, captureTimeMicros: UInt64) {
+    private func encodeInternal(_ pb: CVPixelBuffer, captureTimeMicros: UInt64, updateLast: Bool) {
         encodeLock.lock()
         defer { encodeLock.unlock() }
         guard let s = session else { return }
+        guard CVPixelBufferGetWidth(pb) == Int(width) && CVPixelBufferGetHeight(pb) == Int(height) else { return }
+        if updateLast {
+            lastBufferLock.lock()
+            lastPixelBuffer = pb
+            lastBufferLock.unlock()
+        }
         // 时间戳随帧走：经 sourceFrameRefcon 传给输出回调，避免跨线程共享变量。
         // 堆上分配一个 box，由 emit 负责释放；即使帧被编码器丢弃也不会泄漏
         //（VT 保证每个 refcon 都会在输出或丢弃时被回调一次）。
@@ -881,6 +881,31 @@ final class Encoder {
 
     func stop() {
         if let s = session { VTCompressionSessionCompleteFrames(s, untilPresentationTimeStamp: .invalid) }
+    }
+
+    /// 虚拟屏在系统设置中切换分辨率时，先新建会话再替换旧会话，失败时原编码器完整保留
+    func reconfigure(width: Int, height: Int, bitrateMbps: Int, captureHz: Double) -> Bool {
+        encodeLock.lock()
+        defer { encodeLock.unlock() }
+        let newW = Int32(width)
+        let newH = Int32(height)
+        let newBr = bitrateMbps * 1_000_000
+        let newHz = max(1, captureHz)
+        guard let next = createSession(width: newW, height: newH, bitrate: newBr, captureHz: newHz) else {
+            return false
+        }
+        if let old = session {
+            VTCompressionSessionCompleteFrames(old, untilPresentationTimeStamp: .invalid)
+            VTCompressionSessionInvalidate(old)
+        }
+        session = next
+        self.width = newW
+        self.height = newH
+        self.bitrate = newBr
+        self.captureHz = newHz
+        self.currentMbps = bitrateMbps
+        releaseLastFrame()
+        return true
     }
 
     /// 编码管线延迟统计：从采集时间戳到编码输出回调
@@ -1301,11 +1326,12 @@ final class ScreenshotCapture {
                 // 所以默认仍走 captureImage（原路径），
                 // 需要压内存（4K 屏/低内存机器）时用 SECDISPLAY_PIXFMT=420v 显式切换。
                 let wantYUV = pixelFormatChoice == "420v"
+                let (targetW, targetH, _, _) = currentVideoSizeSnapshot()
                 let pb: CVPixelBuffer
                 if wantYUV {
                     let c = SCStreamConfiguration()
-                    c.width = cfg.width
-                    c.height = cfg.height
+                    c.width = targetW
+                    c.height = targetH
                     c.showsCursor = false
                     // 直接要 YUV420 双平面（video range），每帧 7.4MB 而不是 19.8MB，
                     // 也省掉一次全屏 RGB→YUV 的 CGContext 重绘。
@@ -1326,8 +1352,8 @@ final class ScreenshotCapture {
                     pb = buf
                 } else {
                     let c = SCStreamConfiguration()
-                    c.width = cfg.width
-                    c.height = cfg.height
+                    c.width = targetW
+                    c.height = targetH
                     c.showsCursor = false
                     // 2x HiDPI 下显式要最高清晰度采样，避免 automatic 在负载时降到逻辑分辨率放大
                     if #available(macOS 14.0, *) { c.captureResolution = .best }
@@ -1356,16 +1382,16 @@ final class ScreenshotCapture {
                                         (actualFmt >> 8) & 0xFF, actualFmt & 0xFF)
                         let wantName = wantYUV ? "420v" : "BGRA"
                         actualFormatCode = actualFmt   // 面板显示实测值，不显示配置值
-                        Log.info("采集首帧实测: \(fw)x\(fh) fmt=\(f4) (期望 \(cfg.width)x\(cfg.height) \(wantName))")
+                        Log.info("采集首帧实测: \(fw)x\(fh) fmt=\(f4) (期望 \(targetW)x\(targetH) \(wantName))")
                         if wantYUV && actualFmt != kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange
                             && actualFmt != kCVPixelFormatType_420YpCbCr8BiPlanarFullRange {
                             Log.info("警告: 采集实际格式是 \(f4) 而非 420v，VT 会额外做一次全屏转换，内存收益失效")
                         }
-                    } else if (fw != cfg.width || fh != cfg.height)
+                    } else if (fw != targetW || fh != targetH)
                                 && now - lastSizeWarnAt > 2.0 {
                         // 限流：尺寸偏移时每帧都打会淹日志并拖慢 encodeQueue 临界区
                         lastSizeWarnAt = now
-                        Log.info("警告: 采集帧尺寸偏移 \(fw)x\(fh) != \(cfg.width)x\(cfg.height)")
+                        Log.info("警告: 采集帧尺寸偏移 \(fw)x\(fh) != \(targetW)x\(targetH)")
                     }
                     // 内容冻结诊断：帧在来但画面完全不变时记一条日志。
                     // 只在日志里报，不重启 —— 静止桌面本来就不变，重启会误伤，
@@ -1914,6 +1940,16 @@ final class Sender {
     /// 多出来的载荷会被直接忽略，所以两端版本错配不会断流。
     ///
     /// 载荷（全大端）：[version u8][width u16][height u16][fps u8][reserved u8]
+    func updateSessionInfo(width: Int, height: Int, fps: Int) {
+        queue.async { [weak self] in
+            guard let self else { return }
+            self.sessionWidth = width
+            self.sessionHeight = height
+            self.sessionFps = fps
+            self.sendSessionInfo()
+        }
+    }
+
     func sendSessionInfo() {
         guard connected, let c = conn else { return }
         guard sessionWidth > 0, sessionHeight > 0 else { return }
@@ -3737,12 +3773,21 @@ func logicalDisplayBounds(_ id: CGDirectDisplayID) -> CGRect {
     return b
 }
 
+let cfgStateLock = NSLock()
+
+func currentVideoSizeSnapshot() -> (w: Int, h: Int, lw: Int, lh: Int) {
+    cfgStateLock.lock()
+    defer { cfgStateLock.unlock() }
+    return (cfg.width, cfg.height, cfg.logicalWidth, cfg.logicalHeight)
+}
+
 let injector = InputInjector()
 gMouse = injector
 sender.onInput = { x, y, buttons, wheel in
+    let snap = currentVideoSizeSnapshot()
     injector.handle(x: x, y: y, buttons: buttons, wheel: wheel,
                     bounds: logicalDisplayBounds(vd.displayID),
-                    videoW: cfg.width, videoH: cfg.height)
+                    videoW: snap.w, videoH: snap.h)
 }
 
 // 键盘回放：Windows 侧 0x09 包 → macOS CGEvent 键盘事件
@@ -3759,7 +3804,10 @@ let vb = logicalDisplayBounds(vd.displayID)
 Log.info("坐标基准: 逻辑点 \(Int(vb.width))x\(Int(vb.height)) * \(String(format: "%.2f", vdBackingScale))x → 线上 \(cfg.width)x\(cfg.height)，原点 (\(Int(vb.minX)), \(Int(vb.minY)))")
 let cursor = CursorTracker(sender: sender,
                            bounds: { logicalDisplayBounds(vd.displayID) },
-                           videoSize: { (cfg.width, cfg.height) })
+                           videoSize: {
+                               let snap = currentVideoSizeSnapshot()
+                               return (snap.w, snap.h)
+                           })
 // 真实光标图像：形状变化时才发，让副屏显示 Mac 的光标而非固定 Windows 箭头
 // 真实光标图像（0x05）。SECDISPLAY_NOCURSORIMG=1 可整体关闭，
 // 用于 A/B 判断「光标卡顿是否由接收端反复重建光标引起」——关掉后回退 Windows 标准箭头。
@@ -3819,8 +3867,19 @@ struct RateSignals {
 /// 目标是压住编码与队列积压，不是盲目降带宽。
 final class RateController {
     let encoder: Encoder
-    let targetMbps: Int
+    var targetMbps: Int
     let captureHz: Double
+
+    func updateTargetMbps(_ mbps: Int) {
+        targetMbps = mbps
+        current = mbps
+        probeMbps = nil
+        highRounds = 0
+        lowRounds = 0
+        idleRounds = 0
+        revertCooldownUntil = 0
+        lastDownAt = 0
+    }
     private var current: Int
     private var highRounds = 0
     private var lowRounds = 0
@@ -4416,34 +4475,100 @@ if let rp = Bundle.main.resourcePath,
 } else {
     Log.info("构建标记: 无（命令行构建或旧包）")
 }
-nonisolated(unsafe) private var globalDropBoxHotKey: EventHotKeyRef?
-nonisolated(unsafe) private var globalHotKeyHandler: EventHandlerRef?
+nonisolated(unsafe) private var globalDropBoxTap: CFMachPort?
+nonisolated(unsafe) private var globalDropBoxRunLoopSource: CFRunLoopSource?
+nonisolated(unsafe) private var globalDropBoxKeyMon: Any?
+nonisolated(unsafe) private var localDropBoxKeyMon: Any?
 
 private func registerGlobalDropBoxHotKey() {
-    var spec = EventTypeSpec(eventClass: OSType(kEventClassKeyboard), eventKind: UInt32(kEventHotKeyPressed))
-    InstallEventHandler(GetApplicationEventTarget(), { _, event, _ -> OSStatus in
-        var hkID = EventHotKeyID()
-        GetEventParameter(event, EventParamName(kEventParamDirectObject),
-                          EventParamType(typeEventHotKeyID), nil,
-                          MemoryLayout<EventHotKeyID>.size, nil, &hkID)
-        if hkID.signature == 0x53444258 && hkID.id == 1 {
+    let mask = CGEventMask(1 << CGEventType.keyDown.rawValue)
+    if let tap = CGEvent.tapCreate(
+        tap: .cgSessionEventTap,
+        place: .headInsertEventTap,
+        options: .defaultTap,
+        eventsOfInterest: mask,
+        callback: { _, type, event, _ -> Unmanaged<CGEvent>? in
+            if type == .tapDisabledByTimeout || type == .tapDisabledByUserInput {
+                if let t = globalDropBoxTap { CGEvent.tapEnable(tap: t, enable: true) }
+                return Unmanaged.passUnretained(event)
+            }
+            guard type == .keyDown else { return Unmanaged.passUnretained(event) }
+            let keyCode = event.getIntegerValueField(.keyboardEventKeycode)
+            let flags = event.flags
+            let mods = flags.intersection([.maskControl, .maskAlternate, .maskCommand, .maskShift])
+            if keyCode == Int64(kVK_ANSI_B) && mods == [.maskControl, .maskAlternate] {
+                if event.getIntegerValueField(.keyboardEventAutorepeat) == 0 {
+                    DispatchQueue.main.async { toggleDropBoxPanel() }
+                }
+                return nil
+            }
+            return Unmanaged.passUnretained(event)
+        },
+        userInfo: nil
+    ) {
+        globalDropBoxTap = tap
+        let src = CFMachPortCreateRunLoopSource(kCFAllocatorDefault, tap, 0)
+        globalDropBoxRunLoopSource = src
+        CFRunLoopAddSource(CFRunLoopGetMain(), src, .commonModes)
+        CGEvent.tapEnable(tap: tap, enable: true)
+        Log.info("全局快捷键 Ctrl+Opt+B 已注册（CGEventTap，一键呼出/隐藏投递盒）")
+        return
+    }
+    // 无辅助功能权限时降级为 NSEvent 全局/本地监听
+    globalDropBoxKeyMon = NSEvent.addGlobalMonitorForEvents(matching: .keyDown) { ev in
+        let mods = ev.modifierFlags.intersection([.control, .option, .command, .shift])
+        if !ev.isARepeat && ev.keyCode == UInt16(kVK_ANSI_B) && mods == [.control, .option] {
             DispatchQueue.main.async { toggleDropBoxPanel() }
         }
-        return noErr
-    }, 1, &spec, nil, &globalHotKeyHandler)
-    let id = EventHotKeyID(signature: 0x53444258, id: 1) // 'SDBX'
-    let st = RegisterEventHotKey(UInt32(kVK_ANSI_B), UInt32(controlKey | optionKey),
-                                 id, GetApplicationEventTarget(), 0, &globalDropBoxHotKey)
-    if st == noErr {
-        Log.info("全局快捷键 Ctrl+Opt+B 已注册（一键呼出/隐藏投递盒）")
-    } else {
-        Log.info("全局快捷键 Ctrl+Opt+B 注册失败: \(st)")
     }
+    localDropBoxKeyMon = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { ev in
+        let mods = ev.modifierFlags.intersection([.control, .option, .command, .shift])
+        if ev.keyCode == UInt16(kVK_ANSI_B) && mods == [.control, .option] {
+            if !ev.isARepeat {
+                DispatchQueue.main.async { toggleDropBoxPanel() }
+            }
+            return nil
+        }
+        return ev
+    }
+    Log.info("全局快捷键 Ctrl+Opt+B 已注册（NSEvent 监听，一键呼出/隐藏投递盒）")
 }
 
 // 等 statusApp.run() 启动主事件循环后再注册全局鼠标监视器与光标图像轮询，
 // 避免在 NSApplication 初始化之前抢先建立 SkyLight 事件通道导致窗口点击失灵。
 DispatchQueue.main.async {
+    onDisplayModeReconfig = {
+        guard vd.displayID != 0, let m = CGDisplayCopyDisplayMode(vd.displayID) else { return }
+        let pw = m.pixelWidth, ph = m.pixelHeight
+        let lw = m.width, lh = m.height
+        guard pw >= 320, ph >= 200, lw > 0, lh > 0 else { return }
+        let snap = currentVideoSizeSnapshot()
+        guard pw != snap.w || ph != snap.h || lw != snap.lw || lh != snap.lh else { return }
+        let oldW = snap.w, oldH = snap.h
+        let pixelsPerSec = Double(pw * ph) * cfg.captureHz
+        let newMbps = max(30, min(200, Int(pixelsPerSec * 0.6 / 1_000_000)))
+        if pw != oldW || ph != oldH {
+            guard encoder.reconfigure(width: pw, height: ph, bitrateMbps: newMbps, captureHz: cfg.captureHz) else {
+                Log.info("警告: 分辨率变更 \(oldW)x\(oldH) → \(pw)x\(ph) 重建编码器失败，保持原配置")
+                return
+            }
+        }
+        cfgStateLock.lock()
+        cfg.width = pw
+        cfg.height = ph
+        cfg.logicalWidth = lw
+        cfg.logicalHeight = lh
+        cfg.bitrateMbps = newMbps
+        vdBackingScale = Double(pw) / Double(lw)
+        cfgStateLock.unlock()
+        Log.info("检测到虚拟屏分辨率变化: \(oldW)x\(oldH) → \(pw)x\(ph) (逻辑 \(lw)x\(lh) scale=\(String(format: "%.2f", vdBackingScale)))")
+        if pw != oldW || ph != oldH {
+            rateCtl.updateTargetMbps(newMbps)
+            gCaptureRebuildRequested = true
+            sender.updateSessionInfo(width: pw, height: ph, fps: Int(cfg.captureHz.rounded()))
+        }
+        AppModel.shared.refresh()
+    }
     cursor.start()
     if !disableCursorImage {
         cursorImage.start()
