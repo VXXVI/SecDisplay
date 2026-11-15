@@ -12,14 +12,19 @@
 //   5. 解析虚拟屏对应的 GDI 设备名（\\.\DISPLAYx）、虚拟桌面矩形与 DXGI 输出
 // ============================================================================
 
+#ifndef _WIN32_WINNT
+#define _WIN32_WINNT 0x0A00
+#endif
 #include <windows.h>
 #include <setupapi.h>
 #include <cfgmgr32.h>
 #include <dxgi1_2.h>
 #include <wrl/client.h>
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <functional>
 #include <mutex>
@@ -124,21 +129,27 @@ public:
         return r1 == ERROR_SUCCESS && r2 == ERROR_SUCCESS && r3 == ERROR_SUCCESS;
     }
 
-    bool Start(int width, int height, int hz, LogFn logFn = nullptr) {
+    bool Start(int width, int height, int hz, LogFn logFn = nullptr, int targetDpiPercent = 0) {
         Stop();
         logFn_ = std::move(logFn);
 
-        if (width <= 0) width = 2560;
-        if (height <= 0) height = 1600;
+        if (width <= 0) width = 2880;
+        if (height <= 0) height = 1800;
         if (hz <= 0) hz = 60;
 
         // 对非内置常见尺寸写自定义模式槽位 0（需要在 AddDisplay 前写入）
-        EnsureCustomResolution(width, height, hz);
+        if (!EnsureCustomResolution(width, height, hz)) {
+            EmitLog("WinVDD: 写入 HKLM\\SOFTWARE\\Parsec\\vdd\\0 失败（需管理员权限），自定义分辨率可能回落");
+        }
 
         handle_ = OpenVddDevice();
         if (handle_ == INVALID_HANDLE_VALUE || handle_ == nullptr) {
             handle_ = INVALID_HANDLE_VALUE;
-            EmitLog("WinVDD: 打开 Parsec VDD 设备句柄失败（请确认已安装 Parsec VDD 驱动）");
+            std::string drvDesc;
+            int st = QueryDriverStatus(&drvDesc);
+            char msg[224];
+            snprintf(msg, sizeof(msg), "WinVDD: 打开 Parsec VDD 设备句柄失败 (status=%d: %s)", st, drvDesc.c_str());
+            EmitLog(msg);
             return false;
         }
 
@@ -211,6 +222,7 @@ public:
 
         // 把虚拟屏放置在主屏右侧并设置请求分辨率
         ApplyDisplayMode(devName, width, height, hz);
+        ApplyDisplayDpiScale(devName, targetDpiPercent);
 
         // 读取最终生效的桌面边界
         WinVddBounds b{};
@@ -232,6 +244,36 @@ public:
         snprintf(msg, sizeof(msg),
                  "WinVDD: 虚拟屏就绪 %ls  范围 (%d,%d) %dx%d @ %dHz",
                  b.deviceName.c_str(), b.left, b.top, b.width, b.height, b.hz);
+        EmitLog(msg);
+        return true;
+    }
+
+    bool SetMode(int width, int height, int hz) {
+        std::wstring devName;
+        {
+            std::lock_guard<std::mutex> lk(mtx_);
+            if (!active_ || bounds_.deviceName.empty()) return false;
+            devName = bounds_.deviceName;
+        }
+        if (width <= 0) width = 2880;
+        if (height <= 0) height = 1800;
+        if (hz <= 0) hz = 60;
+        if (!EnsureCustomResolution(width, height, hz)) {
+            EmitLog("WinVDD: 写入 HKLM\\SOFTWARE\\Parsec\\vdd\\0 失败（需管理员权限），动态切分可能回落");
+        }
+        ApplyDisplayMode(devName, width, height, hz);
+        WinVddBounds b{};
+        b.deviceName = devName;
+        if (!ReadCurrentBounds(devName, &b)) return false;
+        {
+            std::lock_guard<std::mutex> lk(mtx_);
+            if (active_ && bounds_.deviceName == devName) {
+                bounds_ = b;
+            }
+        }
+        char msg[160];
+        snprintf(msg, sizeof(msg), "WinVDD: 已动态切换虚拟屏 %dx%d @ %dHz",
+                 b.width, b.height, b.hz);
         EmitLog(msg);
         return true;
     }
@@ -274,14 +316,24 @@ public:
 
     // 刷新并返回最新位置与分辨率（用户在 Windows 显示设置里拖动排列或改分辨率后自动对齐）
     WinVddBounds RefreshBounds() {
-        std::lock_guard<std::mutex> lk(mtx_);
-        if (!active_ || bounds_.deviceName.empty()) return bounds_;
-        WinVddBounds nb{};
-        nb.deviceName = bounds_.deviceName;
-        if (ReadCurrentBounds(bounds_.deviceName, &nb)) {
-            bounds_ = nb;
+        std::wstring devName;
+        WinVddBounds fallback{};
+        {
+            std::lock_guard<std::mutex> lk(mtx_);
+            if (!active_ || bounds_.deviceName.empty()) return bounds_;
+            devName = bounds_.deviceName;
+            fallback = bounds_;
         }
-        return bounds_;
+        WinVddBounds nb{};
+        nb.deviceName = devName;
+        if (ReadCurrentBounds(devName, &nb)) {
+            std::lock_guard<std::mutex> lk(mtx_);
+            if (active_ && bounds_.deviceName == devName) {
+                bounds_ = nb;
+            }
+            return nb;
+        }
+        return fallback;
     }
 
     // 根据虚拟屏 GDI 设备名查找对应的 DXGI Adapter 和 Output
@@ -503,6 +555,79 @@ private:
         out->height = (int)dm.dmPelsHeight;
         out->hz = (int)dm.dmDisplayFrequency;
         return true;
+    }
+
+    // 通过 DisplayConfig 私有 DPI 扩展包（-3 查询 / -4 设置）探测并按需应用独立缩放
+    void ApplyDisplayDpiScale(const std::wstring& devName, int targetDpiPercent) {
+        struct DpiScaleGet {
+            DISPLAYCONFIG_DEVICE_INFO_HEADER header;
+            INT32 minScaleRel;
+            INT32 curScaleRel;
+            INT32 maxScaleRel;
+        };
+        struct DpiScaleSet {
+            DISPLAYCONFIG_DEVICE_INFO_HEADER header;
+            INT32 scaleRel;
+        };
+        static const int kDpiVals[] = { 100, 125, 150, 175, 200, 225, 250, 300, 350, 400, 450, 500 };
+        constexpr int kNumDpi = (int)(sizeof(kDpiVals) / sizeof(kDpiVals[0]));
+
+        UINT32 np = 0, nm = 0;
+        if (GetDisplayConfigBufferSizes(QDC_ONLY_ACTIVE_PATHS, &np, &nm) != ERROR_SUCCESS || np == 0) return;
+        std::vector<DISPLAYCONFIG_PATH_INFO> paths(np);
+        std::vector<DISPLAYCONFIG_MODE_INFO> modes(nm);
+        if (QueryDisplayConfig(QDC_ONLY_ACTIVE_PATHS, &np, paths.data(), &nm, modes.data(), nullptr) != ERROR_SUCCESS) return;
+
+        for (UINT32 i = 0; i < np; ++i) {
+            DISPLAYCONFIG_SOURCE_DEVICE_NAME sn{};
+            sn.header.type = DISPLAYCONFIG_DEVICE_INFO_GET_SOURCE_NAME;
+            sn.header.size = sizeof(sn);
+            sn.header.adapterId = paths[i].sourceInfo.adapterId;
+            sn.header.id = paths[i].sourceInfo.id;
+            if (DisplayConfigGetDeviceInfo(&sn.header) != ERROR_SUCCESS) continue;
+            if (_wcsicmp(sn.viewGdiDeviceName, devName.c_str()) != 0) continue;
+
+            DpiScaleGet dg{};
+            dg.header.type = (DISPLAYCONFIG_DEVICE_INFO_TYPE)-3;
+            dg.header.size = sizeof(dg);
+            dg.header.adapterId = paths[i].sourceInfo.adapterId;
+            dg.header.id = paths[i].sourceInfo.id;
+            if (DisplayConfigGetDeviceInfo(&dg.header) != ERROR_SUCCESS) return;
+
+            int recIdx = std::clamp(-dg.minScaleRel, 0, kNumDpi - 1);
+            int curIdx = std::clamp(recIdx + dg.curScaleRel, 0, kNumDpi - 1);
+            char msg[160];
+            snprintf(msg, sizeof(msg), "WinVDD: 虚拟屏当前 DPI 缩放 %d%% (系统推荐 %d%%)",
+                     kDpiVals[curIdx], kDpiVals[recIdx]);
+            EmitLog(msg);
+
+            if (targetDpiPercent >= 100) {
+                int bestIdx = recIdx;
+                int bestDiff = 9999;
+                for (int k = 0; k < kNumDpi; ++k) {
+                    int d = std::abs(kDpiVals[k] - targetDpiPercent);
+                    if (d < bestDiff) { bestDiff = d; bestIdx = k; }
+                }
+                int desiredRel = std::clamp(bestIdx - recIdx, (int)dg.minScaleRel, (int)dg.maxScaleRel);
+                if (desiredRel != dg.curScaleRel) {
+                    DpiScaleSet ds{};
+                    ds.header.type = (DISPLAYCONFIG_DEVICE_INFO_TYPE)-4;
+                    ds.header.size = sizeof(ds);
+                    ds.header.adapterId = paths[i].sourceInfo.adapterId;
+                    ds.header.id = paths[i].sourceInfo.id;
+                    ds.scaleRel = desiredRel;
+                    LONG sr = DisplayConfigSetDeviceInfo(&ds.header);
+                    if (sr == ERROR_SUCCESS) {
+                        int appliedIdx = std::clamp(recIdx + desiredRel, 0, kNumDpi - 1);
+                        snprintf(msg, sizeof(msg), "WinVDD: 已设置虚拟屏 DPI 缩放 -> %d%%", kDpiVals[appliedIdx]);
+                    } else {
+                        snprintf(msg, sizeof(msg), "WinVDD: 设置虚拟屏 DPI 缩放失败 r=%ld", sr);
+                    }
+                    EmitLog(msg);
+                }
+            }
+            break;
+        }
     }
 };
 

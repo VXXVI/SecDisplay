@@ -34,10 +34,21 @@
 #include <cstring>
 #include <deque>
 #include <functional>
+#include <map>
 #include <mutex>
 #include <string>
 #include <thread>
 #include <vector>
+
+#ifndef SIO_KEEPALIVE_VALS
+#define SIO_KEEPALIVE_VALS _WSAIOW(IOC_VENDOR, 4)
+#endif
+
+struct WinHostKeepAliveCfg {
+    ULONG onoff;
+    ULONG keepalivetime;
+    ULONG keepaliveinterval;
+};
 
 #ifdef _MSC_VER
 #pragma comment(lib, "ws2_32.lib")
@@ -62,15 +73,18 @@ struct WinHostStats {
     std::atomic<uint64_t> bytesSent{0};
     std::atomic<uint64_t> framesDropped{0};
     std::atomic<uint64_t> encodeFail{0};
+    std::atomic<uint64_t> fenceTimeouts{0};
     std::atomic<uint64_t> cursorSent{0};
     std::atomic<uint64_t> inputRecv{0};
     std::atomic<double>   lastEncMs{0.0};
     std::atomic<int>      bitrateMbps{80};
     std::atomic<int>      targetBitrateMbps{80};
     std::atomic<uint64_t> connStartTick{0};
+    std::atomic<uint64_t> lastSentTick{0};
     std::mutex            infoMtx;
     std::string           peerAddr = "--";
     std::wstring          encoderName = L"--";
+    std::string           lastError;
 };
 
 class WinHostSender {
@@ -86,12 +100,12 @@ public:
     WinHostStats& Stats() { return stats_; }
     const WinHostStats& Stats() const { return stats_; }
 
-    bool Start(const std::string& targetHost, int width, int height, int fps, int bitrateMbps, uint16_t port, LogFn logFn) {
+    bool Start(const std::string& targetHost, int width, int height, int fps, int bitrateMbps, uint16_t port, LogFn logFn, int dpiPercent = 0) {
         Stop();
         logFn_ = std::move(logFn);
         targetHost_ = targetHost.empty() ? "10.10.10.1" : targetHost;
-        reqW_ = width > 0 ? width : 2560;
-        reqH_ = height > 0 ? height : 1600;
+        reqW_ = width > 0 ? width : 2880;
+        reqH_ = height > 0 ? height : 1800;
         reqFps_ = (fps >= 24 && fps <= 144) ? fps : 60;
         if (bitrateMbps < 10) bitrateMbps = 10;
         if (bitrateMbps > 200) bitrateMbps = 200;
@@ -102,15 +116,35 @@ public:
         stats_.targetBitrateMbps = targetMbps_;
         stats_.bitrateMbps = bitrateMbps;
         stats_.fps = reqFps_;
+        stats_.lastSentTick = 0;
+        {
+            std::lock_guard<std::mutex> ilk(stats_.infoMtx);
+            stats_.lastError.clear();
+        }
 
-        if (!vdd_.Start(reqW_, reqH_, reqFps_, logFn_)) {
+        if (!vdd_.Start(reqW_, reqH_, reqFps_, logFn_, dpiPercent)) {
+            std::string drvDesc;
+            WinVirtualDisplay::QueryDriverStatus(&drvDesc);
+            {
+                std::lock_guard<std::mutex> ilk(stats_.infoMtx);
+                stats_.lastError = drvDesc.empty() ? "虚拟屏启动失败" : drvDesc;
+            }
             EmitLog("WinHost: 虚拟屏启动失败");
             return false;
         }
         WinVddBounds b = vdd_.Bounds();
+        if (b.width <= 0 || b.height <= 0) {
+            {
+                std::lock_guard<std::mutex> ilk(stats_.infoMtx);
+                stats_.lastError = "虚拟屏尺寸无效";
+            }
+            EmitLog("WinHost: 虚拟屏报告无效尺寸，停止启动");
+            vdd_.Stop();
+            return false;
+        }
         stats_.width = b.width;
         stats_.height = b.height;
-        stats_.fps = b.hz > 0 ? b.hz : reqFps_;
+        stats_.fps = (b.hz >= 24 && b.hz <= 240) ? b.hz : reqFps_;
 
         {
             char msg[128];
@@ -125,6 +159,43 @@ public:
         cursorThread_ = std::thread(&WinHostSender::CursorLoop, this);
         return true;
     }
+
+    // 不断虚拟屏的快速重连：仅关闭当前 TCP 套接字，ConnectLoop 在 1.5s 内自动重连
+    void RestartConnection() {
+        std::lock_guard<std::mutex> slk(sendMtx_);
+        SOCKET cur = INVALID_SOCKET;
+        {
+            std::lock_guard<std::mutex> lk(sockMtx_);
+            cur = clientSock_;
+        }
+        if (cur != INVALID_SOCKET) {
+            shutdown(cur, SD_BOTH);
+        }
+        EmitLog("WinHost: 已触发快速重连（保留虚拟屏）");
+    }
+
+    bool SetResolution(int width, int height, int hz = 0) {
+        int useHz = (hz >= 24 && hz <= 240) ? hz : reqFps_;
+        if (!vdd_.SetMode(width, height, useHz)) return false;
+        WinVddBounds b = vdd_.Bounds();
+        reqW_ = b.width;
+        reqH_ = b.height;
+        stats_.width = b.width;
+        stats_.height = b.height;
+        stats_.fps = (b.hz >= 24 && b.hz <= 240) ? b.hz : useHz;
+        forceKeyframe_.store(true);
+        return true;
+    }
+
+    void SetTargetMbps(int mbps) {
+        int clamped = std::clamp(mbps, 10, 200);
+        targetMbps_ = clamped;
+        curMbps_.store(clamped);
+        stats_.targetBitrateMbps = clamped;
+        stats_.bitrateMbps = clamped;
+    }
+
+    bool VddActive() const { return vdd_.IsActive(); }
 
     void Stop() {
         alive_.store(false);
@@ -310,6 +381,7 @@ private:
         memcpy(pkt.data() + 13, avcc.data(), avcc.size());
         if (SendRawPacket(pkt.data(), pkt.size())) {
             stats_.framesSent++;
+            stats_.lastSentTick = GetTickCount64();
             lastPayloadUs_.store(NowMicros());
         } else {
             stats_.framesDropped++;
@@ -348,8 +420,37 @@ private:
     void ConnectLoop() {
         int connFailCount = 0;
         while (alive_.load()) {
-            SOCKET cs = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+            addrinfo hints{};
+            hints.ai_socktype = SOCK_STREAM;
+            hints.ai_protocol = IPPROTO_TCP;
+            hints.ai_family = AF_UNSPEC;
+            addrinfo* resList = nullptr;
+            char portStr[16];
+            snprintf(portStr, sizeof(portStr), "%u", port_);
+            int gaiErr = getaddrinfo(targetHost_.c_str(), portStr, &hints, &resList);
+            if (gaiErr != 0 || !resList) {
+                ++connFailCount;
+                if (connFailCount == 1 || connFailCount % 30 == 0) {
+                    char msg[192];
+                    snprintf(msg, sizeof(msg), "WinHost: 解析目标地址 %s:%u 失败 (err=%d, 第%d次)",
+                             targetHost_.c_str(), port_, gaiErr, connFailCount);
+                    EmitLog(msg);
+                }
+                if (resList) freeaddrinfo(resList);
+                for (int i = 0; i < 20 && alive_.load(); ++i) Sleep(100);
+                continue;
+            }
+
+            // 优先选择 IPv4，其次 IPv6
+            addrinfo* chosen = nullptr;
+            for (addrinfo* p = resList; p; p = p->ai_next) {
+                if (p->ai_family == AF_INET) { chosen = p; break; }
+            }
+            if (!chosen) chosen = resList;
+
+            SOCKET cs = socket(chosen->ai_family, chosen->ai_socktype, chosen->ai_protocol);
             if (cs == INVALID_SOCKET) {
+                freeaddrinfo(resList);
                 for (int i = 0; i < 15 && alive_.load(); ++i) Sleep(100);
                 continue;
             }
@@ -360,25 +461,17 @@ private:
             int nodelay = 1, keepalive = 1;
             setsockopt(cs, IPPROTO_TCP, TCP_NODELAY, (const char*)&nodelay, sizeof(nodelay));
             setsockopt(cs, SOL_SOCKET, SO_KEEPALIVE, (const char*)&keepalive, sizeof(keepalive));
-
-            sockaddr_in addr{};
-            addr.sin_family = AF_INET;
-            addr.sin_port = htons(port_);
-            if (inet_pton(AF_INET, targetHost_.c_str(), &addr.sin_addr) != 1) {
-                ++connFailCount;
-                if (connFailCount == 1 || connFailCount % 30 == 0) {
-                    char msg[160];
-                    snprintf(msg, sizeof(msg), "WinHost: 无效目标 IP %s (仅支持 IPv4 地址)", targetHost_.c_str());
-                    EmitLog(msg);
-                }
-                closesocket(cs);
-                for (int i = 0; i < 20 && alive_.load(); ++i) Sleep(100);
-                continue;
+            {
+                WinHostKeepAliveCfg ka{ 1, 5000, 2000 };
+                DWORD retBytes = 0;
+                WSAIoctl(cs, SIO_KEEPALIVE_VALS, &ka, sizeof(ka), nullptr, 0, &retBytes, nullptr, nullptr);
             }
 
             u_long nb = 1;
             ioctlsocket(cs, FIONBIO, &nb);
-            connect(cs, (sockaddr*)&addr, sizeof(addr));
+            connect(cs, chosen->ai_addr, (int)chosen->ai_addrlen);
+            freeaddrinfo(resList);
+
             fd_set wfds, efds;
             FD_ZERO(&wfds); FD_ZERO(&efds);
             FD_SET(cs, &wfds); FD_SET(cs, &efds);
@@ -403,7 +496,7 @@ private:
             nb = 0;
             ioctlsocket(cs, FIONBIO, &nb);
 
-            DWORD rcvTo = 500, sndTo = 3000;
+            DWORD rcvTo = 500, sndTo = 1500;
             setsockopt(cs, SOL_SOCKET, SO_RCVTIMEO, (const char*)&rcvTo, sizeof(rcvTo));
             setsockopt(cs, SOL_SOCKET, SO_SNDTIMEO, (const char*)&sndTo, sizeof(sndTo));
 
@@ -431,7 +524,8 @@ private:
 
             // 先发会话头再置 clientConnected=true，确保 0x06 总是早于首帧 0x01 到达
             WinVddBounds b = vdd_.Bounds();
-            SendSessionHeader(b.width, b.height, b.hz > 0 ? b.hz : reqFps_);
+            int initHz = (b.hz >= 24 && b.hz <= 240) ? b.hz : reqFps_;
+            SendSessionHeader(b.width, b.height, initHz);
             stats_.clientConnected = true;
 
             {
@@ -451,6 +545,7 @@ private:
         uint8_t buf[4096];
         std::vector<uint8_t> acc;
         acc.reserve(4096);
+        ULONGLONG lastRxTick = GetTickCount64();
         while (alive_.load()) {
             {
                 std::lock_guard<std::mutex> lk(sockMtx_);
@@ -458,17 +553,26 @@ private:
             }
             int n = recv(cs, (char*)buf, sizeof(buf), 0);
             if (n > 0) {
+                lastRxTick = GetTickCount64();
                 acc.insert(acc.end(), buf, buf + n);
                 ProcessControlBytes(acc);
             } else if (n == 0) {
                 break;
             } else {
                 int err = WSAGetLastError();
-                if (err == WSAETIMEDOUT || err == WSAEINTR) continue;
+                if (err == WSAETIMEDOUT || err == WSAEINTR) {
+                    // Mac 端每 2 秒发送一次 0x07 反馈；连续 15 秒无任何对端回包判定链路已死
+                    if (GetTickCount64() - lastRxTick >= 15000ULL) {
+                        EmitLog("WinHost: 超过 15 秒未收到 Mac 副屏心跳/反馈，主动重连");
+                        break;
+                    }
+                    continue;
+                }
                 break;
             }
         }
         DisconnectClient(cs);
+        ReleaseAllInputs();
         EmitLog("WinHost: Mac 副屏连接断开");
     }
 
@@ -533,7 +637,14 @@ private:
     }
 
     // ---- 反向输入注入（Mac 副屏 → Windows 虚拟屏）----
+    struct HeldKeyEntry {
+        uint16_t vk;
+        uint16_t scan;
+        uint8_t  flags;
+    };
+    std::mutex inputMtx_;
     uint8_t prevMouseButtons_ = 0;
+    std::map<uint64_t, HeldKeyEntry> heldKeys_;
 
     void InjectMouse(float rx, float ry, uint8_t buttons, int16_t wheel) {
         WinVddBounds b = vdd_.Bounds();
@@ -558,21 +669,24 @@ private:
         mv.mi.dwFlags = MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_VIRTUALDESK;
         inputs.push_back(mv);
 
-        auto addBtn = [&](uint8_t mask, DWORD downFlag, DWORD upFlag) {
-            bool was = (prevMouseButtons_ & mask) != 0;
-            bool now = (buttons & mask) != 0;
-            if (now == was) return;
-            INPUT bi{};
-            bi.type = INPUT_MOUSE;
-            bi.mi.dx = normX;
-            bi.mi.dy = normY;
-            bi.mi.dwFlags = MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_VIRTUALDESK | (now ? downFlag : upFlag);
-            inputs.push_back(bi);
-        };
-        addBtn(0x01, MOUSEEVENTF_LEFTDOWN,   MOUSEEVENTF_LEFTUP);
-        addBtn(0x02, MOUSEEVENTF_RIGHTDOWN,  MOUSEEVENTF_RIGHTUP);
-        addBtn(0x04, MOUSEEVENTF_MIDDLEDOWN, MOUSEEVENTF_MIDDLEUP);
-        prevMouseButtons_ = buttons;
+        {
+            std::lock_guard<std::mutex> ilk(inputMtx_);
+            auto addBtn = [&](uint8_t mask, DWORD downFlag, DWORD upFlag) {
+                bool was = (prevMouseButtons_ & mask) != 0;
+                bool now = (buttons & mask) != 0;
+                if (now == was) return;
+                INPUT bi{};
+                bi.type = INPUT_MOUSE;
+                bi.mi.dx = normX;
+                bi.mi.dy = normY;
+                bi.mi.dwFlags = MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_VIRTUALDESK | (now ? downFlag : upFlag);
+                inputs.push_back(bi);
+            };
+            addBtn(0x01, MOUSEEVENTF_LEFTDOWN,   MOUSEEVENTF_LEFTUP);
+            addBtn(0x02, MOUSEEVENTF_RIGHTDOWN,  MOUSEEVENTF_RIGHTUP);
+            addBtn(0x04, MOUSEEVENTF_MIDDLEDOWN, MOUSEEVENTF_MIDDLEUP);
+            prevMouseButtons_ = buttons;
+        }
 
         if (wheel != 0) {
             INPUT wi{};
@@ -589,17 +703,73 @@ private:
         SendInput((UINT)inputs.size(), inputs.data(), sizeof(INPUT));
     }
 
-    static void InjectKeyboard(uint16_t vk, uint16_t scan, bool down, uint8_t flags) {
-        if (vk == 0) return;
+    void InjectKeyboard(uint16_t vk, uint16_t scan, bool down, uint8_t flags) {
+        if (vk == 0 && scan == 0) return;
         INPUT in{};
         in.type = INPUT_KEYBOARD;
-        in.ki.wVk = vk;
-        in.ki.wScan = scan ? scan : (uint16_t)MapVirtualKeyW(vk, MAPVK_VK_TO_VSC);
         DWORD dw = 0;
+        if (vk == 0) {
+            in.ki.wScan = scan;
+            dw |= KEYEVENTF_SCANCODE;
+        } else {
+            in.ki.wVk = vk;
+            in.ki.wScan = scan ? scan : (uint16_t)MapVirtualKeyW(vk, MAPVK_VK_TO_VSC);
+        }
         if (flags & 0x01) dw |= KEYEVENTF_EXTENDEDKEY;
         if (!down) dw |= KEYEVENTF_KEYUP;
         in.ki.dwFlags = dw;
+
+        {
+            std::lock_guard<std::mutex> ilk(inputMtx_);
+            uint64_t k = ((uint64_t)(flags & 0x01) << 32) | ((uint64_t)vk << 16) | (uint64_t)scan;
+            if (down) {
+                heldKeys_[k] = HeldKeyEntry{ vk, scan, flags };
+            } else {
+                heldKeys_.erase(k);
+            }
+        }
         SendInput(1, &in, sizeof(INPUT));
+    }
+
+    void ReleaseAllInputs() {
+        std::vector<INPUT> inputs;
+        {
+            std::lock_guard<std::mutex> ilk(inputMtx_);
+            if (prevMouseButtons_ & 0x01) {
+                INPUT bi{}; bi.type = INPUT_MOUSE; bi.mi.dwFlags = MOUSEEVENTF_LEFTUP;
+                inputs.push_back(bi);
+            }
+            if (prevMouseButtons_ & 0x02) {
+                INPUT bi{}; bi.type = INPUT_MOUSE; bi.mi.dwFlags = MOUSEEVENTF_RIGHTUP;
+                inputs.push_back(bi);
+            }
+            if (prevMouseButtons_ & 0x04) {
+                INPUT bi{}; bi.type = INPUT_MOUSE; bi.mi.dwFlags = MOUSEEVENTF_MIDDLEUP;
+                inputs.push_back(bi);
+            }
+            prevMouseButtons_ = 0;
+
+            for (const auto& kv : heldKeys_) {
+                const HeldKeyEntry& e = kv.second;
+                INPUT in{};
+                in.type = INPUT_KEYBOARD;
+                DWORD dw = KEYEVENTF_KEYUP;
+                if (e.vk == 0) {
+                    in.ki.wScan = e.scan;
+                    dw |= KEYEVENTF_SCANCODE;
+                } else {
+                    in.ki.wVk = e.vk;
+                    in.ki.wScan = e.scan ? e.scan : (uint16_t)MapVirtualKeyW(e.vk, MAPVK_VK_TO_VSC);
+                }
+                if (e.flags & 0x01) dw |= KEYEVENTF_EXTENDEDKEY;
+                in.ki.dwFlags = dw;
+                inputs.push_back(in);
+            }
+            heldKeys_.clear();
+        }
+        if (!inputs.empty()) {
+            SendInput((UINT)inputs.size(), inputs.data(), sizeof(INPUT));
+        }
     }
 
     // ---- 光标位置与位图采集（Windows → Mac）----
@@ -810,9 +980,11 @@ private:
         Microsoft::WRL::ComPtr<ID3D11VideoContext> vctx;
         Microsoft::WRL::ComPtr<ID3D11VideoProcessorEnumerator> vpEnum;
         Microsoft::WRL::ComPtr<ID3D11VideoProcessor> vp;
-        static constexpr int kNv12PoolSize = 4;
+        static constexpr int kNv12PoolSize = 6;
         Microsoft::WRL::ComPtr<ID3D11Texture2D> bgraCopy;
+        Microsoft::WRL::ComPtr<ID3D11VideoProcessorInputView> bgraInputView;
         Microsoft::WRL::ComPtr<ID3D11Texture2D> nv12Pool[kNv12PoolSize];
+        Microsoft::WRL::ComPtr<ID3D11VideoProcessorOutputView> nv12OutputViews[kNv12PoolSize];
         int poolIdx = 0;
         Microsoft::WRL::ComPtr<ID3D11Query> vpFence;
         Microsoft::WRL::ComPtr<ID3D11Texture2D> stagingBgra;
@@ -837,8 +1009,12 @@ private:
             codecApi.Reset();
             evtGen.Reset();
             mft.Reset();
+            bgraInputView.Reset();
             bgraCopy.Reset();
-            for (int i = 0; i < kNv12PoolSize; ++i) nv12Pool[i].Reset();
+            for (int i = 0; i < kNv12PoolSize; ++i) {
+                nv12OutputViews[i].Reset();
+                nv12Pool[i].Reset();
+            }
             poolIdx = 0;
             vpFence.Reset();
             stagingBgra.Reset();
@@ -921,7 +1097,42 @@ private:
             }
             {
                 D3D11_QUERY_DESC qd{ D3D11_QUERY_EVENT, 0 };
-                dev->CreateQuery(&qd, &vpFence);
+                if (FAILED(dev->CreateQuery(&qd, &vpFence))) {
+                    vpFence.Reset();
+                }
+            }
+            if (vp && vpEnum && vdev && vctx) {
+                D3D11_VIDEO_PROCESSOR_INPUT_VIEW_DESC ivd{};
+                ivd.FourCC = 0;
+                ivd.ViewDimension = D3D11_VPIV_DIMENSION_TEXTURE2D;
+                ivd.Texture2D.MipSlice = 0;
+                if (FAILED(vdev->CreateVideoProcessorInputView(bgraCopy.Get(), vpEnum.Get(), &ivd, &bgraInputView))) {
+                    bgraInputView.Reset();
+                }
+                for (int i = 0; i < kNv12PoolSize; ++i) {
+                    D3D11_VIDEO_PROCESSOR_OUTPUT_VIEW_DESC ovd{};
+                    ovd.ViewDimension = D3D11_VPOV_DIMENSION_TEXTURE2D;
+                    ovd.Texture2D.MipSlice = 0;
+                    if (FAILED(vdev->CreateVideoProcessorOutputView(nv12Pool[i].Get(), vpEnum.Get(), &ovd, &nv12OutputViews[i]))) {
+                        nv12OutputViews[i].Reset();
+                    }
+                }
+                RECT srcRc{ 0, 0, w, h };
+                RECT dstRc{ 0, 0, w, h };
+                vctx->VideoProcessorSetStreamFrameFormat(vp.Get(), 0, D3D11_VIDEO_FRAME_FORMAT_PROGRESSIVE);
+                vctx->VideoProcessorSetStreamAutoProcessingMode(vp.Get(), 0, FALSE);
+                vctx->VideoProcessorSetStreamSourceRect(vp.Get(), 0, TRUE, &srcRc);
+                vctx->VideoProcessorSetStreamDestRect(vp.Get(), 0, TRUE, &dstRc);
+                vctx->VideoProcessorSetOutputTargetRect(vp.Get(), TRUE, &dstRc);
+                D3D11_VIDEO_PROCESSOR_COLOR_SPACE inCs{};
+                inCs.RGB_Range = 0;
+                inCs.YCbCr_Matrix = 1;
+                vctx->VideoProcessorSetStreamColorSpace(vp.Get(), 0, &inCs);
+                D3D11_VIDEO_PROCESSOR_COLOR_SPACE outCs{};
+                outCs.RGB_Range = 0;
+                outCs.YCbCr_Matrix = 1;
+                outCs.Nominal_Range = D3D11_VIDEO_PROCESSOR_NOMINAL_RANGE_16_235;
+                vctx->VideoProcessorSetOutputColorSpace(vp.Get(), &outCs);
             }
 
             MFT_REGISTER_TYPE_INFO outInfo{ MFMediaType_Video, MFVideoFormat_H264 };
@@ -1066,61 +1277,64 @@ private:
             }
         }
 
-        ID3D11Texture2D* ConvertBgraToNv12(ID3D11Texture2D* bgraTex) {
+        ID3D11Texture2D* ConvertBgraToNv12(ID3D11Texture2D* bgraTex, WinHostStats* stats = nullptr, LogFn* logFn = nullptr) {
             if (!vp || !vpEnum || !vdev || !vctx || !bgraCopy) return nullptr;
-            ID3D11Texture2D* targetNv12 = nv12Pool[poolIdx].Get();
-            if (!targetNv12) return nullptr;
+            int slot = poolIdx;
             poolIdx = (poolIdx + 1) % kNv12PoolSize;
+            ID3D11Texture2D* targetNv12 = nv12Pool[slot].Get();
+            if (!targetNv12) return nullptr;
 
             // 先从 DXGI Duplication 表面拷贝到稳定 DEFAULT 纹理，确保采集纹理不与 VideoProcessor 并发冲突
             if (bgraTex != bgraCopy.Get()) {
                 ctx->CopyResource(bgraCopy.Get(), bgraTex);
             }
 
-            D3D11_VIDEO_PROCESSOR_INPUT_VIEW_DESC ivd{};
-            ivd.FourCC = 0;
-            ivd.ViewDimension = D3D11_VPIV_DIMENSION_TEXTURE2D;
-            ivd.Texture2D.MipSlice = 0;
-            Microsoft::WRL::ComPtr<ID3D11VideoProcessorInputView> iv;
-            if (FAILED(vdev->CreateVideoProcessorInputView(bgraCopy.Get(), vpEnum.Get(), &ivd, &iv))) return nullptr;
+            Microsoft::WRL::ComPtr<ID3D11VideoProcessorInputView> tmpIv;
+            ID3D11VideoProcessorInputView* ivPtr = bgraInputView.Get();
+            if (!ivPtr) {
+                D3D11_VIDEO_PROCESSOR_INPUT_VIEW_DESC ivd{};
+                ivd.FourCC = 0;
+                ivd.ViewDimension = D3D11_VPIV_DIMENSION_TEXTURE2D;
+                ivd.Texture2D.MipSlice = 0;
+                if (FAILED(vdev->CreateVideoProcessorInputView(bgraCopy.Get(), vpEnum.Get(), &ivd, &tmpIv))) return nullptr;
+                ivPtr = tmpIv.Get();
+            }
 
-            D3D11_VIDEO_PROCESSOR_OUTPUT_VIEW_DESC ovd{};
-            ovd.ViewDimension = D3D11_VPOV_DIMENSION_TEXTURE2D;
-            ovd.Texture2D.MipSlice = 0;
-            Microsoft::WRL::ComPtr<ID3D11VideoProcessorOutputView> ov;
-            if (FAILED(vdev->CreateVideoProcessorOutputView(targetNv12, vpEnum.Get(), &ovd, &ov))) return nullptr;
-
-            RECT srcRc{ 0, 0, w, h };
-            RECT dstRc{ 0, 0, w, h };
-            vctx->VideoProcessorSetStreamAutoProcessingMode(vp.Get(), 0, FALSE);
-            vctx->VideoProcessorSetStreamSourceRect(vp.Get(), 0, TRUE, &srcRc);
-            vctx->VideoProcessorSetStreamDestRect(vp.Get(), 0, TRUE, &dstRc);
-            vctx->VideoProcessorSetOutputTargetRect(vp.Get(), TRUE, &dstRc);
-
-            D3D11_VIDEO_PROCESSOR_COLOR_SPACE inCs{};
-            inCs.RGB_Range = 0; // full 0-255
-            inCs.YCbCr_Matrix = 1; // BT.709
-            vctx->VideoProcessorSetStreamColorSpace(vp.Get(), 0, &inCs);
-
-            D3D11_VIDEO_PROCESSOR_COLOR_SPACE outCs{};
-            outCs.RGB_Range = 0;
-            outCs.YCbCr_Matrix = 1; // BT.709
-            outCs.Nominal_Range = D3D11_VIDEO_PROCESSOR_NOMINAL_RANGE_16_235;
-            vctx->VideoProcessorSetOutputColorSpace(vp.Get(), &outCs);
+            Microsoft::WRL::ComPtr<ID3D11VideoProcessorOutputView> tmpOv;
+            ID3D11VideoProcessorOutputView* ovPtr = nv12OutputViews[slot].Get();
+            if (!ovPtr) {
+                D3D11_VIDEO_PROCESSOR_OUTPUT_VIEW_DESC ovd{};
+                ovd.ViewDimension = D3D11_VPOV_DIMENSION_TEXTURE2D;
+                ovd.Texture2D.MipSlice = 0;
+                if (FAILED(vdev->CreateVideoProcessorOutputView(targetNv12, vpEnum.Get(), &ovd, &tmpOv))) return nullptr;
+                ovPtr = tmpOv.Get();
+            }
 
             D3D11_VIDEO_PROCESSOR_STREAM st{};
             st.Enable = TRUE;
-            st.pInputSurface = iv.Get();
-            HRESULT hr = vctx->VideoProcessorBlt(vp.Get(), ov.Get(), 0, 1, &st);
+            st.pInputSurface = ivPtr;
+            HRESULT hr = vctx->VideoProcessorBlt(vp.Get(), ovPtr, 0, 1, &st);
             if (FAILED(hr)) return nullptr;
             // 等待 VEBOX VideoProcessorBlt 在 GPU 上真实写完再喂给 VDBOX QSV MFT，
             // 仅调用 Flush() 不等待跨引擎完成，会导致画面出现随机白/黑短横线噪点。
             if (vpFence) {
                 ctx->End(vpFence.Get());
                 ctx->Flush();
+                bool done = false;
                 for (int spin = 0; spin < 100; ++spin) {
-                    if (ctx->GetData(vpFence.Get(), nullptr, 0, 0) != S_FALSE) break;
+                    HRESULT qhr = ctx->GetData(vpFence.Get(), nullptr, 0, 0);
+                    if (qhr == S_OK) { done = true; break; }
+                    if (qhr != S_FALSE) break;
                     if (spin < 20) Sleep(0); else Sleep(1);
+                }
+                if (!done && stats) {
+                    uint64_t cnt = ++stats->fenceTimeouts;
+                    if ((cnt == 1 || cnt % 30 == 0) && logFn && *logFn) {
+                        char msg[128];
+                        snprintf(msg, sizeof(msg), "WinHost: VideoProcessor 围栏等待超时 (累计 %llu 次)",
+                                 (unsigned long long)cnt);
+                        (*logFn)(msg);
+                    }
                 }
             } else {
                 ctx->Flush();
@@ -1226,7 +1440,7 @@ private:
         }
 
         bool EncodeTexture(ID3D11Texture2D* bgraTex, bool forceIdr, const std::atomic<bool>& aliveFlag,
-                           std::vector<uint8_t>& outAvcc, bool* outIsIdr, LogFn* logFn = nullptr) {
+                           std::vector<uint8_t>& outAvcc, bool* outIsIdr, LogFn* logFn = nullptr, WinHostStats* stats = nullptr) {
             outAvcc.clear();
             if (outIsIdr) *outIsIdr = false;
             if (!mft) return false;
@@ -1256,7 +1470,7 @@ private:
             MFCreateSample(&inSample);
             bool usedGpuSurface = false;
             if (isHardware) {
-                if (ID3D11Texture2D* nv12Surf = ConvertBgraToNv12(bgraTex)) {
+                if (ID3D11Texture2D* nv12Surf = ConvertBgraToNv12(bgraTex, stats, logFn)) {
                     Microsoft::WRL::ComPtr<IMFMediaBuffer> buf;
                     if (SUCCEEDED(MFCreateDXGISurfaceBuffer(__uuidof(ID3D11Texture2D), nv12Surf, 0, FALSE, &buf))) {
                         Microsoft::WRL::ComPtr<IMF2DBuffer> b2d;
@@ -1329,35 +1543,57 @@ private:
         HRESULT co = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
         bool didCo = SUCCEEDED(co);
 
+        int initFailStreak = 0;
+        auto backoffSleep = [&](const char* reason, HRESULT errHr) {
+            ++initFailStreak;
+            if (initFailStreak == 1 || initFailStreak % 20 == 0) {
+                char msg[224];
+                snprintf(msg, sizeof(msg), "WinHost: %s (hr=0x%08X, 第%d次)",
+                         reason, (unsigned int)errHr, initFailStreak);
+                EmitLog(msg);
+            }
+            int ms = (initFailStreak <= 2) ? 300 : (initFailStreak <= 5 ? 1000 : (initFailStreak <= 10 ? 3000 : 5000));
+            for (int slept = 0; slept < ms && alive_.load(); slept += 100) Sleep(100);
+        };
+
         while (alive_.load()) {
             WinVddBounds b = vdd_.RefreshBounds();
-            if (b.width <= 0 || b.height <= 0) { Sleep(200); continue; }
+            if (b.width <= 0 || b.height <= 0) {
+                backoffSleep("等待虚拟屏就绪", S_OK);
+                continue;
+            }
 
             Microsoft::WRL::ComPtr<IDXGIFactory1> fac;
-            if (FAILED(CreateDXGIFactory1(IID_PPV_ARGS(&fac)))) { Sleep(500); continue; }
+            HRESULT hr = CreateDXGIFactory1(IID_PPV_ARGS(&fac));
+            if (FAILED(hr)) {
+                backoffSleep("CreateDXGIFactory1 失败", hr);
+                continue;
+            }
 
             Microsoft::WRL::ComPtr<IDXGIAdapter1> ad;
             Microsoft::WRL::ComPtr<IDXGIOutput> out;
             if (!vdd_.FindDxgiOutput(fac.Get(), ad, out)) {
-                Sleep(250);
+                backoffSleep("未找到虚拟屏 DXGI 输出", S_FALSE);
                 continue;
             }
 
             Microsoft::WRL::ComPtr<ID3D11Device> dev;
             Microsoft::WRL::ComPtr<ID3D11DeviceContext> ctx;
             D3D_FEATURE_LEVEL lv{};
-            HRESULT hr = D3D11CreateDevice(ad.Get(), D3D_DRIVER_TYPE_UNKNOWN, nullptr,
-                                           D3D11_CREATE_DEVICE_BGRA_SUPPORT | D3D11_CREATE_DEVICE_VIDEO_SUPPORT,
-                                           nullptr, 0, D3D11_SDK_VERSION, &dev, &lv, &ctx);
+            hr = D3D11CreateDevice(ad.Get(), D3D_DRIVER_TYPE_UNKNOWN, nullptr,
+                                   D3D11_CREATE_DEVICE_BGRA_SUPPORT | D3D11_CREATE_DEVICE_VIDEO_SUPPORT,
+                                   nullptr, 0, D3D11_SDK_VERSION, &dev, &lv, &ctx);
             if (FAILED(hr) || !dev) {
-                Sleep(500);
+                backoffSleep("D3D11CreateDevice 失败", hr);
                 continue;
             }
 
             Microsoft::WRL::ComPtr<IDXGIOutput1> out1;
             Microsoft::WRL::ComPtr<IDXGIOutputDuplication> dup;
-            if (FAILED(out.As(&out1)) || FAILED(out1->DuplicateOutput(dev.Get(), &dup))) {
-                Sleep(300);
+            hr = out.As(&out1);
+            if (SUCCEEDED(hr)) hr = out1->DuplicateOutput(dev.Get(), &dup);
+            if (FAILED(hr) || !dup) {
+                backoffSleep("DXGI DuplicateOutput 失败", hr);
                 continue;
             }
 
@@ -1369,14 +1605,15 @@ private:
 
             stats_.width = capW;
             stats_.height = capH;
-            int encFps = b.hz > 0 ? b.hz : reqFps_;
+            int encFps = (b.hz >= 24 && b.hz <= 240) ? b.hz : reqFps_;
             stats_.fps = encFps;
 
             MfH264Encoder enc;
             if (!enc.Init(dev.Get(), ctx.Get(), capW, capH, encFps, curMbps_.load(), logFn_)) {
-                Sleep(1000);
+                backoffSleep("H.264 编码器初始化失败", E_FAIL);
                 continue;
             }
+            initFailStreak = 0;
             {
                 std::lock_guard<std::mutex> lk(stats_.infoMtx);
                 stats_.encoderName = enc.friendlyName;
@@ -1393,7 +1630,8 @@ private:
             uint64_t lastStatBytes = stats_.bytesSent.load();
             bool firstFrame = true;
             bool hasCachedBgra = false;
-            int staticIdrFailStreak = 0;
+            int encFailStreak = 0;
+            int badFormatCount = 0;
 
             while (alive_.load()) {
                 enc.UpdateBitrateIfChanged(curMbps_.load());
@@ -1409,10 +1647,15 @@ private:
                         lastStatSent = curSent;
                         lastStatBytes = curBytes;
                         if (stats_.clientConnected.load()) {
-                            char msg[192];
+                            ULONGLONG lastTx = stats_.lastSentTick.load();
+                            unsigned long long ageMs = lastTx ? (unsigned long long)(nowStat - lastTx) : 0ULL;
+                            char msg[240];
                             snprintf(msg, sizeof(msg),
-                                     "WinHost: %dx%d  %.1f fps  %.1f Mbps (目标 %dM)  编码 %.2f ms  光标 %llu  输入 %llu",
+                                     "WinHost: %dx%d  %.1f fps  %.1f Mbps (目标 %dM)  编码 %.2f ms  距上帧 %llu ms  失败 %llu  围栏超时 %llu  光标 %llu  输入 %llu",
                                      capW, capH, fpsNow, mbpsNow, curMbps_.load(), stats_.lastEncMs.load(),
+                                     ageMs,
+                                     (unsigned long long)stats_.encodeFail.load(),
+                                     (unsigned long long)stats_.fenceTimeouts.load(),
                                      (unsigned long long)stats_.cursorSent.load(),
                                      (unsigned long long)stats_.inputRecv.load());
                             EmitLog(msg);
@@ -1431,8 +1674,8 @@ private:
                             uint64_t capUs = NowMicros();
                             std::vector<uint8_t> avcc;
                             bool isIdr = false;
-                            if (enc.EncodeTexture(enc.bgraCopy.Get(), true, alive_, avcc, &isIdr, &logFn_) && !avcc.empty()) {
-                                staticIdrFailStreak = 0;
+                            if (enc.EncodeTexture(enc.bgraCopy.Get(), true, alive_, avcc, &isIdr, &logFn_, &stats_) && !avcc.empty()) {
+                                encFailStreak = 0;
                                 stats_.framesEncoded++;
                                 SendVideoAvcc(avcc, capUs);
                                 if (!isIdr) forceKeyframe_.store(true);
@@ -1440,7 +1683,7 @@ private:
                             } else {
                                 stats_.encodeFail++;
                                 forceKeyframe_.store(true);
-                                if (++staticIdrFailStreak >= 30) {
+                                if (++encFailStreak >= 30) {
                                     EmitLog("WinHost: 静止桌面补关键帧连续失败 30 次，重建采集与编码器");
                                     break;
                                 }
@@ -1464,7 +1707,9 @@ private:
                 }
 
                 if (hr == DXGI_ERROR_ACCESS_LOST || FAILED(hr)) {
-                    EmitLog("WinHost: DXGI 输出上下文变更，正在重建采集");
+                    char msg[128];
+                    snprintf(msg, sizeof(msg), "WinHost: DXGI 输出上下文变更 (hr=0x%08X)，重建采集", (unsigned int)hr);
+                    EmitLog(msg);
                     break;
                 }
 
@@ -1476,14 +1721,31 @@ private:
                     D3D11_TEXTURE2D_DESC td{};
                     tex->GetDesc(&td);
                     if ((int)td.Width != capW || (int)td.Height != capH) {
+                        char msg[128];
+                        snprintf(msg, sizeof(msg), "WinHost: 分辨率变更 %ux%u -> 重建采集编码", td.Width, td.Height);
+                        EmitLog(msg);
                         dup->ReleaseFrame();
                         break;
                     }
-                    if (enc.bgraCopy) {
+                    if (td.Format != DXGI_FORMAT_B8G8R8A8_UNORM) {
+                        if (++badFormatCount == 1 || badFormatCount % 120 == 0) {
+                            char msg[160];
+                            snprintf(msg, sizeof(msg),
+                                     "WinHost: 采集像素格式非 BGRA8 (format=%u，请关闭虚拟屏 HDR)，跳过本帧",
+                                     (unsigned int)td.Format);
+                            EmitLog(msg);
+                        }
+                        dup->ReleaseFrame();
+                        continue;
+                    }
+                    badFormatCount = 0;
+
+                    bool needSend = stats_.clientConnected.load();
+                    if (enc.bgraCopy && (needSend || !hasCachedBgra || forceKeyframe_.load())) {
                         ctx->CopyResource(enc.bgraCopy.Get(), tex.Get());
                         hasCachedBgra = true;
                     }
-                    if (stats_.clientConnected.load()) {
+                    if (needSend) {
                         LARGE_INTEGER t0{}, t1{};
                         QueryPerformanceCounter(&t0);
                         uint64_t capUs = NowMicros();
@@ -1491,19 +1753,24 @@ private:
                         std::vector<uint8_t> avcc;
                         bool isIdr = false;
                         ID3D11Texture2D* srcTex = enc.bgraCopy ? enc.bgraCopy.Get() : tex.Get();
-                        if (enc.EncodeTexture(srcTex, wantIdr, alive_, avcc, &isIdr, &logFn_) && !avcc.empty()) {
+                        if (enc.EncodeTexture(srcTex, wantIdr, alive_, avcc, &isIdr, &logFn_, &stats_) && !avcc.empty()) {
                             QueryPerformanceCounter(&t1);
                             double encMs = (double)(t1.QuadPart - t0.QuadPart) * 1000.0 / (double)qpf.QuadPart;
                             stats_.lastEncMs = encMs;
                             stats_.framesEncoded++;
-                            staticIdrFailStreak = 0;
+                            encFailStreak = 0;
                             if (wantIdr && !isIdr) {
                                 forceKeyframe_.store(true);
                             }
                             SendVideoAvcc(avcc, capUs);
-                        } else if (wantIdr) {
-                            forceKeyframe_.store(true);
+                        } else {
                             stats_.encodeFail++;
+                            if (wantIdr) forceKeyframe_.store(true);
+                            if (++encFailStreak >= 30) {
+                                EmitLog("WinHost: 编码连续失败 30 次，重建采集与编码器");
+                                dup->ReleaseFrame();
+                                break;
+                            }
                         }
                     }
                 }

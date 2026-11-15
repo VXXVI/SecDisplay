@@ -2332,7 +2332,20 @@ static const int IDC_PANEL_SENDFILE = 2030;
 static const int IDC_PANEL_OPENXFER = 2031;
 static const int IDC_PANEL_DROPBOX  = 2032;
 static const int IDC_PANEL_PASTEXFER = 2033;
-static const int IDC_PANEL_MODE     = 2034;
+static const int IDC_PANEL_MODE      = 2034;
+static const int IDC_PANEL_RES_2880  = 2035;
+static const int IDC_PANEL_RES_2560  = 2036;
+static const int IDC_PANEL_RES_1920  = 2037;
+static const int IDC_PANEL_MBPS_30   = 2038;
+static const int IDC_PANEL_MBPS_50   = 2039;
+static const int IDC_PANEL_MBPS_80   = 2040;
+static const int IDC_PANEL_VDD_RETRY = 2041;
+
+static std::atomic<int> g_hostReqW{2880};
+static std::atomic<int> g_hostReqH{1800};
+static std::atomic<int> g_hostReqFps{60};
+static std::atomic<int> g_hostReqMbps{50};
+static std::atomic<int> g_hostReqDpi{0};
 
 static ULONG_PTR g_gdipToken = 0;
 
@@ -3032,25 +3045,36 @@ static void CopyDiagnostics() {
         }
         ULONGLONG hStart = hs.connStartTick.load();
         unsigned long long hUp = (hs.clientConnected.load() && hStart) ? (GetTickCount64() - hStart) / 1000 : 0;
+        bool vddOk = g_winHost.VddActive();
+        std::string hostErr;
+        {
+            std::lock_guard<std::mutex> lk(hs.infoMtx);
+            hostErr = hs.lastError;
+        }
         swprintf(buf, 2048,
             L"SecDisplay 诊断（主控发送端 Win→Mac）\r\n"
             L"状态: %s\r\n"
+            L"虚拟屏(VDD): %s%hs%s\r\n"
             L"Mac 副屏: %hs\r\n"
-            L"虚拟屏: %dx%d @ %dHz\r\n"
+            L"虚拟屏分辨率: %dx%d @ %dHz\r\n"
             L"连接时长: %llu 秒\r\n"
             L"帧率: %.1f fps  码率: %.1f Mbps (目标 %d Mbps)\r\n"
-            L"编码耗时: %.2f ms  失败: %llu  丢弃: %llu\r\n"
+            L"编码耗时: %.2f ms  失败: %llu  围栏超时: %llu  丢弃: %llu\r\n"
             L"光标发送: %llu  收到输入: %llu\r\n"
             L"编码器: %s\r\n"
             L"进程内存: 工作集 %.0f MB / 私有 %.0f MB\r\n"
             L"日志: %hs\r\n"
             L"程序: %hs",
-            hs.clientConnected.load() ? L"已连接" : L"等待 Mac 副屏",
+            hs.clientConnected.load() ? L"已连接" : L"尝试连接 Mac 副屏",
+            vddOk ? L"已挂载" : L"未就绪",
+            hostErr.empty() ? "" : " (",
+            hostErr.empty() ? L"" : ToWide(hostErr.c_str(), (int)hostErr.size()).c_str(),
             peerStr.c_str(),
             hs.width.load(), hs.height.load(), hs.fps.load(), hUp,
             g_uiFps.load(), g_uiMbps.load(), hs.bitrateMbps.load(),
             hs.lastEncMs.load(),
             (unsigned long long)hs.encodeFail.load(),
+            (unsigned long long)hs.fenceTimeouts.load(),
             (unsigned long long)hs.framesDropped.load(),
             (unsigned long long)hs.cursorSent.load(),
             (unsigned long long)hs.inputRecv.load(),
@@ -3141,17 +3165,34 @@ static void UpdateControlPanel() {
         g_uiMbps.store(mbps);
 
         bool connected = hs.clientConnected.load();
+        bool vddOk = g_winHost.VddActive();
+        ULONGLONG lastTx = hs.lastSentTick.load();
+        bool staticIdle = connected && sentF > 0 && lastTx > 0 && (GetTickCount64() - lastTx > 1500ULL);
         bool streaming = connected && sentF > 0;
-        g_panelData.state = streaming ? 2 : (connected ? 1 : 0);
-        g_panelData.statusText = streaming ? L"主控发送中 · Mac 副屏在线"
-                             : (connected ? L"Mac 已连接 · 准备推流" : L"主控待命 · 等待 Mac 副屏连接 (9922)");
+        if (!vddOk) {
+            g_panelData.state = 0;
+            g_panelData.statusText = L"虚拟屏异常 · 请检查 Parsec VDD 或点击重挂";
+        } else if (streaming) {
+            g_panelData.state = 2;
+            g_panelData.statusText = staticIdle ? L"主控在线 · 桌面静止省流中" : L"主控发送中 · Mac 副屏在线";
+        } else if (connected) {
+            g_panelData.state = 1;
+            g_panelData.statusText = L"Mac 已连接 · 准备推流";
+        } else {
+            g_panelData.state = 0;
+            wchar_t waitBuf[128];
+            swprintf(waitBuf, 128, L"主控待命 · 连接 Mac 副屏 (%d)", g_peerPort);
+            g_panelData.statusText = waitBuf;
+        }
 
         wchar_t buf[256];
+        std::wstring encNameCopy;
         {
             std::lock_guard<std::mutex> lk(hs.infoMtx);
             std::wstring wp = ToWide(hs.peerAddr.c_str(), (int)hs.peerAddr.size());
             g_panelData.peerText = wp.empty() ? L"--" : wp;
-            g_panelData.decoderText = hs.encoderName.empty() ? L"--" : hs.encoderName;
+            encNameCopy = hs.encoderName;
+            g_panelData.decoderText = encNameCopy.empty() ? L"--" : encNameCopy;
         }
         swprintf(buf, 256, L"%d × %d @ %dHz", hs.width.load(), hs.height.load(), hs.fps.load());
         g_panelData.sizeText = buf;
@@ -3174,10 +3215,15 @@ static void UpdateControlPanel() {
         g_panelData.presLatText = buf;
 
         uint64_t encFail = hs.encodeFail.load();
+        uint64_t fenceTo = hs.fenceTimeouts.load();
         uint64_t drop = hs.framesDropped.load();
-        swprintf(buf, 256, L"%llu", (unsigned long long)encFail);
+        if (fenceTo > 0) {
+            swprintf(buf, 256, L"%llu (围栏 %llu)", (unsigned long long)encFail, (unsigned long long)fenceTo);
+        } else {
+            swprintf(buf, 256, L"%llu", (unsigned long long)encFail);
+        }
         g_panelData.decFailText = buf;
-        g_panelData.decFailWarn = encFail > 0;
+        g_panelData.decFailWarn = (encFail > 0 || fenceTo > 0);
         swprintf(buf, 256, L"%llu", (unsigned long long)hs.framesSent.load());
         g_panelData.presFailText = buf;
         g_panelData.presFailWarn = false;
@@ -3194,10 +3240,16 @@ static void UpdateControlPanel() {
                      pmc.WorkingSetSize / 1048576.0, pmc.PrivateUsage / 1048576.0);
             g_panelData.procMemText = buf;
         }
-        g_panelData.cpuText = L"QSV 硬件路径";
-        g_panelData.gpuMemText = L"Parsec VDD 扩展屏";
-        g_panelData.keepOnActive = true;
-        g_panelData.keepOnText = L"虚拟屏已挂载";
+        if (encNameCopy.find(L"(硬件)") != std::wstring::npos) {
+            g_panelData.cpuText = L"硬件编码加速";
+        } else if (encNameCopy.find(L"(软件)") != std::wstring::npos) {
+            g_panelData.cpuText = L"软件编码兜底";
+        } else {
+            g_panelData.cpuText = L"--";
+        }
+        g_panelData.gpuMemText = vddOk ? L"Parsec VDD 已挂载" : L"Parsec VDD 未挂载";
+        g_panelData.keepOnActive = vddOk;
+        g_panelData.keepOnText = vddOk ? L"虚拟屏运行中" : L"虚拟屏未就绪";
         g_panelData.xferConnected = g_xferConnected.load();
         {
             std::lock_guard<std::mutex> lk(g_xferMtx);
@@ -3526,8 +3578,10 @@ static void PaintControlPanel(HWND h) {
     drawSectionHeader(c1x, cy, c1w, L"连接与速率");
     {
         int px = c1x + S(16), pw = c1w - S(32), rowY = cy + S(44), step = S(29), rh = S(25);
-        const wchar_t* shortSt = g_panelData.state == 2 ? L"正在接收"
-                               : (g_panelData.state == 1 ? L"等待首帧" : L"等待重连");
+        const bool hm = g_hostMode.load();
+        const wchar_t* shortSt = g_panelData.state == 2 ? (hm ? L"主控推送中" : L"正在接收")
+                               : (g_panelData.state == 1 ? (hm ? L"准备推流" : L"等待首帧")
+                                                         : (hm ? L"等待重连" : L"等待重连"));
         DrawKVRow(hdc, px, rowY, pw, rh, L"连接状态", shortSt, dotCol);
         DrawKVRow(hdc, px, rowY + step * 1, pw, rh, L"对端地址", g_panelData.peerText.c_str(), valCol);
         DrawKVRow(hdc, px, rowY + step * 2, pw, rh, L"分辨率",   g_panelData.sizeText.c_str(), valCol);
@@ -3572,12 +3626,13 @@ static void PaintControlPanel(HWND h) {
         DrawTextW(hdc, g_panelData.decoderText.c_str(), -1, &rDecV,
                   DT_RIGHT | DT_WORDBREAK | DT_END_ELLIPSIS);
 
+        const bool hm = g_hostMode.load();
         int r2 = rowY + S(46), step = S(31);
         DrawKVRow(hdc, px, r2,            pw, rh, L"进程内存", g_panelData.procMemText.c_str(), valCol);
-        DrawKVRow(hdc, px, r2 + step * 1, pw, rh, L"CPU 占用", g_panelData.cpuText.c_str(), valCol);
-        DrawKVRow(hdc, px, r2 + step * 2, pw, rh, L"GPU 显存", g_panelData.gpuMemText.c_str(), valCol);
-        DrawKVRow(hdc, px, r2 + step * 3, pw, rh, L"屏幕常亮", g_panelData.keepOnText.c_str(),
-                  g_panelData.keepOnActive ? okCol : mutedCol);
+        DrawKVRow(hdc, px, r2 + step * 1, pw, rh, hm ? L"编码管线" : L"CPU 占用", g_panelData.cpuText.c_str(), valCol);
+        DrawKVRow(hdc, px, r2 + step * 2, pw, rh, hm ? L"虚拟副屏" : L"GPU 显存", g_panelData.gpuMemText.c_str(), valCol);
+        DrawKVRow(hdc, px, r2 + step * 3, pw, rh, hm ? L"挂载状态" : L"屏幕常亮", g_panelData.keepOnText.c_str(),
+                  g_panelData.keepOnActive ? okCol : warnCol);
     }
 
     // 3. 雷电双向文件中转站卡片 (20, 304, 920, 64)
@@ -3757,17 +3812,30 @@ static void LayoutPanelControls(HWND h) {
     mv(IDC_PANEL_COPY,   bx[2], 436, bw, bh);
     mv(IDC_PANEL_EXIT,   bx[3], 436, bw, bh);
 
-    // 5 个选项开关均匀排在分隔线下方（主控发送模式下隐藏仅接收端有效的开关）
+    // 5 个选项开关均匀排在分隔线下方（主控发送模式下隐藏接收端开关，改为展示主控虚拟屏/码率控制）
     const int chkShow = g_hostMode.load() ? SW_HIDE : SW_SHOW;
+    const int hostShow = g_hostMode.load() ? SW_SHOW : SW_HIDE;
     auto mvChk = [&](int id, int x, int y, int w, int ch) {
         mv(id, x, y, w, ch);
         if (HWND c = GetDlgItem(h, id)) ShowWindow(c, chkShow);
+    };
+    auto mvHost = [&](int id, int x, int y, int w, int ch) {
+        mv(id, x, y, w, ch);
+        if (HWND c = GetDlgItem(h, id)) ShowWindow(c, hostShow);
     };
     mvChk(IDC_PANEL_VSYNC,    39,  494, 130, 28);
     mvChk(IDC_PANEL_PACE,     185, 494, 130, 28);
     mvChk(IDC_PANEL_FEEDBACK, 331, 494, 130, 28);
     mvChk(IDC_PANEL_SHAKE,    477, 494, 165, 28);
     mvChk(IDC_PANEL_KEEPON,   658, 494, 250, 28);
+
+    mvHost(IDC_PANEL_RES_2880,  39,  491, 116, 32);
+    mvHost(IDC_PANEL_RES_2560,  163, 491, 116, 32);
+    mvHost(IDC_PANEL_RES_1920,  287, 491, 116, 32);
+    mvHost(IDC_PANEL_MBPS_30,   423, 491, 100, 32);
+    mvHost(IDC_PANEL_MBPS_50,   531, 491, 100, 32);
+    mvHost(IDC_PANEL_MBPS_80,   639, 491, 100, 32);
+    mvHost(IDC_PANEL_VDD_RETRY, 759, 491, 162, 32);
 }
 
 static LRESULT CALLBACK PanelWndProc(HWND h, UINT msg, WPARAM w, LPARAM l) {
@@ -3817,6 +3885,14 @@ static LRESULT CALLBACK PanelWndProc(HWND h, UINT msg, WPARAM w, LPARAM l) {
         mkChk(L"状态反馈", IDC_PANEL_FEEDBACK, g_feedbackEnabled.load());
         mkChk(L"晃动找光标", IDC_PANEL_SHAKE, g_shakeEnabled.load());
         mkChk(L"保持屏幕常亮 (防熄屏)", IDC_PANEL_KEEPON, g_keepScreenOn.load());
+
+        mkBtn(L"2880×1800", IDC_PANEL_RES_2880);
+        mkBtn(L"2560×1600", IDC_PANEL_RES_2560);
+        mkBtn(L"1920×1200", IDC_PANEL_RES_1920);
+        mkBtn(L"码率 30M",  IDC_PANEL_MBPS_30);
+        mkBtn(L"码率 50M",  IDC_PANEL_MBPS_50);
+        mkBtn(L"码率 80M",  IDC_PANEL_MBPS_80);
+        mkBtn(L"重挂虚拟屏", IDC_PANEL_VDD_RETRY);
 
         DragAcceptFiles(h, TRUE);
         LayoutPanelControls(h);
@@ -3914,8 +3990,10 @@ static LRESULT CALLBACK PanelWndProc(HWND h, UINT msg, WPARAM w, LPARAM l) {
             return 0;
         case IDC_PANEL_RECONN: {
             if (g_hostMode.load()) {
-                Log("控制面板: 请求重连中转与副屏");
-                SwitchAppMode(true);
+                Log("控制面板: 请求快速重连（保留虚拟屏）");
+                g_winHost.RestartConnection();
+                SOCKET xs = g_xferSock.load();
+                if (xs != INVALID_SOCKET) shutdown(xs, SD_BOTH);
                 return 0;
             }
             SOCKET s = g_sock.load();
@@ -3925,6 +4003,56 @@ static LRESULT CALLBACK PanelWndProc(HWND h, UINT msg, WPARAM w, LPARAM l) {
             }
             return 0;
         }
+        case IDC_PANEL_RES_2880:
+            if (g_hostMode.load()) {
+                g_hostReqW = 2880; g_hostReqH = 1800;
+                g_winHost.SetResolution(2880, 1800, g_hostReqFps.load());
+            }
+            return 0;
+        case IDC_PANEL_RES_2560:
+            if (g_hostMode.load()) {
+                g_hostReqW = 2560; g_hostReqH = 1600;
+                g_winHost.SetResolution(2560, 1600, g_hostReqFps.load());
+            }
+            return 0;
+        case IDC_PANEL_RES_1920:
+            if (g_hostMode.load()) {
+                g_hostReqW = 1920; g_hostReqH = 1200;
+                g_winHost.SetResolution(1920, 1200, g_hostReqFps.load());
+            }
+            return 0;
+        case IDC_PANEL_MBPS_30:
+            if (g_hostMode.load()) {
+                g_hostReqMbps = 30;
+                g_winHost.SetTargetMbps(30);
+                Log("控制面板: 调整主控目标码率 -> 30 Mbps");
+            }
+            return 0;
+        case IDC_PANEL_MBPS_50:
+            if (g_hostMode.load()) {
+                g_hostReqMbps = 50;
+                g_winHost.SetTargetMbps(50);
+                Log("控制面板: 调整主控目标码率 -> 50 Mbps");
+            }
+            return 0;
+        case IDC_PANEL_MBPS_80:
+            if (g_hostMode.load()) {
+                g_hostReqMbps = 80;
+                g_winHost.SetTargetMbps(80);
+                Log("控制面板: 调整主控目标码率 -> 80 Mbps");
+            }
+            return 0;
+        case IDC_PANEL_VDD_RETRY:
+            if (g_hostMode.load()) {
+                Log("控制面板: 请求重挂 Parsec 虚拟屏并重启主控推送");
+                if (!g_winHost.Start(g_peerHost, g_hostReqW.load(), g_hostReqH.load(),
+                                     g_hostReqFps.load(), g_hostReqMbps.load(),
+                                     (uint16_t)g_peerPort, [](const char* s) { Log("%s", s); },
+                                     g_hostReqDpi.load())) {
+                    Log("警告: 重挂 Parsec 虚拟屏仍失败，请检查驱动是否安装");
+                }
+            }
+            return 0;
         case IDC_PANEL_LOG:
             if (!g_logPath.empty()) {
                 std::wstring path = ToWide(g_logPath.c_str(), (int)g_logPath.size());
@@ -5544,6 +5672,7 @@ struct RunConfig {
     int hostHeight = 1800;    // 主控虚拟屏高
     int hostFps = 60;         // 主控发送帧率上限
     int hostBitrateMbps = 50; // 主控发送目标码率（Mbps，PeakConstrainedVBR）
+    int hostDpi = 0;          // 虚拟屏独立 DPI 缩放百分比（0=跟随系统，100..300）
     int waitLockMs = 0;       // 角色切换重启时等待旧实例释放单实例锁的毫秒数
     std::string logFile;      // 非空则同时写日志文件
 };
@@ -5589,6 +5718,8 @@ static void ParseArgs(int argc, char** argv, RunConfig& cfg) {
             cfg.hostFps = atoi(argv[++i]);
         } else if (a == "--bitrate" && i + 1 < argc) {
             cfg.hostBitrateMbps = atoi(argv[++i]);
+        } else if (a == "--host-dpi" && i + 1 < argc) {
+            cfg.hostDpi = atoi(argv[++i]);
         } else if (a == "--wait-lock" && i + 1 < argc) {
             cfg.waitLockMs = atoi(argv[++i]);
         } else if ((a == "--log" || a == "-l") && i + 1 < argc) {
@@ -5618,6 +5749,7 @@ static void ParseArgs(int argc, char** argv, RunConfig& cfg) {
     if (cfg.port <= 0 || cfg.port > 65535) cfg.port = 9922;
     if (cfg.hostFps < 24 || cfg.hostFps > 144) cfg.hostFps = 60;
     if (cfg.hostBitrateMbps < 10 || cfg.hostBitrateMbps > 200) cfg.hostBitrateMbps = 50;
+    if (cfg.hostDpi != 0 && (cfg.hostDpi < 100 || cfg.hostDpi > 300)) cfg.hostDpi = 0;
 }
 
 // ---------------------------------------------------------------------------
@@ -5693,6 +5825,7 @@ static void LoadConfigFile(RunConfig& cfg, const std::string& path) {
         else if (key == "hostheight") cfg.hostHeight = atoi(val.c_str());
         else if (key == "fps") cfg.hostFps = atoi(val.c_str());
         else if (key == "bitrate") cfg.hostBitrateMbps = atoi(val.c_str());
+        else if (key == "hostdpi") cfg.hostDpi = atoi(val.c_str());
         else continue;
         ++applied;
     }
@@ -7044,8 +7177,14 @@ int main(int argc, char** argv) {
         RegisterHotKey(hwnd, HOTKEY_DROPBOX_ID, MOD_CONTROL | MOD_ALT, 'B');
         SetThreadExecutionState(ES_CONTINUOUS | ES_SYSTEM_REQUIRED | ES_DISPLAY_REQUIRED);
 
+        g_hostReqW = cfg.hostWidth;
+        g_hostReqH = cfg.hostHeight;
+        g_hostReqFps = cfg.hostFps;
+        g_hostReqMbps = cfg.hostBitrateMbps;
+        g_hostReqDpi = cfg.hostDpi;
+
         if (!g_winHost.Start(cfg.host, cfg.hostWidth, cfg.hostHeight, cfg.hostFps, cfg.hostBitrateMbps,
-                             (uint16_t)cfg.port, [](const char* s) { Log("%s", s); })) {
+                             (uint16_t)cfg.port, [](const char* s) { Log("%s", s); }, cfg.hostDpi)) {
             Log("警告: 主控发送端启动失败（检查 Parsec VDD 驱动是否就绪）");
         }
         std::thread xfer(TransferLoop, cfg);
