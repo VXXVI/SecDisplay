@@ -1357,22 +1357,35 @@ final class ScreenshotCapture {
         _workerGen &+= 1
         return _workerGen
     }
-    /// 连续重启但一直没恢复的次数。用于把「无限重启」变成「退避重试」。
-    private var restartStreak = 0
+    /// 连续异常采样的次数（每 3 秒一个采样）。只用于决定退避间隔，
+    /// 和「重启了几次」不是一回事 —— 退避期间采样照样在涨但不重启。
+    private var slowStreak = 0
+    /// 自上次恢复以来真正重启的次数。硬上限按这个算。
+    private var restartCount = 0
     private var lastRestartAt: CFAbsoluteTime = 0
-    /// 面板展示用：连续重启次数（>0 表示采集正在异常重试）。
+    /// 面板展示用：自上次恢复以来真正重启的次数。
     /// 与 supervisor 队列共享，走 genLock 保护。
-    var captureRestartStreak: Int {
+    var captureRestartCount: Int {
         genLock.lock(); defer { genLock.unlock() }
-        return restartStreak
+        return restartCount
     }
-    private func bumpRestartStreak() -> Int {
+    private func bumpSlowStreak() -> Int {
         genLock.lock(); defer { genLock.unlock() }
-        restartStreak += 1
-        return restartStreak
+        slowStreak += 1
+        return slowStreak
     }
-    private func resetRestartStreak() {
-        genLock.lock(); restartStreak = 0; genLock.unlock()
+    /// 只清退避计数（唤醒后用），保留重启预算
+    private func resetSlowStreak() {
+        genLock.lock(); slowStreak = 0; genLock.unlock()
+    }
+    private func bumpRestartCount() -> Int {
+        genLock.lock(); defer { genLock.unlock() }
+        restartCount += 1
+        return restartCount
+    }
+    /// 采集恢复正常时清零全部计数
+    private func resetCaptureCounters() {
+        genLock.lock(); slowStreak = 0; restartCount = 0; genLock.unlock()
     }
     /// 重启硬上限。超过就彻底停手，只留面板告警 ——
     /// 「退避」只降低重启频率，卡在 await 里的 Task 永不返回，代次对它们无效，
@@ -1391,6 +1404,12 @@ final class ScreenshotCapture {
     }
     private func bumpCapturedRaw() {
         rawLock.lock(); _capturedRaw &+= 1; rawLock.unlock()
+    }
+    /// 同步作用域加锁。NSLock 的 lock/unlock 在 async 上下文里会被
+    /// Swift 6 判为不可用，包一层同步函数就能在 async 函数里安全调用。
+    private func withRawLock<T>(_ body: () -> T) -> T {
+        rawLock.lock(); defer { rawLock.unlock() }
+        return body()
     }
     /// 显示器休眠只打一次日志，避免每 3 秒刷屏
     private var loggedDisplayAsleep = false
@@ -1423,8 +1442,10 @@ final class ScreenshotCapture {
                 NSLocalizedDescriptionKey: "找不到 SecDisplay 虚拟屏，当前: \(avail.joined(separator: ", "))"
             ])
         }
-        cachedContent = content
-        cachedAt = CFAbsoluteTimeGetCurrent()
+        withRawLock {
+            cachedContent = content
+            cachedAt = CFAbsoluteTimeGetCurrent()
+        }
         running = true
         spawnWorkers()
         // 看护：SCScreenshotManager 并发轮询有两个已知故障模式
@@ -1456,17 +1477,30 @@ final class ScreenshotCapture {
             if self.loggedDisplayAsleep {
                 self.loggedDisplayAsleep = false
                 // 休眠期间 worker 多半已卡在 await 里，唤醒后不会自己恢复。
-                // 直接重建一次比等 3 秒再判「异常」更干净，也不会白白把
-                // 一次重启记进 streak。
-                self.resetRestartStreak()
+                // 直接重建一次比等 3 秒再判「异常」更干净。
+                //
+                // 但这次重建必须计入同一个重启预算：屏保或显示器每分钟休眠
+                // 一次时，若每次都无条件 +4 个 Task，一天就是上千个永不返回的
+                // 线程 —— 正是这个 PR 要消灭的那种增长。
+                self.resetSlowStreak()
+                let n = self.bumpRestartCount()
+                if n > self.restartHardCap {
+                    Log.info("显示器已唤醒，但已累计重启 \(n) 次，跳过重建（请退出并重开 SecDisplay）")
+                    self.lastSupervisorCount = self.capturedRaw
+                    self.lastSupervisorAt = now
+                    return
+                }
                 self.spawnWorkers()
-                Log.info("显示器已唤醒，重建采集工作线程")
+                Log.info("显示器已唤醒，重建采集工作线程（累计第 \(n) 次）")
                 return
             }
 
+            // capturedRaw 只读一次：读两次之间 worker 可能又自增，
+            // delta 和基准就不是同一时刻的快照了。
+            let rawNow = self.capturedRaw
             let dt = now - self.lastSupervisorAt
-            let delta = self.capturedRaw - self.lastSupervisorCount
-            self.lastSupervisorCount = self.capturedRaw
+            let delta = rawNow - self.lastSupervisorCount
+            self.lastSupervisorCount = rawNow
             self.lastSupervisorAt = now
             guard dt > 0.5 else { return }
 
@@ -1476,37 +1510,39 @@ final class ScreenshotCapture {
             let tooSlow = measuredFps < self.cfg.captureHz / 3.0
 
             if tooSlow {
-                let streak = self.bumpRestartStreak()
+                let slow = self.bumpSlowStreak()
                 // 硬上限：真卡死时 worker 永不返回，重启只会堆线程。
                 // 到这里就彻底停手，把「继续重启」换成一条明确的告警。
-                if streak > self.restartHardCap {
+                // 注意判据是「真正重启的次数」，不是异常采样次数。
+                if self.captureRestartCount >= self.restartHardCap {
                     if now - self.lastGiveUpLogAt > 300.0 {
                         self.lastGiveUpLogAt = now
-                        Log.info(String(format: "采集已连续 %d 次重启仍未恢复（%.1ffps），停止自动重启。请退出并重开 SecDisplay",
-                                        streak, measuredFps))
+                        Log.info(String(format: "采集已连续重启 %d 次仍未恢复（%.1ffps），停止自动重启。请退出并重开 SecDisplay",
+                                        self.captureRestartCount, measuredFps))
                     }
                     return
                 }
                 // 退避：前 4 次每 3 秒试一次；之后拉长到 30 秒一次。
-                if streak > 4 && now - self.lastRestartAt < 30.0 {
+                if slow > 4 && now - self.lastRestartAt < 30.0 {
                     return
                 }
                 self.lastRestartAt = now
+                let n = self.bumpRestartCount()
                 // 每次真正重启都记一行。退避后重启频率已降到 30 秒一次，
                 // 不会刷屏；而这里恰恰是「画面一直不动」时唯一的线索，
                 // 之前用 %10 抽样反而会让它长期不出现。
-                if streak <= 4 {
+                if n <= 4 {
                     Log.info(String(format: "截图采集异常（%.1ffps，目标 %.0ffps，第 %d 次重启）",
-                                    measuredFps, self.cfg.captureHz, streak))
+                                    measuredFps, self.cfg.captureHz, n))
                 } else {
-                    Log.info(String(format: "截图采集持续异常（%.1ffps，连续 %d 次），已降为 30 秒重试一次。若画面不动请重启发送端",
-                                    measuredFps, streak))
+                    Log.info(String(format: "截图采集持续异常（%.1ffps，已重启 %d 次），已降为 30 秒重试一次。若画面不动请重启发送端",
+                                    measuredFps, n))
                 }
                 self.spawnWorkers()
             } else {
-                if self.captureRestartStreak > 0 {
+                if self.captureRestartCount > 0 {
                     Log.info("截图采集已恢复正常（\(String(format: "%.0f", measuredFps))fps）")
-                    self.resetRestartStreak()
+                    self.resetCaptureCounters()
                 }
             }
         }
@@ -1750,14 +1786,15 @@ final class ScreenshotCapture {
         // 否则会继续用旧的 SCDisplay 绑定，抓到的是镜像源画面。
         if gCaptureRebuildRequested {
             gCaptureRebuildRequested = false
-            cachedContent = nil
-            cachedAt = 0
+            withRawLock { cachedContent = nil; cachedAt = 0 }
             Log.info("显示排列变化，刷新采集共享内容")
         }
-        if let c = cachedContent, now - cachedAt < 2.0 { return c }
+        // 缓存被 4 个 worker 并发访问。SCShareableContent 是类引用，
+        // 无同步的读写会撞上 retain/release，所以统一走 rawLock。
+        let (cached, cachedTime) = withRawLock { (cachedContent, cachedAt) }
+        if let c = cached, now - cachedTime < 2.0 { return c }
         let c = try await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: false)
-        cachedContent = c
-        cachedAt = now
+        withRawLock { cachedContent = c; cachedAt = now }
         return c
     }
 }
@@ -3398,7 +3435,7 @@ Timer.scheduledTimer(withTimeInterval: 2.0, repeats: true) { _ in
     // 「空闲 / 静跳」两个计数只存在于未启用的 Capture 类里，恒为 0，
     // 早就没有参考价值。换成采集异常计数，和面板那一行对应。
     Log.info(String(format: "采集 %d  峰值 %.0ffps  异常 %d  发送 %d  光标+%d  图像+%d  输入 %d  丢弃 %d  %.1f Mbps  在途 %d  采集延迟 %.1f  编码延迟 %.1f ms",
-                    cap.captured, peakFps, cap.captureRestartStreak, sender.sent, cursorDelta, imgDelta,
+                    cap.captured, peakFps, cap.captureRestartCount, sender.sent, cursorDelta, imgDelta,
                     injector.eventCount, sender.dropped, mbps, sender.inFlight, capAvg, encAvg))
     cap.capLatSum = 0; cap.capLatCount = 0; cap.capLatMax = 0
     encoder.encLatSum = 0; encoder.encLatCount = 0; encoder.encLatMax = 0

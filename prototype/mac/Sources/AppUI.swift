@@ -114,7 +114,7 @@ final class AppModel: ObservableObject {
             actual = String(bytes: b, encoding: .ascii) ?? "未知"
         }
         capturePath = actual + " · 4 路"
-        captureRestarts = cap.captureRestartStreak
+        captureRestarts = cap.captureRestartCount
         totalSent = UInt64(max(0, sender.totalSent))
         uptimeSec = CFAbsoluteTimeGetCurrent() - appStartTime
         peer = sender.peerDescription
@@ -225,10 +225,10 @@ struct StatusView: View {
                     StatRow(label: "采集延迟", value: String(format: "%.1f ms", model.capMs))
                     StatRow(label: "编码延迟", value: String(format: "%.1f ms", model.encMs))
                     StatRow(label: "画质档位", value: model.presetName)
-                    // 采集异常计数：>0 说明 SCK 采集帧率不达标、看护正在重试。
+                    // 采集重启次数：>0 说明 SCK 采集不达标、看护已经重建过工作线程。
                     // 原来这行显示「静止跳过」，但那个计数只存在于死代码里恒为 0。
-                    StatRow(label: "采集异常", value: model.captureRestarts == 0
-                            ? "无" : "连续 \(model.captureRestarts) 次",
+                    StatRow(label: "采集重启", value: model.captureRestarts == 0
+                            ? "无" : "\(model.captureRestarts) 次",
                             warn: model.captureRestarts > 0 ? .orange : nil)
                 }
 

@@ -1106,7 +1106,14 @@ bool Decoder::Init(Graphics* gfx, int width, int height) {
                        MFT_ENUM_FLAG_ALL,
                        &inInfo, nullptr, &acts, &count);
     }
-    if (FAILED(hr) || count == 0) { Log("MFTEnumEx 失败 %08X", hr); return false; }
+    if (FAILED(hr) || count == 0) {
+        Log("MFTEnumEx 失败 %08X", hr);
+        // 写面板：这是最可能出现的失败形态（系统缺解码器），
+        // 不写的话面板会一直显示上一次重连成功的解码器名。
+        std::lock_guard<std::mutex> lk(g_decoderInfoMtx);
+        g_decoderInfo = L"无可用解码器（枚举失败）";
+        return false;
+    }
 
     // 打印候选清单，便于排查选错的情况
     Log("找到 %u 个 H.264 解码器候选", count);
@@ -2281,14 +2288,29 @@ static void UpdateControlPanel() {
     static uint64_t lastDecoded = 0, lastBytes = 0;
     static ULONGLONG lastTick = 0;
     ULONGLONG now = GetTickCount64();
-    double dt = lastTick ? (double)(now - lastTick) / 1000.0 : 1.0;
     uint64_t decoded = g_stats.decoded.load();
     uint64_t bytes = g_stats.bytes.load();
-    double fps = dt > 0.0 ? (double)(decoded - lastDecoded) / dt : 0.0;
-    double mbps = dt > 0.0 ? (double)(bytes - lastBytes) * 8.0 / dt / 1e6 : 0.0;
-    lastDecoded = decoded;
-    lastBytes = bytes;
-    lastTick = now;
+    // 沿用上一次算出的值：面板显示时会被调用两次（WM_SHOWWINDOW 一次、
+    // ShowControlPanel 一次），第二次的 dt 接近 0，直接算会把帧率写成 0
+    // 并顺带污染「复制诊断」的剪贴板内容。
+    double fps = g_uiFps.load();
+    double mbps = g_uiMbps.load();
+    if (lastTick == 0) {
+        // 第一次只建立基准。否则会把「进程启动以来的累计解码帧数」
+        // 当成一秒钟的帧率，显示出一个离谱的数字。
+        lastDecoded = decoded;
+        lastBytes = bytes;
+        lastTick = now;
+    } else {
+        double dt = (double)(now - lastTick) / 1000.0;
+        if (dt >= 0.2 && decoded >= lastDecoded && bytes >= lastBytes) {
+            fps = (double)(decoded - lastDecoded) / dt;
+            mbps = (double)(bytes - lastBytes) * 8.0 / dt / 1e6;
+            lastDecoded = decoded;
+            lastBytes = bytes;
+            lastTick = now;
+        }
+    }
     // 写回全局供 CopyDiagnostics 复用：那两个全局原来只有声明和读取，
     // 从来没有赋值，剪贴板里的帧率/码率恒为 0.0，和面板显示自相矛盾。
     g_uiFps.store(fps);
@@ -2798,7 +2820,9 @@ static bool DetectShake(int64_t now, int x, int y) {
         if (g_shakeBuf[prevIdx].t == now) {
             g_shakeBuf[prevIdx].x = x;
             g_shakeBuf[prevIdx].y = y;
-            return g_shakeActive;
+            // 返回 false 而不是 g_shakeActive：调用方用它决定是否把缩放
+            // 拉回满值，返回 true 会让收缩动画期间闪一下。
+            return false;
         }
     }
     g_shakeBuf[g_shakeHead] = ShakeSample{ now, x, y };
