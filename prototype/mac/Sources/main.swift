@@ -2664,7 +2664,18 @@ final class CursorImageTracker {
         guard rawW > 0, rawH > 0 else { return }
 
         let now = CFAbsoluteTimeGetCurrent()
-        if normalCursorMaxDim > 0 && rawMax > Int(Double(normalCursorMaxDim) * 1.65) && rawMax > 48 {
+        if normalCursorMaxDim == 0 {
+            enlargedCursorSince = 0
+            normalCursorMaxDim = rawMax
+        } else if rawMax <= 42 {
+            // 常规 1x 系统光标（如 23x22 I型 <-> 28x40 箭头）不高于 42pt，
+            // 直接放行并维护基线，绝不会在晃动期间把基线抬高到 43+。
+            enlargedCursorSince = 0
+            normalCursorMaxDim = rawMax
+        } else if rawMax <= Int(Double(normalCursorMaxDim) * 1.35) {
+            // 已处于永久大指针模式（例如无障碍 64pt+）时的正常形状切换
+            enlargedCursorSince = 0
+        } else {
             if enlargedCursorSince == 0 {
                 enlargedCursorSince = now
             }
@@ -2672,11 +2683,6 @@ final class CursorImageTracker {
                 return
             }
             normalCursorMaxDim = rawMax
-        } else {
-            enlargedCursorSince = 0
-            if rawMax <= 48 || normalCursorMaxDim == 0 {
-                normalCursorMaxDim = rawMax
-            }
         }
 
         let clampScale = rawMax > maxDim ? Double(maxDim) / Double(rawMax) : 1.0
@@ -3141,7 +3147,7 @@ final class FileTransferService {
         activeBusy = false
         activeProgress = 0
         activeSpeedText = ""
-        activeStatus = outQueue.isEmpty ? "等待接收端" : "连接断开，\(outQueue.count) 个文件等待重连"
+        activeStatus = outQueue.isEmpty ? "等待接收端" : "连接断开，\(outQueue.count) 项等待重连"
         stateLock.unlock()
         notifyUI()
     }
@@ -3367,7 +3373,7 @@ final class FileTransferService {
             if stopped || !_connected || outQueue.isEmpty {
                 isSending = false
                 if !_connected && !outQueue.isEmpty {
-                    activeStatus = "等待接收端重连（排队 \(outQueue.count) 个）"
+                    activeStatus = "等待接收端重连（排队 \(outQueue.count) 项）"
                 } else if _connected && outQueue.isEmpty && activeStatus.hasPrefix("发送") {
                     activeStatus = "已连接（端口 \(listenPort)）· 可拖入文件直传"
                 }

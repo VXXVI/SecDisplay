@@ -2427,6 +2427,15 @@ static void SetTransferFeedback(int kind, const std::wstring& title, const std::
     if (db && g_alive) PostMessageW(db, WM_APP_XFER_UI, 0, 0);
 }
 
+static std::wstring ToWideStrict(const char* utf8, int bytes) {
+    if (!utf8 || bytes <= 0) return {};
+    int len = ::MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, utf8, bytes, nullptr, 0);
+    if (len <= 0) return {};
+    std::wstring out((size_t)len, L'\0');
+    if (::MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, utf8, bytes, &out[0], len) <= 0) return {};
+    return out;
+}
+
 static std::string WideToUtf8N(const wchar_t* w, int chars) {
     if (!w || chars <= 0) return {};
     int len = ::WideCharToMultiByte(CP_UTF8, 0, w, chars, nullptr, 0, nullptr, nullptr);
@@ -6516,7 +6525,7 @@ static void TransferLoop(RunConfig cfg) {
                     sendAck(id, false);
                     continue;
                 }
-                std::wstring wtext = ToWide((const char*)(payload.data() + 4), (int)(len - 4));
+                std::wstring wtext = ToWideStrict((const char*)(payload.data() + 4), (int)(len - 4));
                 if (wtext.empty()) {
                     Log("中转站收到文本 #%u 解码失败", id);
                     sendAck(id, false);
@@ -6530,6 +6539,10 @@ static void TransferLoop(RunConfig cfg) {
                         g_clipTextQ.push_back(PendingClipText{ id, std::move(wtext), preview, (size_t)(len - 4) });
                     }
                     posted = (PostMessageW(g_hwnd, WM_APP_SET_CLIP_TEXT, 0, 0) != FALSE);
+                    if (!posted) {
+                        std::lock_guard<std::mutex> lk(g_clipTextMtx);
+                        if (!g_clipTextQ.empty() && g_clipTextQ.back().id == id) g_clipTextQ.pop_back();
+                    }
                 }
                 sendAck(id, posted);
             } else if (type == XFER_ACK && len >= 5) {
