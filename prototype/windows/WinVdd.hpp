@@ -524,32 +524,43 @@ private:
     }
 
     void ApplyDisplayMode(const std::wstring& devName, int w, int h, int hz) {
-        // 找其它已挂载屏幕的最右边沿，把虚拟屏放到主屏右侧
-        bool foundOther = false;
-        LONG rightEdge = LONG_MIN;
-        for (DWORD i = 0; ; ++i) {
-            DISPLAY_DEVICEW dd{}; dd.cb = sizeof(dd);
-            if (!EnumDisplayDevicesW(nullptr, i, &dd, 0)) break;
-            if (!(dd.StateFlags & DISPLAY_DEVICE_ATTACHED_TO_DESKTOP)) continue;
-            if (_wcsicmp(dd.DeviceName, devName.c_str()) == 0) continue;
-            DEVMODEW dm{}; dm.dmSize = sizeof(dm);
-            if (EnumDisplaySettingsW(dd.DeviceName, ENUM_CURRENT_SETTINGS, &dm)) {
-                LONG r = dm.dmPosition.x + (LONG)dm.dmPelsWidth;
-                if (!foundOther || r > rightEdge) {
-                    rightEdge = r;
-                    foundOther = true;
+        auto scanRightEdge = [&](bool* outFound) -> LONG {
+            bool found = false;
+            LONG edge = LONG_MIN;
+            for (DWORD i = 0; ; ++i) {
+                DISPLAY_DEVICEW dd{}; dd.cb = sizeof(dd);
+                if (!EnumDisplayDevicesW(nullptr, i, &dd, 0)) break;
+                if (!(dd.StateFlags & DISPLAY_DEVICE_ATTACHED_TO_DESKTOP)) continue;
+                if (_wcsicmp(dd.DeviceName, devName.c_str()) == 0) continue;
+                DEVMODEW dm{}; dm.dmSize = sizeof(dm);
+                if (EnumDisplaySettingsW(dd.DeviceName, ENUM_CURRENT_SETTINGS, &dm)) {
+                    LONG r = dm.dmPosition.x + (LONG)dm.dmPelsWidth;
+                    if (!found || r > edge) {
+                        edge = r;
+                        found = true;
+                    }
                 }
             }
-        }
+            if (outFound) *outFound = found;
+            return found ? edge : 0;
+        };
+
+        bool foundOther = false;
+        LONG rightEdge = scanRightEdge(&foundOther);
         if (!foundOther) {
-            rightEdge = 0;
             // 若物理主屏因空闲息屏导致当前无其它在线屏幕，Windows GDI ChangeDisplaySettingsEx 可能返回 DISP_CHANGE_FAILED(-1)；
-            // 触发一次零位移输入唤醒显示会话，再下发分辨率
+            // 触发一次零位移输入唤醒显示会话，并重新枚举物理屏右边界
             INPUT wake{};
             wake.type = INPUT_MOUSE;
             wake.mi.dwFlags = MOUSEEVENTF_MOVE;
-            SendInput(1, &wake, sizeof(INPUT));
-            Sleep(250);
+            if (SendInput(1, &wake, sizeof(INPUT)) == 0) {
+                char msg[128];
+                snprintf(msg, sizeof(msg), "WinVDD: 零位移唤醒输入失败 err=%lu", GetLastError());
+                EmitLog(msg);
+            } else {
+                Sleep(250);
+                rightEdge = scanRightEdge(&foundOther);
+            }
         }
 
         auto applyRaw = [&](DWORD reqW, DWORD reqH, DWORD reqHz, bool withPos) -> bool {
@@ -562,19 +573,30 @@ private:
                 dm.dmPosition.x = rightEdge;
                 dm.dmPosition.y = 0;
             }
-            LONG r1 = ChangeDisplaySettingsExW(devName.c_str(), &dm, nullptr,
-                                               CDS_UPDATEREGISTRY | CDS_NORESET, nullptr);
-            LONG r2 = (r1 == DISP_CHANGE_SUCCESSFUL)
-                ? ChangeDisplaySettingsExW(nullptr, nullptr, nullptr, 0, nullptr)
-                : r1;
-            if (r1 != DISP_CHANGE_SUCCESSFUL || r2 != DISP_CHANGE_SUCCESSFUL) {
-                // 部分驱动或单屏场景不支持 CDS_NORESET 两段式，退回直接应用
-                r2 = ChangeDisplaySettingsExW(devName.c_str(), &dm, nullptr, 0, nullptr);
+            // 先用 flags=0 直接探测并生效，避免失败时在注册表留下未应用的脏模式条目
+            LONG r = ChangeDisplaySettingsExW(devName.c_str(), &dm, nullptr, 0, nullptr);
+            if (r != DISP_CHANGE_SUCCESSFUL) {
+                return false;
             }
-            Sleep(80);
             WinVddBounds chk{};
-            return (r2 == DISP_CHANGE_SUCCESSFUL &&
-                    ReadCurrentBounds(devName, &chk) && chk.width == (int)reqW && chk.height == (int)reqH);
+            bool matched = false;
+            for (int t = 0; t < 8; ++t) {
+                Sleep(50);
+                if (ReadCurrentBounds(devName, &chk) && chk.width == (int)reqW && chk.height == (int)reqH) {
+                    matched = true;
+                    break;
+                }
+            }
+            if (!matched) return false;
+            if (withPos && chk.left != rightEdge) {
+                char msg[128];
+                snprintf(msg, sizeof(msg), "WinVDD: 虚拟屏位置实际 (%d,%d)，请求 (%ld,0)",
+                         chk.left, chk.top, rightEdge);
+                EmitLog(msg);
+            }
+            // 仅对已验证生效的分辨率持久化写入注册表
+            ChangeDisplaySettingsExW(devName.c_str(), &dm, nullptr, CDS_UPDATEREGISTRY, nullptr);
+            return true;
         };
 
         auto tryMode = [&](DWORD reqW, DWORD reqH, DWORD reqHz) -> bool {
