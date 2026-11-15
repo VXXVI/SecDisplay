@@ -1,7 +1,7 @@
 // MacReceiver.swift —— Mac 副屏接收端（Windows 主控 → Mac 显示与键鼠回传）
 //
 // 管线：
-//   NWConnection TCP 客户端 (host:9922)
+//   NWListener TCP 服务端 (监听 9922，Windows 主动连入，绕开 macOS 本地网络出站阻断)
 //     → 拆帧 [4B BE len][1B type][8B BE ts][payload]
 //     → 0x01 AVCC 提取 SPS/PPS → VideoToolbox 硬解 (BGRA IOSurface CVPixelBuffer)
 //     → CALayer 零拷贝等比上屏 + 0x03/0x05 远端光标叠加层
@@ -258,7 +258,6 @@ final class VideoToolboxDecoder {
 
         guard let session, let formatDesc, !vclPayload.isEmpty else {
             if session == nil {
-                onDecodeError?()
                 onNeedKeyframe?()
             }
             return
@@ -412,20 +411,21 @@ final class VideoToolboxDecoder {
     }
 }
 
-// MARK: - Mac 副屏网络客户端（9922）
+// MARK: - Mac 副屏网络监听端（9922：Mac 固定监听，Windows 主动直连，绕开 macOS 本地网络 TCC 阻断）
 
 final class MacReceiverClient {
     private let netQueue = DispatchQueue(label: "SecDisplay.macrecv.net")
     private let decodeQueue = DispatchQueue(label: "SecDisplay.macrecv.decode", qos: .userInteractive)
     private let stateLock = NSLock()
 
+    private var listener: NWListener?
     private var conn: NWConnection?
     private var connEpoch = 0
     private var stopped = true
-    private var targetHost = "10.10.10.2"
-    private var targetPort: UInt16 = 9922
+    private var listenPort: UInt16 = 9922
+    private var peerDesc = "-"
     private var recvBuf = Data()
-    private var reconnectScheduled = false
+    private var listenerRestartScheduled = false
     private var feedbackTimer: DispatchSourceTimer?
 
     private let decoder = VideoToolboxDecoder()
@@ -490,15 +490,14 @@ final class MacReceiverClient {
         }
     }
 
-    func start(host: String, port: UInt16) {
+    func listen(port: UInt16) {
         stop()
         stateLock.lock()
         stopped = false
-        targetHost = host
-        targetPort = port
+        listenPort = port
         stateLock.unlock()
         netQueue.async { [weak self] in
-            self?.connectNow()
+            self?.startListener()
         }
     }
 
@@ -507,6 +506,7 @@ final class MacReceiverClient {
         stopped = true
         _connected = false
         _streaming = false
+        peerDesc = "-"
         stateLock.unlock()
         netQueue.async { [weak self] in
             guard let self else { return }
@@ -515,6 +515,8 @@ final class MacReceiverClient {
             self.feedbackTimer = nil
             self.conn?.cancel()
             self.conn = nil
+            self.listener?.cancel()
+            self.listener = nil
             self.recvBuf.removeAll()
         }
         decodeQueue.async { [weak self] in
@@ -545,7 +547,7 @@ final class MacReceiverClient {
         return MacReceiverSnapshot(
             connected: _connected,
             streaming: _streaming,
-            peer: _connected ? "\(targetHost):\(targetPort)" : "-",
+            peer: _connected ? peerDesc : "-",
             width: w,
             height: h,
             sessionFps: _sessFps,
@@ -570,37 +572,92 @@ final class MacReceiverClient {
         return s[idx]
     }
 
-    private func connectNow() {
+    private func startListener() {
         stateLock.lock()
         let isStopped = stopped
-        let host = targetHost
-        let port = targetPort
+        let port = listenPort
         stateLock.unlock()
         guard !isStopped, let nwPort = NWEndpoint.Port(rawValue: port) else { return }
 
-        connEpoch &+= 1
-        let epoch = connEpoch
-        conn?.cancel()
-        recvBuf.removeAll()
-
         let params = NWParameters.tcp
+        params.allowLocalEndpointReuse = true
         if let tcp = params.defaultProtocolStack.transportProtocol as? NWProtocolTCP.Options {
             tcp.noDelay = true
-            tcp.connectionTimeout = 4
             tcp.enableKeepalive = true
             tcp.keepaliveIdle = 5
         }
-        let c = NWConnection(host: NWEndpoint.Host(host), port: nwPort, using: params)
-        conn = c
+        let l: NWListener
+        do {
+            l = try NWListener(using: params, on: nwPort)
+        } catch {
+            Log.info("MacReceiver: 监听端口 \(port) 失败 \(error)")
+            scheduleListenerRestart()
+            return
+        }
+        self.listener = l
+        l.newConnectionHandler = { [weak self, weak l] c in
+            guard let self, let l, self.listener === l else { return }
+            self.acceptConnection(c)
+        }
+        l.stateUpdateHandler = { [weak self, weak l] st in
+            guard let self, let l, self.listener === l else { return }
+            switch st {
+            case .ready:
+                self.listenerRestartScheduled = false
+                Log.info("MacReceiver: 已监听端口 \(port)，等待 Windows 主控端连接")
+            case .failed(let e):
+                Log.info("MacReceiver: 监听异常 \(e)")
+                self.scheduleListenerRestart()
+            case .cancelled:
+                break
+            default:
+                break
+            }
+        }
+        l.start(queue: netQueue)
+    }
+
+    private func scheduleListenerRestart() {
+        stateLock.lock()
+        let isStopped = stopped
+        stateLock.unlock()
+        guard !isStopped, !listenerRestartScheduled else { return }
+        listenerRestartScheduled = true
+        netQueue.asyncAfter(deadline: .now() + 2.0) { [weak self] in
+            guard let self else { return }
+            self.listenerRestartScheduled = false
+            self.listener?.cancel()
+            self.listener = nil
+            self.startListener()
+        }
+    }
+
+    private func acceptConnection(_ c: NWConnection) {
+        stateLock.lock()
+        let isStopped = stopped
+        stateLock.unlock()
+        if isStopped {
+            c.cancel()
+            return
+        }
+
+        connEpoch &+= 1
+        let epoch = connEpoch
+        let old = self.conn
+        self.conn = c
+        self.recvBuf.removeAll()
+        old?.cancel()
 
         c.stateUpdateHandler = { [weak self] st in
             guard let self, self.connEpoch == epoch else { return }
             switch st {
             case .ready:
-                Log.info("MacReceiver: 已连接 Windows 主控端 \(host):\(port)")
+                let ep = String(describing: c.endpoint)
+                Log.info("MacReceiver: Windows 主控端已连接 \(ep)")
                 self.stateLock.lock()
                 self._connected = true
                 self._streaming = false
+                self.peerDesc = ep
                 self._connStartAt = CFAbsoluteTimeGetCurrent()
                 self._windowStartAt = CFAbsoluteTimeGetCurrent()
                 self._framesInWindow = 0
@@ -635,20 +692,13 @@ final class MacReceiverClient {
         conn = nil
         recvBuf.removeAll()
         stateLock.lock()
-        let isStopped = stopped
         _connected = false
         _streaming = false
         _decodeInFlight = 0
+        peerDesc = "-"
         stateLock.unlock()
         decodeQueue.async { [weak self] in
             self?.decoder.reset()
-        }
-        guard !isStopped, !reconnectScheduled else { return }
-        reconnectScheduled = true
-        netQueue.asyncAfter(deadline: .now() + 1.5) { [weak self] in
-            guard let self else { return }
-            self.reconnectScheduled = false
-            self.connectNow()
         }
     }
 
@@ -822,14 +872,23 @@ final class MacReceiverClient {
 
     // ---- 发送控制包回 Windows 主控端 ----
 
-    func sendKeyframeRequest(throttled: Bool) {
+    private func sendBytes(_ pkt: Data) {
         netQueue.async { [weak self] in
             guard let self, let c = self.conn else { return }
-            let now = CFAbsoluteTimeGetCurrent()
-            if throttled && now - self._lastKeyframeReqAt < 0.8 { return }
-            self._lastKeyframeReqAt = now
-            c.send(content: Data([0x02]), completion: .contentProcessed { _ in })
+            c.send(content: pkt, completion: .contentProcessed { _ in })
         }
+    }
+
+    func sendKeyframeRequest(throttled: Bool) {
+        stateLock.lock()
+        let now = CFAbsoluteTimeGetCurrent()
+        if throttled && now - _lastKeyframeReqAt < 0.8 {
+            stateLock.unlock()
+            return
+        }
+        _lastKeyframeReqAt = now
+        stateLock.unlock()
+        sendBytes(Data([0x02]))
     }
 
     func sendMouseInput(x: Float, y: Float, buttons: UInt8, wheel: Int16) {
@@ -842,13 +901,10 @@ final class MacReceiverClient {
         withUnsafeBytes(of: &fy) { pkt.append(contentsOf: $0) }
         pkt.append(buttons)
         withUnsafeBytes(of: &w16) { pkt.append(contentsOf: $0) }
-        netQueue.async { [weak self] in
-            guard let self, let c = self.conn else { return }
-            self.stateLock.lock()
-            self._inputSent &+= 1
-            self.stateLock.unlock()
-            c.send(content: pkt, completion: .contentProcessed { _ in })
-        }
+        stateLock.lock()
+        _inputSent &+= 1
+        stateLock.unlock()
+        sendBytes(pkt)
     }
 
     func sendKeyInput(vk: UInt16, scan: UInt16, down: Bool, flags: UInt8) {
@@ -860,13 +916,10 @@ final class MacReceiverClient {
         withUnsafeBytes(of: &s16) { pkt.append(contentsOf: $0) }
         pkt.append(down ? 1 : 0)
         pkt.append(flags)
-        netQueue.async { [weak self] in
-            guard let self, let c = self.conn else { return }
-            self.stateLock.lock()
-            self._inputSent &+= 1
-            self.stateLock.unlock()
-            c.send(content: pkt, completion: .contentProcessed { _ in })
-        }
+        stateLock.lock()
+        _inputSent &+= 1
+        stateLock.unlock()
+        sendBytes(pkt)
     }
 
     private static func avccContainsIDR(_ avcc: Data) -> Bool {
@@ -906,7 +959,7 @@ final class MacReceiverClient {
         put16(UInt16(clamping: dropDelta))
         put16(0)
         put16(0)
-        conn?.send(content: pkt, completion: .contentProcessed { _ in })
+        sendBytes(pkt)
     }
 
     private func readU16BE(_ d: Data, _ off: Int) -> UInt16 {
@@ -944,6 +997,7 @@ final class ReceiverCanvasView: NSView {
     private var heldKeys = Set<UInt16>()
     private var heldModifiers = Set<UInt16>()
     private var trackingArea: NSTrackingArea?
+    private var currentPixelBuffer: CVPixelBuffer?
 
     private static let invisibleCursor: NSCursor = {
         let img = NSImage(size: NSSize(width: 1, height: 1))
@@ -1014,6 +1068,7 @@ final class ReceiverCanvasView: NSView {
         CATransaction.setDisableActions(true)
         videoLayer.frame = bounds
         if let scale = window?.backingScaleFactor, scale > 0 {
+            videoLayer.contentsScale = scale
             cursorLayer.contentsScale = scale
         }
         updateCursorLayerFrame()
@@ -1024,6 +1079,7 @@ final class ReceiverCanvasView: NSView {
     override func viewDidChangeBackingProperties() {
         super.viewDidChangeBackingProperties()
         if let scale = window?.backingScaleFactor, scale > 0 {
+            videoLayer.contentsScale = scale
             cursorLayer.contentsScale = scale
         }
     }
@@ -1042,6 +1098,7 @@ final class ReceiverCanvasView: NSView {
             waitLabel.isHidden = true
             window?.invalidateCursorRects(for: self)
         }
+        currentPixelBuffer = pb
         CATransaction.begin()
         CATransaction.setDisableActions(true)
         videoLayer.contents = surf
@@ -1298,7 +1355,31 @@ final class ReceiverWindowController: NSObject, NSWindowDelegate {
         }
         client.onSessionChanged = { [weak win] vw, vh, fps in
             DispatchQueue.main.async {
-                win?.title = "SecDisplay 副屏 (\(vw)×\(vh) @ \(fps)Hz) · Ctrl+Cmd+F 全屏"
+                guard let win else { return }
+                win.title = "SecDisplay 副屏 (\(vw)×\(vh) @ \(fps)Hz) · Ctrl+Cmd+F 全屏"
+                // 窗口模式下按 1:1 Retina 物理像素自适应窗口尺寸，避免非整数缩放发虚
+                if !win.styleMask.contains(.fullScreen),
+                   let scr = win.screen ?? NSScreen.main {
+                    let scale = max(1.0, win.backingScaleFactor)
+                    var cw = CGFloat(vw) / scale
+                    var ch = CGFloat(vh) / scale
+                    let vf = scr.visibleFrame
+                    let maxW = vf.width * 0.90
+                    let maxH = vf.height * 0.90
+                    if cw > maxW || ch > maxH {
+                        let s = min(maxW / cw, maxH / ch)
+                        cw *= s
+                        ch *= s
+                    }
+                    let frame = win.frameRect(forContentRect: NSRect(x: 0, y: 0, width: cw, height: ch))
+                    let centered = NSRect(
+                        x: vf.midX - frame.width * 0.5,
+                        y: vf.midY - frame.height * 0.5,
+                        width: frame.width,
+                        height: frame.height
+                    )
+                    win.setFrame(centered, display: true)
+                }
             }
         }
     }

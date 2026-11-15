@@ -4171,11 +4171,11 @@ if appRole == .sender {
         }
     }
 } else {
-    Log.info("SecDisplay 副屏模式启动: 连接 Windows 主控端 \(winHostAddress):\(cfg.port)/\(cfg.port &+ 1)")
+    Log.info("SecDisplay 副屏模式启动: 监听端口 \(cfg.port)/\(cfg.port &+ 1)，等待 Windows 主控端连接")
     let rc = MacReceiverClient()
     macReceiverClient = rc
-    rc.start(host: winHostAddress, port: cfg.port)
-    transferService.connect(host: winHostAddress, port: cfg.port &+ 1)
+    rc.listen(port: cfg.port)
+    transferService.listen(port: cfg.port &+ 1)
 }
 
 // MARK: - 自适应码率
@@ -4428,6 +4428,15 @@ if appRole == .sender {
         encoder.encLatSum = 0; encoder.encLatCount = 0; encoder.encLatMax = 0
         sender.sentBytes = 0
         sender.sent = 0
+    }
+} else {
+    Timer.scheduledTimer(withTimeInterval: 5.0, repeats: true) { _ in
+        guard let snap = macReceiverClient?.snapshot(), snap.connected else { return }
+        Log.info(String(format: "MacReceiver: %dx%d  %.1f fps  %.1f Mbps  p95 %.1f/%.1f ms  累计 %llu 帧  错误 %llu  丢帧 %llu  光标 %llu  输入 %llu",
+                        snap.width, snap.height, snap.decodeFps, snap.mbps,
+                        snap.sourceP95, snap.presentP95,
+                        snap.decodedFrames, snap.decodeErrors, snap.droppedFrames,
+                        snap.cursorRecv, snap.inputSent))
     }
 }
 

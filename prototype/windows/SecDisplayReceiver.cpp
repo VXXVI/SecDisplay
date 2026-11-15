@@ -5540,8 +5540,10 @@ struct RunConfig {
     bool pace = false;        // --pace：1~3 帧抖动缓冲，按自适应节拍上屏，抹平源端小抖动
     bool feedback = false;    // --feedback：每 2 秒向 Mac 回传 0x07 健康度，供自适应码率环使用
     bool hostMode = false;    // --mode sender：Windows 作为主控发送端（Mac 当副屏）
+    int hostWidth = 2880;     // 主控虚拟屏宽（默认 2880x1800 匹配 Retina 16:10 清晰度，不与 receiver 的 1600x1000 混淆）
+    int hostHeight = 1800;    // 主控虚拟屏高
     int hostFps = 60;         // 主控发送帧率上限
-    int hostBitrateMbps = 80; // 主控发送目标码率（Mbps）
+    int hostBitrateMbps = 50; // 主控发送目标码率（Mbps，PeakConstrainedVBR）
     int waitLockMs = 0;       // 角色切换重启时等待旧实例释放单实例锁的毫秒数
     std::string logFile;      // 非空则同时写日志文件
 };
@@ -5580,6 +5582,9 @@ static void ParseArgs(int argc, char** argv, RunConfig& cfg) {
             } else {
                 Log("警告: 未知 --mode 参数 %s，保持默认模式", m.c_str());
             }
+        } else if (a == "--host-size" && i + 2 < argc) {
+            cfg.hostWidth = atoi(argv[++i]);
+            cfg.hostHeight = atoi(argv[++i]);
         } else if (a == "--fps" && i + 1 < argc) {
             cfg.hostFps = atoi(argv[++i]);
         } else if (a == "--bitrate" && i + 1 < argc) {
@@ -5608,9 +5613,11 @@ static void ParseArgs(int argc, char** argv, RunConfig& cfg) {
     }
     if (cfg.width <= 0) cfg.width = 2880;
     if (cfg.height <= 0) cfg.height = 1800;
+    if (cfg.hostWidth <= 0) cfg.hostWidth = 2880;
+    if (cfg.hostHeight <= 0) cfg.hostHeight = 1800;
     if (cfg.port <= 0 || cfg.port > 65535) cfg.port = 9922;
     if (cfg.hostFps < 24 || cfg.hostFps > 144) cfg.hostFps = 60;
-    if (cfg.hostBitrateMbps < 10 || cfg.hostBitrateMbps > 200) cfg.hostBitrateMbps = 80;
+    if (cfg.hostBitrateMbps < 10 || cfg.hostBitrateMbps > 200) cfg.hostBitrateMbps = 50;
 }
 
 // ---------------------------------------------------------------------------
@@ -5682,7 +5689,9 @@ static void LoadConfigFile(RunConfig& cfg, const std::string& path) {
             std::string mv = val;
             std::transform(mv.begin(), mv.end(), mv.begin(), [](unsigned char c) { return (char)std::tolower(c); });
             cfg.hostMode = (mv == "sender" || mv == "host" || mv == "1");
-        } else if (key == "fps") cfg.hostFps = atoi(val.c_str());
+        } else if (key == "hostwidth") cfg.hostWidth = atoi(val.c_str());
+        else if (key == "hostheight") cfg.hostHeight = atoi(val.c_str());
+        else if (key == "fps") cfg.hostFps = atoi(val.c_str());
         else if (key == "bitrate") cfg.hostBitrateMbps = atoi(val.c_str());
         else continue;
         ++applied;
@@ -6444,18 +6453,11 @@ static std::wstring UniqueDestPathW(const std::wstring& dir, const std::wstring&
     return dir + L"\\" + stem + ts + ext;
 }
 
-static std::atomic<SOCKET> g_xferListenSock{ INVALID_SOCKET };
-
 static void TransferLoop(RunConfig cfg) {
     const uint16_t xferPort = (uint16_t)(cfg.port + 1);
     const std::wstring inbox = GetTransferInboxDir();
-    if (cfg.hostMode) {
-        Log("中转站服务端启动: 监听端口 %d，目录 %s",
-            xferPort, ToUtf8(inbox.c_str()).c_str());
-    } else {
-        Log("中转站线程启动: 目标 %s:%d，目录 %s",
-            cfg.host.c_str(), xferPort, ToUtf8(inbox.c_str()).c_str());
-    }
+    Log("中转站线程启动: 目标 %s:%d，目录 %s",
+        cfg.host.c_str(), xferPort, ToUtf8(inbox.c_str()).c_str());
 
     auto putU16 = [](std::vector<uint8_t>& v, uint16_t x) {
         v.push_back((uint8_t)(x >> 8)); v.push_back((uint8_t)(x & 0xFF));
@@ -6478,84 +6480,43 @@ static void TransferLoop(RunConfig cfg) {
         return ((uint64_t)rdU32(p) << 32) | rdU32(p + 4);
     };
 
-    SOCKET listenSock = INVALID_SOCKET;
-    if (cfg.hostMode) {
-        listenSock = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
-        if (listenSock != INVALID_SOCKET) {
-            int reuse = 1;
-            setsockopt(listenSock, SOL_SOCKET, SO_REUSEADDR, (const char*)&reuse, sizeof(reuse));
-            sockaddr_in la{};
-            la.sin_family = AF_INET;
-            la.sin_addr.s_addr = INADDR_ANY;
-            la.sin_port = htons(xferPort);
-            if (bind(listenSock, (sockaddr*)&la, sizeof(la)) != 0 || listen(listenSock, 2) != 0) {
-                Log("中转站监听端口 %d 失败 err=%d", xferPort, WSAGetLastError());
-                closesocket(listenSock);
-                listenSock = INVALID_SOCKET;
-            } else {
-                g_xferListenSock = listenSock;
-                SetTransferStatus(L"中转站服务端就绪，等待 Mac 连接 (9923)…");
-            }
-        }
-    }
-
     while (g_alive) {
-        SOCKET sock = INVALID_SOCKET;
-        if (cfg.hostMode) {
-            if (listenSock == INVALID_SOCKET) { SleepAlive(2000); continue; }
-            fd_set rfds;
-            FD_ZERO(&rfds);
-            FD_SET(listenSock, &rfds);
-            timeval tv{ 0, 250000 };
-            int sel = select(0, &rfds, nullptr, nullptr, &tv);
-            if (sel <= 0) continue;
-            sockaddr_in ca{}; int clen = sizeof(ca);
-            sock = accept(listenSock, (sockaddr*)&ca, &clen);
-            if (sock == INVALID_SOCKET) continue;
-            int bufSz = 4 * 1024 * 1024;
-            setsockopt(sock, SOL_SOCKET, SO_SNDBUF, (const char*)&bufSz, sizeof(bufSz));
-            setsockopt(sock, SOL_SOCKET, SO_RCVBUF, (const char*)&bufSz, sizeof(bufSz));
-            int nodelay = 1, keepalive = 1;
-            setsockopt(sock, IPPROTO_TCP, TCP_NODELAY, (const char*)&nodelay, sizeof(nodelay));
-            setsockopt(sock, SOL_SOCKET, SO_KEEPALIVE, (const char*)&keepalive, sizeof(keepalive));
-        } else {
-            sock = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
-            if (sock == INVALID_SOCKET) { SleepAlive(2000); continue; }
+        SOCKET sock = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+        if (sock == INVALID_SOCKET) { SleepAlive(2000); continue; }
 
-            int bufSz = 4 * 1024 * 1024;
-            setsockopt(sock, SOL_SOCKET, SO_SNDBUF, (const char*)&bufSz, sizeof(bufSz));
-            setsockopt(sock, SOL_SOCKET, SO_RCVBUF, (const char*)&bufSz, sizeof(bufSz));
-            int nodelay = 1, keepalive = 1;
-            setsockopt(sock, IPPROTO_TCP, TCP_NODELAY, (const char*)&nodelay, sizeof(nodelay));
-            setsockopt(sock, SOL_SOCKET, SO_KEEPALIVE, (const char*)&keepalive, sizeof(keepalive));
+        int bufSz = 4 * 1024 * 1024;
+        setsockopt(sock, SOL_SOCKET, SO_SNDBUF, (const char*)&bufSz, sizeof(bufSz));
+        setsockopt(sock, SOL_SOCKET, SO_RCVBUF, (const char*)&bufSz, sizeof(bufSz));
+        int nodelay = 1, keepalive = 1;
+        setsockopt(sock, IPPROTO_TCP, TCP_NODELAY, (const char*)&nodelay, sizeof(nodelay));
+        setsockopt(sock, SOL_SOCKET, SO_KEEPALIVE, (const char*)&keepalive, sizeof(keepalive));
 
-            sockaddr_in addr{};
-            addr.sin_family = AF_INET;
-            addr.sin_port = htons(xferPort);
-            if (inet_pton(AF_INET, cfg.host.c_str(), &addr.sin_addr) != 1) {
-                closesocket(sock);
-                SleepAlive(3000);
-                continue;
-            }
-
-            u_long nb = 1;
-            ioctlsocket(sock, FIONBIO, &nb);
-            connect(sock, (sockaddr*)&addr, sizeof(addr));
-            fd_set wfds, efds;
-            FD_ZERO(&wfds); FD_ZERO(&efds);
-            FD_SET(sock, &wfds); FD_SET(sock, &efds);
-            timeval tv{ 2, 0 };
-            int sel = select(0, nullptr, &wfds, &efds, &tv);
-            int soErr = 0; int soLen = sizeof(soErr);
-            getsockopt(sock, SOL_SOCKET, SO_ERROR, (char*)&soErr, &soLen);
-            if (sel <= 0 || FD_ISSET(sock, &efds) || soErr != 0) {
-                closesocket(sock);
-                SleepAlive(2000);
-                continue;
-            }
-            nb = 0;
-            ioctlsocket(sock, FIONBIO, &nb);
+        sockaddr_in addr{};
+        addr.sin_family = AF_INET;
+        addr.sin_port = htons(xferPort);
+        if (inet_pton(AF_INET, cfg.host.c_str(), &addr.sin_addr) != 1) {
+            closesocket(sock);
+            SleepAlive(3000);
+            continue;
         }
+
+        u_long nb = 1;
+        ioctlsocket(sock, FIONBIO, &nb);
+        connect(sock, (sockaddr*)&addr, sizeof(addr));
+        fd_set wfds, efds;
+        FD_ZERO(&wfds); FD_ZERO(&efds);
+        FD_SET(sock, &wfds); FD_SET(sock, &efds);
+        timeval tv{ 2, 0 };
+        int sel = select(0, nullptr, &wfds, &efds, &tv);
+        int soErr = 0; int soLen = sizeof(soErr);
+        getsockopt(sock, SOL_SOCKET, SO_ERROR, (char*)&soErr, &soLen);
+        if (sel <= 0 || FD_ISSET(sock, &efds) || soErr != 0) {
+            closesocket(sock);
+            SleepAlive(2000);
+            continue;
+        }
+        nb = 0;
+        ioctlsocket(sock, FIONBIO, &nb);
 
         DWORD rcvTo = 1000, sndTo = 5000;
         setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, (const char*)&rcvTo, sizeof(rcvTo));
@@ -6564,7 +6525,7 @@ static void TransferLoop(RunConfig cfg) {
         g_xferSock = sock;
         g_xferConnected = true;
         SetTransferStatus(L"已连接 · 可拖入文件或点击「发送文件到 Mac」");
-        Log("中转站已连接 %s:%d", cfg.hostMode ? "Mac" : cfg.host.c_str(), xferPort);
+        Log("中转站已连接 %s:%d", cfg.host.c_str(), xferPort);
 
         std::atomic<bool> xferAlive{ true };
         std::mutex xferSendMtx;
@@ -6910,13 +6871,9 @@ static void TransferLoop(RunConfig cfg) {
         recvs.clear();
 
         closesocket(sock);
-        SetTransferStatus(cfg.hostMode ? L"中转站等待 Mac 连接 (9923)…" : L"中转连接断开，2 秒后重连…");
+        SetTransferStatus(L"中转连接断开，2 秒后重连…");
         if (!g_alive) break;
-        SleepAlive(cfg.hostMode ? 200 : 2000);
-    }
-    if (listenSock != INVALID_SOCKET) {
-        g_xferListenSock.exchange(INVALID_SOCKET);
-        closesocket(listenSock);
+        SleepAlive(2000);
     }
     Log("中转站线程退出");
 }
@@ -7033,7 +6990,7 @@ int main(int argc, char** argv) {
                      : "================ SecDisplay 接收端 ================");
     if (cfg.hostMode) {
         Log("模式: 主控发送  端口 %d/%d  虚拟屏 %dx%d@%dHz  码率 %dMbps",
-            cfg.port, cfg.port + 1, cfg.width, cfg.height, cfg.hostFps, cfg.hostBitrateMbps);
+            cfg.port, cfg.port + 1, cfg.hostWidth, cfg.hostHeight, cfg.hostFps, cfg.hostBitrateMbps);
     } else {
         Log("目标 %s:%d  分辨率 %dx%d  %s  重连 %s",
             cfg.host.c_str(), cfg.port, cfg.width, cfg.height,
@@ -7085,8 +7042,9 @@ int main(int argc, char** argv) {
         TrayCreate(hwnd);
         RegisterHotKey(hwnd, HOTKEY_QUIT_ID, MOD_CONTROL | MOD_ALT, 'Q');
         RegisterHotKey(hwnd, HOTKEY_DROPBOX_ID, MOD_CONTROL | MOD_ALT, 'B');
+        SetThreadExecutionState(ES_CONTINUOUS | ES_SYSTEM_REQUIRED | ES_DISPLAY_REQUIRED);
 
-        if (!g_winHost.Start(cfg.width, cfg.height, cfg.hostFps, cfg.hostBitrateMbps,
+        if (!g_winHost.Start(cfg.host, cfg.hostWidth, cfg.hostHeight, cfg.hostFps, cfg.hostBitrateMbps,
                              (uint16_t)cfg.port, [](const char* s) { Log("%s", s); })) {
             Log("警告: 主控发送端启动失败（检查 Parsec VDD 驱动是否就绪）");
         }
@@ -7111,6 +7069,7 @@ int main(int argc, char** argv) {
             DispatchMessage(&msg);
         }
 
+        SetThreadExecutionState(ES_CONTINUOUS);
         TrayRemove();
         UnregisterHotKey(hwnd, HOTKEY_QUIT_ID);
         UnregisterHotKey(hwnd, HOTKEY_DROPBOX_ID);

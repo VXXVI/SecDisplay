@@ -96,6 +96,8 @@ cat > "$APP/Contents/Info.plist" <<'PLIST'
     <string>SecDisplay 需要采集虚拟屏画面并发送到 Windows。</string>
     <key>NSAppleEventsUsageDescription</key>
     <string>SecDisplay 需要用 AppleScript 调整显示器排列。</string>
+    <key>NSLocalNetworkUsageDescription</key>
+    <string>SecDisplay 需要通过本地雷电网桥与 Windows 主机建立投屏与文件传输连接。</string>
 </dict>
 </plist>
 PLIST

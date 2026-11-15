@@ -24,6 +24,10 @@ feedback=0
 
 # 角色模式: receiver=Windows当副屏(默认), sender=Mac当Windows副屏
 mode=receiver
+hostwidth=2880
+hostheight=1800
+fps=60
+bitrate=50
 
 # 日志文件，相对路径按进程工作目录
 log=logs\ssh-receiver.log

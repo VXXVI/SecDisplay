@@ -86,9 +86,10 @@ public:
     WinHostStats& Stats() { return stats_; }
     const WinHostStats& Stats() const { return stats_; }
 
-    bool Start(int width, int height, int fps, int bitrateMbps, uint16_t port, LogFn logFn) {
+    bool Start(const std::string& targetHost, int width, int height, int fps, int bitrateMbps, uint16_t port, LogFn logFn) {
         Stop();
         logFn_ = std::move(logFn);
+        targetHost_ = targetHost.empty() ? "10.10.10.1" : targetHost;
         reqW_ = width > 0 ? width : 2560;
         reqH_ = height > 0 ? height : 1600;
         reqFps_ = (fps >= 24 && fps <= 144) ? fps : 60;
@@ -111,39 +112,15 @@ public:
         stats_.height = b.height;
         stats_.fps = b.hz > 0 ? b.hz : reqFps_;
 
-        // 同步绑定并监听端口，端口冲突时立即失败回滚 VDD
-        SOCKET ls = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
-        if (ls == INVALID_SOCKET) {
-            EmitLog("WinHost: 创建监听 socket 失败");
-            vdd_.Stop();
-            return false;
-        }
-        int reuse = 1;
-        setsockopt(ls, SOL_SOCKET, SO_REUSEADDR, (const char*)&reuse, sizeof(reuse));
-        sockaddr_in addr{};
-        addr.sin_family = AF_INET;
-        addr.sin_addr.s_addr = INADDR_ANY;
-        addr.sin_port = htons(port_);
-        if (bind(ls, (sockaddr*)&addr, sizeof(addr)) != 0 || listen(ls, 2) != 0) {
+        {
             char msg[128];
-            snprintf(msg, sizeof(msg), "WinHost: 绑定/监听端口 %u 失败 err=%d", port_, WSAGetLastError());
-            EmitLog(msg);
-            closesocket(ls);
-            vdd_.Stop();
-            return false;
-        }
-        {
-            std::lock_guard<std::mutex> lk(sockMtx_);
-            listenSock_ = ls;
-        }
-        {
-            char msg[96];
-            snprintf(msg, sizeof(msg), "WinHost: 已监听端口 %u，等待 Mac 副屏连接", port_);
+            snprintf(msg, sizeof(msg), "WinHost: 主控端启动，准备连接 Mac 副屏 %s:%u",
+                     targetHost_.c_str(), port_);
             EmitLog(msg);
         }
 
         alive_.store(true);
-        acceptThread_ = std::thread(&WinHostSender::AcceptLoop, this);
+        acceptThread_ = std::thread(&WinHostSender::ConnectLoop, this);
         captureThread_ = std::thread(&WinHostSender::CaptureEncodeLoop, this);
         cursorThread_ = std::thread(&WinHostSender::CursorLoop, this);
         return true;
@@ -166,14 +143,6 @@ public:
         if (acceptThread_.joinable()) acceptThread_.join();
         if (captureThread_.joinable()) captureThread_.join();
         if (cursorThread_.joinable()) cursorThread_.join();
-
-        {
-            std::lock_guard<std::mutex> lk(sockMtx_);
-            if (listenSock_ != INVALID_SOCKET) {
-                closesocket(listenSock_);
-                listenSock_ = INVALID_SOCKET;
-            }
-        }
 
         vdd_.Stop();
         EmitLog("WinHost: 发送端已停止");
@@ -199,6 +168,7 @@ private:
     WinHostStats stats_;
     LogFn logFn_;
 
+    std::string targetHost_ = "10.10.10.1";
     int reqW_ = 2560;
     int reqH_ = 1600;
     int reqFps_ = 60;
@@ -212,12 +182,8 @@ private:
 
     std::mutex sockMtx_;
     std::mutex sendMtx_;
-    SOCKET listenSock_ = INVALID_SOCKET;
     SOCKET clientSock_ = INVALID_SOCKET;
     uint64_t connEpoch_ = 0;
-
-    std::mutex lastFrameMtx_;
-    std::vector<uint8_t> lastAvccFrame_;
 
     std::thread acceptThread_;
     std::thread captureThread_;
@@ -378,27 +344,14 @@ private:
         SendRawPacket(pkt.data(), pkt.size());
     }
 
-    // ---- TCP 服务端接收与控制回传 ----
-    void AcceptLoop() {
-        SOCKET ls = INVALID_SOCKET;
-        {
-            std::lock_guard<std::mutex> lk(sockMtx_);
-            ls = listenSock_;
-        }
-        if (ls == INVALID_SOCKET) return;
-
+    // ---- TCP 主动连接 Mac 副屏（绕开 macOS 本地网络 TCC 对出站连接的阻断）----
+    void ConnectLoop() {
         while (alive_.load()) {
-            fd_set rfds;
-            FD_ZERO(&rfds);
-            FD_SET(ls, &rfds);
-            timeval tv{ 0, 250000 };
-            int sel = select(0, &rfds, nullptr, nullptr, &tv);
-            if (sel <= 0) continue;
-
-            sockaddr_in cliAddr{};
-            int cliLen = sizeof(cliAddr);
-            SOCKET cs = accept(ls, (sockaddr*)&cliAddr, &cliLen);
-            if (cs == INVALID_SOCKET) continue;
+            SOCKET cs = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+            if (cs == INVALID_SOCKET) {
+                for (int i = 0; i < 15 && alive_.load(); ++i) Sleep(100);
+                continue;
+            }
 
             int bufSz = 4 * 1024 * 1024;
             setsockopt(cs, SOL_SOCKET, SO_SNDBUF, (const char*)&bufSz, sizeof(bufSz));
@@ -406,13 +359,39 @@ private:
             int nodelay = 1, keepalive = 1;
             setsockopt(cs, IPPROTO_TCP, TCP_NODELAY, (const char*)&nodelay, sizeof(nodelay));
             setsockopt(cs, SOL_SOCKET, SO_KEEPALIVE, (const char*)&keepalive, sizeof(keepalive));
+
+            sockaddr_in addr{};
+            addr.sin_family = AF_INET;
+            addr.sin_port = htons(port_);
+            if (inet_pton(AF_INET, targetHost_.c_str(), &addr.sin_addr) != 1) {
+                closesocket(cs);
+                for (int i = 0; i < 20 && alive_.load(); ++i) Sleep(100);
+                continue;
+            }
+
+            u_long nb = 1;
+            ioctlsocket(cs, FIONBIO, &nb);
+            connect(cs, (sockaddr*)&addr, sizeof(addr));
+            fd_set wfds, efds;
+            FD_ZERO(&wfds); FD_ZERO(&efds);
+            FD_SET(cs, &wfds); FD_SET(cs, &efds);
+            timeval tv{ 1, 500000 };
+            int sel = select(0, nullptr, &wfds, &efds, &tv);
+            int soErr = 0; int soLen = sizeof(soErr);
+            getsockopt(cs, SOL_SOCKET, SO_ERROR, (char*)&soErr, &soLen);
+            if (sel <= 0 || FD_ISSET(cs, &efds) || soErr != 0) {
+                closesocket(cs);
+                for (int i = 0; i < 15 && alive_.load(); ++i) Sleep(100);
+                continue;
+            }
+            nb = 0;
+            ioctlsocket(cs, FIONBIO, &nb);
+
             DWORD rcvTo = 500, sndTo = 3000;
             setsockopt(cs, SOL_SOCKET, SO_RCVTIMEO, (const char*)&rcvTo, sizeof(rcvTo));
             setsockopt(cs, SOL_SOCKET, SO_SNDTIMEO, (const char*)&sndTo, sizeof(sndTo));
 
-            char ipStr[64] = {};
-            inet_ntop(AF_INET, &cliAddr.sin_addr, ipStr, sizeof(ipStr));
-            std::string peer = std::string(ipStr) + ":" + std::to_string(ntohs(cliAddr.sin_port));
+            std::string peer = targetHost_ + ":" + std::to_string(port_);
 
             uint64_t epoch = 0;
             {
@@ -437,13 +416,16 @@ private:
 
             {
                 char msg[128];
-                snprintf(msg, sizeof(msg), "WinHost: Mac 副屏已连接 %s", peer.c_str());
+                snprintf(msg, sizeof(msg), "WinHost: 已连接 Mac 副屏 %s", peer.c_str());
                 EmitLog(msg);
             }
 
             WinVddBounds b = vdd_.Bounds();
             SendSessionHeader(b.width, b.height, b.hz > 0 ? b.hz : reqFps_);
             ClientRecvLoop(cs, epoch);
+
+            if (!alive_.load()) break;
+            for (int i = 0; i < 15 && alive_.load(); ++i) Sleep(100);
         }
     }
 
@@ -810,7 +792,11 @@ private:
         Microsoft::WRL::ComPtr<ID3D11VideoContext> vctx;
         Microsoft::WRL::ComPtr<ID3D11VideoProcessorEnumerator> vpEnum;
         Microsoft::WRL::ComPtr<ID3D11VideoProcessor> vp;
-        Microsoft::WRL::ComPtr<ID3D11Texture2D> nv12Tex;
+        static constexpr int kNv12PoolSize = 4;
+        Microsoft::WRL::ComPtr<ID3D11Texture2D> bgraCopy;
+        Microsoft::WRL::ComPtr<ID3D11Texture2D> nv12Pool[kNv12PoolSize];
+        int poolIdx = 0;
+        Microsoft::WRL::ComPtr<ID3D11Query> vpFence;
         Microsoft::WRL::ComPtr<ID3D11Texture2D> stagingBgra;
 
         Microsoft::WRL::ComPtr<IMFTransform> mft;
@@ -833,7 +819,10 @@ private:
             codecApi.Reset();
             evtGen.Reset();
             mft.Reset();
-            nv12Tex.Reset();
+            bgraCopy.Reset();
+            for (int i = 0; i < kNv12PoolSize; ++i) nv12Pool[i].Reset();
+            poolIdx = 0;
+            vpFence.Reset();
             stagingBgra.Reset();
             vp.Reset();
             vpEnum.Reset();
@@ -861,6 +850,14 @@ private:
                 dxgiMgr->ResetDevice(dev.Get(), token);
             }
 
+            // 开启 D3D11 多线程保护：Intel QSV Async MFT 内部工作线程会并发访问 D3D11 设备
+            {
+                Microsoft::WRL::ComPtr<ID3D11Multithread> mt;
+                if (SUCCEEDED(dev.As(&mt)) && mt) {
+                    mt->SetMultithreadProtected(TRUE);
+                }
+            }
+
             // 创建 GPU BGRA -> NV12 VideoProcessor
             if (SUCCEEDED(dev.As(&vdev)) && SUCCEEDED(ctx.As(&vctx))) {
                 D3D11_VIDEO_PROCESSOR_CONTENT_DESC cd{};
@@ -875,6 +872,20 @@ private:
                 }
             }
 
+            D3D11_TEXTURE2D_DESC bd{};
+            bd.Width = (UINT)w;
+            bd.Height = (UINT)h;
+            bd.MipLevels = 1;
+            bd.ArraySize = 1;
+            bd.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+            bd.SampleDesc.Count = 1;
+            bd.Usage = D3D11_USAGE_DEFAULT;
+            bd.BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
+            if (FAILED(dev->CreateTexture2D(&bd, nullptr, &bgraCopy))) {
+                if (logFn) logFn("WinHost: 创建 BGRA 缓冲纹理失败");
+                return false;
+            }
+
             D3D11_TEXTURE2D_DESC nd{};
             nd.Width = (UINT)w;
             nd.Height = (UINT)h;
@@ -884,9 +895,15 @@ private:
             nd.SampleDesc.Count = 1;
             nd.Usage = D3D11_USAGE_DEFAULT;
             nd.BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
-            if (FAILED(dev->CreateTexture2D(&nd, nullptr, &nv12Tex))) {
-                if (logFn) logFn("WinHost: 创建 NV12 纹理失败");
-                return false;
+            for (int i = 0; i < kNv12PoolSize; ++i) {
+                if (FAILED(dev->CreateTexture2D(&nd, nullptr, &nv12Pool[i]))) {
+                    if (logFn) logFn("WinHost: 创建 NV12 纹理池失败");
+                    return false;
+                }
+            }
+            {
+                D3D11_QUERY_DESC qd{ D3D11_QUERY_EVENT, 0 };
+                dev->CreateQuery(&qd, &vpFence);
             }
 
             MFT_REGISTER_TYPE_INFO outInfo{ MFMediaType_Video, MFVideoFormat_H264 };
@@ -932,7 +949,7 @@ private:
                     }
                 }
 
-                // 设置输出类型 H.264
+                // 设置输出类型 H.264（优先 High Profile，锐度更好）
                 Microsoft::WRL::ComPtr<IMFMediaType> ot;
                 MFCreateMediaType(&ot);
                 ot->SetGUID(MF_MT_MAJOR_TYPE, MFMediaType_Video);
@@ -942,8 +959,11 @@ private:
                 MFSetAttributeRatio(ot.Get(), MF_MT_FRAME_RATE, (UINT32)fps, 1);
                 MFSetAttributeRatio(ot.Get(), MF_MT_PIXEL_ASPECT_RATIO, 1, 1);
                 ot->SetUINT32(MF_MT_INTERLACE_MODE, MFVideoInterlace_Progressive);
-                ot->SetUINT32(MF_MT_MPEG2_PROFILE, eAVEncH264VProfile_Main);
-                if (FAILED(cand->SetOutputType(0, ot.Get(), 0))) continue;
+                ot->SetUINT32(MF_MT_MPEG2_PROFILE, eAVEncH264VProfile_High);
+                if (FAILED(cand->SetOutputType(0, ot.Get(), 0))) {
+                    ot->SetUINT32(MF_MT_MPEG2_PROFILE, eAVEncH264VProfile_Main);
+                    if (FAILED(cand->SetOutputType(0, ot.Get(), 0))) continue;
+                }
 
                 // 设置输入类型 NV12
                 Microsoft::WRL::ComPtr<IMFMediaType> it;
@@ -956,14 +976,20 @@ private:
                 it->SetUINT32(MF_MT_INTERLACE_MODE, MFVideoInterlace_Progressive);
                 if (FAILED(cand->SetInputType(0, it.Get(), 0))) continue;
 
-                // 低延迟编码参数
+                // 低延迟编码参数：优先 PeakConstrainedVBR，兼顾静态文字锐度与动态带宽控制
                 Microsoft::WRL::ComPtr<ICodecAPI> api;
                 if (SUCCEEDED(cand.As(&api)) && api) {
                     VARIANT v{};
-                    v.vt = VT_UI4; v.ulVal = eAVEncCommonRateControlMode_CBR;
-                    api->SetValue(&CODECAPI_AVEncCommonRateControlMode, &v);
+                    v.vt = VT_UI4;
+                    v.ulVal = eAVEncCommonRateControlMode_PeakConstrainedVBR;
+                    if (FAILED(api->SetValue(&CODECAPI_AVEncCommonRateControlMode, &v))) {
+                        v.ulVal = eAVEncCommonRateControlMode_CBR;
+                        api->SetValue(&CODECAPI_AVEncCommonRateControlMode, &v);
+                    }
                     v.ulVal = (ULONG)mbps * 1000000UL;
                     api->SetValue(&CODECAPI_AVEncCommonMeanBitRate, &v);
+                    v.ulVal = (ULONG)std::min(160, mbps * 3 / 2) * 1000000UL;
+                    api->SetValue(&CODECAPI_AVEncCommonMaxBitRate, &v);
                     v.ulVal = (ULONG)(fps * 2);
                     api->SetValue(&CODECAPI_AVEncMPVGOPSize, &v);
                     v.ulVal = 0;
@@ -1018,23 +1044,33 @@ private:
             }
         }
 
-        bool ConvertBgraToNv12(ID3D11Texture2D* bgraTex) {
-            if (!vp || !vpEnum || !vdev || !vctx || !nv12Tex) return false;
+        ID3D11Texture2D* ConvertBgraToNv12(ID3D11Texture2D* bgraTex) {
+            if (!vp || !vpEnum || !vdev || !vctx || !bgraCopy) return nullptr;
+            ID3D11Texture2D* targetNv12 = nv12Pool[poolIdx].Get();
+            if (!targetNv12) return nullptr;
+            poolIdx = (poolIdx + 1) % kNv12PoolSize;
+
+            // 先从 DXGI Duplication 表面拷贝到稳定 DEFAULT 纹理，确保采集纹理不与 VideoProcessor 并发冲突
+            if (bgraTex != bgraCopy.Get()) {
+                ctx->CopyResource(bgraCopy.Get(), bgraTex);
+            }
+
             D3D11_VIDEO_PROCESSOR_INPUT_VIEW_DESC ivd{};
             ivd.FourCC = 0;
             ivd.ViewDimension = D3D11_VPIV_DIMENSION_TEXTURE2D;
             ivd.Texture2D.MipSlice = 0;
             Microsoft::WRL::ComPtr<ID3D11VideoProcessorInputView> iv;
-            if (FAILED(vdev->CreateVideoProcessorInputView(bgraTex, vpEnum.Get(), &ivd, &iv))) return false;
+            if (FAILED(vdev->CreateVideoProcessorInputView(bgraCopy.Get(), vpEnum.Get(), &ivd, &iv))) return nullptr;
 
             D3D11_VIDEO_PROCESSOR_OUTPUT_VIEW_DESC ovd{};
             ovd.ViewDimension = D3D11_VPOV_DIMENSION_TEXTURE2D;
             ovd.Texture2D.MipSlice = 0;
             Microsoft::WRL::ComPtr<ID3D11VideoProcessorOutputView> ov;
-            if (FAILED(vdev->CreateVideoProcessorOutputView(nv12Tex.Get(), vpEnum.Get(), &ovd, &ov))) return false;
+            if (FAILED(vdev->CreateVideoProcessorOutputView(targetNv12, vpEnum.Get(), &ovd, &ov))) return nullptr;
 
             RECT srcRc{ 0, 0, w, h };
             RECT dstRc{ 0, 0, w, h };
+            vctx->VideoProcessorSetStreamAutoProcessingMode(vp.Get(), 0, FALSE);
             vctx->VideoProcessorSetStreamSourceRect(vp.Get(), 0, TRUE, &srcRc);
             vctx->VideoProcessorSetStreamDestRect(vp.Get(), 0, TRUE, &dstRc);
             vctx->VideoProcessorSetOutputTargetRect(vp.Get(), TRUE, &dstRc);
@@ -1054,7 +1090,20 @@ private:
             st.Enable = TRUE;
             st.pInputSurface = iv.Get();
             HRESULT hr = vctx->VideoProcessorBlt(vp.Get(), ov.Get(), 0, 1, &st);
-            return SUCCEEDED(hr);
+            if (FAILED(hr)) return nullptr;
+            // 等待 VEBOX VideoProcessorBlt 在 GPU 上真实写完再喂给 VDBOX QSV MFT，
+            // 仅调用 Flush() 不等待跨引擎完成，会导致画面出现随机白/黑短横线噪点。
+            if (vpFence) {
+                ctx->End(vpFence.Get());
+                ctx->Flush();
+                for (int spin = 0; spin < 100; ++spin) {
+                    if (ctx->GetData(vpFence.Get(), nullptr, 0, 0) != S_FALSE) break;
+                    if (spin < 20) Sleep(0); else Sleep(1);
+                }
+            } else {
+                ctx->Flush();
+            }
+            return targetNv12;
         }
 
         // 从 BGRA 纹理经 CPU 转为 NV12 系统内存（仅软件 MFT 兜底用）
@@ -1184,17 +1233,19 @@ private:
             Microsoft::WRL::ComPtr<IMFSample> inSample;
             MFCreateSample(&inSample);
             bool usedGpuSurface = false;
-            if (isHardware && ConvertBgraToNv12(bgraTex)) {
-                Microsoft::WRL::ComPtr<IMFMediaBuffer> buf;
-                if (SUCCEEDED(MFCreateDXGISurfaceBuffer(__uuidof(ID3D11Texture2D), nv12Tex.Get(), 0, FALSE, &buf))) {
-                    Microsoft::WRL::ComPtr<IMF2DBuffer> b2d;
-                    if (SUCCEEDED(buf.As(&b2d))) {
-                        DWORD clen = 0;
-                        b2d->GetContiguousLength(&clen);
-                        buf->SetCurrentLength(clen);
+            if (isHardware) {
+                if (ID3D11Texture2D* nv12Surf = ConvertBgraToNv12(bgraTex)) {
+                    Microsoft::WRL::ComPtr<IMFMediaBuffer> buf;
+                    if (SUCCEEDED(MFCreateDXGISurfaceBuffer(__uuidof(ID3D11Texture2D), nv12Surf, 0, FALSE, &buf))) {
+                        Microsoft::WRL::ComPtr<IMF2DBuffer> b2d;
+                        if (SUCCEEDED(buf.As(&b2d))) {
+                            DWORD clen = 0;
+                            b2d->GetContiguousLength(&clen);
+                            buf->SetCurrentLength(clen);
+                        }
+                        inSample->AddBuffer(buf.Get());
+                        usedGpuSurface = true;
                     }
-                    inSample->AddBuffer(buf.Get());
-                    usedGpuSurface = true;
                 }
             }
             if (!usedGpuSurface) {
@@ -1214,10 +1265,10 @@ private:
             inSample->SetSampleDuration(dur);
 
             if (forceIdr && codecApi) {
-                VARIANT vb{};
-                vb.vt = VT_BOOL;
-                vb.boolVal = VARIANT_TRUE;
-                codecApi->SetValue(&CODECAPI_AVEncVideoForceKeyFrame, &vb);
+                VARIANT v{};
+                v.vt = VT_UI4;
+                v.ulVal = 1;
+                codecApi->SetValue(&CODECAPI_AVEncVideoForceKeyFrame, &v);
             }
 
             if (FAILED(mft->ProcessInput(0, inSample.Get(), 0))) return !outAvcc.empty();
@@ -1315,10 +1366,36 @@ private:
             LARGE_INTEGER qpf{};
             QueryPerformanceFrequency(&qpf);
             ULONGLONG lastSessTick = GetTickCount64();
+            ULONGLONG lastStatTick = lastSessTick;
+            uint64_t lastStatSent = stats_.framesSent.load();
+            uint64_t lastStatBytes = stats_.bytesSent.load();
             bool firstFrame = true;
+            bool hasCachedBgra = false;
 
             while (alive_.load()) {
                 enc.UpdateBitrateIfChanged(curMbps_.load());
+                {
+                    ULONGLONG nowStat = GetTickCount64();
+                    if (nowStat - lastStatTick >= 5000) {
+                        double dt = (double)(nowStat - lastStatTick) / 1000.0;
+                        uint64_t curSent = stats_.framesSent.load();
+                        uint64_t curBytes = stats_.bytesSent.load();
+                        double fpsNow = (double)(curSent - lastStatSent) / dt;
+                        double mbpsNow = (double)(curBytes - lastStatBytes) * 8.0 / dt / 1e6;
+                        lastStatTick = nowStat;
+                        lastStatSent = curSent;
+                        lastStatBytes = curBytes;
+                        if (stats_.clientConnected.load()) {
+                            char msg[192];
+                            snprintf(msg, sizeof(msg),
+                                     "WinHost: %dx%d  %.1f fps  %.1f Mbps (目标 %dM)  编码 %.2f ms  光标 %llu  输入 %llu",
+                                     capW, capH, fpsNow, mbpsNow, curMbps_.load(), stats_.lastEncMs.load(),
+                                     (unsigned long long)stats_.cursorSent.load(),
+                                     (unsigned long long)stats_.inputRecv.load());
+                            EmitLog(msg);
+                        }
+                    }
+                }
 
                 DXGI_OUTDUPL_FRAME_INFO fi{};
                 Microsoft::WRL::ComPtr<IDXGIResource> res;
@@ -1326,6 +1403,20 @@ private:
 
                 if (hr == DXGI_ERROR_WAIT_TIMEOUT) {
                     if (stats_.clientConnected.load()) {
+                        if (forceKeyframe_.load() && hasCachedBgra && enc.bgraCopy) {
+                            forceKeyframe_.store(false);
+                            uint64_t capUs = NowMicros();
+                            std::vector<uint8_t> avcc;
+                            bool isIdr = false;
+                            if (enc.EncodeTexture(enc.bgraCopy.Get(), true, alive_, avcc, &isIdr, &logFn_) && !avcc.empty()) {
+                                stats_.framesEncoded++;
+                                SendVideoAvcc(avcc, capUs);
+                                if (!isIdr) forceKeyframe_.store(true);
+                                continue;
+                            } else {
+                                forceKeyframe_.store(true);
+                            }
+                        }
                         ULONGLONG nowTick = GetTickCount64();
                         if (nowTick - lastSessTick >= 5000) {
                             lastSessTick = nowTick;
@@ -1333,15 +1424,9 @@ private:
                         }
                         uint64_t nowUs = NowMicros();
                         uint64_t prevUs = lastPayloadUs_.load();
-                        if (prevUs > 0 && nowUs - prevUs >= 80000ULL) {
-                            std::vector<uint8_t> copy;
-                            {
-                                std::lock_guard<std::mutex> flk(lastFrameMtx_);
-                                copy = lastAvccFrame_;
-                            }
-                            if (!copy.empty()) SendVideoAvcc(copy, nowUs);
-                            else SendHeartbeat();
-                        } else if (prevUs == 0) {
+                        // 静止桌面绝不重复发送同一帧 P 帧（QSV P 帧含非零残差/运动矢量，重复喂给解码器会叠加漂移出彩斑与噪点），
+                        // 仅发 13 字节 0x06 心跳维持 TCP 链路活性。
+                        if (prevUs == 0 || nowUs - prevUs >= 80000ULL) {
                             SendHeartbeat();
                             lastPayloadUs_.store(nowUs);
                         }
@@ -1357,7 +1442,7 @@ private:
                 Microsoft::WRL::ComPtr<ID3D11Texture2D> tex;
                 res.As(&tex);
                 bool hasImage = (firstFrame || fi.LastPresentTime.QuadPart != 0 || fi.AccumulatedFrames > 0);
-                if (tex && hasImage && stats_.clientConnected.load()) {
+                if (tex && hasImage) {
                     firstFrame = false;
                     D3D11_TEXTURE2D_DESC td{};
                     tex->GetDesc(&td);
@@ -1365,26 +1450,31 @@ private:
                         dup->ReleaseFrame();
                         break;
                     }
-
-                    LARGE_INTEGER t0{}, t1{};
-                    QueryPerformanceCounter(&t0);
-                    uint64_t capUs = NowMicros();
-                    bool wantIdr = forceKeyframe_.exchange(false);
-                    std::vector<uint8_t> avcc;
-                    bool isIdr = false;
-                    if (enc.EncodeTexture(tex.Get(), wantIdr, alive_, avcc, &isIdr, &logFn_) && !avcc.empty()) {
-                        QueryPerformanceCounter(&t1);
-                        double encMs = (double)(t1.QuadPart - t0.QuadPart) * 1000.0 / (double)qpf.QuadPart;
-                        stats_.lastEncMs = encMs;
-                        stats_.framesEncoded++;
-                        {
-                            std::lock_guard<std::mutex> flk(lastFrameMtx_);
-                            lastAvccFrame_ = avcc;
+                    if (enc.bgraCopy) {
+                        ctx->CopyResource(enc.bgraCopy.Get(), tex.Get());
+                        hasCachedBgra = true;
+                    }
+                    if (stats_.clientConnected.load()) {
+                        LARGE_INTEGER t0{}, t1{};
+                        QueryPerformanceCounter(&t0);
+                        uint64_t capUs = NowMicros();
+                        bool wantIdr = forceKeyframe_.exchange(false);
+                        std::vector<uint8_t> avcc;
+                        bool isIdr = false;
+                        ID3D11Texture2D* srcTex = enc.bgraCopy ? enc.bgraCopy.Get() : tex.Get();
+                        if (enc.EncodeTexture(srcTex, wantIdr, alive_, avcc, &isIdr, &logFn_) && !avcc.empty()) {
+                            QueryPerformanceCounter(&t1);
+                            double encMs = (double)(t1.QuadPart - t0.QuadPart) * 1000.0 / (double)qpf.QuadPart;
+                            stats_.lastEncMs = encMs;
+                            stats_.framesEncoded++;
+                            if (wantIdr && !isIdr) {
+                                forceKeyframe_.store(true);
+                            }
+                            SendVideoAvcc(avcc, capUs);
+                        } else if (wantIdr) {
+                            forceKeyframe_.store(true);
+                            stats_.encodeFail++;
                         }
-                        SendVideoAvcc(avcc, capUs);
-                    } else if (wantIdr) {
-                        forceKeyframe_.store(true);
-                        stats_.encodeFail++;
                     }
                 }
                 dup->ReleaseFrame();
