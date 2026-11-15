@@ -3974,10 +3974,32 @@ static void RenderDropBoxLayered(HWND h) {
     ReleaseDC(nullptr, screenDc);
 }
 
+static void ArmDropBoxFeedbackTimer(HWND h) {
+    if (!h) return;
+    UINT delayMs = 0;
+    {
+        std::lock_guard<std::mutex> lk(g_xferMtx);
+        if (g_xferFbKind != 0) {
+            ULONGLONG now = GetTickCount64();
+            if (now >= g_xferFbExpireTick) {
+                g_xferFbKind = 0;
+                g_xferFbTitle.clear();
+                g_xferFbDetail.clear();
+            } else {
+                ULONGLONG rem = g_xferFbExpireTick - now;
+                delayMs = (UINT)std::min<ULONGLONG>(rem + 30, 5000);
+            }
+        }
+    }
+    if (delayMs > 0) SetTimer(h, kDropBoxFbTimer, delayMs, nullptr);
+    else KillTimer(h, kDropBoxFbTimer);
+}
+
 static LRESULT CALLBACK DropBoxWndProc(HWND h, UINT msg, WPARAM w, LPARAM l) {
     switch (msg) {
     case WM_CREATE:
         DragAcceptFiles(h, TRUE);
+        ArmDropBoxFeedbackTimer(h);
         RenderDropBoxLayered(h);
         return 0;
     case WM_ERASEBKGND:
@@ -3990,29 +4012,35 @@ static LRESULT CALLBACK DropBoxWndProc(HWND h, UINT msg, WPARAM w, LPARAM l) {
         return 0;
     }
     case WM_APP_XFER_UI: {
-        bool armFbTimer = false;
-        {
-            std::lock_guard<std::mutex> lk(g_xferMtx);
-            armFbTimer = (g_xferFbKind != 0);
-        }
-        if (armFbTimer) SetTimer(h, kDropBoxFbTimer, 2250, nullptr);
-        else KillTimer(h, kDropBoxFbTimer);
+        ArmDropBoxFeedbackTimer(h);
         RenderDropBoxLayered(h);
         return 0;
     }
     case WM_TIMER:
         if (w == kDropBoxFbTimer) {
+            bool expiredOrNone = true;
             bool changed = false;
+            UINT nextDelay = 0;
             {
                 std::lock_guard<std::mutex> lk(g_xferMtx);
-                if (g_xferFbKind != 0 && GetTickCount64() >= g_xferFbExpireTick) {
-                    g_xferFbKind = 0;
-                    g_xferFbTitle.clear();
-                    g_xferFbDetail.clear();
-                    changed = true;
+                if (g_xferFbKind != 0) {
+                    ULONGLONG now = GetTickCount64();
+                    if (now >= g_xferFbExpireTick) {
+                        g_xferFbKind = 0;
+                        g_xferFbTitle.clear();
+                        g_xferFbDetail.clear();
+                        changed = true;
+                    } else {
+                        expiredOrNone = false;
+                        nextDelay = (UINT)std::min<ULONGLONG>((g_xferFbExpireTick - now) + 30, 5000);
+                    }
                 }
             }
-            KillTimer(h, kDropBoxFbTimer);
+            if (expiredOrNone) {
+                KillTimer(h, kDropBoxFbTimer);
+            } else if (nextDelay > 0) {
+                SetTimer(h, kDropBoxFbTimer, nextDelay, nullptr);
+            }
             if (changed) RenderDropBoxLayered(h);
             return 0;
         }
@@ -4152,10 +4180,14 @@ static void ShowDropBoxWindow() {
         if (GetWindowRect(cur, &wr)) {
             // 若所在外接屏已断开导致窗口跑出所有显示器，拉回当前工作区右下角；否则保留用户拖动的位置
             if (!MonitorFromRect(&wr, MONITOR_DEFAULTTONULL)) {
-                const int dpi = PanelWindowDpi(nullptr);
-                int rw = DpiPx(272, dpi), rh = DpiPx(292, dpi);
                 RECT wa{};
                 SystemParametersInfoW(SPI_GETWORKAREA, 0, &wa, 0);
+                // 先移到主工作区右下角附近，再取目标显示器的真实 DPI 精算宽高
+                SetWindowPos(cur, nullptr, std::max((int)wa.left, (int)wa.right - 300),
+                             std::max((int)wa.top, (int)wa.bottom - 320), 0, 0,
+                             SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
+                const int dpi = PanelWindowDpi(cur);
+                int rw = DpiPx(272, dpi), rh = DpiPx(292, dpi);
                 int rx = (wa.right > wa.left) ? (wa.right - rw - DpiPx(16, dpi)) : (GetSystemMetrics(SM_CXSCREEN) - rw - 16);
                 int ry = (wa.bottom > wa.top) ? (wa.bottom - rh - DpiPx(16, dpi)) : (GetSystemMetrics(SM_CYSCREEN) - rh - 40);
                 SetWindowPos(cur, nullptr, rx, ry, rw, rh, SWP_NOZORDER | SWP_NOACTIVATE);
@@ -4163,6 +4195,7 @@ static void ShowDropBoxWindow() {
                 g_dropBoxHasPos = true;
             }
         }
+        ArmDropBoxFeedbackTimer(cur);
         ShowWindow(cur, SW_SHOWNOACTIVATE);
         SetWindowPos(cur, g_dropBoxPinned.load() ? HWND_TOPMOST : HWND_NOTOPMOST,
                      0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
@@ -6048,9 +6081,12 @@ static void TransferLoop(RunConfig cfg) {
                 if (it == recvs.end() || dlen > len - 8) continue;
                 DWORD written = 0;
                 if (dlen > 0 && (!WriteFile(it->second.hf, payload.data() + 8, dlen, &written, nullptr) || written != dlen)) {
+                    std::wstring errName = it->second.safeName;
                     CloseHandle(it->second.hf);
                     DeleteFileW(it->second.partPath.c_str());
                     recvs.erase(it);
+                    SetTransferStatus(L"保存失败: " + errName, -1, L"");
+                    SetTransferFeedback(-1, L"保存失败", errName);
                     sendAck(id, false);
                     continue;
                 }
@@ -6156,9 +6192,10 @@ int main(int argc, char** argv) {
     // GUI 子系统下默认无控制台黑框；若用户主动从 cmd/PowerShell 交互运行，则附着父控制台输出日志
     if (GetConsoleWindow() == nullptr) {
         DWORD errType = GetFileType(GetStdHandle(STD_ERROR_HANDLE));
+        DWORD outType = GetFileType(GetStdHandle(STD_OUTPUT_HANDLE));
         if (errType == FILE_TYPE_UNKNOWN) {
             if (AttachConsole(ATTACH_PARENT_PROCESS)) {
-                freopen("CONOUT$", "w", stdout);
+                if (outType == FILE_TYPE_UNKNOWN) freopen("CONOUT$", "w", stdout);
                 freopen("CONOUT$", "w", stderr);
             }
         }

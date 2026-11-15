@@ -2782,7 +2782,7 @@ final class FileTransferService {
         stateLock.unlock()
         notifyUI()
         if kind != 0 {
-            sendQueue.asyncAfter(deadline: .now() + 2.2) { [weak self] in
+            DispatchQueue.main.asyncAfter(deadline: .now() + 2.2) { [weak self] in
                 guard let self else { return }
                 self.stateLock.lock()
                 let clear = (self.feedbackSeq == seq)
@@ -3118,6 +3118,8 @@ final class FileTransferService {
                 try? rf.handle.close()
                 try? FileManager.default.removeItem(at: rf.partURL)
                 activeRecvs.removeValue(forKey: id)
+                updateStatus("保存失败: \(rf.safeName)", busy: false, progress: 0, speed: "")
+                showFeedback(kind: -1, title: "保存失败", detail: rf.safeName)
                 sendAck(id: id, ok: false)
                 return
             }
@@ -3175,6 +3177,7 @@ final class FileTransferService {
             let ok = payload[4] == 1
             if !ok {
                 Log.info("中转站对端落盘失败 #\(id)")
+                showFeedback(kind: -1, title: "对端保存失败", detail: "")
             }
 
         default:
@@ -3250,6 +3253,7 @@ final class FileTransferService {
               let fh = try? FileHandle(forReadingFrom: url) else {
             Log.info("中转站无法读取文件: \(url.path)")
             updateStatus("读取失败: \(url.lastPathComponent)", busy: false, progress: 0, speed: "")
+            showFeedback(kind: -1, title: "读取失败", detail: url.lastPathComponent)
             return .localFailed
         }
         defer { try? fh.close() }
@@ -3313,7 +3317,11 @@ final class FileTransferService {
             return true
         }
 
-        if !sendFrame(beginFrame) { return .connLost }
+        if !sendFrame(beginFrame) {
+            updateStatus("发送中断: \(fname)", busy: false, progress: 0, speed: "")
+            showFeedback(kind: -1, title: "发送中断", detail: fname)
+            return .connLost
+        }
 
         var sentBytes: UInt64 = 0
         var readErr = false
@@ -3357,6 +3365,7 @@ final class FileTransferService {
         if !connAlive() || sendFailed {
             // 连接已断，不再尝试发 endFrame
             updateStatus("发送中断: \(fname)", busy: false, progress: 0, speed: "")
+            showFeedback(kind: -1, title: "发送中断", detail: fname)
             return .connLost
         }
 
@@ -3402,6 +3411,12 @@ final class FileTransferService {
         activeBusy = busy
         activeProgress = progress
         activeSpeedText = speed
+        if busy {
+            feedbackSeq &+= 1
+            activeFeedbackKind = 0
+            activeFeedbackTitle = ""
+            activeFeedbackDetail = ""
+        }
         stateLock.unlock()
         notifyUI()
     }
@@ -4411,7 +4426,7 @@ private func registerGlobalDropBoxHotKey() {
         GetEventParameter(event, EventParamName(kEventParamDirectObject),
                           EventParamType(typeEventHotKeyID), nil,
                           MemoryLayout<EventHotKeyID>.size, nil, &hkID)
-        if hkID.id == 1 {
+        if hkID.signature == 0x53444258 && hkID.id == 1 {
             DispatchQueue.main.async { toggleDropBoxPanel() }
         }
         return noErr
