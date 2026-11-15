@@ -932,7 +932,12 @@ final class Encoder {
 
 }
 
-// MARK: - 抓屏
+// MARK: - 抓屏（SCStream 路径，当前未启用）
+//
+// 注意：这个类目前没有任何实例化点，实际采集走下面的 ScreenshotCapture。
+// 保留它是因为里面记了 SCStream 在 CGVirtualDisplay 上的实测结论（见
+// startCompositeCapture 的注释），将来若要回到 SCStream 路径可直接参考。
+// 它的 idleFrameCount / staticSkipCount 因此恒为 0，不要拿去做面板指标。
 
 final class Capture: NSObject, SCStreamOutput, SCStreamDelegate {
     let encoder: Encoder
@@ -1087,7 +1092,8 @@ final class Capture: NSObject, SCStreamOutput, SCStreamDelegate {
     private var compositeSeq: Int64 = 0
     private let compositeQueue = DispatchQueue(label: "SecDisplay.capture.composite")
 
-    /// 默认走合成抓屏；SECDISPLAY_CAPTURE=sck 可退回 ScreenCaptureKit。
+    /// 合成抓屏（CGWindowListCreateImage）开关。
+    /// 注意：本类当前未被实例化，这个开关不生效；实际采集走 ScreenshotCapture。
     private var isCompositeMode: Bool {
         ProcessInfo.processInfo.environment["SECDISPLAY_CAPTURE"] != "sck"
     }
@@ -2871,6 +2877,11 @@ if presetName == nil, let rp = Bundle.main.resourcePath {
 /// 同样支持环境变量与 bundle 内资源文件两种来源 —— 从 Finder 启动的 .app
 /// 拿不到环境变量，没有这个文件的话省内存选项等于用户根本用不上。
 /// 写 Contents/Resources/pixfmt 内容为 420v 即可切换。
+///
+/// 注意 420v 的色域链路两端都没有锚点：本端采集侧设了 ITU-R 709，
+/// 但 VideoToolbox 不写 VUI 色彩描述，Windows 侧 D3D11 VideoProcessor
+/// 也没有显式 SetStreamColorSpace，最终用驱动默认矩阵。所以切到 420v
+/// 后如果发现偏色（发灰或偏青），属于已知问题，切回 bgra 即可。
 var pixelFormatChoice = ProcessInfo.processInfo.environment["SECDISPLAY_PIXFMT"]
 if pixelFormatChoice == nil, let rp = Bundle.main.resourcePath {
     let p = rp + "/pixfmt"
