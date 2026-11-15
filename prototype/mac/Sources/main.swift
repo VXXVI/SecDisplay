@@ -1457,11 +1457,14 @@ final class ScreenshotCapture {
                     return
                 }
                 self.lastRestartAt = now
+                // 每次真正重启都记一行。退避后重启频率已降到 30 秒一次，
+                // 不会刷屏；而这里恰恰是「画面一直不动」时唯一的线索，
+                // 之前用 %10 抽样反而会让它长期不出现。
                 if streak <= 4 {
                     Log.info(String(format: "截图采集异常（%.1ffps，目标 %.0ffps，第 %d 次重启）",
                                     measuredFps, self.cfg.captureHz, streak))
-                } else if streak % 10 == 1 {
-                    Log.info(String(format: "截图采集持续异常（%.1ffps，已重启 %d 次），改为 30 秒重试一次。若画面不动请重启发送端",
+                } else {
+                    Log.info(String(format: "截图采集持续异常（%.1ffps，连续 %d 次），已降为 30 秒重试一次。若画面不动请重启发送端",
                                     measuredFps, streak))
                 }
                 self.spawnWorkers()
