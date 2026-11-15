@@ -217,15 +217,15 @@ Mac 端可通过菜单栏面板、`prototype/mac/preset.sh` 或环境变量调�
 
 ### 码率
 
-正向模式可通过 `SECDISPLAY_MBPS` 调整（默认 180）；反向模式可通过 `config.ini` 的 `bitrate=`（默认 50，PeakConstrainedVBR）或 Windows 主控面板底栏 `30M / 50M / 80M` 按钮实时切换：
+正向模式可通过 `SECDISPLAY_MBPS` 调整（`10~1000`，默认 `180`）：
 
-| 内容 | 建议 |
+| 内容 | 正向模式建议 (Mbps) |
 |---|---|
 | 纯文字 | 40~80 |
 | 混合办公 | 100~150 |
 | 有视频 | 200~300 |
 
-千兆网上限 940 Mbps，给到 200 也不挤。
+反向模式（Windows 主控 → Mac 副屏）目标码率范围为 `10~200 Mbps`（越界回落默认 `50`，在 `config.ini` 用 `bitrate=` 配置，或直接在 Windows 控制面板底栏 `30M / 50M / 80M` 按钮实时切换）；千兆或雷电直连给到 `200` 也不挤。
 
 ---
 
