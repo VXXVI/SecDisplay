@@ -275,6 +275,9 @@ static std::string ToUtf8(const wchar_t* w) {
     return out;
 }
 
+#include "WinHostSender.hpp"
+static secdisplay::WinHostSender g_winHost;
+
 // Unix 纪元微秒的本地墙钟。FILETIME 是 1601-01-01 起的 100ns 单位，
 // 常量 116444736000000000 把它换算到 Unix 纪元。QPC 是开机以来的相对
 // 时间，不能与 Mac 端的 Unix 纪元时间戳相减。
@@ -620,6 +623,7 @@ static const UINT ID_TRAY_ABOUT  = 1003;
 static const UINT ID_TRAY_MINIMIZE = 1004;
 static const UINT ID_TRAY_PANEL = 1005;
 static const UINT ID_TRAY_DROPBOX = 1006;
+static const UINT ID_TRAY_MODE = 1007;
 static const int  HOTKEY_QUIT_ID = 1;
 static const int  HOTKEY_HIDE_ID = 2;   // Ctrl+Alt+H：最小化让位/还原，不退出
 static const int  HOTKEY_DROPBOX_ID = 3; // Ctrl+Alt+B：一键呼出/隐藏文件投递盒
@@ -675,6 +679,14 @@ static void TrayRemove() {
     }
 }
 
+static std::atomic<bool> g_hostMode{ false };
+static std::atomic<bool> g_switchRoleRequested{ false };
+static std::atomic<bool> g_switchRoleToHost{ false };
+static HANDLE g_instMutex = nullptr;
+
+// 前向声明：主控模式切换与托盘菜单联动
+static void SwitchAppMode(bool toHostMode);
+
 static void TrayShowMenu(HWND hwnd) {
     POINT pt{};
     GetCursorPos(&pt);
@@ -683,9 +695,14 @@ static void TrayShowMenu(HWND hwnd) {
     // W 版菜单 + 宽字符：绕开 CP936 对 UTF-8 中文的 GBK 误解码
     AppendMenuW(menu, MF_STRING, ID_TRAY_PANEL, L"控制面板");
     AppendMenuW(menu, MF_STRING, ID_TRAY_DROPBOX, L"文件投递盒（悬浮窗）  (Ctrl+Alt+B)");
+    AppendMenuW(menu, MF_STRING, ID_TRAY_MODE,
+                g_hostMode.load() ? L"切到副屏模式 (接收 Mac 画面)" : L"切到主控模式 (Mac 当 Windows 副屏)");
+    if (!g_hostMode.load()) {
+        AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
+        AppendMenuW(menu, MF_STRING, ID_TRAY_TOGGLE, L"切换全屏 / 窗口  (F11)");
+        AppendMenuW(menu, MF_STRING, ID_TRAY_MINIMIZE, L"最小化让位 / 还原  (Ctrl+Alt+H)");
+    }
     AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
-    AppendMenuW(menu, MF_STRING, ID_TRAY_TOGGLE, L"切换全屏 / 窗口  (F11)");
-    AppendMenuW(menu, MF_STRING, ID_TRAY_MINIMIZE, L"最小化让位 / 还原  (Ctrl+Alt+H)");
     AppendMenuW(menu, MF_STRING, ID_TRAY_ABOUT,  L"关于 SecDisplay");
     AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
     AppendMenuW(menu, MF_STRING | MF_DEFAULT, ID_TRAY_EXIT, L"退出 SecDisplay");
@@ -2312,6 +2329,7 @@ static const int IDC_PANEL_SENDFILE = 2030;
 static const int IDC_PANEL_OPENXFER = 2031;
 static const int IDC_PANEL_DROPBOX  = 2032;
 static const int IDC_PANEL_PASTEXFER = 2033;
+static const int IDC_PANEL_MODE     = 2034;
 
 static ULONG_PTR g_gdipToken = 0;
 
@@ -2938,6 +2956,11 @@ static LRESULT CALLBACK PanelBtnSubclassProc(HWND h, UINT msg, WPARAM w, LPARAM 
 }
 
 static void RequestKeyframe() {
+    if (g_hostMode.load()) {
+        g_winHost.RequestKeyframe();
+        Log("控制面板: 已触发发送端关键帧");
+        return;
+    }
     SOCKET s = g_sock.load();
     if (s == INVALID_SOCKET) {
         Log("控制面板: 请求关键帧失败，当前未连接");
@@ -2995,35 +3018,72 @@ static void CopyDiagnostics() {
         }
     }
     wchar_t buf[2048];
-    swprintf(buf, 2048,
-        L"SecDisplay 诊断\r\n"
-        L"状态: %s\r\n"
-        L"对端: %hs:%d\r\n"
-        L"分辨率: %dx%d\r\n"
-        L"连接时长: %llu 秒\r\n"
-        L"帧率: %.1f fps  码率: %.1f Mbps\r\n"
-        L"源延迟: p50 %.1f / p95 %.1f ms\r\n"
-        L"呈现延迟: p50 %.1f / p95 %.1f ms\r\n"
-        L"解码失败: %llu  呈现失败: %llu\r\n"
-        L"同帧重复: %llu  丢弃: %llu\r\n"
-        L"解码器: %s\r\n"
-        L"进程内存: 工作集 %.0f MB / 私有 %.0f MB\r\n"
-        L"屏幕常亮: %s\r\n"
-        L"日志: %hs\r\n"
-        L"程序: %hs",
-        g_sock.load() != INVALID_SOCKET ? L"已连接" : L"未连接",
-        g_peerHost.c_str(), g_peerPort,
-        dw, dh, up,
-        g_uiFps.load(), g_uiMbps.load(),
-        g_srcP50.load(), g_srcP95.load(),
-        g_presP50.load(), g_presP95.load(),
-        (unsigned long long)g_stats.decodeFail.load(),
-        (unsigned long long)g_stats.presentFail.load(),
-        (unsigned long long)g_stats.dupFrame.load(),
-        (unsigned long long)g_stats.dropped.load(),
-        decoderBuf, wsMb, privMb,
-        g_keepScreenOn.load() ? L"开启（防熄屏）" : L"关闭",
-        g_logPath.c_str(), exe);
+    if (g_hostMode.load()) {
+        auto& hs = g_winHost.Stats();
+        std::string peerStr;
+        std::wstring encName;
+        {
+            std::lock_guard<std::mutex> lk(hs.infoMtx);
+            peerStr = hs.peerAddr;
+            encName = hs.encoderName;
+        }
+        ULONGLONG hStart = hs.connStartTick.load();
+        unsigned long long hUp = (hs.clientConnected.load() && hStart) ? (GetTickCount64() - hStart) / 1000 : 0;
+        swprintf(buf, 2048,
+            L"SecDisplay 诊断（主控发送端 Win→Mac）\r\n"
+            L"状态: %s\r\n"
+            L"Mac 副屏: %hs\r\n"
+            L"虚拟屏: %dx%d @ %dHz\r\n"
+            L"连接时长: %llu 秒\r\n"
+            L"帧率: %.1f fps  码率: %.1f Mbps (目标 %d Mbps)\r\n"
+            L"编码耗时: %.2f ms  失败: %llu  丢弃: %llu\r\n"
+            L"光标发送: %llu  收到输入: %llu\r\n"
+            L"编码器: %s\r\n"
+            L"进程内存: 工作集 %.0f MB / 私有 %.0f MB\r\n"
+            L"日志: %hs\r\n"
+            L"程序: %hs",
+            hs.clientConnected.load() ? L"已连接" : L"等待 Mac 副屏",
+            peerStr.c_str(),
+            hs.width.load(), hs.height.load(), hs.fps.load(), hUp,
+            g_uiFps.load(), g_uiMbps.load(), hs.bitrateMbps.load(),
+            hs.lastEncMs.load(),
+            (unsigned long long)hs.encodeFail.load(),
+            (unsigned long long)hs.framesDropped.load(),
+            (unsigned long long)hs.cursorSent.load(),
+            (unsigned long long)hs.inputRecv.load(),
+            encName.c_str(), wsMb, privMb,
+            g_logPath.c_str(), exe);
+    } else {
+        swprintf(buf, 2048,
+            L"SecDisplay 诊断\r\n"
+            L"状态: %s\r\n"
+            L"对端: %hs:%d\r\n"
+            L"分辨率: %dx%d\r\n"
+            L"连接时长: %llu 秒\r\n"
+            L"帧率: %.1f fps  码率: %.1f Mbps\r\n"
+            L"源延迟: p50 %.1f / p95 %.1f ms\r\n"
+            L"呈现延迟: p50 %.1f / p95 %.1f ms\r\n"
+            L"解码失败: %llu  呈现失败: %llu\r\n"
+            L"同帧重复: %llu  丢弃: %llu\r\n"
+            L"解码器: %s\r\n"
+            L"进程内存: 工作集 %.0f MB / 私有 %.0f MB\r\n"
+            L"屏幕常亮: %s\r\n"
+            L"日志: %hs\r\n"
+            L"程序: %hs",
+            g_sock.load() != INVALID_SOCKET ? L"已连接" : L"未连接",
+            g_peerHost.c_str(), g_peerPort,
+            dw, dh, up,
+            g_uiFps.load(), g_uiMbps.load(),
+            g_srcP50.load(), g_srcP95.load(),
+            g_presP50.load(), g_presP95.load(),
+            (unsigned long long)g_stats.decodeFail.load(),
+            (unsigned long long)g_stats.presentFail.load(),
+            (unsigned long long)g_stats.dupFrame.load(),
+            (unsigned long long)g_stats.dropped.load(),
+            decoderBuf, wsMb, privMb,
+            g_keepScreenOn.load() ? L"开启（防熄屏）" : L"关闭",
+            g_logPath.c_str(), exe);
+    }
     if (OpenClipboard(g_panel)) {
         EmptyClipboard();
         size_t bytes = (wcslen(buf) + 1) * sizeof(wchar_t);
@@ -3043,6 +3103,116 @@ static void CopyDiagnostics() {
 
 static void UpdateControlPanel() {
     if (!g_panel) return;
+
+    const bool hostMode = g_hostMode.load();
+    if (hostMode) {
+        auto& hs = g_winHost.Stats();
+        static uint64_t lastSentFrames = 0, lastSentBytes = 0;
+        static ULONGLONG lastHostTick = 0;
+        ULONGLONG now = GetTickCount64();
+        uint64_t sentF = hs.framesSent.load();
+        uint64_t sentB = hs.bytesSent.load();
+        double fps = g_uiFps.load();
+        double mbps = g_uiMbps.load();
+        if (lastHostTick == 0 || sentF < lastSentFrames || sentB < lastSentBytes) {
+            lastSentFrames = sentF;
+            lastSentBytes = sentB;
+            lastHostTick = now;
+            fps = 0.0;
+            mbps = 0.0;
+        } else {
+            double dt = (double)(now - lastHostTick) / 1000.0;
+            if (dt >= 5.0) {
+                lastSentFrames = sentF;
+                lastSentBytes = sentB;
+                lastHostTick = now;
+            } else if (dt >= 0.2) {
+                fps = (double)(sentF - lastSentFrames) / dt;
+                mbps = (double)(sentB - lastSentBytes) * 8.0 / dt / 1e6;
+                lastSentFrames = sentF;
+                lastSentBytes = sentB;
+                lastHostTick = now;
+            }
+        }
+        g_uiFps.store(fps);
+        g_uiMbps.store(mbps);
+
+        bool connected = hs.clientConnected.load();
+        bool streaming = connected && sentF > 0;
+        g_panelData.state = streaming ? 2 : (connected ? 1 : 0);
+        g_panelData.statusText = streaming ? L"主控发送中 · Mac 副屏在线"
+                             : (connected ? L"Mac 已连接 · 准备推流" : L"主控待命 · 等待 Mac 副屏连接 (9922)");
+
+        wchar_t buf[256];
+        {
+            std::lock_guard<std::mutex> lk(hs.infoMtx);
+            std::wstring wp = ToWide(hs.peerAddr.c_str(), (int)hs.peerAddr.size());
+            g_panelData.peerText = wp.empty() ? L"--" : wp;
+            g_panelData.decoderText = hs.encoderName.empty() ? L"--" : hs.encoderName;
+        }
+        swprintf(buf, 256, L"%d × %d @ %dHz", hs.width.load(), hs.height.load(), hs.fps.load());
+        g_panelData.sizeText = buf;
+
+        ULONGLONG start = hs.connStartTick.load();
+        unsigned long long up = (connected && start) ? (GetTickCount64() - start) / 1000 : 0;
+        swprintf(buf, 256, L"%02llu:%02llu:%02llu", up / 3600, (up / 60) % 60, up % 60);
+        g_panelData.uptimeText = buf;
+
+        swprintf(buf, 256, L"%.1f fps", fps);
+        g_panelData.fpsText = buf;
+        swprintf(buf, 256, L"%.1f Mbps (目标 %dM)", mbps, hs.bitrateMbps.load());
+        g_panelData.mbpsText = buf;
+
+        swprintf(buf, 256, L"%.2f ms", hs.lastEncMs.load());
+        g_panelData.srcLatText = buf;
+        swprintf(buf, 256, L"光标 %llu / 输入 %llu",
+                 (unsigned long long)hs.cursorSent.load(),
+                 (unsigned long long)hs.inputRecv.load());
+        g_panelData.presLatText = buf;
+
+        uint64_t encFail = hs.encodeFail.load();
+        uint64_t drop = hs.framesDropped.load();
+        swprintf(buf, 256, L"%llu", (unsigned long long)encFail);
+        g_panelData.decFailText = buf;
+        g_panelData.decFailWarn = encFail > 0;
+        swprintf(buf, 256, L"%llu", (unsigned long long)hs.framesSent.load());
+        g_panelData.presFailText = buf;
+        g_panelData.presFailWarn = false;
+        swprintf(buf, 256, L"%llu", (unsigned long long)hs.inputRecv.load());
+        g_panelData.dupText = buf;
+        swprintf(buf, 256, L"%llu", (unsigned long long)drop);
+        g_panelData.dropText = buf;
+        g_panelData.dropWarn = drop > 0;
+
+        PROCESS_MEMORY_COUNTERS_EX pmc{};
+        pmc.cb = sizeof(pmc);
+        if (GetProcessMemoryInfo(GetCurrentProcess(), (PROCESS_MEMORY_COUNTERS*)&pmc, sizeof(pmc))) {
+            swprintf(buf, 256, L"工作集 %.0f / 私有 %.0f MB",
+                     pmc.WorkingSetSize / 1048576.0, pmc.PrivateUsage / 1048576.0);
+            g_panelData.procMemText = buf;
+        }
+        g_panelData.cpuText = L"QSV 硬件路径";
+        g_panelData.gpuMemText = L"Parsec VDD 扩展屏";
+        g_panelData.keepOnActive = true;
+        g_panelData.keepOnText = L"虚拟屏已挂载";
+        g_panelData.xferConnected = g_xferConnected.load();
+        {
+            std::lock_guard<std::mutex> lk(g_xferMtx);
+            g_panelData.xferStatusText = g_xferStatus;
+        }
+        {
+            std::lock_guard<std::mutex> lk(g_logLock);
+            g_panelData.recentLogs.clear();
+            size_t total = g_recentLogs.size();
+            size_t startIdx = (total > 4) ? (total - 4) : 0;
+            for (size_t i = startIdx; i < total; ++i) g_panelData.recentLogs.push_back(g_recentLogs[i]);
+        }
+        SetWindowTextW(GetDlgItem(g_panel, IDC_PANEL_MODE), L"切回副屏模式");
+        SetWindowTextW(GetDlgItem(g_panel, IDC_PANEL_FULL), L"显示设置");
+        SetWindowTextW(GetDlgItem(g_panel, IDC_PANEL_RECONN), L"断开重连");
+        InvalidateRect(g_panel, nullptr, FALSE);
+        return;
+    }
 
     static uint64_t lastDecoded = 0, lastBytes = 0;
     static ULONGLONG lastTick = 0;
@@ -3217,6 +3387,7 @@ static void UpdateControlPanel() {
         }
     }
 
+    SetWindowTextW(GetDlgItem(g_panel, IDC_PANEL_MODE), L"切到主控(Mac当副屏)");
     SetWindowTextW(GetDlgItem(g_panel, IDC_PANEL_FULL),
                    g_isFullscreen ? L"回到窗口" : L"全屏显示");
     SetWindowTextW(GetDlgItem(g_panel, IDC_PANEL_TOP),
@@ -3315,7 +3486,7 @@ static void PaintControlPanel(HWND h) {
         DeleteObject(db); DeleteObject(dp);
     }
     {
-        RECT rt{ S(58), S(12), S(540), S(56) };
+        RECT rt{ S(58), S(12), S(455), S(56) };
         SelectObject(hdc, g_theme.fontTitle);
         SetTextColor(hdc, titleCol);
         DrawTextW(hdc, g_panelData.statusText.c_str(), -1, &rt,
@@ -3325,7 +3496,7 @@ static void PaintControlPanel(HWND h) {
         std::wstring summary = g_panelData.peerText + L"   ·   " +
                                g_panelData.sizeText + L"   ·   " +
                                g_panelData.uptimeText;
-        RECT rs{ S(520), S(12), S(922), S(56) };
+        RECT rs{ S(455), S(12), S(752), S(56) };
         SelectObject(hdc, g_theme.fontBody);
         SetTextColor(hdc, mutedCol);
         DrawTextW(hdc, summary.c_str(), -1, &rs,
@@ -3365,16 +3536,17 @@ static void PaintControlPanel(HWND h) {
     // 卡片 2：延迟与质量 (320, 66, 292, 228)
     const int c2x = S(320), c2w = S(292);
     DrawPanelCard(hdc, c2x, cy, c2w, chCard, S(8), cardFill, cardBorder);
-    drawSectionHeader(c2x, cy, c2w, L"延迟与质量");
+    drawSectionHeader(c2x, cy, c2w, g_hostMode.load() ? L"编码与输入" : L"延迟与质量");
     {
         int px = c2x + S(16), pw = c2w - S(32), rowY = cy + S(44), step = S(29), rh = S(25);
-        DrawKVRow(hdc, px, rowY, pw, rh, L"源端延迟", g_panelData.srcLatText.c_str(), valCol);
-        DrawKVRow(hdc, px, rowY + step * 1, pw, rh, L"呈现延迟", g_panelData.presLatText.c_str(), valCol);
-        DrawKVRow(hdc, px, rowY + step * 2, pw, rh, L"解码失败", g_panelData.decFailText.c_str(),
+        const bool hm = g_hostMode.load();
+        DrawKVRow(hdc, px, rowY, pw, rh, hm ? L"编码耗时" : L"源端延迟", g_panelData.srcLatText.c_str(), valCol);
+        DrawKVRow(hdc, px, rowY + step * 1, pw, rh, hm ? L"光标与输入" : L"呈现延迟", g_panelData.presLatText.c_str(), valCol);
+        DrawKVRow(hdc, px, rowY + step * 2, pw, rh, hm ? L"编码失败" : L"解码失败", g_panelData.decFailText.c_str(),
                   g_panelData.decFailWarn ? errCol : valCol);
-        DrawKVRow(hdc, px, rowY + step * 3, pw, rh, L"上屏失败", g_panelData.presFailText.c_str(),
+        DrawKVRow(hdc, px, rowY + step * 3, pw, rh, hm ? L"累计发送" : L"上屏失败", g_panelData.presFailText.c_str(),
                   g_panelData.presFailWarn ? errCol : valCol);
-        DrawKVRow(hdc, px, rowY + step * 4, pw, rh, L"同帧重复", g_panelData.dupText.c_str(), valCol);
+        DrawKVRow(hdc, px, rowY + step * 4, pw, rh, hm ? L"收到输入" : L"同帧重复", g_panelData.dupText.c_str(), valCol);
         DrawKVRow(hdc, px, rowY + step * 5, pw, rh, L"丢弃帧数", g_panelData.dropText.c_str(),
                   g_panelData.dropWarn ? warnCol : valCol);
     }
@@ -3385,11 +3557,11 @@ static void PaintControlPanel(HWND h) {
     drawSectionHeader(c3x, cy, c3w, L"硬件与资源");
     {
         int px = c3x + S(16), pw = c3w - S(32), rowY = cy + S(44), rh = S(25);
-        // 解码器名往往较长（例如 Microsoft H264 Video Decoder MFT），给 42dp 双行空间不截断
+        // 解码器/编码器名往往较长，给 42dp 双行空间不截断
         RECT rDecL{ px, rowY, px + S(72), rowY + rh };
         SelectObject(hdc, g_theme.fontBody);
         SetTextColor(hdc, mutedCol);
-        DrawTextW(hdc, L"解码器", -1, &rDecL, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
+        DrawTextW(hdc, g_hostMode.load() ? L"编码器" : L"解码器", -1, &rDecL, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
 
         RECT rDecV{ px + S(66), rowY + S(2), px + pw, rowY + S(42) };
         SelectObject(hdc, g_theme.fontValue);
@@ -3560,6 +3732,9 @@ static void LayoutPanelControls(HWND h) {
         MoveWindow(c, S(x), S(y), S(w), S(ch), TRUE);
     };
 
+    // 顶部横幅右侧角色切换按钮
+    mv(IDC_PANEL_MODE,       762, 18,  166, 32);
+
     // 中转站右侧按钮（发送文件 / 粘贴截图 / 悬浮盒 / 打开目录）
     mv(IDC_PANEL_SENDFILE,   504, 319, 108, 34);
     mv(IDC_PANEL_PASTEXFER,  620, 319, 102, 34);
@@ -3615,6 +3790,7 @@ static LRESULT CALLBACK PanelWndProc(HWND h, UINT msg, WPARAM w, LPARAM l) {
             return c;
         };
 
+        mkBtn(g_hostMode.load() ? L"切回副屏模式" : L"切到主控(Mac当副屏)", IDC_PANEL_MODE);
         mkBtn(L"发送文件", IDC_PANEL_SENDFILE);
         mkBtn(L"粘贴发送", IDC_PANEL_PASTEXFER);
         mkBtn(L"悬浮盒", IDC_PANEL_DROPBOX);
@@ -3718,13 +3894,25 @@ static LRESULT CALLBACK PanelWndProc(HWND h, UINT msg, WPARAM w, LPARAM l) {
             ShellExecuteW(nullptr, L"open", dir.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
             return 0;
         }
+        case IDC_PANEL_MODE:
+            SwitchAppMode(!g_hostMode.load());
+            return 0;
         case IDC_PANEL_FULL:
-            if (g_hwnd) PostMessageW(g_hwnd, WM_COMMAND, ID_TRAY_TOGGLE, 0);
+            if (g_hostMode.load()) {
+                ShellExecuteW(nullptr, L"open", L"ms-settings:display", nullptr, nullptr, SW_SHOWNORMAL);
+            } else if (g_hwnd) {
+                PostMessageW(g_hwnd, WM_COMMAND, ID_TRAY_TOGGLE, 0);
+            }
             return 0;
         case IDC_PANEL_RECONN: {
+            if (g_hostMode.load()) {
+                Log("控制面板: 请求重连中转与副屏");
+                SwitchAppMode(true);
+                return 0;
+            }
             SOCKET s = g_sock.load();
             if (s != INVALID_SOCKET) {
-                Log("控制面板请求重新连接");
+                Log("控制面板: 控制面板请求重新连接");
                 shutdown(s, SD_BOTH);
             }
             return 0;
@@ -5168,6 +5356,7 @@ static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
         switch (LOWORD(w)) {
         case ID_TRAY_PANEL:   ShowControlPanel(); return 0;
         case ID_TRAY_DROPBOX: ShowDropBoxWindow(); return 0;
+        case ID_TRAY_MODE:    SwitchAppMode(!g_hostMode.load()); return 0;
         case ID_TRAY_EXIT:   RequestQuit(); return 0;
         case ID_TRAY_TOGGLE:
             if (g_isFullscreen) ExitFullscreen(); else EnterFullscreen();
@@ -5342,6 +5531,10 @@ struct RunConfig {
     bool vsync = true;        // true=垂直同步（画面均匀），false=免同步（延迟最低但可能抖）
     bool pace = false;        // --pace：1~3 帧抖动缓冲，按自适应节拍上屏，抹平源端小抖动
     bool feedback = false;    // --feedback：每 2 秒向 Mac 回传 0x07 健康度，供自适应码率环使用
+    bool hostMode = false;    // --mode sender：Windows 作为主控发送端（Mac 当副屏）
+    int hostFps = 60;         // 主控发送帧率上限
+    int hostBitrateMbps = 80; // 主控发送目标码率（Mbps）
+    int waitLockMs = 0;       // 角色切换重启时等待旧实例释放单实例锁的毫秒数
     std::string logFile;      // 非空则同时写日志文件
 };
 
@@ -5365,6 +5558,20 @@ static void ParseArgs(int argc, char** argv, RunConfig& cfg) {
             cfg.pace = true;
         } else if (a == "--feedback") {
             cfg.feedback = true;
+        } else if (a == "--sender" || a == "--host") {
+            cfg.hostMode = true;
+        } else if (a == "--receiver") {
+            cfg.hostMode = false;
+        } else if (a == "--mode" && i + 1 < argc) {
+            std::string m = argv[++i];
+            std::transform(m.begin(), m.end(), m.begin(), [](unsigned char c) { return (char)std::tolower(c); });
+            cfg.hostMode = (m == "sender" || m == "host" || m == "1");
+        } else if (a == "--fps" && i + 1 < argc) {
+            cfg.hostFps = atoi(argv[++i]);
+        } else if (a == "--bitrate" && i + 1 < argc) {
+            cfg.hostBitrateMbps = atoi(argv[++i]);
+        } else if (a == "--wait-lock" && i + 1 < argc) {
+            cfg.waitLockMs = atoi(argv[++i]);
         } else if ((a == "--log" || a == "-l") && i + 1 < argc) {
             cfg.logFile = argv[++i];
         } else if (a == "--config" && i + 1 < argc) {
@@ -5388,6 +5595,8 @@ static void ParseArgs(int argc, char** argv, RunConfig& cfg) {
     if (cfg.width <= 0) cfg.width = 2880;
     if (cfg.height <= 0) cfg.height = 1800;
     if (cfg.port <= 0 || cfg.port > 65535) cfg.port = 9922;
+    if (cfg.hostFps < 24 || cfg.hostFps > 144) cfg.hostFps = 60;
+    if (cfg.hostBitrateMbps < 10 || cfg.hostBitrateMbps > 200) cfg.hostBitrateMbps = 80;
 }
 
 // ---------------------------------------------------------------------------
@@ -5455,10 +5664,53 @@ static void LoadConfigFile(RunConfig& cfg, const std::string& path) {
         else if (key == "feedback") cfg.feedback = Truthy(val);
         else if (key == "coordw") cfg.coordW = atoi(val.c_str());
         else if (key == "coordh") cfg.coordH = atoi(val.c_str());
+        else if (key == "mode") {
+            std::string mv = val;
+            std::transform(mv.begin(), mv.end(), mv.begin(), [](unsigned char c) { return (char)std::tolower(c); });
+            cfg.hostMode = (mv == "sender" || mv == "host" || mv == "1");
+        } else if (key == "fps") cfg.hostFps = atoi(val.c_str());
+        else if (key == "bitrate") cfg.hostBitrateMbps = atoi(val.c_str());
         else continue;
         ++applied;
     }
     Log("已读取配置 %s（%d 项）", path.c_str(), applied);
+}
+
+static void SaveModeToConfigFile(bool toHostMode) {
+    std::string cfgPath = ExeDir() + "\\config.ini";
+    std::vector<std::string> lines;
+    bool replaced = false;
+    {
+        std::ifstream fin(cfgPath);
+        if (fin) {
+            std::string ln;
+            while (std::getline(fin, ln)) {
+                std::string t = TrimStr(ln);
+                std::string low = t;
+                std::transform(low.begin(), low.end(), low.begin(),
+                               [](unsigned char c) { return (char)std::tolower(c); });
+                if (low.rfind("mode=", 0) == 0 || low.rfind("mode ", 0) == 0) {
+                    lines.push_back(toHostMode ? "mode=sender" : "mode=receiver");
+                    replaced = true;
+                } else {
+                    lines.push_back(ln);
+                }
+            }
+        }
+    }
+    if (!replaced) lines.push_back(toHostMode ? "mode=sender" : "mode=receiver");
+    std::ofstream fout(cfgPath, std::ios::trunc);
+    if (fout) {
+        for (const auto& l : lines) fout << l << "\n";
+    }
+}
+
+static void SwitchAppMode(bool toHostMode) {
+    if (g_switchRoleRequested.exchange(true)) return;
+    g_switchRoleToHost = toHostMode;
+    SaveModeToConfigFile(toHostMode);
+    Log("角色切换请求: %s，准备重启进程", toHostMode ? "主控模式 (Mac 当副屏)" : "副屏模式 (接收 Mac)");
+    RequestQuit();
 }
 
 // ---------------------------------------------------------------------------
@@ -6151,11 +6403,18 @@ static std::wstring UniqueDestPathW(const std::wstring& dir, const std::wstring&
     return dir + L"\\" + stem + ts + ext;
 }
 
+static std::atomic<SOCKET> g_xferListenSock{ INVALID_SOCKET };
+
 static void TransferLoop(RunConfig cfg) {
     const uint16_t xferPort = (uint16_t)(cfg.port + 1);
     const std::wstring inbox = GetTransferInboxDir();
-    Log("中转站线程启动: 目标 %s:%d，目录 %s",
-        cfg.host.c_str(), xferPort, ToUtf8(inbox.c_str()).c_str());
+    if (cfg.hostMode) {
+        Log("中转站服务端启动: 监听端口 %d，目录 %s",
+            xferPort, ToUtf8(inbox.c_str()).c_str());
+    } else {
+        Log("中转站线程启动: 目标 %s:%d，目录 %s",
+            cfg.host.c_str(), xferPort, ToUtf8(inbox.c_str()).c_str());
+    }
 
     auto putU16 = [](std::vector<uint8_t>& v, uint16_t x) {
         v.push_back((uint8_t)(x >> 8)); v.push_back((uint8_t)(x & 0xFF));
@@ -6178,43 +6437,84 @@ static void TransferLoop(RunConfig cfg) {
         return ((uint64_t)rdU32(p) << 32) | rdU32(p + 4);
     };
 
+    SOCKET listenSock = INVALID_SOCKET;
+    if (cfg.hostMode) {
+        listenSock = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+        if (listenSock != INVALID_SOCKET) {
+            int reuse = 1;
+            setsockopt(listenSock, SOL_SOCKET, SO_REUSEADDR, (const char*)&reuse, sizeof(reuse));
+            sockaddr_in la{};
+            la.sin_family = AF_INET;
+            la.sin_addr.s_addr = INADDR_ANY;
+            la.sin_port = htons(xferPort);
+            if (bind(listenSock, (sockaddr*)&la, sizeof(la)) != 0 || listen(listenSock, 2) != 0) {
+                Log("中转站监听端口 %d 失败 err=%d", xferPort, WSAGetLastError());
+                closesocket(listenSock);
+                listenSock = INVALID_SOCKET;
+            } else {
+                g_xferListenSock = listenSock;
+                SetTransferStatus(L"中转站服务端就绪，等待 Mac 连接 (9923)…");
+            }
+        }
+    }
+
     while (g_alive) {
-        SOCKET sock = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
-        if (sock == INVALID_SOCKET) { SleepAlive(2000); continue; }
+        SOCKET sock = INVALID_SOCKET;
+        if (cfg.hostMode) {
+            if (listenSock == INVALID_SOCKET) { SleepAlive(2000); continue; }
+            fd_set rfds;
+            FD_ZERO(&rfds);
+            FD_SET(listenSock, &rfds);
+            timeval tv{ 0, 250000 };
+            int sel = select(0, &rfds, nullptr, nullptr, &tv);
+            if (sel <= 0) continue;
+            sockaddr_in ca{}; int clen = sizeof(ca);
+            sock = accept(listenSock, (sockaddr*)&ca, &clen);
+            if (sock == INVALID_SOCKET) continue;
+            int bufSz = 4 * 1024 * 1024;
+            setsockopt(sock, SOL_SOCKET, SO_SNDBUF, (const char*)&bufSz, sizeof(bufSz));
+            setsockopt(sock, SOL_SOCKET, SO_RCVBUF, (const char*)&bufSz, sizeof(bufSz));
+            int nodelay = 1, keepalive = 1;
+            setsockopt(sock, IPPROTO_TCP, TCP_NODELAY, (const char*)&nodelay, sizeof(nodelay));
+            setsockopt(sock, SOL_SOCKET, SO_KEEPALIVE, (const char*)&keepalive, sizeof(keepalive));
+        } else {
+            sock = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+            if (sock == INVALID_SOCKET) { SleepAlive(2000); continue; }
 
-        int bufSz = 4 * 1024 * 1024;
-        setsockopt(sock, SOL_SOCKET, SO_SNDBUF, (const char*)&bufSz, sizeof(bufSz));
-        setsockopt(sock, SOL_SOCKET, SO_RCVBUF, (const char*)&bufSz, sizeof(bufSz));
-        int nodelay = 1, keepalive = 1;
-        setsockopt(sock, IPPROTO_TCP, TCP_NODELAY, (const char*)&nodelay, sizeof(nodelay));
-        setsockopt(sock, SOL_SOCKET, SO_KEEPALIVE, (const char*)&keepalive, sizeof(keepalive));
+            int bufSz = 4 * 1024 * 1024;
+            setsockopt(sock, SOL_SOCKET, SO_SNDBUF, (const char*)&bufSz, sizeof(bufSz));
+            setsockopt(sock, SOL_SOCKET, SO_RCVBUF, (const char*)&bufSz, sizeof(bufSz));
+            int nodelay = 1, keepalive = 1;
+            setsockopt(sock, IPPROTO_TCP, TCP_NODELAY, (const char*)&nodelay, sizeof(nodelay));
+            setsockopt(sock, SOL_SOCKET, SO_KEEPALIVE, (const char*)&keepalive, sizeof(keepalive));
 
-        sockaddr_in addr{};
-        addr.sin_family = AF_INET;
-        addr.sin_port = htons(xferPort);
-        if (inet_pton(AF_INET, cfg.host.c_str(), &addr.sin_addr) != 1) {
-            closesocket(sock);
-            SleepAlive(3000);
-            continue;
+            sockaddr_in addr{};
+            addr.sin_family = AF_INET;
+            addr.sin_port = htons(xferPort);
+            if (inet_pton(AF_INET, cfg.host.c_str(), &addr.sin_addr) != 1) {
+                closesocket(sock);
+                SleepAlive(3000);
+                continue;
+            }
+
+            u_long nb = 1;
+            ioctlsocket(sock, FIONBIO, &nb);
+            connect(sock, (sockaddr*)&addr, sizeof(addr));
+            fd_set wfds, efds;
+            FD_ZERO(&wfds); FD_ZERO(&efds);
+            FD_SET(sock, &wfds); FD_SET(sock, &efds);
+            timeval tv{ 2, 0 };
+            int sel = select(0, nullptr, &wfds, &efds, &tv);
+            int soErr = 0; int soLen = sizeof(soErr);
+            getsockopt(sock, SOL_SOCKET, SO_ERROR, (char*)&soErr, &soLen);
+            if (sel <= 0 || FD_ISSET(sock, &efds) || soErr != 0) {
+                closesocket(sock);
+                SleepAlive(2000);
+                continue;
+            }
+            nb = 0;
+            ioctlsocket(sock, FIONBIO, &nb);
         }
-
-        u_long nb = 1;
-        ioctlsocket(sock, FIONBIO, &nb);
-        connect(sock, (sockaddr*)&addr, sizeof(addr));
-        fd_set wfds, efds;
-        FD_ZERO(&wfds); FD_ZERO(&efds);
-        FD_SET(sock, &wfds); FD_SET(sock, &efds);
-        timeval tv{ 2, 0 };
-        int sel = select(0, nullptr, &wfds, &efds, &tv);
-        int soErr = 0; int soLen = sizeof(soErr);
-        getsockopt(sock, SOL_SOCKET, SO_ERROR, (char*)&soErr, &soLen);
-        if (sel <= 0 || FD_ISSET(sock, &efds) || soErr != 0) {
-            closesocket(sock);
-            SleepAlive(2000);
-            continue;
-        }
-        nb = 0;
-        ioctlsocket(sock, FIONBIO, &nb);
 
         DWORD rcvTo = 1000, sndTo = 5000;
         setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, (const char*)&rcvTo, sizeof(rcvTo));
@@ -6223,7 +6523,7 @@ static void TransferLoop(RunConfig cfg) {
         g_xferSock = sock;
         g_xferConnected = true;
         SetTransferStatus(L"已连接 · 可拖入文件或点击「发送文件到 Mac」");
-        Log("中转站已连接 %s:%d", cfg.host.c_str(), xferPort);
+        Log("中转站已连接 %s:%d", cfg.hostMode ? "Mac" : cfg.host.c_str(), xferPort);
 
         std::atomic<bool> xferAlive{ true };
         std::mutex xferSendMtx;
@@ -6569,9 +6869,13 @@ static void TransferLoop(RunConfig cfg) {
         recvs.clear();
 
         closesocket(sock);
-        SetTransferStatus(L"中转连接断开，2 秒后重连…");
+        SetTransferStatus(cfg.hostMode ? L"中转站等待 Mac 连接 (9923)…" : L"中转连接断开，2 秒后重连…");
         if (!g_alive) break;
-        SleepAlive(2000);
+        SleepAlive(cfg.hostMode ? 200 : 2000);
+    }
+    if (listenSock != INVALID_SOCKET) {
+        g_xferListenSock = INVALID_SOCKET;
+        closesocket(listenSock);
     }
     Log("中转站线程退出");
 }
@@ -6639,14 +6943,21 @@ int main(int argc, char** argv) {
 
     // 单实例。旧实例被新实例踢掉后收流线程退出、交换链停止 Present，
     // 窗口会永久停在最后一帧，看起来就像「显示的是别的屏」。
-    // 这里直接拒绝第二个实例，并把已有窗口提到前台。
+    // 这里直接拒绝第二个实例，并把已有窗口提到前台（角色切换重启时短暂等待旧实例释放锁）。
     {
-        HANDLE instMutex = CreateMutexW(nullptr, TRUE, L"Global\\SecDisplayReceiver");
-        if (instMutex && GetLastError() == ERROR_ALREADY_EXISTS) {
-            HWND existing = FindWindowA("SecDisplayReceiver", nullptr);
-            if (existing) { ShowWindow(existing, SW_RESTORE); SetForegroundWindow(existing); }
-            Log("已有接收端实例在运行，本次启动退出（避免两个实例互踢留下冻结窗口）");
-            return 0;
+        int waited = 0;
+        for (;;) {
+            g_instMutex = CreateMutexW(nullptr, TRUE, L"Global\\SecDisplayReceiver");
+            if (g_instMutex && GetLastError() != ERROR_ALREADY_EXISTS) break;
+            if (g_instMutex) { CloseHandle(g_instMutex); g_instMutex = nullptr; }
+            if (waited >= cfg.waitLockMs) {
+                HWND existing = FindWindowA("SecDisplayReceiver", nullptr);
+                if (existing) { ShowWindow(existing, SW_RESTORE); SetForegroundWindow(existing); }
+                Log("已有 SecDisplay 实例在运行，本次启动退出");
+                return 0;
+            }
+            Sleep(50);
+            waited += 50;
         }
     }
 
@@ -6657,11 +6968,18 @@ int main(int argc, char** argv) {
         if (!g_logFile) fprintf(stderr, "无法打开日志文件 %s\n", cfg.logFile.c_str());
     }
 
-    Log("================ SecDisplay 接收端 ================");
-    Log("目标 %s:%d  分辨率 %dx%d  %s  重连 %s",
-        cfg.host.c_str(), cfg.port, cfg.width, cfg.height,
-        cfg.fullscreen ? "全屏" : "窗口",
-        cfg.reconnect ? "开" : "关");
+    g_hostMode = cfg.hostMode;
+    Log(cfg.hostMode ? "================ SecDisplay 主控发送端 (Win→Mac) ================"
+                     : "================ SecDisplay 接收端 ================");
+    if (cfg.hostMode) {
+        Log("模式: 主控发送  端口 %d/%d  虚拟屏 %dx%d@%dHz  码率 %dMbps",
+            cfg.port, cfg.port + 1, cfg.width, cfg.height, cfg.hostFps, cfg.hostBitrateMbps);
+    } else {
+        Log("目标 %s:%d  分辨率 %dx%d  %s  重连 %s",
+            cfg.host.c_str(), cfg.port, cfg.width, cfg.height,
+            cfg.fullscreen ? "全屏" : "窗口",
+            cfg.reconnect ? "开" : "关");
+    }
     if (!cfg.logFile.empty()) Log("日志文件: %s", cfg.logFile.c_str());
 
     SetUnhandledExceptionFilter(CrashFilter);
@@ -6684,16 +7002,107 @@ int main(int argc, char** argv) {
         Gdiplus::GdiplusStartup(&g_gdipToken, &gsi, nullptr);
     }
 
-    Graphics gfx;
-    if (!gfx.Init(cfg.width, cfg.height)) return 2;
-    g_gfx = &gfx;   // 控制面板查询 GPU 显存用
-
     WNDCLASSA wc{};
     wc.lpfnWndProc = WndProc;
     wc.hInstance = GetModuleHandleA(nullptr);
     wc.lpszClassName = "SecDisplayReceiver";
     wc.hIcon = LoadIconA(wc.hInstance, MAKEINTRESOURCEA(1));
     RegisterClassA(&wc);
+
+    if (cfg.hostMode) {
+        WSADATA wsa;
+        if (WSAStartup(MAKEWORD(2, 2), &wsa) != 0) { Log("WSAStartup 失败"); return 5; }
+
+        HWND hwnd = CreateWindowExA(0, "SecDisplayReceiver", "SecDisplay Host",
+                                    WS_OVERLAPPED, 0, 0, 1, 1,
+                                    nullptr, nullptr, wc.hInstance, nullptr);
+        if (!hwnd) { Log("宿主消息窗口创建失败"); return 3; }
+        g_hwnd = hwnd;
+        g_peerHost = cfg.host;
+        g_peerPort = cfg.port;
+        g_logPath = cfg.logFile;
+
+        TrayCreate(hwnd);
+        RegisterHotKey(hwnd, HOTKEY_QUIT_ID, MOD_CONTROL | MOD_ALT, 'Q');
+        RegisterHotKey(hwnd, HOTKEY_DROPBOX_ID, MOD_CONTROL | MOD_ALT, 'B');
+
+        if (!g_winHost.Start(cfg.width, cfg.height, cfg.hostFps, cfg.hostBitrateMbps,
+                             (uint16_t)cfg.port, [](const char* s) { Log("%s", s); })) {
+            Log("警告: 主控发送端启动失败（检查 Parsec VDD 驱动是否就绪）");
+        }
+        std::thread xfer(TransferLoop, cfg);
+        ShowControlPanel();
+
+        MSG msg;
+        while (GetMessage(&msg, nullptr, 0, 0)) {
+            if (msg.message == WM_KEYDOWN && msg.wParam == 'V' &&
+                (GetKeyState(VK_CONTROL) & 0x8000) &&
+                !(GetKeyState(VK_MENU) & 0x8000) &&
+                !(GetKeyState(VK_SHIFT) & 0x8000)) {
+                HWND act = GetActiveWindow();
+                HWND hp = g_panel.load();
+                HWND db = g_dropBox.load();
+                if (act && (act == hp || act == db || (hp && IsChild(hp, act)))) {
+                    PasteClipboardToTransfer(act);
+                    continue;
+                }
+            }
+            TranslateMessage(&msg);
+            DispatchMessage(&msg);
+        }
+
+        TrayRemove();
+        UnregisterHotKey(hwnd, HOTKEY_QUIT_ID);
+        UnregisterHotKey(hwnd, HOTKEY_DROPBOX_ID);
+        g_alive = false;
+        g_winHost.Stop();
+        g_xferCv.notify_all();
+        {
+            SOCKET xls = g_xferListenSock.exchange(INVALID_SOCKET);
+            if (xls != INVALID_SOCKET) closesocket(xls);
+            SOCKET xs = g_xferSock.load();
+            if (xs != INVALID_SOCKET) shutdown(xs, SD_BOTH);
+        }
+        if (xfer.joinable()) xfer.join();
+        HWND panelToDestroy = g_panel.exchange(nullptr);
+        if (panelToDestroy) DestroyWindow(panelToDestroy);
+        HWND dbToDestroy = g_dropBox.exchange(nullptr);
+        if (dbToDestroy) DestroyWindow(dbToDestroy);
+        {
+            std::lock_guard<std::mutex> lk(g_xferMtx);
+            for (const auto& it : g_xferOutQ) {
+                if (it.deleteAfterSend) DeleteFileW(it.path.c_str());
+            }
+            g_xferOutQ.clear();
+        }
+        g_theme.ReleaseAll();
+        if (g_gdipToken) { Gdiplus::GdiplusShutdown(g_gdipToken); g_gdipToken = 0; }
+        WSACleanup();
+        MFShutdown();
+        CoUninitialize();
+        if (g_instMutex) { ReleaseMutex(g_instMutex); CloseHandle(g_instMutex); g_instMutex = nullptr; }
+
+        if (g_switchRoleRequested.load()) {
+            wchar_t exePath[MAX_PATH] = {};
+            GetModuleFileNameW(nullptr, exePath, MAX_PATH);
+            wchar_t cmdLine[512];
+            swprintf(cmdLine, 512, L"\"%s\" --mode %s --wait-lock 3000",
+                     exePath, g_switchRoleToHost.load() ? L"sender" : L"receiver");
+            STARTUPINFOW si{}; si.cb = sizeof(si);
+            PROCESS_INFORMATION pi{};
+            if (CreateProcessW(exePath, cmdLine, nullptr, nullptr, FALSE, 0, nullptr, nullptr, &si, &pi)) {
+                CloseHandle(pi.hThread);
+                CloseHandle(pi.hProcess);
+            }
+        }
+        Log("主控端退出，进程结束");
+        if (g_logFile) { fclose(g_logFile); g_logFile = nullptr; }
+        return 0;
+    }
+
+    Graphics gfx;
+    if (!gfx.Init(cfg.width, cfg.height)) return 2;
+    g_gfx = &gfx;   // 控制面板查询 GPU 显存用
 
     HWND hwnd = nullptr;
     if (cfg.fullscreen) {
@@ -7001,6 +7410,21 @@ int main(int argc, char** argv) {
     gfx.Shutdown();
     MFShutdown();
     CoUninitialize();
+    if (g_instMutex) { ReleaseMutex(g_instMutex); CloseHandle(g_instMutex); g_instMutex = nullptr; }
+
+    if (g_switchRoleRequested.load()) {
+        wchar_t exePath[MAX_PATH] = {};
+        GetModuleFileNameW(nullptr, exePath, MAX_PATH);
+        wchar_t cmdLine[512];
+        swprintf(cmdLine, 512, L"\"%s\" --mode %s --wait-lock 3000",
+                 exePath, g_switchRoleToHost.load() ? L"sender" : L"receiver");
+        STARTUPINFOW si{}; si.cb = sizeof(si);
+        PROCESS_INFORMATION pi{};
+        if (CreateProcessW(exePath, cmdLine, nullptr, nullptr, FALSE, 0, nullptr, nullptr, &si, &pi)) {
+            CloseHandle(pi.hThread);
+            CloseHandle(pi.hProcess);
+        }
+    }
 
     Log("主循环退出，进程结束");
     if (g_logFile) { fclose(g_logFile); g_logFile = nullptr; }
