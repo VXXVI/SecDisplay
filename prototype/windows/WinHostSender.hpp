@@ -120,23 +120,31 @@ public:
 
     void Stop() {
         alive_.store(false);
+        // 防止在 AcceptLoop select 期间从外部关闭 listenSock_ 引发未定义行为：
+        // AcceptLoop 每 250ms 醒来检查 alive_，先 join 线程再统一关闭句柄。
+        SOCKET oldClient = INVALID_SOCKET;
         {
             std::lock_guard<std::mutex> lk(sockMtx_);
-            if (listenSock_ != INVALID_SOCKET) {
-                closesocket(listenSock_);
-                listenSock_ = INVALID_SOCKET;
-            }
-            if (clientSock_ != INVALID_SOCKET) {
-                shutdown(clientSock_, SD_BOTH);
-                closesocket(clientSock_);
-                clientSock_ = INVALID_SOCKET;
-            }
+            oldClient = clientSock_;
+            clientSock_ = INVALID_SOCKET;
+        }
+        if (oldClient != INVALID_SOCKET) {
+            shutdown(oldClient, SD_BOTH);
+            closesocket(oldClient);
         }
         stats_.clientConnected = false;
 
         if (acceptThread_.joinable()) acceptThread_.join();
         if (captureThread_.joinable()) captureThread_.join();
         if (cursorThread_.joinable()) cursorThread_.join();
+
+        {
+            std::lock_guard<std::mutex> lk(sockMtx_);
+            if (listenSock_ != INVALID_SOCKET) {
+                closesocket(listenSock_);
+                listenSock_ = INVALID_SOCKET;
+            }
+        }
 
         vdd_.Stop();
         EmitLog("WinHost: 发送端已停止");

@@ -683,6 +683,9 @@ static std::atomic<bool> g_hostMode{ false };
 static std::atomic<bool> g_switchRoleRequested{ false };
 static std::atomic<bool> g_switchRoleToHost{ false };
 static HANDLE g_instMutex = nullptr;
+static std::string g_activeCfgPath;
+static bool g_useConfigFile = true;
+static std::vector<std::string> g_preservedArgs;
 
 // 前向声明：主控模式切换与托盘菜单联动
 static void SwitchAppMode(bool toHostMode);
@@ -3754,12 +3757,17 @@ static void LayoutPanelControls(HWND h) {
     mv(IDC_PANEL_COPY,   bx[2], 436, bw, bh);
     mv(IDC_PANEL_EXIT,   bx[3], 436, bw, bh);
 
-    // 5 个选项开关均匀排在分隔线下方
-    mv(IDC_PANEL_VSYNC,    39,  494, 130, 28);
-    mv(IDC_PANEL_PACE,     185, 494, 130, 28);
-    mv(IDC_PANEL_FEEDBACK, 331, 494, 130, 28);
-    mv(IDC_PANEL_SHAKE,    477, 494, 165, 28);
-    mv(IDC_PANEL_KEEPON,   658, 494, 250, 28);
+    // 5 个选项开关均匀排在分隔线下方（主控发送模式下隐藏仅接收端有效的开关）
+    const int chkShow = g_hostMode.load() ? SW_HIDE : SW_SHOW;
+    auto mvChk = [&](int id, int x, int y, int w, int ch) {
+        mv(id, x, y, w, ch);
+        if (HWND c = GetDlgItem(h, id)) ShowWindow(c, chkShow);
+    };
+    mvChk(IDC_PANEL_VSYNC,    39,  494, 130, 28);
+    mvChk(IDC_PANEL_PACE,     185, 494, 130, 28);
+    mvChk(IDC_PANEL_FEEDBACK, 331, 494, 130, 28);
+    mvChk(IDC_PANEL_SHAKE,    477, 494, 165, 28);
+    mvChk(IDC_PANEL_KEEPON,   658, 494, 250, 28);
 }
 
 static LRESULT CALLBACK PanelWndProc(HWND h, UINT msg, WPARAM w, LPARAM l) {
@@ -5565,7 +5573,13 @@ static void ParseArgs(int argc, char** argv, RunConfig& cfg) {
         } else if (a == "--mode" && i + 1 < argc) {
             std::string m = argv[++i];
             std::transform(m.begin(), m.end(), m.begin(), [](unsigned char c) { return (char)std::tolower(c); });
-            cfg.hostMode = (m == "sender" || m == "host" || m == "1");
+            if (m == "sender" || m == "host" || m == "1") {
+                cfg.hostMode = true;
+            } else if (m == "receiver" || m == "client" || m == "0") {
+                cfg.hostMode = false;
+            } else {
+                Log("警告: 未知 --mode 参数 %s，保持默认模式", m.c_str());
+            }
         } else if (a == "--fps" && i + 1 < argc) {
             cfg.hostFps = atoi(argv[++i]);
         } else if (a == "--bitrate" && i + 1 < argc) {
@@ -5677,7 +5691,8 @@ static void LoadConfigFile(RunConfig& cfg, const std::string& path) {
 }
 
 static void SaveModeToConfigFile(bool toHostMode) {
-    std::string cfgPath = ExeDir() + "\\config.ini";
+    if (!g_useConfigFile) return;
+    std::string cfgPath = g_activeCfgPath.empty() ? (ExeDir() + "\\config.ini") : g_activeCfgPath;
     std::vector<std::string> lines;
     bool replaced = false;
     {
@@ -5702,6 +5717,32 @@ static void SaveModeToConfigFile(bool toHostMode) {
     std::ofstream fout(cfgPath, std::ios::trunc);
     if (fout) {
         for (const auto& l : lines) fout << l << "\n";
+    }
+}
+
+static void LaunchSelfForModeSwitch(bool toHostMode) {
+    wchar_t exePath[MAX_PATH] = {};
+    GetModuleFileNameW(nullptr, exePath, MAX_PATH);
+    std::wstring cmd = L"\"" + std::wstring(exePath) + L"\"";
+    for (const auto& a : g_preservedArgs) {
+        std::wstring wa = ToWide(a.c_str(), (int)a.size());
+        if (wa.find(L' ') != std::wstring::npos || wa.find(L'\t') != std::wstring::npos) {
+            cmd += L" \"" + wa + L"\"";
+        } else {
+            cmd += L" " + wa;
+        }
+    }
+    cmd += L" --mode ";
+    cmd += (toHostMode ? L"sender" : L"receiver");
+    cmd += L" --wait-lock 3000";
+
+    std::vector<wchar_t> cmdBuf(cmd.begin(), cmd.end());
+    cmdBuf.push_back(L'\0');
+    STARTUPINFOW si{}; si.cb = sizeof(si);
+    PROCESS_INFORMATION pi{};
+    if (CreateProcessW(exePath, cmdBuf.data(), nullptr, nullptr, FALSE, 0, nullptr, nullptr, &si, &pi)) {
+        CloseHandle(pi.hThread);
+        CloseHandle(pi.hProcess);
     }
 }
 
@@ -6874,7 +6915,7 @@ static void TransferLoop(RunConfig cfg) {
         SleepAlive(cfg.hostMode ? 200 : 2000);
     }
     if (listenSock != INVALID_SOCKET) {
-        g_xferListenSock = INVALID_SOCKET;
+        g_xferListenSock.exchange(INVALID_SOCKET);
         closesocket(listenSock);
     }
     Log("中转站线程退出");
@@ -6935,9 +6976,24 @@ int main(int argc, char** argv) {
     bool useConfigFile = true;
     for (int i = 1; i < argc; ++i) {
         std::string a = argv[i];
-        if (a == "--config" && i + 1 < argc) cfgPath = argv[++i];
-        else if (a == "--no-config") useConfigFile = false;
+        if (a == "--config" && i + 1 < argc) {
+            cfgPath = argv[++i];
+            g_preservedArgs.push_back("--config");
+            g_preservedArgs.push_back(cfgPath);
+        } else if (a == "--no-config") {
+            useConfigFile = false;
+            g_preservedArgs.push_back(a);
+        } else if (a == "--sender" || a == "--host" || a == "--receiver") {
+            continue;
+        } else if ((a == "--mode" || a == "--wait-lock") && i + 1 < argc) {
+            ++i;
+            continue;
+        } else {
+            g_preservedArgs.push_back(a);
+        }
     }
+    g_activeCfgPath = cfgPath;
+    g_useConfigFile = useConfigFile;
     if (useConfigFile) LoadConfigFile(cfg, cfgPath);
     ParseArgs(argc, argv, cfg);
 
@@ -6953,7 +7009,11 @@ int main(int argc, char** argv) {
             if (waited >= cfg.waitLockMs) {
                 HWND existing = FindWindowA("SecDisplayReceiver", nullptr);
                 if (existing) { ShowWindow(existing, SW_RESTORE); SetForegroundWindow(existing); }
-                Log("已有 SecDisplay 实例在运行，本次启动退出");
+                if (cfg.waitLockMs > 0) {
+                    Log("等待旧实例释放互斥锁超时 (%d ms)，本次启动退出", cfg.waitLockMs);
+                } else {
+                    Log("已有 SecDisplay 实例在运行，本次启动退出");
+                }
                 return 0;
             }
             Sleep(50);
@@ -7058,8 +7118,6 @@ int main(int argc, char** argv) {
         g_winHost.Stop();
         g_xferCv.notify_all();
         {
-            SOCKET xls = g_xferListenSock.exchange(INVALID_SOCKET);
-            if (xls != INVALID_SOCKET) closesocket(xls);
             SOCKET xs = g_xferSock.load();
             if (xs != INVALID_SOCKET) shutdown(xs, SD_BOTH);
         }
@@ -7083,17 +7141,7 @@ int main(int argc, char** argv) {
         if (g_instMutex) { ReleaseMutex(g_instMutex); CloseHandle(g_instMutex); g_instMutex = nullptr; }
 
         if (g_switchRoleRequested.load()) {
-            wchar_t exePath[MAX_PATH] = {};
-            GetModuleFileNameW(nullptr, exePath, MAX_PATH);
-            wchar_t cmdLine[512];
-            swprintf(cmdLine, 512, L"\"%s\" --mode %s --wait-lock 3000",
-                     exePath, g_switchRoleToHost.load() ? L"sender" : L"receiver");
-            STARTUPINFOW si{}; si.cb = sizeof(si);
-            PROCESS_INFORMATION pi{};
-            if (CreateProcessW(exePath, cmdLine, nullptr, nullptr, FALSE, 0, nullptr, nullptr, &si, &pi)) {
-                CloseHandle(pi.hThread);
-                CloseHandle(pi.hProcess);
-            }
+            LaunchSelfForModeSwitch(g_switchRoleToHost.load());
         }
         Log("主控端退出，进程结束");
         if (g_logFile) { fclose(g_logFile); g_logFile = nullptr; }
@@ -7413,17 +7461,7 @@ int main(int argc, char** argv) {
     if (g_instMutex) { ReleaseMutex(g_instMutex); CloseHandle(g_instMutex); g_instMutex = nullptr; }
 
     if (g_switchRoleRequested.load()) {
-        wchar_t exePath[MAX_PATH] = {};
-        GetModuleFileNameW(nullptr, exePath, MAX_PATH);
-        wchar_t cmdLine[512];
-        swprintf(cmdLine, 512, L"\"%s\" --mode %s --wait-lock 3000",
-                 exePath, g_switchRoleToHost.load() ? L"sender" : L"receiver");
-        STARTUPINFOW si{}; si.cb = sizeof(si);
-        PROCESS_INFORMATION pi{};
-        if (CreateProcessW(exePath, cmdLine, nullptr, nullptr, FALSE, 0, nullptr, nullptr, &si, &pi)) {
-            CloseHandle(pi.hThread);
-            CloseHandle(pi.hProcess);
-        }
+        LaunchSelfForModeSwitch(g_switchRoleToHost.load());
     }
 
     Log("主循环退出，进程结束");
