@@ -220,7 +220,7 @@ struct StatusView: View {
                 // 采集与编码（发送端本地）
                 SectionHeader(title: "采集 / 编码")
                 VStack(spacing: 6) {
-                    StatRow(label: "采集帧率", value: String(format: "%.0f fps", model.fps))
+                    StatRow(label: "采集峰值", value: String(format: "%.0f fps", model.fps))
                     StatRow(label: "采集通道", value: model.capturePath)
                     StatRow(label: "采集延迟", value: String(format: "%.1f ms", model.capMs))
                     StatRow(label: "编码延迟", value: String(format: "%.1f ms", model.encMs))
@@ -343,7 +343,7 @@ func copyDiagnostics() {
     对端: \(m.peer)
     分辨率: \(m.width)x\(m.height)  scale=\(String(format: "%.2f", m.scale))
     采集通道: \(m.capturePath)
-    采集帧率: \(String(format: "%.0f", m.fps)) fps
+    采集峰值: \(String(format: "%.0f", m.fps)) fps
     采集延迟: \(String(format: "%.1f", m.capMs)) ms
     编码延迟: \(String(format: "%.1f", m.encMs)) ms
     码率: \(m.bitrateNow)/\(m.bitrateTarget) Mbps  实际 \(String(format: "%.1f", m.mbps)) Mbps
