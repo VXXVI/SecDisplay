@@ -1,0 +1,1399 @@
+#pragma once
+// ============================================================================
+// WinHostSender.hpp —— Windows 主控发送端引擎（Mac 当 Windows 副屏）
+//
+// 管线：
+//   WinVirtualDisplay (Parsec VDD 扩展屏)
+//     → DXGI Desktop Duplication (零拷贝抓取虚拟屏 BGRA 纹理)
+//     → ID3D11VideoProcessor (GPU BGRA → NV12, BT.709)
+//     → Media Foundation H.264 硬件编码 (Intel Quick Sync Async MFT / 软编兜底)
+//     → Annex-B 转 AVCC（IDR 自动补齐 SPS/PPS）
+//     → TCP 服务端 9922（0x01 视频 / 0x03 光标 / 0x05 光标图像 / 0x06 会话头）
+//     ← 接收 Mac 副屏回传（0x02 关键帧请求 / 0x04 鼠标 / 0x07 健康度 / 0x09 键盘）
+// ============================================================================
+
+#include "WinVdd.hpp"
+#include <winsock2.h>
+#include <ws2tcpip.h>
+#include <d3d11.h>
+#include <d3d11_1.h>
+#include <dxgi1_2.h>
+#include <mfapi.h>
+#include <mfidl.h>
+#include <mftransform.h>
+#include <mferror.h>
+#include <codecapi.h>
+#include <wrl/client.h>
+
+#include <algorithm>
+#include <atomic>
+#include <chrono>
+#include <condition_variable>
+#include <cstdint>
+#include <cstdio>
+#include <cstring>
+#include <deque>
+#include <functional>
+#include <mutex>
+#include <string>
+#include <thread>
+#include <vector>
+
+#ifdef _MSC_VER
+#pragma comment(lib, "ws2_32.lib")
+#pragma comment(lib, "d3d11.lib")
+#pragma comment(lib, "dxgi.lib")
+#pragma comment(lib, "mfplat.lib")
+#pragma comment(lib, "mfuuid.lib")
+#pragma comment(lib, "ole32.lib")
+#pragma comment(lib, "user32.lib")
+#pragma comment(lib, "gdi32.lib")
+#endif
+
+namespace secdisplay {
+
+struct WinHostStats {
+    std::atomic<bool>     clientConnected{false};
+    std::atomic<int>      width{0};
+    std::atomic<int>      height{0};
+    std::atomic<int>      fps{60};
+    std::atomic<uint64_t> framesEncoded{0};
+    std::atomic<uint64_t> framesSent{0};
+    std::atomic<uint64_t> bytesSent{0};
+    std::atomic<uint64_t> framesDropped{0};
+    std::atomic<uint64_t> encodeFail{0};
+    std::atomic<uint64_t> cursorSent{0};
+    std::atomic<uint64_t> inputRecv{0};
+    std::atomic<double>   lastEncMs{0.0};
+    std::atomic<int>      bitrateMbps{80};
+    std::atomic<int>      targetBitrateMbps{80};
+    std::atomic<uint64_t> connStartTick{0};
+    std::mutex            infoMtx;
+    std::string           peerAddr = "--";
+    std::wstring          encoderName = L"--";
+};
+
+class WinHostSender {
+public:
+    using LogFn = std::function<void(const char*)>;
+
+    WinHostSender() = default;
+    ~WinHostSender() { Stop(); }
+
+    WinHostSender(const WinHostSender&) = delete;
+    WinHostSender& operator=(const WinHostSender&) = delete;
+
+    WinHostStats& Stats() { return stats_; }
+    const WinHostStats& Stats() const { return stats_; }
+
+    bool Start(int width, int height, int fps, int bitrateMbps, uint16_t port, LogFn logFn) {
+        Stop();
+        logFn_ = std::move(logFn);
+        reqW_ = width > 0 ? width : 2560;
+        reqH_ = height > 0 ? height : 1600;
+        reqFps_ = (fps >= 24 && fps <= 144) ? fps : 60;
+        if (bitrateMbps < 10) bitrateMbps = 10;
+        if (bitrateMbps > 200) bitrateMbps = 200;
+        targetMbps_ = bitrateMbps;
+        curMbps_.store(bitrateMbps);
+        port_ = port > 0 ? port : 9922;
+
+        stats_.targetBitrateMbps = targetMbps_;
+        stats_.bitrateMbps = bitrateMbps;
+        stats_.fps = reqFps_;
+
+        if (!vdd_.Start(reqW_, reqH_, reqFps_, logFn_)) {
+            EmitLog("WinHost: 虚拟屏启动失败");
+            return false;
+        }
+        WinVddBounds b = vdd_.Bounds();
+        stats_.width = b.width;
+        stats_.height = b.height;
+        stats_.fps = b.hz > 0 ? b.hz : reqFps_;
+
+        // 同步绑定并监听端口，端口冲突时立即失败回滚 VDD
+        SOCKET ls = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+        if (ls == INVALID_SOCKET) {
+            EmitLog("WinHost: 创建监听 socket 失败");
+            vdd_.Stop();
+            return false;
+        }
+        int reuse = 1;
+        setsockopt(ls, SOL_SOCKET, SO_REUSEADDR, (const char*)&reuse, sizeof(reuse));
+        sockaddr_in addr{};
+        addr.sin_family = AF_INET;
+        addr.sin_addr.s_addr = INADDR_ANY;
+        addr.sin_port = htons(port_);
+        if (bind(ls, (sockaddr*)&addr, sizeof(addr)) != 0 || listen(ls, 2) != 0) {
+            char msg[128];
+            snprintf(msg, sizeof(msg), "WinHost: 绑定/监听端口 %u 失败 err=%d", port_, WSAGetLastError());
+            EmitLog(msg);
+            closesocket(ls);
+            vdd_.Stop();
+            return false;
+        }
+        {
+            std::lock_guard<std::mutex> lk(sockMtx_);
+            listenSock_ = ls;
+        }
+        {
+            char msg[96];
+            snprintf(msg, sizeof(msg), "WinHost: 已监听端口 %u，等待 Mac 副屏连接", port_);
+            EmitLog(msg);
+        }
+
+        alive_.store(true);
+        acceptThread_ = std::thread(&WinHostSender::AcceptLoop, this);
+        captureThread_ = std::thread(&WinHostSender::CaptureEncodeLoop, this);
+        cursorThread_ = std::thread(&WinHostSender::CursorLoop, this);
+        return true;
+    }
+
+    void Stop() {
+        alive_.store(false);
+        // 按 sendMtx_ -> sockMtx_ 顺序校验身份并一起 shutdown+closesocket，彻底消除锁外句柄复用竞态
+        {
+            std::lock_guard<std::mutex> slk(sendMtx_);
+            std::lock_guard<std::mutex> lk(sockMtx_);
+            if (clientSock_ != INVALID_SOCKET) {
+                shutdown(clientSock_, SD_BOTH);
+                closesocket(clientSock_);
+                clientSock_ = INVALID_SOCKET;
+            }
+        }
+        stats_.clientConnected = false;
+
+        if (acceptThread_.joinable()) acceptThread_.join();
+        if (captureThread_.joinable()) captureThread_.join();
+        if (cursorThread_.joinable()) cursorThread_.join();
+
+        {
+            std::lock_guard<std::mutex> lk(sockMtx_);
+            if (listenSock_ != INVALID_SOCKET) {
+                closesocket(listenSock_);
+                listenSock_ = INVALID_SOCKET;
+            }
+        }
+
+        vdd_.Stop();
+        EmitLog("WinHost: 发送端已停止");
+    }
+
+    void RequestKeyframe() {
+        forceKeyframe_.store(true);
+    }
+
+    bool IsRunning() const { return alive_.load(); }
+
+private:
+    static constexpr uint8_t kTypeVideo       = 0x01;
+    static constexpr uint8_t kTypeKeyframeReq = 0x02;
+    static constexpr uint8_t kTypeCursorPos   = 0x03;
+    static constexpr uint8_t kTypeMouseInput  = 0x04;
+    static constexpr uint8_t kTypeCursorImg   = 0x05;
+    static constexpr uint8_t kTypeSession     = 0x06;
+    static constexpr uint8_t kTypeFeedback    = 0x07;
+    static constexpr uint8_t kTypeKeyInput    = 0x09;
+
+    WinVirtualDisplay vdd_;
+    WinHostStats stats_;
+    LogFn logFn_;
+
+    int reqW_ = 2560;
+    int reqH_ = 1600;
+    int reqFps_ = 60;
+    int targetMbps_ = 80;
+    std::atomic<int> curMbps_{80};
+    uint16_t port_ = 9922;
+
+    std::atomic<bool> alive_{false};
+    std::atomic<bool> forceKeyframe_{true};
+    std::atomic<uint64_t> lastPayloadUs_{0};
+
+    std::mutex sockMtx_;
+    std::mutex sendMtx_;
+    SOCKET listenSock_ = INVALID_SOCKET;
+    SOCKET clientSock_ = INVALID_SOCKET;
+    uint64_t connEpoch_ = 0;
+
+    std::mutex lastFrameMtx_;
+    std::vector<uint8_t> lastAvccFrame_;
+
+    std::thread acceptThread_;
+    std::thread captureThread_;
+    std::thread cursorThread_;
+
+    void EmitLog(const char* s) {
+        if (logFn_ && s) logFn_(s);
+    }
+
+    static uint64_t NowMicros() {
+        // 与协议一致：任意单调/墙钟微秒即可，用 FILETIME 转 2001 纪元微秒
+        FILETIME ft{};
+        GetSystemTimeAsFileTime(&ft);
+        ULARGE_INTEGER ui{};
+        ui.LowPart = ft.dwLowDateTime;
+        ui.HighPart = ft.dwHighDateTime;
+        // 1601->2001 偏移: 12622780800 秒
+        uint64_t unixUs = (ui.QuadPart - 116444736000000000ULL) / 10ULL;
+        return unixUs > 978307200000000ULL ? (unixUs - 978307200000000ULL) : unixUs;
+    }
+
+    static void PutU16BE(uint8_t* p, uint16_t v) {
+        p[0] = (uint8_t)(v >> 8); p[1] = (uint8_t)(v & 0xFF);
+    }
+    static void PutU32BE(uint8_t* p, uint32_t v) {
+        p[0] = (uint8_t)((v >> 24) & 0xFF); p[1] = (uint8_t)((v >> 16) & 0xFF);
+        p[2] = (uint8_t)((v >> 8) & 0xFF);  p[3] = (uint8_t)(v & 0xFF);
+    }
+    static void PutU64BE(uint8_t* p, uint64_t v) {
+        PutU32BE(p, (uint32_t)(v >> 32));
+        PutU32BE(p + 4, (uint32_t)(v & 0xFFFFFFFFu));
+    }
+    static void PutF32BE(uint8_t* p, float f) {
+        uint32_t u = 0; memcpy(&u, &f, 4);
+        PutU32BE(p, u);
+    }
+    static uint16_t RdU16BE(const uint8_t* p) {
+        return ((uint16_t)p[0] << 8) | p[1];
+    }
+    static uint32_t RdU32BE(const uint8_t* p) {
+        return ((uint32_t)p[0] << 24) | ((uint32_t)p[1] << 16) | ((uint32_t)p[2] << 8) | p[3];
+    }
+    static float RdF32BE(const uint8_t* p) {
+        uint32_t u = RdU32BE(p);
+        float f = 0.0f; memcpy(&f, &u, 4);
+        return f;
+    }
+
+    bool SendRawPacket(const uint8_t* data, size_t len) {
+        std::lock_guard<std::mutex> slk(sendMtx_);
+        SOCKET s = INVALID_SOCKET;
+        {
+            std::lock_guard<std::mutex> lk(sockMtx_);
+            s = clientSock_;
+        }
+        if (s == INVALID_SOCKET) return false;
+
+        size_t sent = 0;
+        while (sent < len && alive_.load()) {
+            int n = send(s, (const char*)(data + sent), (int)std::min<size_t>(len - sent, 1 << 20), 0);
+            if (n > 0) {
+                sent += (size_t)n;
+            } else {
+                int err = WSAGetLastError();
+                if (err == WSAEINTR) continue;
+                CloseClientUnderSendLock(s);
+                return false;
+            }
+        }
+        if (sent == len) {
+            stats_.bytesSent += len;
+            return true;
+        }
+        return false;
+    }
+
+    // 调用方已持有 sendMtx_
+    void CloseClientUnderSendLock(SOCKET expected) {
+        std::lock_guard<std::mutex> lk(sockMtx_);
+        if (clientSock_ == expected && expected != INVALID_SOCKET) {
+            shutdown(clientSock_, SD_BOTH);
+            closesocket(clientSock_);
+            clientSock_ = INVALID_SOCKET;
+            stats_.clientConnected = false;
+            std::lock_guard<std::mutex> ilk(stats_.infoMtx);
+            stats_.peerAddr = "--";
+        }
+    }
+
+    void DisconnectClient(SOCKET expected) {
+        if (expected == INVALID_SOCKET) return;
+        std::lock_guard<std::mutex> slk(sendMtx_);
+        CloseClientUnderSendLock(expected);
+    }
+
+    void SendSessionHeader(int w, int h, int fps) {
+        if (w <= 0 || h <= 0) return;
+        uint8_t pkt[20];
+        PutU32BE(pkt, 16);                 // 1 type + 8 ts + 7 payload
+        pkt[4] = kTypeSession;
+        PutU64BE(pkt + 5, NowMicros());
+        pkt[13] = 1;                       // protocol version
+        PutU16BE(pkt + 14, (uint16_t)w);
+        PutU16BE(pkt + 16, (uint16_t)h);
+        pkt[18] = (uint8_t)std::clamp(fps, 1, 240);
+        pkt[19] = 0;
+        SendRawPacket(pkt, sizeof(pkt));
+    }
+
+    void SendHeartbeat() {
+        uint8_t pkt[13];
+        PutU32BE(pkt, 9);
+        pkt[4] = kTypeSession;
+        PutU64BE(pkt + 5, NowMicros());
+        SendRawPacket(pkt, sizeof(pkt));
+    }
+
+    void SendVideoAvcc(const std::vector<uint8_t>& avcc, uint64_t tsUs) {
+        if (avcc.empty()) return;
+        std::vector<uint8_t> pkt(13 + avcc.size());
+        PutU32BE(pkt.data(), (uint32_t)(9 + avcc.size()));
+        pkt[4] = kTypeVideo;
+        PutU64BE(pkt.data() + 5, tsUs);
+        memcpy(pkt.data() + 13, avcc.data(), avcc.size());
+        if (SendRawPacket(pkt.data(), pkt.size())) {
+            stats_.framesSent++;
+            lastPayloadUs_.store(NowMicros());
+        } else {
+            stats_.framesDropped++;
+        }
+    }
+
+    void SendCursorPos(float rx, float ry, bool visible) {
+        uint8_t pkt[22];
+        PutU32BE(pkt, 18);                 // 1 + 8 + 4 + 4 + 1
+        pkt[4] = kTypeCursorPos;
+        PutU64BE(pkt + 5, NowMicros());
+        PutF32BE(pkt + 13, rx);
+        PutF32BE(pkt + 17, ry);
+        pkt[21] = visible ? 1 : 0;
+        if (SendRawPacket(pkt, sizeof(pkt))) {
+            stats_.cursorSent++;
+        }
+    }
+
+    void SendCursorImage(int w, int h, int hotX, int hotY, const std::vector<uint8_t>& bgra) {
+        if (w <= 0 || h <= 0 || bgra.size() != (size_t)w * (size_t)h * 4) return;
+        std::vector<uint8_t> pkt(4 + 1 + 8 + 12 + bgra.size());
+        PutU32BE(pkt.data(), (uint32_t)(1 + 8 + 12 + bgra.size()));
+        pkt[4] = kTypeCursorImg;
+        PutU64BE(pkt.data() + 5, NowMicros());
+        PutU16BE(pkt.data() + 13, (uint16_t)w);
+        PutU16BE(pkt.data() + 15, (uint16_t)h);
+        PutU16BE(pkt.data() + 17, (uint16_t)std::clamp(hotX, 0, w - 1));
+        PutU16BE(pkt.data() + 19, (uint16_t)std::clamp(hotY, 0, h - 1));
+        PutU32BE(pkt.data() + 21, (uint32_t)bgra.size());
+        memcpy(pkt.data() + 25, bgra.data(), bgra.size());
+        SendRawPacket(pkt.data(), pkt.size());
+    }
+
+    // ---- TCP 服务端接收与控制回传 ----
+    void AcceptLoop() {
+        SOCKET ls = INVALID_SOCKET;
+        {
+            std::lock_guard<std::mutex> lk(sockMtx_);
+            ls = listenSock_;
+        }
+        if (ls == INVALID_SOCKET) return;
+
+        while (alive_.load()) {
+            fd_set rfds;
+            FD_ZERO(&rfds);
+            FD_SET(ls, &rfds);
+            timeval tv{ 0, 250000 };
+            int sel = select(0, &rfds, nullptr, nullptr, &tv);
+            if (sel <= 0) continue;
+
+            sockaddr_in cliAddr{};
+            int cliLen = sizeof(cliAddr);
+            SOCKET cs = accept(ls, (sockaddr*)&cliAddr, &cliLen);
+            if (cs == INVALID_SOCKET) continue;
+
+            int bufSz = 4 * 1024 * 1024;
+            setsockopt(cs, SOL_SOCKET, SO_SNDBUF, (const char*)&bufSz, sizeof(bufSz));
+            setsockopt(cs, SOL_SOCKET, SO_RCVBUF, (const char*)&bufSz, sizeof(bufSz));
+            int nodelay = 1, keepalive = 1;
+            setsockopt(cs, IPPROTO_TCP, TCP_NODELAY, (const char*)&nodelay, sizeof(nodelay));
+            setsockopt(cs, SOL_SOCKET, SO_KEEPALIVE, (const char*)&keepalive, sizeof(keepalive));
+            DWORD rcvTo = 500, sndTo = 3000;
+            setsockopt(cs, SOL_SOCKET, SO_RCVTIMEO, (const char*)&rcvTo, sizeof(rcvTo));
+            setsockopt(cs, SOL_SOCKET, SO_SNDTIMEO, (const char*)&sndTo, sizeof(sndTo));
+
+            char ipStr[64] = {};
+            inet_ntop(AF_INET, &cliAddr.sin_addr, ipStr, sizeof(ipStr));
+            std::string peer = std::string(ipStr) + ":" + std::to_string(ntohs(cliAddr.sin_port));
+
+            uint64_t epoch = 0;
+            {
+                std::lock_guard<std::mutex> slk(sendMtx_);
+                std::lock_guard<std::mutex> lk(sockMtx_);
+                SOCKET oldSock = clientSock_;
+                clientSock_ = cs;
+                epoch = ++connEpoch_;
+                if (oldSock != INVALID_SOCKET) {
+                    shutdown(oldSock, SD_BOTH);
+                    closesocket(oldSock);
+                }
+            }
+            {
+                std::lock_guard<std::mutex> ilk(stats_.infoMtx);
+                stats_.peerAddr = peer;
+            }
+            stats_.clientConnected = true;
+            stats_.connStartTick = GetTickCount64();
+            lastPayloadUs_.store(0);
+            forceKeyframe_.store(true);
+
+            {
+                char msg[128];
+                snprintf(msg, sizeof(msg), "WinHost: Mac 副屏已连接 %s", peer.c_str());
+                EmitLog(msg);
+            }
+
+            WinVddBounds b = vdd_.Bounds();
+            SendSessionHeader(b.width, b.height, b.hz > 0 ? b.hz : reqFps_);
+            ClientRecvLoop(cs, epoch);
+        }
+    }
+
+    void ClientRecvLoop(SOCKET cs, uint64_t epoch) {
+        uint8_t buf[4096];
+        std::vector<uint8_t> acc;
+        acc.reserve(4096);
+        while (alive_.load()) {
+            {
+                std::lock_guard<std::mutex> lk(sockMtx_);
+                if (clientSock_ != cs || connEpoch_ != epoch) break;
+            }
+            int n = recv(cs, (char*)buf, sizeof(buf), 0);
+            if (n > 0) {
+                acc.insert(acc.end(), buf, buf + n);
+                ProcessControlBytes(acc);
+            } else if (n == 0) {
+                break;
+            } else {
+                int err = WSAGetLastError();
+                if (err == WSAETIMEDOUT || err == WSAEINTR) continue;
+                break;
+            }
+        }
+        DisconnectClient(cs);
+        EmitLog("WinHost: Mac 副屏连接断开");
+    }
+
+    void ProcessControlBytes(std::vector<uint8_t>& acc) {
+        // 接收端回传格式：与 SecDisplayReceiver.cpp 完全对称（无 4B 长度前缀）
+        //   0x02: 1B 关键帧请求
+        //   0x04: 12B [0x04][x f32 BE][y f32 BE][buttons u8][wheel i16 BE]
+        //   0x07: 13B [0x07][presentP95 u16][sourceP95 u16][decFps10 u16][presDrop u16][pacedDrop u16][res u16]
+        //   0x09: 7B  [0x09][vk u16][scan u16][down u8][flags u8]
+        size_t pos = 0;
+        while (pos < acc.size()) {
+            uint8_t t = acc[pos];
+            if (t == kTypeKeyframeReq) {
+                forceKeyframe_.store(true);
+                pos += 1;
+            } else if (t == kTypeMouseInput) {
+                if (acc.size() - pos < 12) break;
+                float x = RdF32BE(acc.data() + pos + 1);
+                float y = RdF32BE(acc.data() + pos + 5);
+                uint8_t buttons = acc[pos + 9];
+                int16_t wheel = (int16_t)RdU16BE(acc.data() + pos + 10);
+                InjectMouse(x, y, buttons, wheel);
+                stats_.inputRecv++;
+                pos += 12;
+            } else if (t == kTypeKeyInput) {
+                if (acc.size() - pos < 7) break;
+                uint16_t vk = RdU16BE(acc.data() + pos + 1);
+                uint16_t scan = RdU16BE(acc.data() + pos + 3);
+                bool down = acc[pos + 5] != 0;
+                uint8_t flags = acc[pos + 6];
+                InjectKeyboard(vk, scan, down, flags);
+                stats_.inputRecv++;
+                pos += 7;
+            } else if (t == kTypeFeedback) {
+                if (acc.size() - pos < 13) break;
+                uint16_t presentP95 = RdU16BE(acc.data() + pos + 1);
+                uint16_t sourceP95  = RdU16BE(acc.data() + pos + 3);
+                uint16_t presDrop   = RdU16BE(acc.data() + pos + 7);
+                uint16_t pacedDrop  = RdU16BE(acc.data() + pos + 9);
+                AdjustAdaptiveBitrate(presentP95, sourceP95, presDrop, pacedDrop);
+                pos += 13;
+            } else {
+                // 未知控制字节跳过 1 字节同步恢复
+                pos += 1;
+            }
+        }
+        if (pos > 0) acc.erase(acc.begin(), acc.begin() + pos);
+        if (acc.size() > 65536) acc.clear();
+    }
+
+    void AdjustAdaptiveBitrate(uint16_t presentP95, uint16_t sourceP95,
+                               uint16_t presDrop, uint16_t pacedDrop) {
+        int cur = curMbps_.load();
+        int minMbps = std::max(15, targetMbps_ / 3);
+        if (presDrop > 2 || pacedDrop > 2 || (presentP95 > sourceP95 + 25 && presentP95 > 45)) {
+            cur = std::max(minMbps, (int)(cur * 0.78));
+        } else if (presDrop == 0 && pacedDrop == 0 && cur < targetMbps_) {
+            cur = std::min(targetMbps_, cur + std::max(2, targetMbps_ / 15));
+        }
+        curMbps_.store(cur);
+        stats_.bitrateMbps = cur;
+    }
+
+    // ---- 反向输入注入（Mac 副屏 → Windows 虚拟屏）----
+    uint8_t prevMouseButtons_ = 0;
+
+    void InjectMouse(float rx, float ry, uint8_t buttons, int16_t wheel) {
+        WinVddBounds b = vdd_.Bounds();
+        if (b.width <= 0 || b.height <= 0) return;
+
+        int vx = GetSystemMetrics(SM_XVIRTUALSCREEN);
+        int vy = GetSystemMetrics(SM_YVIRTUALSCREEN);
+        int vw = GetSystemMetrics(SM_CXVIRTUALSCREEN);
+        int vh = GetSystemMetrics(SM_CYVIRTUALSCREEN);
+        if (vw <= 1 || vh <= 1) return;
+
+        double deskX = (double)b.left + std::clamp((double)rx, 0.0, (double)(b.width - 1));
+        double deskY = (double)b.top  + std::clamp((double)ry, 0.0, (double)(b.height - 1));
+        LONG normX = (LONG)std::clamp((deskX - vx) * 65535.0 / (double)(vw - 1), 0.0, 65535.0);
+        LONG normY = (LONG)std::clamp((deskY - vy) * 65535.0 / (double)(vh - 1), 0.0, 65535.0);
+
+        std::vector<INPUT> inputs;
+        INPUT mv{};
+        mv.type = INPUT_MOUSE;
+        mv.mi.dx = normX;
+        mv.mi.dy = normY;
+        mv.mi.dwFlags = MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_VIRTUALDESK;
+        inputs.push_back(mv);
+
+        auto addBtn = [&](uint8_t mask, DWORD downFlag, DWORD upFlag) {
+            bool was = (prevMouseButtons_ & mask) != 0;
+            bool now = (buttons & mask) != 0;
+            if (now == was) return;
+            INPUT bi{};
+            bi.type = INPUT_MOUSE;
+            bi.mi.dx = normX;
+            bi.mi.dy = normY;
+            bi.mi.dwFlags = MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_VIRTUALDESK | (now ? downFlag : upFlag);
+            inputs.push_back(bi);
+        };
+        addBtn(0x01, MOUSEEVENTF_LEFTDOWN,   MOUSEEVENTF_LEFTUP);
+        addBtn(0x02, MOUSEEVENTF_RIGHTDOWN,  MOUSEEVENTF_RIGHTUP);
+        addBtn(0x04, MOUSEEVENTF_MIDDLEDOWN, MOUSEEVENTF_MIDDLEUP);
+        prevMouseButtons_ = buttons;
+
+        if (wheel != 0) {
+            INPUT wi{};
+            wi.type = INPUT_MOUSE;
+            wi.mi.dx = normX;
+            wi.mi.dy = normY;
+            wi.mi.dwFlags = MOUSEEVENTF_WHEEL | MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_VIRTUALDESK;
+            // Mac 发来的 wheel 正数为向下（SecDisplayReceiver 传给 Mac 时做了 -delta）；
+            // Windows MOUSEEVENTF_WHEEL 正数向上，故取反还原
+            wi.mi.mouseData = (DWORD)(-(int)wheel);
+            inputs.push_back(wi);
+        }
+
+        SendInput((UINT)inputs.size(), inputs.data(), sizeof(INPUT));
+    }
+
+    static void InjectKeyboard(uint16_t vk, uint16_t scan, bool down, uint8_t flags) {
+        if (vk == 0) return;
+        INPUT in{};
+        in.type = INPUT_KEYBOARD;
+        in.ki.wVk = vk;
+        in.ki.wScan = scan ? scan : (uint16_t)MapVirtualKeyW(vk, MAPVK_VK_TO_VSC);
+        DWORD dw = 0;
+        if (flags & 0x01) dw |= KEYEVENTF_EXTENDEDKEY;
+        if (!down) dw |= KEYEVENTF_KEYUP;
+        in.ki.dwFlags = dw;
+        SendInput(1, &in, sizeof(INPUT));
+    }
+
+    // ---- 光标位置与位图采集（Windows → Mac）----
+    void CursorLoop() {
+        HCURSOR lastCursor = nullptr;
+        int lastX = -99999, lastY = -99999;
+        bool lastVis = false;
+        ULONGLONG lastSendMs = 0;
+
+        while (alive_.load()) {
+            Sleep(11);
+            if (!stats_.clientConnected.load()) {
+                lastCursor = nullptr;
+                lastVis = false;
+                continue;
+            }
+            CURSORINFO ci{};
+            ci.cbSize = sizeof(ci);
+            if (!GetCursorInfo(&ci)) continue;
+
+            WinVddBounds b = vdd_.Bounds();
+            bool vis = (ci.flags & CURSOR_SHOWING) &&
+                       ci.ptScreenPos.x >= b.left && ci.ptScreenPos.x < b.left + b.width &&
+                       ci.ptScreenPos.y >= b.top  && ci.ptScreenPos.y < b.top + b.height;
+
+            float rx = (float)(ci.ptScreenPos.x - b.left);
+            float ry = (float)(ci.ptScreenPos.y - b.top);
+            ULONGLONG now = GetTickCount64();
+
+            if (vis != lastVis || (vis && (ci.ptScreenPos.x != lastX || ci.ptScreenPos.y != lastY)) ||
+                (now - lastSendMs >= 250)) {
+                SendCursorPos(rx, ry, vis);
+                lastX = ci.ptScreenPos.x;
+                lastY = ci.ptScreenPos.y;
+                lastVis = vis;
+                lastSendMs = now;
+            }
+
+            if (vis && ci.hCursor && ci.hCursor != lastCursor) {
+                int w = 0, h = 0, hx = 0, hy = 0;
+                std::vector<uint8_t> bgra;
+                if (ExtractCursorBgra(ci.hCursor, &w, &h, &hx, &hy, &bgra)) {
+                    SendCursorImage(w, h, hx, hy, bgra);
+                    lastCursor = ci.hCursor;
+                }
+            }
+        }
+    }
+
+    static bool ExtractCursorBgra(HCURSOR hc, int* outW, int* outH, int* outHx, int* outHy,
+                                  std::vector<uint8_t>* outBgra) {
+        ICONINFO ii{};
+        if (!GetIconInfo(hc, &ii)) return false;
+
+        int w = 0, h = 0;
+        BITMAP bm{};
+        if (ii.hbmColor && GetObjectW(ii.hbmColor, sizeof(bm), &bm)) {
+            w = bm.bmWidth;
+            h = abs(bm.bmHeight);
+        } else if (ii.hbmMask && GetObjectW(ii.hbmMask, sizeof(bm), &bm)) {
+            w = bm.bmWidth;
+            h = abs(bm.bmHeight) / 2;
+        }
+        if (w <= 0 || h <= 0 || w > 128 || h > 128) {
+            if (ii.hbmColor) DeleteObject(ii.hbmColor);
+            if (ii.hbmMask) DeleteObject(ii.hbmMask);
+            return false;
+        }
+
+        HDC hdc = CreateCompatibleDC(nullptr);
+        BITMAPINFO bmi{};
+        bmi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+        bmi.bmiHeader.biWidth = w;
+        bmi.bmiHeader.biHeight = -h; // top-down
+        bmi.bmiHeader.biPlanes = 1;
+        bmi.bmiHeader.biBitCount = 32;
+        bmi.bmiHeader.biCompression = BI_RGB;
+
+        std::vector<uint8_t> pixels((size_t)w * (size_t)h * 4, 0);
+        bool dibOk = false;
+        if (ii.hbmColor) {
+            if (GetDIBits(hdc, ii.hbmColor, 0, (UINT)h, pixels.data(), &bmi, DIB_RGB_COLORS) > 0) {
+                dibOk = true;
+                bool hasAlpha = false;
+                for (size_t i = 3; i < pixels.size(); i += 4) {
+                    if (pixels[i] != 0) { hasAlpha = true; break; }
+                }
+                if (!hasAlpha && ii.hbmMask) {
+                    std::vector<uint8_t> mask((size_t)w * (size_t)h * 4, 0);
+                    if (GetDIBits(hdc, ii.hbmMask, 0, (UINT)h, mask.data(), &bmi, DIB_RGB_COLORS) > 0) {
+                        for (size_t i = 0; i < pixels.size(); i += 4) {
+                            pixels[i + 3] = (mask[i] == 0) ? 255 : 0;
+                        }
+                    }
+                }
+            }
+        } else if (ii.hbmMask) {
+            // 单色光标：上半部分 AND 掩码，下半部分 XOR 掩码
+            BITMAPINFO mbmi = bmi;
+            mbmi.bmiHeader.biHeight = -(h * 2);
+            std::vector<uint8_t> full((size_t)w * (size_t)h * 2 * 4, 0);
+            if (GetDIBits(hdc, ii.hbmMask, 0, (UINT)(h * 2), full.data(), &mbmi, DIB_RGB_COLORS) > 0) {
+                dibOk = true;
+                size_t half = (size_t)w * (size_t)h * 4;
+                for (size_t i = 0; i < half; i += 4) {
+                    uint8_t andB = full[i];
+                    uint8_t xorB = full[half + i];
+                    if (andB == 0) {
+                        uint8_t v = xorB ? 255 : 0;
+                        pixels[i] = v; pixels[i + 1] = v; pixels[i + 2] = v; pixels[i + 3] = 255;
+                    } else if (xorB != 0) {
+                        // 反色像素（I 型光标常见）：用白描边黑/半透白示意
+                        pixels[i] = 20; pixels[i + 1] = 20; pixels[i + 2] = 20; pixels[i + 3] = 220;
+                    } else {
+                        pixels[i] = pixels[i + 1] = pixels[i + 2] = pixels[i + 3] = 0;
+                    }
+                }
+            }
+        }
+
+        DeleteDC(hdc);
+        if (ii.hbmColor) DeleteObject(ii.hbmColor);
+        if (ii.hbmMask) DeleteObject(ii.hbmMask);
+        if (!dibOk) return false;
+
+        *outW = w;
+        *outH = h;
+        *outHx = (int)ii.xHotspot;
+        *outHy = (int)ii.yHotspot;
+        *outBgra = std::move(pixels);
+        return true;
+    }
+
+    // ---- Annex-B → AVCC 转换与 SPS/PPS 缓存 ----
+    struct AvccConverter {
+        std::vector<uint8_t> sps;
+        std::vector<uint8_t> pps;
+
+        static size_t FindStartCode(const uint8_t* data, size_t size, size_t from, size_t* scLen) {
+            for (size_t i = from; i + 2 < size; ++i) {
+                if (data[i] == 0 && data[i + 1] == 0) {
+                    if (data[i + 2] == 1) { *scLen = 3; return i; }
+                    if (i + 3 < size && data[i + 2] == 0 && data[i + 3] == 1) { *scLen = 4; return i; }
+                }
+            }
+            return size;
+        }
+
+        static void AppendAvccNal(std::vector<uint8_t>& out, const uint8_t* nal, size_t len) {
+            if (len == 0) return;
+            uint32_t n = (uint32_t)len;
+            out.push_back((uint8_t)((n >> 24) & 0xFF));
+            out.push_back((uint8_t)((n >> 16) & 0xFF));
+            out.push_back((uint8_t)((n >> 8) & 0xFF));
+            out.push_back((uint8_t)(n & 0xFF));
+            out.insert(out.end(), nal, nal + len);
+        }
+
+        // 追加转换一个 Annex-B 样本到 outAvcc（不清空已有数据，支持多输出 AU 拼接）
+        bool ConvertAppend(const uint8_t* annexb, size_t size, std::vector<uint8_t>& outAvcc, bool* outIsIdr) {
+            if (!annexb || size < 4) return false;
+
+            std::vector<std::pair<const uint8_t*, size_t>> nals;
+            size_t scLen = 0;
+            size_t pos = FindStartCode(annexb, size, 0, &scLen);
+            if (pos >= size) return false;
+
+            while (pos < size) {
+                size_t nalStart = pos + scLen;
+                size_t nextScLen = 0;
+                size_t nextPos = FindStartCode(annexb, size, nalStart, &nextScLen);
+                size_t nalLen = nextPos - nalStart;
+                if (nalLen > 0) nals.emplace_back(annexb + nalStart, nalLen);
+                pos = nextPos;
+                scLen = nextScLen;
+            }
+
+            bool hasSps = false, hasPps = false, isIdr = false;
+            for (auto& pr : nals) {
+                uint8_t nt = pr.first[0] & 0x1F;
+                if (nt == 7) { sps.assign(pr.first, pr.first + pr.second); hasSps = true; }
+                else if (nt == 8) { pps.assign(pr.first, pr.first + pr.second); hasPps = true; }
+                else if (nt == 5) { isIdr = true; }
+            }
+            if (isIdr && outIsIdr) *outIsIdr = true;
+
+            if (isIdr && !hasSps && !sps.empty() && !pps.empty()) {
+                AppendAvccNal(outAvcc, sps.data(), sps.size());
+                AppendAvccNal(outAvcc, pps.data(), pps.size());
+            } else if (isIdr && !hasPps && !pps.empty() && hasSps) {
+                AppendAvccNal(outAvcc, pps.data(), pps.size());
+            }
+
+            const size_t before = outAvcc.size();
+            for (auto& pr : nals) {
+                AppendAvccNal(outAvcc, pr.first, pr.second);
+            }
+            return outAvcc.size() > before;
+        }
+    };
+
+    // ---- Media Foundation H.264 编码器 ----
+    struct MfH264Encoder {
+        Microsoft::WRL::ComPtr<ID3D11Device> dev;
+        Microsoft::WRL::ComPtr<ID3D11DeviceContext> ctx;
+        Microsoft::WRL::ComPtr<IMFDXGIDeviceManager> dxgiMgr;
+        Microsoft::WRL::ComPtr<ID3D11VideoDevice> vdev;
+        Microsoft::WRL::ComPtr<ID3D11VideoContext> vctx;
+        Microsoft::WRL::ComPtr<ID3D11VideoProcessorEnumerator> vpEnum;
+        Microsoft::WRL::ComPtr<ID3D11VideoProcessor> vp;
+        Microsoft::WRL::ComPtr<ID3D11Texture2D> nv12Tex;
+        Microsoft::WRL::ComPtr<ID3D11Texture2D> stagingBgra;
+
+        Microsoft::WRL::ComPtr<IMFTransform> mft;
+        Microsoft::WRL::ComPtr<IMFMediaEventGenerator> evtGen;
+        Microsoft::WRL::ComPtr<ICodecAPI> codecApi;
+        bool isAsync = false;
+        bool isHardware = false;
+        int needInput = 0;
+        int w = 0, h = 0, fps = 60, mbps = 80;
+        int lastAppliedMbps = 0;
+        uint64_t frameIdx = 0;
+        std::wstring friendlyName = L"--";
+        AvccConverter avccConv;
+
+        void Shutdown() {
+            if (mft) {
+                mft->ProcessMessage(MFT_MESSAGE_NOTIFY_END_OF_STREAM, 0);
+                mft->ProcessMessage(MFT_MESSAGE_COMMAND_DRAIN, 0);
+            }
+            codecApi.Reset();
+            evtGen.Reset();
+            mft.Reset();
+            nv12Tex.Reset();
+            stagingBgra.Reset();
+            vp.Reset();
+            vpEnum.Reset();
+            vctx.Reset();
+            vdev.Reset();
+            dxgiMgr.Reset();
+            ctx.Reset();
+            dev.Reset();
+            needInput = 0;
+        }
+
+        bool Init(ID3D11Device* d3dDev, ID3D11DeviceContext* d3dCtx, int width, int height, int targetFps, int bitrateMbps, LogFn& logFn) {
+            Shutdown();
+            dev = d3dDev;
+            ctx = d3dCtx;
+            w = width;
+            h = height;
+            fps = targetFps;
+            mbps = bitrateMbps;
+            lastAppliedMbps = bitrateMbps;
+            frameIdx = 0;
+
+            UINT token = 0;
+            if (SUCCEEDED(MFCreateDXGIDeviceManager(&token, &dxgiMgr))) {
+                dxgiMgr->ResetDevice(dev.Get(), token);
+            }
+
+            // 创建 GPU BGRA -> NV12 VideoProcessor
+            if (SUCCEEDED(dev.As(&vdev)) && SUCCEEDED(ctx.As(&vctx))) {
+                D3D11_VIDEO_PROCESSOR_CONTENT_DESC cd{};
+                cd.InputFrameFormat = D3D11_VIDEO_FRAME_FORMAT_PROGRESSIVE;
+                cd.InputWidth = (UINT)w;
+                cd.InputHeight = (UINT)h;
+                cd.OutputWidth = (UINT)w;
+                cd.OutputHeight = (UINT)h;
+                cd.Usage = D3D11_VIDEO_USAGE_PLAYBACK_NORMAL;
+                if (SUCCEEDED(vdev->CreateVideoProcessorEnumerator(&cd, &vpEnum))) {
+                    vdev->CreateVideoProcessor(vpEnum.Get(), 0, &vp);
+                }
+            }
+
+            D3D11_TEXTURE2D_DESC nd{};
+            nd.Width = (UINT)w;
+            nd.Height = (UINT)h;
+            nd.MipLevels = 1;
+            nd.ArraySize = 1;
+            nd.Format = DXGI_FORMAT_NV12;
+            nd.SampleDesc.Count = 1;
+            nd.Usage = D3D11_USAGE_DEFAULT;
+            nd.BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
+            if (FAILED(dev->CreateTexture2D(&nd, nullptr, &nv12Tex))) {
+                if (logFn) logFn("WinHost: 创建 NV12 纹理失败");
+                return false;
+            }
+
+            MFT_REGISTER_TYPE_INFO outInfo{ MFMediaType_Video, MFVideoFormat_H264 };
+            IMFActivate** acts = nullptr;
+            UINT32 cnt = 0;
+            HRESULT hr = MFTEnumEx(MFT_CATEGORY_VIDEO_ENCODER,
+                                   MFT_ENUM_FLAG_HARDWARE | MFT_ENUM_FLAG_ASYNCMFT |
+                                   MFT_ENUM_FLAG_SYNCMFT | MFT_ENUM_FLAG_SORTANDFILTER,
+                                   nullptr, &outInfo, &acts, &cnt);
+            if (FAILED(hr) || cnt == 0) {
+                if (acts) CoTaskMemFree(acts);
+                if (logFn) logFn("WinHost: 未找到 H.264 编码器");
+                return false;
+            }
+
+            bool ready = false;
+            for (UINT32 i = 0; i < cnt && !ready; ++i) {
+                LPWSTR nm = nullptr; UINT32 nml = 0;
+                acts[i]->GetAllocatedString(MFT_FRIENDLY_NAME_Attribute, &nm, &nml);
+                std::wstring candName = nm ? nm : L"H264 Encoder";
+                if (nm) CoTaskMemFree(nm);
+
+                Microsoft::WRL::ComPtr<IMFTransform> cand;
+                if (FAILED(acts[i]->ActivateObject(IID_PPV_ARGS(&cand))) || !cand) continue;
+
+                Microsoft::WRL::ComPtr<IMFAttributes> attr;
+                bool candAsync = false;
+                UINT32 d3d11Aware = 0;
+                if (SUCCEEDED(cand->GetAttributes(&attr)) && attr) {
+                    UINT32 a = 0;
+                    attr->GetUINT32(MF_TRANSFORM_ASYNC, &a);
+                    candAsync = (a != 0);
+                    attr->GetUINT32(MF_SA_D3D11_AWARE, &d3d11Aware);
+                    if (candAsync) {
+                        if (FAILED(attr->SetUINT32(MF_TRANSFORM_ASYNC_UNLOCK, TRUE))) continue;
+                    }
+                }
+
+                bool hw = false;
+                if (d3d11Aware && dxgiMgr) {
+                    if (SUCCEEDED(cand->ProcessMessage(MFT_MESSAGE_SET_D3D_MANAGER, (ULONG_PTR)dxgiMgr.Get()))) {
+                        hw = true;
+                    }
+                }
+
+                // 设置输出类型 H.264
+                Microsoft::WRL::ComPtr<IMFMediaType> ot;
+                MFCreateMediaType(&ot);
+                ot->SetGUID(MF_MT_MAJOR_TYPE, MFMediaType_Video);
+                ot->SetGUID(MF_MT_SUBTYPE, MFVideoFormat_H264);
+                ot->SetUINT32(MF_MT_AVG_BITRATE, (UINT32)mbps * 1000000U);
+                MFSetAttributeSize(ot.Get(), MF_MT_FRAME_SIZE, (UINT32)w, (UINT32)h);
+                MFSetAttributeRatio(ot.Get(), MF_MT_FRAME_RATE, (UINT32)fps, 1);
+                MFSetAttributeRatio(ot.Get(), MF_MT_PIXEL_ASPECT_RATIO, 1, 1);
+                ot->SetUINT32(MF_MT_INTERLACE_MODE, MFVideoInterlace_Progressive);
+                ot->SetUINT32(MF_MT_MPEG2_PROFILE, eAVEncH264VProfile_Main);
+                if (FAILED(cand->SetOutputType(0, ot.Get(), 0))) continue;
+
+                // 设置输入类型 NV12
+                Microsoft::WRL::ComPtr<IMFMediaType> it;
+                MFCreateMediaType(&it);
+                it->SetGUID(MF_MT_MAJOR_TYPE, MFMediaType_Video);
+                it->SetGUID(MF_MT_SUBTYPE, MFVideoFormat_NV12);
+                MFSetAttributeSize(it.Get(), MF_MT_FRAME_SIZE, (UINT32)w, (UINT32)h);
+                MFSetAttributeRatio(it.Get(), MF_MT_FRAME_RATE, (UINT32)fps, 1);
+                MFSetAttributeRatio(it.Get(), MF_MT_PIXEL_ASPECT_RATIO, 1, 1);
+                it->SetUINT32(MF_MT_INTERLACE_MODE, MFVideoInterlace_Progressive);
+                if (FAILED(cand->SetInputType(0, it.Get(), 0))) continue;
+
+                // 低延迟编码参数
+                Microsoft::WRL::ComPtr<ICodecAPI> api;
+                if (SUCCEEDED(cand.As(&api)) && api) {
+                    VARIANT v{};
+                    v.vt = VT_UI4; v.ulVal = eAVEncCommonRateControlMode_CBR;
+                    api->SetValue(&CODECAPI_AVEncCommonRateControlMode, &v);
+                    v.ulVal = (ULONG)mbps * 1000000UL;
+                    api->SetValue(&CODECAPI_AVEncCommonMeanBitRate, &v);
+                    v.ulVal = (ULONG)(fps * 2);
+                    api->SetValue(&CODECAPI_AVEncMPVGOPSize, &v);
+                    v.ulVal = 0;
+                    api->SetValue(&CODECAPI_AVEncMPVDefaultBPictureCount, &v);
+                    VARIANT vb{};
+                    vb.vt = VT_BOOL; vb.boolVal = VARIANT_TRUE;
+                    api->SetValue(&CODECAPI_AVLowLatencyMode, &vb);
+                }
+
+                if (candAsync) {
+                    if (FAILED(cand.As(&evtGen)) || !evtGen) continue;
+                }
+
+                cand->ProcessMessage(MFT_MESSAGE_NOTIFY_BEGIN_STREAMING, 0);
+                cand->ProcessMessage(MFT_MESSAGE_NOTIFY_START_OF_STREAM, 0);
+
+                mft = cand;
+                codecApi = api;
+                isAsync = candAsync;
+                isHardware = hw;
+                friendlyName = candName + (hw ? L" (硬件)" : L" (软件)");
+                needInput = isAsync ? 0 : 1;
+                ready = true;
+            }
+
+            for (UINT32 i = 0; i < cnt; ++i) acts[i]->Release();
+            CoTaskMemFree(acts);
+
+            if (!ready) {
+                if (logFn) logFn("WinHost: 所有 H.264 编码器初始化失败");
+                return false;
+            }
+            if (logFn) {
+                char msg[256];
+                int n = WideCharToMultiByte(CP_UTF8, 0, friendlyName.c_str(), -1, nullptr, 0, nullptr, nullptr);
+                std::string u8(n > 0 ? (size_t)n - 1 : 0, '\0');
+                if (n > 1) WideCharToMultiByte(CP_UTF8, 0, friendlyName.c_str(), -1, &u8[0], n, nullptr, nullptr);
+                snprintf(msg, sizeof(msg), "WinHost: 编码器就绪 %dx%d@%d %dMbps -> %s",
+                         w, h, fps, mbps, u8.c_str());
+                logFn(msg);
+            }
+            return true;
+        }
+
+        void UpdateBitrateIfChanged(int newMbps) {
+            if (newMbps == lastAppliedMbps || !codecApi) return;
+            VARIANT v{};
+            v.vt = VT_UI4;
+            v.ulVal = (ULONG)newMbps * 1000000UL;
+            if (SUCCEEDED(codecApi->SetValue(&CODECAPI_AVEncCommonMeanBitRate, &v))) {
+                lastAppliedMbps = newMbps;
+            }
+        }
+
+        bool ConvertBgraToNv12(ID3D11Texture2D* bgraTex) {
+            if (!vp || !vpEnum || !vdev || !vctx || !nv12Tex) return false;
+            D3D11_VIDEO_PROCESSOR_INPUT_VIEW_DESC ivd{};
+            ivd.FourCC = 0;
+            ivd.ViewDimension = D3D11_VPIV_DIMENSION_TEXTURE2D;
+            ivd.Texture2D.MipSlice = 0;
+            Microsoft::WRL::ComPtr<ID3D11VideoProcessorInputView> iv;
+            if (FAILED(vdev->CreateVideoProcessorInputView(bgraTex, vpEnum.Get(), &ivd, &iv))) return false;
+
+            D3D11_VIDEO_PROCESSOR_OUTPUT_VIEW_DESC ovd{};
+            ovd.ViewDimension = D3D11_VPOV_DIMENSION_TEXTURE2D;
+            ovd.Texture2D.MipSlice = 0;
+            Microsoft::WRL::ComPtr<ID3D11VideoProcessorOutputView> ov;
+            if (FAILED(vdev->CreateVideoProcessorOutputView(nv12Tex.Get(), vpEnum.Get(), &ovd, &ov))) return false;
+
+            RECT srcRc{ 0, 0, w, h };
+            RECT dstRc{ 0, 0, w, h };
+            vctx->VideoProcessorSetStreamSourceRect(vp.Get(), 0, TRUE, &srcRc);
+            vctx->VideoProcessorSetStreamDestRect(vp.Get(), 0, TRUE, &dstRc);
+            vctx->VideoProcessorSetOutputTargetRect(vp.Get(), TRUE, &dstRc);
+
+            D3D11_VIDEO_PROCESSOR_COLOR_SPACE inCs{};
+            inCs.RGB_Range = 0; // full 0-255
+            inCs.YCbCr_Matrix = 1; // BT.709
+            vctx->VideoProcessorSetStreamColorSpace(vp.Get(), 0, &inCs);
+
+            D3D11_VIDEO_PROCESSOR_COLOR_SPACE outCs{};
+            outCs.RGB_Range = 0;
+            outCs.YCbCr_Matrix = 1; // BT.709
+            outCs.Nominal_Range = D3D11_VIDEO_PROCESSOR_NOMINAL_RANGE_16_235;
+            vctx->VideoProcessorSetOutputColorSpace(vp.Get(), &outCs);
+
+            D3D11_VIDEO_PROCESSOR_STREAM st{};
+            st.Enable = TRUE;
+            st.pInputSurface = iv.Get();
+            HRESULT hr = vctx->VideoProcessorBlt(vp.Get(), ov.Get(), 0, 1, &st);
+            return SUCCEEDED(hr);
+        }
+
+        // 从 BGRA 纹理经 CPU 转为 NV12 系统内存（仅软件 MFT 兜底用）
+        bool BuildCpuNv12Buffer(ID3D11Texture2D* bgraTex, Microsoft::WRL::ComPtr<IMFMediaBuffer>& outBuf) {
+            if (!stagingBgra) {
+                D3D11_TEXTURE2D_DESC sd{};
+                sd.Width = (UINT)w; sd.Height = (UINT)h;
+                sd.MipLevels = 1; sd.ArraySize = 1;
+                sd.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+                sd.SampleDesc.Count = 1;
+                sd.Usage = D3D11_USAGE_STAGING;
+                sd.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+                if (FAILED(dev->CreateTexture2D(&sd, nullptr, &stagingBgra))) return false;
+            }
+            ctx->CopyResource(stagingBgra.Get(), bgraTex);
+            D3D11_MAPPED_SUBRESOURCE mapped{};
+            if (FAILED(ctx->Map(stagingBgra.Get(), 0, D3D11_MAP_READ, 0, &mapped))) return false;
+
+            size_t uvW = (size_t)((w + 1) & ~1);
+            size_t uvH = (size_t)((h + 1) / 2);
+            DWORD nv12Size = (DWORD)((size_t)w * (size_t)h + uvW * uvH);
+            if (FAILED(MFCreateMemoryBuffer(nv12Size, &outBuf)) || !outBuf) {
+                ctx->Unmap(stagingBgra.Get(), 0);
+                return false;
+            }
+            BYTE* dst = nullptr;
+            if (FAILED(outBuf->Lock(&dst, nullptr, nullptr)) || !dst) {
+                ctx->Unmap(stagingBgra.Get(), 0);
+                return false;
+            }
+            uint8_t* yPlane = dst;
+            uint8_t* uvPlane = dst + (size_t)w * (size_t)h;
+            for (int y = 0; y < h; ++y) {
+                const uint8_t* row = (const uint8_t*)mapped.pData + (size_t)y * mapped.RowPitch;
+                uint8_t* yRow = yPlane + (size_t)y * (size_t)w;
+                for (int x = 0; x < w; ++x) {
+                    int b = row[x * 4 + 0];
+                    int g = row[x * 4 + 1];
+                    int r = row[x * 4 + 2];
+                    int Y = ((47 * r + 157 * g + 16 * b + 128) >> 8) + 16;
+                    yRow[x] = (uint8_t)std::clamp(Y, 16, 235);
+                    if ((y & 1) == 0 && (x & 1) == 0 && (size_t)x + 1 < uvW) {
+                        int U = ((-26 * r - 87 * g + 112 * b + 128) >> 8) + 128;
+                        int V = ((112 * r - 102 * g - 10 * b + 128) >> 8) + 128;
+                        size_t uvIdx = (size_t)(y / 2) * uvW + (size_t)x;
+                        uvPlane[uvIdx + 0] = (uint8_t)std::clamp(U, 16, 240);
+                        uvPlane[uvIdx + 1] = (uint8_t)std::clamp(V, 16, 240);
+                    }
+                }
+            }
+            outBuf->Unlock();
+            outBuf->SetCurrentLength(nv12Size);
+            ctx->Unmap(stagingBgra.Get(), 0);
+            return true;
+        }
+
+        bool DrainOneOutput(std::vector<uint8_t>& outAvcc, bool* outIsIdr) {
+            MFT_OUTPUT_DATA_BUFFER odb{};
+            odb.dwStreamID = 0;
+            MFT_OUTPUT_STREAM_INFO osi{};
+            if (FAILED(mft->GetOutputStreamInfo(0, &osi))) return false;
+            Microsoft::WRL::ComPtr<IMFSample> localSample;
+            if (!(osi.dwFlags & MFT_OUTPUT_STREAM_PROVIDES_SAMPLES)) {
+                MFCreateSample(&localSample);
+                Microsoft::WRL::ComPtr<IMFMediaBuffer> mb;
+                MFCreateMemoryBuffer(std::max<DWORD>(osi.cbSize, (DWORD)(w * h)), &mb);
+                localSample->AddBuffer(mb.Get());
+                odb.pSample = localSample.Get();
+            }
+            DWORD status = 0;
+            HRESULT hr = mft->ProcessOutput(0, 1, &odb, &status);
+            if (odb.pEvents) odb.pEvents->Release();
+            if (hr == MF_E_TRANSFORM_STREAM_CHANGE) {
+                Microsoft::WRL::ComPtr<IMFMediaType> nt;
+                if (SUCCEEDED(mft->GetOutputAvailableType(0, 0, &nt))) {
+                    mft->SetOutputType(0, nt.Get(), 0);
+                }
+                if (localSample == nullptr && odb.pSample) odb.pSample->Release();
+                return false;
+            }
+            if (FAILED(hr) || !odb.pSample) {
+                if (localSample == nullptr && odb.pSample) odb.pSample->Release();
+                return false;
+            }
+
+            Microsoft::WRL::ComPtr<IMFMediaBuffer> buf;
+            bool ok = false;
+            if (SUCCEEDED(odb.pSample->ConvertToContiguousBuffer(&buf)) && buf) {
+                BYTE* p = nullptr;
+                DWORD len = 0;
+                if (SUCCEEDED(buf->Lock(&p, nullptr, &len)) && p && len > 0) {
+                    ok = avccConv.ConvertAppend(p, len, outAvcc, outIsIdr);
+                    buf->Unlock();
+                }
+            }
+            if (localSample == nullptr && odb.pSample) odb.pSample->Release();
+            return ok;
+        }
+
+        bool EncodeTexture(ID3D11Texture2D* bgraTex, bool forceIdr, const std::atomic<bool>& aliveFlag,
+                           std::vector<uint8_t>& outAvcc, bool* outIsIdr, LogFn* logFn = nullptr) {
+            outAvcc.clear();
+            if (outIsIdr) *outIsIdr = false;
+            if (!mft) return false;
+
+            if (isAsync && evtGen) {
+                // 非阻塞排空挂起事件（最长 ~80ms），严禁阻塞 GetEvent(0) 防止 Stop() 死锁；
+                // 期间吐出的遗留 AU 直接并入 outAvcc，避免丢 P 帧引起花屏。
+                for (int k = 0; k < 80 && needInput == 0 && aliveFlag.load(); ++k) {
+                    Microsoft::WRL::ComPtr<IMFMediaEvent> ev;
+                    HRESULT ehr = evtGen->GetEvent(MF_EVENT_FLAG_NO_WAIT, &ev);
+                    if (ehr == MF_E_NO_EVENTS_AVAILABLE) {
+                        Sleep(1);
+                        continue;
+                    }
+                    if (FAILED(ehr) || !ev) break;
+                    MediaEventType met = MEUnknown;
+                    ev->GetType(&met);
+                    if (met == METransformNeedInput) ++needInput;
+                    else if (met == METransformHaveOutput) {
+                        DrainOneOutput(outAvcc, outIsIdr);
+                    }
+                }
+                if (needInput <= 0) return !outAvcc.empty();
+            }
+
+            Microsoft::WRL::ComPtr<IMFSample> inSample;
+            MFCreateSample(&inSample);
+            bool usedGpuSurface = false;
+            if (isHardware && ConvertBgraToNv12(bgraTex)) {
+                Microsoft::WRL::ComPtr<IMFMediaBuffer> buf;
+                if (SUCCEEDED(MFCreateDXGISurfaceBuffer(__uuidof(ID3D11Texture2D), nv12Tex.Get(), 0, FALSE, &buf))) {
+                    Microsoft::WRL::ComPtr<IMF2DBuffer> b2d;
+                    if (SUCCEEDED(buf.As(&b2d))) {
+                        DWORD clen = 0;
+                        b2d->GetContiguousLength(&clen);
+                        buf->SetCurrentLength(clen);
+                    }
+                    inSample->AddBuffer(buf.Get());
+                    usedGpuSurface = true;
+                }
+            }
+            if (!usedGpuSurface) {
+                if (isHardware && logFn && *logFn) {
+                    (*logFn)("WinHost: GPU BGRA->NV12 转换不可用，回落 CPU NV12");
+                    isHardware = false;
+                }
+                Microsoft::WRL::ComPtr<IMFMediaBuffer> buf;
+                if (!BuildCpuNv12Buffer(bgraTex, buf)) return !outAvcc.empty();
+                inSample->AddBuffer(buf.Get());
+            }
+
+            LONGLONG dur = 10000000LL / std::max(1, fps);
+            LONGLONG pts = (LONGLONG)frameIdx * dur;
+            ++frameIdx;
+            inSample->SetSampleTime(pts);
+            inSample->SetSampleDuration(dur);
+
+            if (forceIdr && codecApi) {
+                VARIANT vb{};
+                vb.vt = VT_BOOL;
+                vb.boolVal = VARIANT_TRUE;
+                codecApi->SetValue(&CODECAPI_AVEncVideoForceKeyFrame, &vb);
+            }
+
+            if (FAILED(mft->ProcessInput(0, inSample.Get(), 0))) return !outAvcc.empty();
+            if (isAsync) --needInput;
+
+            if (isAsync && evtGen) {
+                for (int tries = 0; tries < 40 && aliveFlag.load(); ++tries) {
+                    Microsoft::WRL::ComPtr<IMFMediaEvent> ev;
+                    HRESULT ehr = evtGen->GetEvent(MF_EVENT_FLAG_NO_WAIT, &ev);
+                    if (ehr == MF_E_NO_EVENTS_AVAILABLE) {
+                        if (!outAvcc.empty()) return true;
+                        Sleep(1);
+                        continue;
+                    }
+                    if (FAILED(ehr) || !ev) break;
+                    MediaEventType met = MEUnknown;
+                    ev->GetType(&met);
+                    if (met == METransformNeedInput) {
+                        ++needInput;
+                        if (tries > 6 && needInput > 0) {
+                            return !outAvcc.empty();
+                        }
+                    } else if (met == METransformHaveOutput) {
+                        DrainOneOutput(outAvcc, outIsIdr);
+                    }
+                }
+                return !outAvcc.empty();
+            }
+
+            DrainOneOutput(outAvcc, outIsIdr);
+            return !outAvcc.empty();
+        }
+    };
+
+    void CaptureEncodeLoop() {
+        HRESULT co = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+        bool didCo = SUCCEEDED(co);
+
+        while (alive_.load()) {
+            WinVddBounds b = vdd_.RefreshBounds();
+            if (b.width <= 0 || b.height <= 0) { Sleep(200); continue; }
+
+            Microsoft::WRL::ComPtr<IDXGIFactory1> fac;
+            if (FAILED(CreateDXGIFactory1(IID_PPV_ARGS(&fac)))) { Sleep(500); continue; }
+
+            Microsoft::WRL::ComPtr<IDXGIAdapter1> ad;
+            Microsoft::WRL::ComPtr<IDXGIOutput> out;
+            if (!vdd_.FindDxgiOutput(fac.Get(), ad, out)) {
+                Sleep(250);
+                continue;
+            }
+
+            Microsoft::WRL::ComPtr<ID3D11Device> dev;
+            Microsoft::WRL::ComPtr<ID3D11DeviceContext> ctx;
+            D3D_FEATURE_LEVEL lv{};
+            HRESULT hr = D3D11CreateDevice(ad.Get(), D3D_DRIVER_TYPE_UNKNOWN, nullptr,
+                                           D3D11_CREATE_DEVICE_BGRA_SUPPORT | D3D11_CREATE_DEVICE_VIDEO_SUPPORT,
+                                           nullptr, 0, D3D11_SDK_VERSION, &dev, &lv, &ctx);
+            if (FAILED(hr) || !dev) {
+                Sleep(500);
+                continue;
+            }
+
+            Microsoft::WRL::ComPtr<IDXGIOutput1> out1;
+            Microsoft::WRL::ComPtr<IDXGIOutputDuplication> dup;
+            if (FAILED(out.As(&out1)) || FAILED(out1->DuplicateOutput(dev.Get(), &dup))) {
+                Sleep(300);
+                continue;
+            }
+
+            DXGI_OUTPUT_DESC od{};
+            out->GetDesc(&od);
+            int capW = (int)(od.DesktopCoordinates.right - od.DesktopCoordinates.left);
+            int capH = (int)(od.DesktopCoordinates.bottom - od.DesktopCoordinates.top);
+            if (capW <= 0 || capH <= 0) { capW = b.width; capH = b.height; }
+
+            stats_.width = capW;
+            stats_.height = capH;
+            int encFps = b.hz > 0 ? b.hz : reqFps_;
+            stats_.fps = encFps;
+
+            MfH264Encoder enc;
+            if (!enc.Init(dev.Get(), ctx.Get(), capW, capH, encFps, curMbps_.load(), logFn_)) {
+                Sleep(1000);
+                continue;
+            }
+            {
+                std::lock_guard<std::mutex> lk(stats_.infoMtx);
+                stats_.encoderName = enc.friendlyName;
+            }
+            if (stats_.clientConnected.load()) {
+                SendSessionHeader(capW, capH, encFps);
+            }
+
+            LARGE_INTEGER qpf{};
+            QueryPerformanceFrequency(&qpf);
+            ULONGLONG lastSessTick = GetTickCount64();
+            bool firstFrame = true;
+
+            while (alive_.load()) {
+                enc.UpdateBitrateIfChanged(curMbps_.load());
+
+                DXGI_OUTDUPL_FRAME_INFO fi{};
+                Microsoft::WRL::ComPtr<IDXGIResource> res;
+                hr = dup->AcquireNextFrame(16, &fi, &res);
+
+                if (hr == DXGI_ERROR_WAIT_TIMEOUT) {
+                    if (stats_.clientConnected.load()) {
+                        ULONGLONG nowTick = GetTickCount64();
+                        if (nowTick - lastSessTick >= 5000) {
+                            lastSessTick = nowTick;
+                            SendSessionHeader(capW, capH, encFps);
+                        }
+                        uint64_t nowUs = NowMicros();
+                        uint64_t prevUs = lastPayloadUs_.load();
+                        if (prevUs > 0 && nowUs - prevUs >= 80000ULL) {
+                            std::vector<uint8_t> copy;
+                            {
+                                std::lock_guard<std::mutex> flk(lastFrameMtx_);
+                                copy = lastAvccFrame_;
+                            }
+                            if (!copy.empty()) SendVideoAvcc(copy, nowUs);
+                            else SendHeartbeat();
+                        } else if (prevUs == 0) {
+                            SendHeartbeat();
+                            lastPayloadUs_.store(nowUs);
+                        }
+                    }
+                    continue;
+                }
+
+                if (hr == DXGI_ERROR_ACCESS_LOST || FAILED(hr)) {
+                    EmitLog("WinHost: DXGI 输出上下文变更，正在重建采集");
+                    break;
+                }
+
+                Microsoft::WRL::ComPtr<ID3D11Texture2D> tex;
+                res.As(&tex);
+                bool hasImage = (firstFrame || fi.LastPresentTime.QuadPart != 0 || fi.AccumulatedFrames > 0);
+                if (tex && hasImage && stats_.clientConnected.load()) {
+                    firstFrame = false;
+                    D3D11_TEXTURE2D_DESC td{};
+                    tex->GetDesc(&td);
+                    if ((int)td.Width != capW || (int)td.Height != capH) {
+                        dup->ReleaseFrame();
+                        break;
+                    }
+
+                    LARGE_INTEGER t0{}, t1{};
+                    QueryPerformanceCounter(&t0);
+                    uint64_t capUs = NowMicros();
+                    bool wantIdr = forceKeyframe_.exchange(false);
+                    std::vector<uint8_t> avcc;
+                    bool isIdr = false;
+                    if (enc.EncodeTexture(tex.Get(), wantIdr, alive_, avcc, &isIdr, &logFn_) && !avcc.empty()) {
+                        QueryPerformanceCounter(&t1);
+                        double encMs = (double)(t1.QuadPart - t0.QuadPart) * 1000.0 / (double)qpf.QuadPart;
+                        stats_.lastEncMs = encMs;
+                        stats_.framesEncoded++;
+                        {
+                            std::lock_guard<std::mutex> flk(lastFrameMtx_);
+                            lastAvccFrame_ = avcc;
+                        }
+                        SendVideoAvcc(avcc, capUs);
+                    } else if (wantIdr) {
+                        forceKeyframe_.store(true);
+                        stats_.encodeFail++;
+                    }
+                }
+                dup->ReleaseFrame();
+            }
+            enc.Shutdown();
+        }
+
+        if (didCo) CoUninitialize();
+    }
+};
+
+} // namespace secdisplay
