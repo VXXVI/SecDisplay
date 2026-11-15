@@ -1843,7 +1843,6 @@ final class Sender {
     /// 光标位置。不走视频帧，独立小包，不占用在途帧配额。
     /// 坐标是相对虚拟屏左上角的视频像素基准（cfg.width x cfg.height，与 Windows g_coordW/H 对齐）。
     func sendCursor(x: Float, y: Float, visible: Bool) {
-        guard connected, let c = conn else { return }
         var packet = Data(capacity: 19)
         // 长度 = 1 类型 + 8 时间戳 + 9 载荷 = 18
         var len = UInt32(18).bigEndian
@@ -1856,7 +1855,10 @@ final class Sender {
         var fy = y.bitPattern.bigEndian
         withUnsafeBytes(of: &fy) { packet.append(contentsOf: $0) }
         packet.append(visible ? 1 : 0)
-        c.send(content: packet, completion: .contentProcessed { _ in })
+        queue.async { [weak self] in
+            guard let self, self.connected, let c = self.conn else { return }
+            c.send(content: packet, completion: .contentProcessed { _ in })
+        }
     }
 
     /// 发送真实系统光标图像。独立类型 0x05，不动 0x03 位置链路，
@@ -1865,7 +1867,6 @@ final class Sender {
     /// BGRA 是 Windows DIB(32bpp BI_RGB) 直接可用的排布。
     func sendCursorImage(width: Int, height: Int,
                          hotX: Int, hotY: Int, bgra: Data) {
-        guard connected, let c = conn else { return }
         let headerBytes = 12
         let payloadLen = headerBytes + bgra.count
         let total = 1 + 8 + payloadLen          // type + ts + payload
@@ -1881,7 +1882,10 @@ final class Sender {
         put16(UInt16(hotX));  put16(UInt16(hotY))
         put32(UInt32(bgra.count))
         packet.append(bgra)
-        c.send(content: packet, completion: .contentProcessed { _ in })
+        queue.async { [weak self] in
+            guard let self, self.connected, let c = self.conn else { return }
+            c.send(content: packet, completion: .contentProcessed { _ in })
+        }
     }
 
     /// 链路心跳。静止桌面下 SCK 不出帧，lastPayload 可能为 nil，
@@ -2017,6 +2021,21 @@ final class Sender {
 final class InputInjector {
     private var lastButtons: UInt8 = 0
     private(set) var eventCount = 0
+    private let injectLock = NSLock()
+    private var lastInjectedAt: CFAbsoluteTime = 0
+    private var lastInjectedPoint: CGPoint = .zero
+
+    /// 刚刚由 Windows 0x04 回放过移动的位置，用于避免 CursorTracker
+    /// 立刻把这次自己注入的移动当成用户移动再发回 Windows，形成双向自激震荡。
+    func isEchoOfInjected(_ p: CGPoint) -> Bool {
+        injectLock.lock()
+        let dt = CFAbsoluteTimeGetCurrent() - lastInjectedAt
+        let pt = lastInjectedPoint
+        injectLock.unlock()
+        guard dt >= 0 && dt < 0.08 else { return false }
+        let dx = p.x - pt.x, dy = p.y - pt.y
+        return (dx * dx + dy * dy) < 9.0
+    }
 
     /// 断连时补发残留的 mouseUp。
     /// 只清 lastButtons 是不够的：事件投到 .cghidEventTap 后 HID 层的按下状态
@@ -2063,6 +2082,10 @@ final class InputInjector {
         if let mv = CGEvent(mouseEventSource: nil, mouseType: drag?.0 ?? .mouseMoved,
                             mouseCursorPosition: p, mouseButton: drag?.1 ?? .left) {
             mv.flags = mods
+            injectLock.lock()
+            lastInjectedAt = CFAbsoluteTimeGetCurrent()
+            lastInjectedPoint = p
+            injectLock.unlock()
             mv.post(tap: .cghidEventTap)
         }
 
@@ -2480,6 +2503,8 @@ final class CursorTracker {
     }
 
     private func emit(_ p: CGPoint) {
+        // 避免把刚由 Windows 0x04 注入的指针移动再当作本地移动发回 Windows
+        if gMouse?.isEchoOfInjected(p) == true { return }
         let b = bounds()
         let rx = Float(p.x - b.minX)
         let ry = Float(p.y - b.minY)
@@ -2515,6 +2540,8 @@ final class CursorImageTracker {
     private var timer: DispatchSourceTimer?
     /// 上次发送的图像指纹，用于检测形状变化
     private var lastFingerprint: UInt64 = 0
+    /// 形状防抖：连续两次 100ms 采样一致才发送，避免鼠标快速掠过边缘时闪烁重建
+    private var pendingFingerprint: UInt64 = 0
     /// 上次观察到的连接代数，用于连接重建时强制重发
     private var lastEpoch = -1
     private let maxDim = 128       // 光标不会超过 128 像素，超出则截断保护
@@ -2600,9 +2627,20 @@ final class CursorImageTracker {
         let epoch = sender.currentEpoch
         let force = epoch != lastEpoch
         lastEpoch = epoch
-        guard force || fp != lastFingerprint else { return }
-        // 非强制（仅形状变化）时限流，避免移动中形状频繁切换导致接收端反复重建光标
-        if !force, CFAbsoluteTimeGetCurrent() - lastSendAt < minSendGap { return }
+        guard force || fp != lastFingerprint else {
+            pendingFingerprint = fp
+            return
+        }
+        // 非强制形状变化：要求连续两次采样一致（100ms 防抖），
+        // 防止鼠标快速经过输入框/链接边缘时瞬间切一次光标又切回，导致对端频繁重建 HCURSOR。
+        if !force {
+            if fp != pendingFingerprint {
+                pendingFingerprint = fp
+                return
+            }
+            if CFAbsoluteTimeGetCurrent() - lastSendAt < minSendGap { return }
+        }
+        pendingFingerprint = fp
         lastSendAt = CFAbsoluteTimeGetCurrent()
         lastFingerprint = fp
         sentCount += 1
@@ -2846,17 +2884,24 @@ if !axTrusted {
 } else {
     Log.info("辅助功能权限: 已授权，副屏点击与滚轮可正常回放")
 }
+/// 虚拟屏在全局坐标系里的逻辑点矩形。
+/// 原点取 CGDisplayBounds.origin，宽高优先取 CGDisplayCopyDisplayMode 的逻辑点尺寸
+/// （2x Retina 下为 1440x900，而不是 pixelWidth 2880x1800），防止某版 macOS 下
+/// CGDisplayBounds.size 漂移成物理像素后导致光标被压缩到副屏左上角。
+func logicalDisplayBounds(_ id: CGDirectDisplayID) -> CGRect {
+    let b = CGDisplayBounds(id)
+    if let m = CGDisplayCopyDisplayMode(id), m.width > 0, m.height > 0 {
+        return CGRect(x: b.origin.x, y: b.origin.y,
+                      width: CGFloat(m.width), height: CGFloat(m.height))
+    }
+    return b
+}
+
 let injector = InputInjector()
 gMouse = injector
 sender.onInput = { x, y, buttons, wheel in
-    // 这里不能再按「面板是否可见」整条丢弃输入。
-    // 早期为了防面板被光标劫持加过这个门控，但面板点不动的真正根因是
-    // NSEvent 全局监视器抢在 NSApplication 初始化前建立 SkyLight 会话
-    // （已由延迟到 app.run 后注册修复）。保留门控的后果是：只要面板开着，
-    // 点击事件被整条吞掉，而光标移动走 0x03 显示链路不受影响，
-    // 表现就是「鼠标能动、点不动」。因此回放始终生效。
     injector.handle(x: x, y: y, buttons: buttons, wheel: wheel,
-                    bounds: CGDisplayBounds(vd.displayID),
+                    bounds: logicalDisplayBounds(vd.displayID),
                     videoW: cfg.width, videoH: cfg.height)
 }
 
@@ -2867,13 +2912,13 @@ sender.onKey = { vk, scan, down, flags in
     keyboard.handle(vk: vk, scan: scan, down: down, keyFlags: flags)
 }
 
-// 光标转发：CGEvent.location 与 CGDisplayBounds 处于逻辑点坐标系；
+// 光标转发：CGEvent.location 处于逻辑点坐标系；
 // 2x Retina 时逻辑点为 1440x900，CursorTracker / InputInjector 会按 cfg/bounds 比例
 // 统一换算到线上物理像素基准（2880x1800），与 Windows 端 g_coordW/H 对齐。
-let vb = CGDisplayBounds(vd.displayID)
+let vb = logicalDisplayBounds(vd.displayID)
 Log.info("坐标基准: 逻辑点 \(Int(vb.width))x\(Int(vb.height)) * \(String(format: "%.2f", vdBackingScale))x → 线上 \(cfg.width)x\(cfg.height)，原点 (\(Int(vb.minX)), \(Int(vb.minY)))")
 let cursor = CursorTracker(sender: sender,
-                           bounds: { CGDisplayBounds(vd.displayID) },
+                           bounds: { logicalDisplayBounds(vd.displayID) },
                            videoSize: { (cfg.width, cfg.height) })
 // 真实光标图像：形状变化时才发，让副屏显示 Mac 的光标而非固定 Windows 箭头
 // 真实光标图像（0x05）。SECDISPLAY_NOCURSORIMG=1 可整体关闭，

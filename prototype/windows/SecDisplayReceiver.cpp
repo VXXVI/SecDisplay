@@ -309,10 +309,39 @@ static std::atomic<bool> g_cursorVisible{true};
 // 程序自己调用 SetCursorPos 会引起 WM_MOUSEMOVE；用时间戳把它和用户真实
 // 输入区分开，否则每次跟随都会被当成「用户动了」，导致门控反复自锁。
 static std::atomic<int64_t> g_lastRemoteCursorMoveMs{ 0 };
-// 程序 SetCursorPos 的目标点。只过滤「时间接近且落点等于目标点」的那一次 WM_MOUSEMOVE，
-// 不能只看时间窗：Mac 光标高频移动时，真实本地移动会被一直吞掉。
+// 程序 SetCursorPos 的目标点与 16 槽位历史环形缓冲，配合 WM_INPUT 硬件鼠标记时，
+// 彻底过滤连发覆盖 / 边界舍入 / 异步投递产生的 WM_MOUSEMOVE 回声。
 static std::atomic<LONG> g_lastRemoteCursorX{ INT_MIN };
 static std::atomic<LONG> g_lastRemoteCursorY{ INT_MIN };
+static std::atomic<bool> g_cursorMsgPending{ false };
+static std::atomic<uint64_t> g_lastHardwareMouseMs{ 0 };
+static bool g_coordUserSpecified = false;
+
+struct RemoteTargetSample { LONG x = 0; LONG y = 0; uint64_t ms = 0; };
+static const int kRemoteTargetCap = 16;
+static RemoteTargetSample g_remoteTargets[kRemoteTargetCap];
+static int g_remoteTargetHead = 0;
+
+static void RecordRemoteTarget(LONG x, LONG y, uint64_t ms) {
+    g_remoteTargets[g_remoteTargetHead] = RemoteTargetSample{ x, y, ms };
+    g_remoteTargetHead = (g_remoteTargetHead + 1) % kRemoteTargetCap;
+}
+
+static bool IsRemoteCursorEcho(LONG x, LONG y, uint64_t nowMs) {
+    // 若最近 150ms 内有真实硬件鼠标活动（WM_INPUT），放行本次移动以便本地瞬间接管
+    if (nowMs - (uint64_t)g_lastHardwareMouseMs.load() < 150) return false;
+    for (int i = 0; i < kRemoteTargetCap; ++i) {
+        const RemoteTargetSample& s = g_remoteTargets[i];
+        if (s.ms == 0 || nowMs - s.ms > 300) continue;
+        if (std::abs(x - s.x) <= 4 && std::abs(y - s.y) <= 4) return true;
+    }
+    // 兜底：无硬件鼠标输入且距上次 SetCursorPos 不足 250ms，小幅滞后/插值落点也视为回声
+    if (nowMs - (uint64_t)g_lastRemoteCursorMoveMs.load() < 250) {
+        LONG lx = g_lastRemoteCursorX.load(), ly = g_lastRemoteCursorY.load();
+        if (lx != INT_MIN && std::abs(x - lx) <= 32 && std::abs(y - ly) <= 32) return true;
+    }
+    return false;
+}
 
 // 真实 Mac 光标图像（0x05）。网络线程只把收到的 BGRA 存进缓冲并 post 消息，
 // HCURSOR 的创建/替换/销毁统一在 UI 线程做，避免跨线程句柄竞态。
@@ -341,6 +370,18 @@ static HCURSOR g_customCursor = nullptr;   // 仅 UI 线程访问
 // 避免重复的 CreateIconIndirect/DestroyCursor 造成光标闪烁和句柄抖动。
 static uint64_t g_cursorAppliedFp = 0;     // 仅 UI 线程访问
 static int g_cursorAppliedScalePm = 0;     // 仅 UI 线程访问
+struct CachedCursor { uint64_t fp = 0; int scalePm = 0; HCURSOR cur = nullptr; };
+static const int kCursorCacheCap = 16;
+static CachedCursor g_cursorCache[kCursorCacheCap];
+static int g_cursorCacheNext = 0;
+
+static bool IsInCursorCache(HCURSOR c) {
+    if (!c) return false;
+    for (int i = 0; i < kCursorCacheCap; ++i) {
+        if (g_cursorCache[i].cur == c) return true;
+    }
+    return false;
+}
 
 // ---- 快速晃动放大光标（模仿 macOS 的「晃动找光标」）----
 // 在副屏上快速左右/上下晃动光标时，Mac 那边看不到你自己的手，容易找不到指针。
@@ -649,10 +690,14 @@ static void OnCursorPacket(const uint8_t* p, size_t payloadLen) {
     double oldX = g_cursorX.load(), oldY = g_cursorY.load();
     g_cursorX = rx;
     g_cursorY = ry;
-    // 只在位置真的变化时通知 UI。Mac 端静止不发包，这里再挡一层，
-    // 避免重复 SetCursorPos。
+    // 只在位置真的变化时通知 UI；并用 g_cursorMsgPending 合并连发包，
+    // 防止消息队列积压多条 WM_APP_REMOTE_CURSOR 后连续 SetCursorPos 引发回声震荡。
     if (rx == oldX && ry == oldY) return;
-    if (g_hwnd) PostMessageA(g_hwnd, WM_APP_REMOTE_CURSOR, 0, 0);
+    if (g_hwnd && !g_cursorMsgPending.exchange(true)) {
+        if (!PostMessageA(g_hwnd, WM_APP_REMOTE_CURSOR, 0, 0)) {
+            g_cursorMsgPending.store(false);
+        }
+    }
 }
 
 // 0x05 真实光标图像。载荷(全大端):
@@ -3157,6 +3202,18 @@ static void ApplyCursorImage() {
     if (g_customCursor && fp == g_cursorAppliedFp && scalePm == g_cursorAppliedScalePm) {
         return;   // 同一张图同一缩放，沿用现有 HCURSOR
     }
+    // 命中稳态缓存：直接切换句柄，零 GDI 分配（箭头/I型/手型间切换不再卡顿）
+    for (int i = 0; i < kCursorCacheCap; ++i) {
+        if (g_cursorCache[i].cur && g_cursorCache[i].fp == fp && g_cursorCache[i].scalePm == scalePm) {
+            HCURSOR old = g_customCursor;
+            g_customCursor = g_cursorCache[i].cur;
+            g_cursorAppliedFp = fp;
+            g_cursorAppliedScalePm = scalePm;
+            if (g_cursorVisible.load()) SetCursor(g_customCursor);
+            if (old && old != g_customCursor && !IsInCursorCache(old)) DestroyCursor(old);
+            return;
+        }
+    }
 
     // 等比缩放：两轴用同一个系数，再整体夹到 256 上限。
     // 逐轴独立夹会让非方形光标在放大后变扁（例如 32x64 在 DPI 300% 下被压成 240x256）。
@@ -3235,7 +3292,13 @@ static void ApplyCursorImage() {
     g_cursorAppliedFp = fp;
     g_cursorAppliedScalePm = scalePm;   // 唯一权威：当前实际应用的缩放
     if (g_cursorVisible.load()) SetCursor(cur);
-    if (old) DestroyCursor(old);
+    if (g_shakeZoom == 1.0) {
+        HCURSOR victim = g_cursorCache[g_cursorCacheNext].cur;
+        g_cursorCache[g_cursorCacheNext] = CachedCursor{ fp, scalePm, cur };
+        g_cursorCacheNext = (g_cursorCacheNext + 1) % kCursorCacheCap;
+        if (victim && victim != cur && victim != old) DestroyCursor(victim);
+    }
+    if (old && old != cur && !IsInCursorCache(old)) DestroyCursor(old);
 }
 
 // 晃动检测。返回 true 表示「本次这一个光标包判定为晃动」，
@@ -3546,12 +3609,14 @@ static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
         ResetShakeSamples();
         break;   // 窗口位置/尺寸仍交给 DefWindowProc
     case WM_APP_REMOTE_CURSOR: {
-        // 事件驱动：只有收到新的远程位置才搬一次光标，不再 4ms 轮询。
-        // Mac 端静止时本来就不发包，所以不会出现「停下 1 秒就被拽回」。
-        // 两个门控都通过才动：
-        //   1. 副屏窗口在前台，用户在别的程序里操作时不抢
-        //   2. 本机鼠标最近 250ms 没动，本地输入优先
-        if (GetForegroundWindow() != g_hwnd) return 0;
+        // 先清合并标志再读坐标：确保读取之后若网络线程又收到更新，不会漏掉下一次通知。
+        g_cursorMsgPending.store(false);
+        // 门控：
+        //   1. 最小化时不移动光标
+        //   2. 窗口模式下非前台不抢夺用户在其他软件里的光标；全屏副屏时允许跨弹窗操作
+        //   3. 本机物理鼠标最近 250ms 内有活动时，本地输入优先
+        if (IsIconic(g_hwnd)) return 0;
+        if (!g_isFullscreen && GetForegroundWindow() != g_hwnd) return 0;
         if (GetTickCount64() - (uint64_t)g_lastLocalInputMs.load() < 250) return 0;
         double cx = g_cursorX.load(), cy = g_cursorY.load();
         if (cx < 0 || cy < 0) return 0;
@@ -3563,12 +3628,17 @@ static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
         if (cw <= 0 || ch <= 0) return 0;
         POINT tl{ rc.left, rc.top };
         ClientToScreen(g_hwnd, &tl);
-        // 标记这次移动是程序发起的，随后的 WM_MOUSEMOVE 只在落点等于目标点时才忽略
         int sx = tl.x + (int)(cx / vw * cw);
         int sy = tl.y + (int)(cy / vh * ch);
+        if (sx < tl.x) sx = tl.x;
+        if (sx >= tl.x + cw) sx = tl.x + cw - 1;
+        if (sy < tl.y) sy = tl.y;
+        if (sy >= tl.y + ch) sy = tl.y + ch - 1;
+        const uint64_t nowMoveMs = GetTickCount64();
         g_lastRemoteCursorX = sx;
         g_lastRemoteCursorY = sy;
-        g_lastRemoteCursorMoveMs = GetTickCount64();
+        g_lastRemoteCursorMoveMs = (int64_t)nowMoveMs;
+        RecordRemoteTarget(sx, sy, nowMoveMs);
         SetCursorPos(sx, sy);
 
         // 晃动检测：放大状态变化时重建光标位图。放在 SetCursorPos 之后。
@@ -3660,14 +3730,26 @@ static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
         QueueKeyEvent((uint16_t)(w & 0xFFFF), scan, down ? 1 : 0, flags);
         return 0;
     }
+    case WM_INPUT: {
+        // 物理鼠标 HID 输入（SetCursorPos 不会触发 WM_INPUT），用于把真实本地移动与程序回声区分开
+        UINT sz = sizeof(RAWINPUT);
+        RAWINPUT raw{};
+        if (GetRawInputData((HRAWINPUT)l, RID_INPUT, &raw, &sz, sizeof(RAWINPUTHEADER)) != (UINT)-1) {
+            if (raw.header.dwType == RIM_TYPEMOUSE) {
+                const RAWMOUSE& rm = raw.data.mouse;
+                if (rm.usButtonFlags != 0 || rm.lLastX != 0 || rm.lLastY != 0) {
+                    g_lastHardwareMouseMs.store(GetTickCount64());
+                }
+            }
+        }
+        break;
+    }
     case WM_MOUSEMOVE: {
-        // 只过滤程序自己 SetCursorPos 产生的那一次移动：时间接近且落点等于目标点。
-        // 不能只看时间窗，否则 Mac 光标高频移动时，真实本地移动会被一直吞掉，
-        // g_lastLocalInputMs 永不刷新，本地鼠标无法在 250ms 后抢回控制权。
+        // 过滤程序 SetCursorPos 产生的 WM_MOUSEMOVE 回声（16 项历史目标 + WM_INPUT 硬件判定）。
+        // 过滤失败会把远程移动误判为本地鼠标输入，导致 250ms 冻结并向 Mac 回传 0x04 把光标拽回。
         POINT pt{ GET_X_LPARAM(l), GET_Y_LPARAM(l) };
         ClientToScreen(h, &pt);
-        if (GetTickCount64() - (uint64_t)g_lastRemoteCursorMoveMs.load() < 50 &&
-            pt.x == g_lastRemoteCursorX.load() && pt.y == g_lastRemoteCursorY.load()) {
+        if (IsRemoteCursorEcho(pt.x, pt.y, GetTickCount64())) {
             return 0;
         }
         float vx, vy;
@@ -3896,6 +3978,12 @@ static void OnSessionPacket(const uint8_t* p, size_t n) {
     if (g_sessW.load() == w && g_sessH.load() == h && g_sessFps.load() == fps) return;
 
     g_sessW = w; g_sessH = h; g_sessFps = fps;
+    // 坐标基准立即跟随会话头，不与 presenter->Resize 成败绑定：
+    // 否则 Resize 失败时 g_coordW 停在旧值，会把远程光标压缩进画面左上角。
+    if (!g_coordUserSpecified) {
+        g_coordW = w;
+        g_coordH = h;
+    }
     Log("会话头: 协议 v%u  虚拟屏 %dx%d @ %d fps", ver, w, h, fps);
 
     int dw = g_displayW.load(), dh = g_displayH.load();
@@ -4624,6 +4712,18 @@ int main(int argc, char** argv) {
     g_hwnd = hwnd;
     g_isFullscreen = cfg.fullscreen;   // 与启动模式对齐，F11 首次切换才正确
 
+    // 注册鼠标 Raw Input，精准识别真实物理鼠标移动（SetCursorPos 不会触发 WM_INPUT）
+    {
+        RAWINPUTDEVICE rid{};
+        rid.usUsagePage = 0x01;
+        rid.usUsage     = 0x02;
+        rid.dwFlags     = RIDEV_INPUTSINK;
+        rid.hwndTarget  = hwnd;
+        if (!RegisterRawInputDevices(&rid, 1, sizeof(rid))) {
+            Log("警告: RegisterRawInputDevices 失败 %lu", GetLastError());
+        }
+    }
+
     // 记录显示器刷新率：判断源帧率与刷新率是否成整数比，是 vsync 顿挫的前提。
     {
         int hz = QueryRefreshHz(hwnd);
@@ -4712,6 +4812,7 @@ int main(int argc, char** argv) {
     // 因此默认取物理尺寸，与 Mac 对齐。早期按「逻辑点=物理/2」的假设会
     // 让光标显示偏移一半、点击回传放大一倍。
     // 若换到 CGDisplayBounds 返回逻辑点的系统，用 --coord W H 现场纠正。
+    g_coordUserSpecified = (cfg.coordW > 0);
     g_coordW = cfg.coordW > 0 ? cfg.coordW : cfg.width;
     g_coordH = cfg.coordH > 0 ? cfg.coordH : cfg.height;
     // 记录当前管线尺寸，供会话头比较；不一致时 NetworkLoop 会重建
@@ -4794,7 +4895,16 @@ int main(int argc, char** argv) {
     TrayRemove();
     UnregisterHotKey(hwnd, HOTKEY_QUIT_ID);
     UnregisterHotKey(hwnd, HOTKEY_HIDE_ID);
-    if (g_customCursor) { DestroyCursor(g_customCursor); g_customCursor = nullptr; }
+    if (g_customCursor && !IsInCursorCache(g_customCursor)) {
+        DestroyCursor(g_customCursor);
+    }
+    g_customCursor = nullptr;
+    for (int i = 0; i < kCursorCacheCap; ++i) {
+        if (g_cursorCache[i].cur) {
+            DestroyCursor(g_cursorCache[i].cur);
+            g_cursorCache[i].cur = nullptr;
+        }
+    }
     if (g_hintFont)  { DeleteObject(g_hintFont);  g_hintFont = nullptr; }
     if (g_hintBrush) { DeleteObject(g_hintBrush); g_hintBrush = nullptr; }
     if (g_hintHwnd)  { DestroyWindow(g_hintHwnd); g_hintHwnd = nullptr; }
