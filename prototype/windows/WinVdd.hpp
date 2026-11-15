@@ -541,21 +541,45 @@ private:
                 }
             }
         }
-        if (!foundOther) rightEdge = 2880;
+        if (!foundOther) {
+            rightEdge = 0;
+            // 若物理主屏因空闲息屏导致当前无其它在线屏幕，Windows GDI ChangeDisplaySettingsEx 可能返回 DISP_CHANGE_FAILED(-1)；
+            // 触发一次零位移输入唤醒显示会话，再下发分辨率
+            INPUT wake{};
+            wake.type = INPUT_MOUSE;
+            wake.mi.dwFlags = MOUSEEVENTF_MOVE;
+            SendInput(1, &wake, sizeof(INPUT));
+            Sleep(250);
+        }
 
-        auto tryMode = [&](DWORD reqW, DWORD reqH, DWORD reqHz) -> bool {
+        auto applyRaw = [&](DWORD reqW, DWORD reqH, DWORD reqHz, bool withPos) -> bool {
             DEVMODEW dm{}; dm.dmSize = sizeof(dm);
-            dm.dmFields = DM_PELSWIDTH | DM_PELSHEIGHT | DM_DISPLAYFREQUENCY | DM_POSITION;
+            dm.dmFields = DM_PELSWIDTH | DM_PELSHEIGHT | DM_DISPLAYFREQUENCY | (withPos ? DM_POSITION : 0);
             dm.dmPelsWidth = reqW;
             dm.dmPelsHeight = reqH;
             dm.dmDisplayFrequency = reqHz;
-            dm.dmPosition.x = rightEdge;
-            dm.dmPosition.y = 0;
+            if (withPos) {
+                dm.dmPosition.x = rightEdge;
+                dm.dmPosition.y = 0;
+            }
             LONG r1 = ChangeDisplaySettingsExW(devName.c_str(), &dm, nullptr,
                                                CDS_UPDATEREGISTRY | CDS_NORESET, nullptr);
-            if (r1 != DISP_CHANGE_SUCCESSFUL) return false;
-            LONG r2 = ChangeDisplaySettingsExW(nullptr, nullptr, nullptr, 0, nullptr);
-            return (r2 == DISP_CHANGE_SUCCESSFUL);
+            LONG r2 = (r1 == DISP_CHANGE_SUCCESSFUL)
+                ? ChangeDisplaySettingsExW(nullptr, nullptr, nullptr, 0, nullptr)
+                : r1;
+            if (r1 != DISP_CHANGE_SUCCESSFUL || r2 != DISP_CHANGE_SUCCESSFUL) {
+                // 部分驱动或单屏场景不支持 CDS_NORESET 两段式，退回直接应用
+                r2 = ChangeDisplaySettingsExW(devName.c_str(), &dm, nullptr, 0, nullptr);
+            }
+            Sleep(80);
+            WinVddBounds chk{};
+            return (r2 == DISP_CHANGE_SUCCESSFUL &&
+                    ReadCurrentBounds(devName, &chk) && chk.width == (int)reqW && chk.height == (int)reqH);
+        };
+
+        auto tryMode = [&](DWORD reqW, DWORD reqH, DWORD reqHz) -> bool {
+            if (applyRaw(reqW, reqH, reqHz, true)) return true;
+            return applyRaw(reqW, reqH, reqHz, false);
         };
 
         if (tryMode((DWORD)w, (DWORD)h, (DWORD)hz)) return;
