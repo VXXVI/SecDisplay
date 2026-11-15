@@ -426,6 +426,7 @@ final class MacReceiverClient {
     private var peerDesc = "-"
     private var recvBuf = Data()
     private var listenerRestartScheduled = false
+    private var listenerRestartWorkItem: DispatchWorkItem?
     private var feedbackTimer: DispatchSourceTimer?
 
     private let decoder = VideoToolboxDecoder()
@@ -515,6 +516,9 @@ final class MacReceiverClient {
             self.feedbackTimer = nil
             self.conn?.cancel()
             self.conn = nil
+            self.listenerRestartWorkItem?.cancel()
+            self.listenerRestartWorkItem = nil
+            self.listenerRestartScheduled = false
             self.listener?.cancel()
             self.listener = nil
             self.recvBuf.removeAll()
@@ -596,13 +600,18 @@ final class MacReceiverClient {
         }
         self.listener = l
         l.newConnectionHandler = { [weak self, weak l] c in
-            guard let self, let l, self.listener === l else { return }
+            guard let self, let l, self.listener === l else {
+                c.cancel()
+                return
+            }
             self.acceptConnection(c)
         }
         l.stateUpdateHandler = { [weak self, weak l] st in
             guard let self, let l, self.listener === l else { return }
             switch st {
             case .ready:
+                self.listenerRestartWorkItem?.cancel()
+                self.listenerRestartWorkItem = nil
                 self.listenerRestartScheduled = false
                 Log.info("MacReceiver: 已监听端口 \(port)，等待 Windows 主控端连接")
             case .failed(let e):
@@ -623,13 +632,16 @@ final class MacReceiverClient {
         stateLock.unlock()
         guard !isStopped, !listenerRestartScheduled else { return }
         listenerRestartScheduled = true
-        netQueue.asyncAfter(deadline: .now() + 2.0) { [weak self] in
+        let wi = DispatchWorkItem { [weak self] in
             guard let self else { return }
             self.listenerRestartScheduled = false
+            self.listenerRestartWorkItem = nil
             self.listener?.cancel()
             self.listener = nil
             self.startListener()
         }
+        listenerRestartWorkItem = wi
+        netQueue.asyncAfter(deadline: .now() + 2.0, execute: wi)
     }
 
     private func acceptConnection(_ c: NWConnection) {
@@ -648,11 +660,11 @@ final class MacReceiverClient {
         self.recvBuf.removeAll()
         old?.cancel()
 
-        c.stateUpdateHandler = { [weak self] st in
+        c.stateUpdateHandler = { [weak self, weak c] st in
             guard let self, self.connEpoch == epoch else { return }
             switch st {
             case .ready:
-                let ep = String(describing: c.endpoint)
+                let ep = c.map { String(describing: $0.endpoint) } ?? "-"
                 Log.info("MacReceiver: Windows 主控端已连接 \(ep)")
                 self.stateLock.lock()
                 self._connected = true
