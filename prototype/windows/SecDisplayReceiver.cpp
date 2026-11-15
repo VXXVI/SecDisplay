@@ -352,7 +352,7 @@ static const int kShakeWinMs = 700;      // 观察窗口
 static const int kShakeMinReversals = 3; // 至少 3 次方向反转才算晃动
 static const int kShakeMinSpanPx = 180;  // 横向/纵向累计摆幅下限，防止细微抖动误触
 static const double kShakeCursorZoom = 2.5;  // 晃动时的放大倍数
-static const int64_t kShakeHoldMs = 700;     // 停手到开始收缩的静默时长
+static const int64_t kShakeHoldMs = 700;     // 停手后保持放大的时长，之后开始收缩
 static const int kShakeShrinkMs = 260;       // 收缩动画时长
 static const int kShakeTickMs = 16;          // 动画帧间隔（约 60fps）
 static const UINT_PTR kShakeTimer = 4004;
@@ -367,11 +367,12 @@ static int g_shakeHead = 0;
 static bool g_shakeActive = false;
 // 晃动找光标总开关（可在控制面板关闭）
 static std::atomic<bool> g_shakeEnabled{true};
-// 每一个远程光标包的时间（不管是否在晃动）。TickShakeShrink 用它判断
-// 「已经多久没有新位置了」，不依赖 DetectShake 再次被调用。
-static int64_t g_shakeLastPacketMs = 0;
+// 最后一次「判定为正在晃动」的时刻。收缩计时锚在这个时间上，而不是锚在
+// 最后一个光标包上：晃完继续慢慢移动光标时位置包不会断，用包时间判断
+// 「是否还在动」会让放大状态永久收不回来。
+static int64_t g_shakeLastShakeMs = 0;
 static double g_shakeZoom = 1.0;
-static bool g_shakeHolding = false;      // 已停止晃动、正在等待静默期结束
+static bool g_shakeHolding = false;      // 已停止晃动、正在等待保持期结束
 static int64_t g_shakeHoldUntil = 0;
 
 // 输入回传：把窗口内的鼠标位置和按键状态发给 Mac，由它重放事件。
@@ -1105,7 +1106,14 @@ bool Decoder::Init(Graphics* gfx, int width, int height) {
                        MFT_ENUM_FLAG_ALL,
                        &inInfo, nullptr, &acts, &count);
     }
-    if (FAILED(hr) || count == 0) { Log("MFTEnumEx 失败 %08X", hr); return false; }
+    if (FAILED(hr) || count == 0) {
+        Log("MFTEnumEx 失败 %08X", hr);
+        // 写面板：这是最可能出现的失败形态（系统缺解码器），
+        // 不写的话面板会一直显示上一次重连成功的解码器名。
+        std::lock_guard<std::mutex> lk(g_decoderInfoMtx);
+        g_decoderInfo = L"无可用解码器（枚举失败）";
+        return false;
+    }
 
     // 打印候选清单，便于排查选错的情况
     Log("找到 %u 个 H.264 解码器候选", count);
@@ -1173,7 +1181,14 @@ bool Decoder::Init(Graphics* gfx, int width, int height) {
 
     for (UINT32 i = 0; i < count; ++i) acts[i]->Release();
     CoTaskMemFree(acts);
-    if (!transform_) { Log("没有可用的解码器"); return false; }
+    if (!transform_) {
+        Log("没有可用的解码器");
+        // 失败也要写面板：否则面板会一直显示上一次重连成功的解码器名，
+        // 与实际管线不符，排障时误导。
+        std::lock_guard<std::mutex> lk(g_decoderInfoMtx);
+        g_decoderInfo = L"无可用解码器";
+        return false;
+    }
 
     // 记录给控制面板看：硬件/软件 + 友好名
     {
@@ -2126,7 +2141,7 @@ static void RefreshCursorScale();
 static std::atomic<bool> g_panelTopmost{false};
 static std::atomic<ULONGLONG> g_connStartTick{0};
 static std::atomic<double> g_srcP50{0.0}, g_srcP95{0.0}, g_presP50{0.0}, g_presP95{0.0};
-static double g_uiFps = 0.0, g_uiMbps = 0.0;
+static std::atomic<double> g_uiFps{0.0}, g_uiMbps{0.0};
 
 // 主 Graphics 对象，控制面板查 GPU 显存用
 static Graphics* g_gfx = nullptr;
@@ -2241,7 +2256,7 @@ static void CopyDiagnostics() {
         g_sock.load() != INVALID_SOCKET ? L"已连接" : L"未连接",
         g_peerHost.c_str(), g_peerPort,
         dw, dh, up,
-        g_uiFps, g_uiMbps,
+        g_uiFps.load(), g_uiMbps.load(),
         g_srcP50.load(), g_srcP95.load(),
         g_presP50.load(), g_presP95.load(),
         (unsigned long long)g_stats.decodeFail.load(),
@@ -2273,14 +2288,47 @@ static void UpdateControlPanel() {
     static uint64_t lastDecoded = 0, lastBytes = 0;
     static ULONGLONG lastTick = 0;
     ULONGLONG now = GetTickCount64();
-    double dt = lastTick ? (double)(now - lastTick) / 1000.0 : 1.0;
     uint64_t decoded = g_stats.decoded.load();
     uint64_t bytes = g_stats.bytes.load();
-    double fps = dt > 0.0 ? (double)(decoded - lastDecoded) / dt : 0.0;
-    double mbps = dt > 0.0 ? (double)(bytes - lastBytes) * 8.0 / dt / 1e6 : 0.0;
-    lastDecoded = decoded;
-    lastBytes = bytes;
-    lastTick = now;
+    // 沿用上一次算出的值：面板显示时会被调用两次（WM_SHOWWINDOW 一次、
+    // ShowControlPanel 一次），第二次的 dt 接近 0，直接算会把帧率写成 0
+    // 并顺带污染「复制诊断」的剪贴板内容。
+    double fps = g_uiFps.load();
+    double mbps = g_uiMbps.load();
+    if (lastTick == 0) {
+        // 第一次只建立基准。否则会把「进程启动以来的累计解码帧数」
+        // 当成一秒钟的帧率，显示出一个离谱的数字。
+        lastDecoded = decoded;
+        lastBytes = bytes;
+        lastTick = now;
+    } else if (decoded < lastDecoded || bytes < lastBytes) {
+        // 重连时 g_stats 被清零。必须重建基准，否则下面的差值会算出负数，
+        // 而且基准再也追不上来，帧率会永久冻在旧值。
+        lastDecoded = decoded;
+        lastBytes = bytes;
+        lastTick = now;
+        fps = 0.0;
+        mbps = 0.0;
+    } else {
+        double dt = (double)(now - lastTick) / 1000.0;
+        // dt 太大说明面板刚被重新打开（隐藏期间定时器已停），
+        // 那段时间的平均值没有参考价值，只重建基准。
+        if (dt >= 5.0) {
+            lastDecoded = decoded;
+            lastBytes = bytes;
+            lastTick = now;
+        } else if (dt >= 0.2) {
+            fps = (double)(decoded - lastDecoded) / dt;
+            mbps = (double)(bytes - lastBytes) * 8.0 / dt / 1e6;
+            lastDecoded = decoded;
+            lastBytes = bytes;
+            lastTick = now;
+        }
+    }
+    // 写回全局供 CopyDiagnostics 复用：那两个全局原来只有声明和读取，
+    // 从来没有赋值，剪贴板里的帧率/码率恒为 0.0，和面板显示自相矛盾。
+    g_uiFps.store(fps);
+    g_uiMbps.store(mbps);
 
     bool connected = g_sock.load() != INVALID_SOCKET;
     bool receiving = connected && g_stats.packets.load() > 0;
@@ -2472,6 +2520,16 @@ static LRESULT CALLBACK PanelWndProc(HWND h, UINT msg, WPARAM w, LPARAM l) {
     case WM_TIMER:
         if (w == 1) UpdateControlPanel();
         return 0;
+    case WM_SHOWWINDOW:
+        // 面板只隐藏不销毁，WM_CREATE 里那个 SetTimer 在 WM_CLOSE 之后已经停掉。
+        // 重新显示时必须把它装回去，否则面板上所有数字会冻在关闭那一刻。
+        if (w) {
+            SetTimer(h, 1, 1000, nullptr);
+            UpdateControlPanel();
+        } else {
+            KillTimer(h, 1);
+        }
+        return 0;
     case WM_CTLCOLORSTATIC:
         // 静态文本默认用 COLOR_BTNFACE 画背景，会显示成一块块灰底；
         // 改成透明背景加窗口底色，和面板融为一体
@@ -2553,7 +2611,12 @@ static LRESULT CALLBACK PanelWndProc(HWND h, UINT msg, WPARAM w, LPARAM l) {
         }
         return 0;
     case WM_CLOSE:
-        // 只隐藏，不销毁：投屏继续跑，下次从托盘再打开
+        // 只隐藏，不销毁：投屏继续跑，下次从托盘再打开。
+        // 必须顺手停掉 1Hz 刷新定时器：SetTimer 属于线程消息队列，
+        // 窗口隐藏不会停它，隐藏期间会每秒白跑一次
+        // GetProcessMemoryInfo / GetProcessTimes / QueryVideoMemoryInfo
+        // 和二十多次 SetWindowTextW。
+        KillTimer(h, 1);
         ShowWindow(h, SW_HIDE);
         return 0;
     case WM_DESTROY:
@@ -2759,7 +2822,8 @@ static void ApplyCursorImage() {
     if (old) DestroyCursor(old);
 }
 
-// 晃动检测。返回 true 表示当前应处于「放大」状态。
+// 晃动检测。返回 true 表示「本次这一个光标包判定为晃动」，
+// 不是「当前是否处于放大态」——调用方靠它区分真晃动和收缩期间的孤立噪声包。
 // 只看最近 kShakeWinMs 的轨迹，求 x（或 y）方向的符号反转次数与总摆幅。
 // 用「反转次数 + 摆幅」双条件：单靠摆幅会把慢速大范围拖动误判成晃动。
 static bool DetectShake(int64_t now, int x, int y) {
@@ -2770,7 +2834,9 @@ static bool DetectShake(int64_t now, int x, int y) {
         if (g_shakeBuf[prevIdx].t == now) {
             g_shakeBuf[prevIdx].x = x;
             g_shakeBuf[prevIdx].y = y;
-            return g_shakeActive;
+            // 返回 false 而不是 g_shakeActive：调用方用它决定是否把缩放
+            // 拉回满值，返回 true 会让收缩动画期间闪一下。
+            return false;
         }
     }
     g_shakeBuf[g_shakeHead] = ShakeSample{ now, x, y };
@@ -2784,7 +2850,7 @@ static bool DetectShake(int64_t now, int x, int y) {
         int idx = (g_shakeHead - g_shakeCount + i + kShakeCap) % kShakeCap;
         if (now - g_shakeBuf[idx].t <= kShakeWinMs) win[n++] = g_shakeBuf[idx];
     }
-    if (n < 4) return g_shakeActive;
+    if (n < 4) return false;   // 样本不足，本次不判定为晃动
 
     // 位移方向序列（用相邻点差值，忽略 <8px 的抖动）。
     // 阈值从 4 提到 8：同毫秒去重会把轨迹降采样到约 60Hz，一两个像素的抖动
@@ -2821,6 +2887,7 @@ static bool DetectShake(int64_t now, int x, int y) {
     if (shaking) {
         if (!g_shakeEnabled.load()) return false;
         g_shakeHolding = false;
+        g_shakeLastShakeMs = now;
         if (!g_shakeActive) {
             g_shakeActive = true;
             // 放大是立刻的：直接把目标倍数给上，动画只用于收缩
@@ -2845,6 +2912,14 @@ static bool DetectShake(int64_t now, int x, int y) {
     return false;
 }
 
+// 清空晃动采样缓冲。窗口几何变化（移动、缩放、换 DPI、切换显示模式）后
+// 屏幕坐标会整体跳变，相邻样本之间的差值会被当成一次大摆幅，
+// 配合正常移动的反转次数就可能误触发放大。
+static void ResetShakeSamples() {
+    g_shakeCount = 0;
+    g_shakeHead = 0;
+}
+
 // 收缩动画的一帧。返回 true 表示动画仍在进行，需要继续定时器。
 // 用 ease-out（1-(1-t)^3）让收缩前段快、尾段贴住原尺寸，观感比线性自然。
 static bool TickShakeShrink(int64_t now) {
@@ -2854,13 +2929,19 @@ static bool TickShakeShrink(int64_t now) {
     // DetectShake 只在 WM_APP_REMOTE_CURSOR 里被调用，而晃动结束的标准用法
     // 就是「停手不再移动」——此后再无光标包，holding 永远不会被置上，
     // 光标就会永久停在放大状态、定时器永久空转。
-    // 所以这里用「距离最后一个光标包」来判断，由定时器自己转入 hold。
+    //
+    // 计时锚在「最后一次判定为晃动」而不是「最后一个光标包」：
+    // 晃完继续慢慢移动时位置包不断，锚在包时间上会让放大永久收不回来，
+    // 同时 16ms 定时器还会一直空转重建光标图。
+    //
+    // holdUntil 直接取 lastShake + kShakeHoldMs，不再叠加第二段：
+    // 原来这里是「静默 700 + hold 700」，实际要 1.4 秒才开始收缩。
     if (!g_shakeHolding) {
-        if (now - g_shakeLastPacketMs < kShakeHoldMs) return true;   // 还在动
+        if (now - g_shakeLastShakeMs < kShakeHoldMs) return true;   // 仍在晃动/刚晃完
         g_shakeHolding = true;
-        g_shakeHoldUntil = now + kShakeHoldMs;
+        g_shakeHoldUntil = g_shakeLastShakeMs + kShakeHoldMs;
     }
-    if (now < g_shakeHoldUntil) return true;   // hold 未到期
+    if (now < g_shakeHoldUntil) return true;   // 保持期未到期
 
     const int64_t t0 = g_shakeHoldUntil;
     const double p = (double)(now - t0) / (double)kShakeShrinkMs;
@@ -2955,6 +3036,8 @@ static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
                 g_pendingClientH = ch;
                 g_syncSwapRetry = 0;
                 SetTimer(h, TIMER_SYNC_SWAP, 120, nullptr);
+                // 客户区尺寸变了，远程坐标到屏幕坐标的换算比例也变了
+                ResetShakeSamples();
             } else {
                 KillTimer(h, TIMER_SYNC_SWAP);
             }
@@ -3021,6 +3104,12 @@ static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
     case WM_EXITSIZEMOVE:
         // 显示模式变化或窗口跨屏移动后，刷新率可能变了，--pace 的节拍要跟着更新
         UpdateRefreshHz();
+        // 晃动轨迹用屏幕坐标，窗口移动/尺寸变化会让相邻样本出现几百像素的突跳，
+        // 直接计入摆幅会误触发放大。清空采样缓冲，从新几何重新累积。
+        ResetShakeSamples();
+        return 0;
+    case WM_MOVE:
+        ResetShakeSamples();
         return 0;
     case WM_DPICHANGED:
         // 窗口被拖到另一块缩放不同的显示器：按新 DPI 重建光标位图。
@@ -3030,6 +3119,7 @@ static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
             if (!g_cursorImage.bgra.empty()) g_cursorImage.pending = true;
         }
         ApplyCursorImage();
+        ResetShakeSamples();
         break;   // 窗口位置/尺寸仍交给 DefWindowProc
     case WM_APP_REMOTE_CURSOR: {
         // 事件驱动：只有收到新的远程位置才搬一次光标，不再 4ms 轮询。
@@ -3057,11 +3147,11 @@ static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
         g_lastRemoteCursorMoveMs = GetTickCount64();
         SetCursorPos(sx, sy);
 
-        // 晃动检测：放大状态变化时重建光标位图。放在 SetCursorPos 之后，
-        // 用屏幕坐标参与判定（客户区坐标在窗口移动时会整体平移，容易误判）。
+        // 晃动检测：放大状态变化时重建光标位图。放在 SetCursorPos 之后。
+        // 用屏幕坐标参与判定，代价是窗口移动/DPI 变化会污染轨迹，
+        // 所以那些事件里会清空采样缓冲（见 WM_MOVE / WM_SIZE / WM_DPICHANGED）。
         {
             const int64_t nowMs = GetTickCount64();
-            g_shakeLastPacketMs = nowMs;   // 每个包都记，供 TickShakeShrink 判「停手」
             const bool wasActive = g_shakeActive;
             const bool shaking = DetectShake(nowMs, sx, sy);
             // 只有「本次真的判定为晃动」才把缩放拉回满值并立即重建，

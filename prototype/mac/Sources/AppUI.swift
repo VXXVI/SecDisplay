@@ -17,7 +17,8 @@ final class AppModel: ObservableObject {
     @Published var mbps: Double = 0
     @Published var inFlight = 0
     @Published var dropped = 0
-    @Published var skipped = 0
+    /// 采集连续异常次数。>0 表示 SCK 采集异常、看护正在重试。
+    @Published var captureRestarts = 0
     @Published var width = 0
     @Published var height = 0
     @Published var scale: Double = 1.0
@@ -77,7 +78,6 @@ final class AppModel: ObservableObject {
         mbps = lastMbps
         inFlight = sender.inFlight
         dropped = sender.dropped
-        skipped = cap.staticSkipCount
         width = cfg.width
         height = cfg.height
         scale = vdBackingScale
@@ -98,7 +98,23 @@ final class AppModel: ObservableObject {
         clientPresentP95 = fb.presentP95
         clientQueueMs = max(0, fb.presentP95 - fb.sourceP95)
         clientPresentDrop = fb.presentDrop
-        capturePath = (pixelFormatChoice == "420v" ? "420v" : "BGRA") + " · 4 路"
+        // 采集通道显示实测格式。SCK 可能忽略 pixelFormat 仍给 BGRA，
+        // 这时显示配置值会骗人（日志里那条「内存收益失效」的警告就白打了）。
+        // 还没采到帧时显示请求值加问号，提示尚未确认。
+        let wantName = pixelFormatChoice == "420v" ? "420v" : "BGRA"
+        let code = cap.actualFormatCode
+        // 四字符码还原成可读名：420v / BGRA / 未知
+        let actual: String
+        switch code {
+        case 0:                 actual = "\(wantName)?"
+        case 0x34323076:        actual = "420v"     // '420v'
+        case 0x42475241:        actual = "BGRA"     // 'BGRA'
+        default:
+            let b = [24, 16, 8, 0].map { UInt8((code >> UInt32($0)) & 0xFF) }
+            actual = String(bytes: b, encoding: .ascii) ?? "未知"
+        }
+        capturePath = actual + " · 4 路"
+        captureRestarts = cap.captureRestartCount
         totalSent = UInt64(max(0, sender.totalSent))
         uptimeSec = CFAbsoluteTimeGetCurrent() - appStartTime
         peer = sender.peerDescription
@@ -155,6 +171,10 @@ private func fmtUptime(_ s: Double) -> String {
 
 struct StatusView: View {
     @ObservedObject var model = AppModel.shared
+    /// 标题栏遮挡的高度，由 showControlPanel 按窗口实际 contentLayoutRect 算出。
+    /// 写死 28pt 不可靠：SwiftUI 自己可能已经从 NSHostingView 拿到安全区，
+    /// 再叠一个 28 就变成 56pt 空白；反过来若没拿到，24pt 又不够。
+    var topInset: CGFloat = 28
 
     private var healthText: String {
         String(format: "%.2f", model.health)
@@ -166,8 +186,14 @@ struct StatusView: View {
     }
 
     var body: some View {
-        ScrollView {
-            VStack(alignment: .leading, spacing: 14) {
+        // 窗口是 .fullSizeContentView + 透明标题栏，内容会从窗口最上沿开始画，
+        // 正好压在红绿灯按钮上。用一个固定高度的占位把标题栏高度让出来 ——
+        // 放在 ScrollView 外面，不会跟着滚走。
+        // ignoresSafeArea 是为了让高度可控：否则 SwiftUI 可能再加一次安全区。
+        VStack(spacing: 0) {
+            Color.clear.frame(height: topInset)
+            ScrollView {
+                VStack(alignment: .leading, spacing: 14) {
                 // 头部
                 HStack(spacing: 10) {
                     Circle()
@@ -194,12 +220,16 @@ struct StatusView: View {
                 // 采集与编码（发送端本地）
                 SectionHeader(title: "采集 / 编码")
                 VStack(spacing: 6) {
-                    StatRow(label: "采集帧率", value: String(format: "%.0f fps", model.fps))
+                    StatRow(label: "采集峰值", value: String(format: "%.0f fps", model.fps))
                     StatRow(label: "采集通道", value: model.capturePath)
                     StatRow(label: "采集延迟", value: String(format: "%.1f ms", model.capMs))
                     StatRow(label: "编码延迟", value: String(format: "%.1f ms", model.encMs))
                     StatRow(label: "画质档位", value: model.presetName)
-                    StatRow(label: "静止跳过", value: "\(model.skipped)")
+                    // 采集重启次数：>0 说明 SCK 采集不达标、看护已经重建过工作线程。
+                    // 原来这行显示「静止跳过」，但那个计数只存在于死代码里恒为 0。
+                    StatRow(label: "采集重启", value: model.captureRestarts == 0
+                            ? "无" : "\(model.captureRestarts) 次",
+                            warn: model.captureRestarts > 0 ? .orange : nil)
                 }
 
                 // 码率控制
@@ -260,6 +290,10 @@ struct StatusView: View {
                     get: { model.cursorImageOn },
                     set: { on in
                         disableCursorImage = !on
+                        // 启动时若带 SECDISPLAY_NOCURSORIMG=1，CursorImageTracker 的
+                        // 定时器从未创建；只改标志位会让开关显示 ON 却一帧都不发。
+                        // 打开时补一次 start()（内部幂等）。
+                        if on { cursorImage.start() }
                         Log.info(on ? "面板开启光标图像(0x05)" : "面板关闭光标图像(0x05)")
                     }))
                     .toggleStyle(.switch)
@@ -289,11 +323,11 @@ struct StatusView: View {
                 }
             }
             .padding(18)
-            // 窗口是 .fullSizeContentView + 透明标题栏，ScrollView 会顶到
-            // 窗口最上沿，把「已连接」那一行压到红绿灯按钮底下。
-            // 额外让出标题栏高度。
-            .padding(.top, 6)
+            }
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
         }
+        // 自己管顶部让位，就不要 SwiftUI 再叠一次安全区
+        .ignoresSafeArea(.container, edges: .top)
         .frame(width: 400, height: 620)
     }
 }
@@ -309,7 +343,7 @@ func copyDiagnostics() {
     对端: \(m.peer)
     分辨率: \(m.width)x\(m.height)  scale=\(String(format: "%.2f", m.scale))
     采集通道: \(m.capturePath)
-    采集帧率: \(String(format: "%.0f", m.fps)) fps
+    采集峰值: \(String(format: "%.0f", m.fps)) fps
     采集延迟: \(String(format: "%.1f", m.capMs)) ms
     编码延迟: \(String(format: "%.1f", m.encMs)) ms
     码率: \(m.bitrateNow)/\(m.bitrateTarget) Mbps  实际 \(String(format: "%.1f", m.mbps)) Mbps
@@ -439,7 +473,6 @@ func showControlPanel() {
         targetWindow = w
         Log.info("面板已前置 key=\(w.isKeyWindow) visible=\(w.isVisible) frame=\(w.frame)")
     } else {
-        let host = NSHostingView(rootView: StatusView())
         let w = NSWindow(
             contentRect: NSRect(x: 0, y: 0, width: 400, height: 620),
             styleMask: [.titled, .closable, .miniaturizable, .fullSizeContentView],
@@ -450,6 +483,13 @@ func showControlPanel() {
         w.isReleasedWhenClosed = false
         w.hidesOnDeactivate = false
         w.delegate = panelWindowDelegate
+        // 标题栏遮挡高度按窗口实际布局算，不写死 28pt。
+        // fullSizeContentView 下 contentView 铺满整个窗口，contentLayoutRect
+        // 才是扣掉标题栏之后的可布局区域，两者之差就是需要让出的高度。
+        let topInset = max(0, w.frame.height - w.contentLayoutRect.height)
+        Log.info(String(format: "面板顶部让位 %.0fpt（窗口 %.0f / 可布局 %.0f）",
+                        topInset, w.frame.height, w.contentLayoutRect.height))
+        let host = NSHostingView(rootView: StatusView(topInset: topInset))
         w.contentView = host
         placeOnUserScreen(w)
         w.makeKeyAndOrderFront(nil)

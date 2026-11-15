@@ -932,7 +932,12 @@ final class Encoder {
 
 }
 
-// MARK: - 抓屏
+// MARK: - 抓屏（SCStream 路径，当前未启用）
+//
+// 注意：这个类目前没有任何实例化点，实际采集走下面的 ScreenshotCapture。
+// 保留它是因为里面记了 SCStream 在 CGVirtualDisplay 上的实测结论（见
+// startCompositeCapture 的注释），将来若要回到 SCStream 路径可直接参考。
+// 它的 idleFrameCount / staticSkipCount 因此恒为 0，不要拿去做面板指标。
 
 final class Capture: NSObject, SCStreamOutput, SCStreamDelegate {
     let encoder: Encoder
@@ -1087,7 +1092,8 @@ final class Capture: NSObject, SCStreamOutput, SCStreamDelegate {
     private var compositeSeq: Int64 = 0
     private let compositeQueue = DispatchQueue(label: "SecDisplay.capture.composite")
 
-    /// 默认走合成抓屏；SECDISPLAY_CAPTURE=sck 可退回 ScreenCaptureKit。
+    /// 合成抓屏（CGWindowListCreateImage）开关。
+    /// 注意：本类当前未被实例化，这个开关不生效；实际采集走 ScreenshotCapture。
     private var isCompositeMode: Bool {
         ProcessInfo.processInfo.environment["SECDISPLAY_CAPTURE"] != "sck"
     }
@@ -1305,8 +1311,14 @@ final class ScreenshotCapture {
     var capLatCount = 0
     var capLatMax: Double = 0
     var lastFrameTime: CFAbsoluteTime = 0
-    private(set) var idleFrameCount = 0
-    private(set) var staticSkipCount = 0
+    /// 采集首帧实测到的像素格式（四字符码原始值）。面板用它显示真实通道，
+    /// 而不是配置里请求的格式 —— SCK 可能忽略 pixelFormat 仍给 BGRA，
+    /// 那种情况下配置值会骗人。
+    ///
+    /// 存 UInt32 而不是 String：写入方是 worker（encodeQueue 内），读取方是
+    /// 主线程面板。String 的赋值与读取都不是原子操作，可能读到半写状态并在
+    /// retain 时崩溃。格式化交给面板做，0 表示还没采到帧。
+    private(set) var actualFormatCode: UInt32 = 0
 
     private let encodeQueue = DispatchQueue(label: "SecDisplay.encode")
     private var running = false
@@ -1326,9 +1338,18 @@ final class ScreenshotCapture {
     /// 写方是 supervisor 队列，读方是 worker 任务，用锁保护。
     private let genLock = NSLock()
     private var _workerGen = 0
+    /// 已请求停止的粘滞标志。stop() 置位，start() 在 await 返回后必须检查 ——
+    /// 否则退出请求若落在 start() 的 await 期间，start() 恢复后会把 running
+    /// 置回 true 并重新起 worker，而 shutdown 已经走到 destroy 虚拟屏那一步，
+    /// destroy 会被静默拒绝，留下孤儿屏。
+    private var _stopRequested = false
     private var workerGen: Int {
         genLock.lock(); defer { genLock.unlock() }
         return _workerGen
+    }
+    private var stopRequested: Bool {
+        genLock.lock(); defer { genLock.unlock() }
+        return _stopRequested
     }
     /// 自增代次并返回新值
     private func bumpWorkerGen() -> Int {
@@ -1336,6 +1357,76 @@ final class ScreenshotCapture {
         _workerGen &+= 1
         return _workerGen
     }
+    /// 连续异常采样的次数（每 3 秒一个采样）。只用于决定退避间隔，
+    /// 和「重启了几次」不是一回事 —— 退避期间采样照样在涨但不重启。
+    private var slowStreak = 0
+    /// 自上次恢复以来真正重启的次数。硬上限按这个算。
+    private var restartCount = 0
+    private var lastRestartAt: CFAbsoluteTime = 0
+    /// 面板展示用：自上次恢复以来真正重启的次数。
+    /// 与 supervisor 队列共享，走 genLock 保护。
+    var captureRestartCount: Int {
+        genLock.lock(); defer { genLock.unlock() }
+        return restartCount
+    }
+    private func bumpSlowStreak() -> Int {
+        genLock.lock(); defer { genLock.unlock() }
+        slowStreak += 1
+        return slowStreak
+    }
+    private func bumpRestartCount() -> Int {
+        genLock.lock(); defer { genLock.unlock() }
+        restartCount += 1
+        return restartCount
+    }
+    /// 采集恢复正常时清零全部计数
+    private func resetCaptureCounters() {
+        genLock.lock(); slowStreak = 0; restartCount = 0; genLock.unlock()
+    }
+    /// 连续失败的重启上限。超过就停手，等用户重启进程 ——
+    /// 这一条针对「采集彻底死掉」：退避只降低频率，卡在 await 里的 Task
+    /// 永不返回，每 30 秒仍会净增 4 个线程。
+    private let restartHardCap = 20
+    /// 进程生命周期内 spawnWorkers 的总次数，**不随恢复清零**。
+    ///
+    /// 为什么需要它：连续失败上限会在采集恢复正常时归零，而「休眠 → 唤醒」
+    /// 恰好是「先失败一次、随后恢复正常」的模式。屏保每分钟休眠一次时，
+    /// 每次唤醒都会新建 4 个 worker，休眠期间卡住的旧 worker 永不返回，
+    /// 连续失败计数却永远到不了 20。一天下来就是几千个僵尸线程。
+    /// 这里按代次总量设一个绝对上限，与是否恢复无关。
+    private let spawnHardCap = 300
+    private var totalSpawns = 0
+    private func bumpTotalSpawns() -> Int {
+        genLock.lock(); defer { genLock.unlock() }
+        totalSpawns += 1
+        return totalSpawns
+    }
+    private var totalSpawnCount: Int {
+        genLock.lock(); defer { genLock.unlock() }
+        return totalSpawns
+    }
+    /// 放弃自动重启后，日志降频到 5 分钟一条
+    private var lastGiveUpLogAt: CFAbsoluteTime = 0
+    /// 原始采集计数：capture 一返回就自增，不经过 encodeQueue。
+    /// 看护要用它判断「采集本身」是否健康；captured 是在 encodeQueue 里
+    /// encode 之后才自增的，包含编码与排队时间，VT 变慢时会被误判成采集卡死。
+    private let rawLock = NSLock()
+    private var _capturedRaw = 0
+    var capturedRaw: Int {
+        rawLock.lock(); defer { rawLock.unlock() }
+        return _capturedRaw
+    }
+    private func bumpCapturedRaw() {
+        rawLock.lock(); _capturedRaw &+= 1; rawLock.unlock()
+    }
+    /// 同步作用域加锁。NSLock 的 lock/unlock 在 async 上下文里会被
+    /// Swift 6 判为不可用，包一层同步函数就能在 async 函数里安全调用。
+    private func withRawLock<T>(_ body: () -> T) -> T {
+        rawLock.lock(); defer { rawLock.unlock() }
+        return body()
+    }
+    /// 显示器休眠只打一次日志，避免每 3 秒刷屏
+    private var loggedDisplayAsleep = false
     /// 上一帧内容的采样指纹。用来识别「帧还在来、但画面不再更新」——
     /// SCScreenshotManager 跑约 30 秒后偶尔会开始返回陈旧内容，
     /// 此时 captured 仍在增长，现有看护只看计数，抓不到这种情况。
@@ -1351,6 +1442,12 @@ final class ScreenshotCapture {
 
     func start() async throws {
         let content = try await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: false)
+        // await 期间可能已经收到退出请求，这时必须放弃启动，否则会把
+        // running 置回 true 并在 shutdown 清理虚拟屏时仍在采集。
+        if stopRequested {
+            Log.info("启动过程中已收到停止请求，放弃启动采集")
+            return
+        }
         guard content.displays.contains(where: { isOurVirtualDisplay($0.displayID) }) else {
             let avail = content.displays.map {
                 String(format: "id=%u vendor=0x%x", $0.displayID, CGDisplayVendorNumber($0.displayID))
@@ -1359,49 +1456,168 @@ final class ScreenshotCapture {
                 NSLocalizedDescriptionKey: "找不到 SecDisplay 虚拟屏，当前: \(avail.joined(separator: ", "))"
             ])
         }
-        cachedContent = content
-        cachedAt = CFAbsoluteTimeGetCurrent()
+        withRawLock {
+            cachedContent = content
+            cachedAt = CFAbsoluteTimeGetCurrent()
+        }
         running = true
         spawnWorkers()
-        // 看护：并发调用 SCScreenshotManager 偶尔会整体卡住（实测跑约 26 秒后
-        // 采集数不再增长，CPU 掉到 1%）。发现 3 秒没新帧就重新拉起工作线程。
+        // 看护：SCScreenshotManager 并发轮询有两个已知故障模式
+        //   1. 整体卡住：continuation 永不 resume，captured 不再增长
+        //   2. 半卡死：偶尔回一帧，但远低于目标帧率
+        // 所以判据用「实测帧率 < 目标的三分之一」，不是「严格 0 帧」。
+        //
+        // 关键：卡在 await 里的 Task 不会返回，代次对它们无效 —— 每次重启都是
+        // 净增 4 个僵尸线程。实测日志里代次一路涨到 104，等于 400 多个线程。
+        // 因此这里必须限次退避，不能无限重启。
         supervisor = DispatchSource.makeTimerSource(queue: DispatchQueue(label: "SecDisplay.capture.sup"))
         supervisor?.schedule(deadline: .now() + 3, repeating: 3)
         supervisor?.setEventHandler { [weak self] in
-            guard let self, self.running else { return }
+            guard let self, self.running, !self.stopRequested else { return }
             let now = CFAbsoluteTimeGetCurrent()
-            if self.captured == self.lastSupervisorCount && now - self.lastSupervisorAt > 3.0 {
-                Log.info("截图采集停滞（\(Int(now - self.lastSupervisorAt))s 无新帧），重启工作线程")
-                self.spawnWorkers()
-            }
-            if self.captured != self.lastSupervisorCount {
-                self.lastSupervisorCount = self.captured
+
+            // 显示器睡眠时采集本来就拿不到帧，不是故障。此时既不判停滞也不重启，
+            // 唤醒后自动恢复。没有这段的话，用户离开屏幕休眠会触发无限重启。
+            let vdID = self.displayIDProvider()
+            if CGDisplayIsAsleep(vdID) != 0 {
+                if !self.loggedDisplayAsleep {
+                    self.loggedDisplayAsleep = true
+                    Log.info("显示器已休眠，暂停采集判活（唤醒后自动恢复）")
+                }
+                self.lastSupervisorCount = self.capturedRaw
                 self.lastSupervisorAt = now
+                return
+            }
+            if self.loggedDisplayAsleep {
+                self.loggedDisplayAsleep = false
+                // 休眠期间 worker 多半已卡在 await 里，唤醒后不会自己恢复。
+                // 直接重建一次比等 3 秒再判「异常」更干净。
+                //
+                // 唤醒本身不算失败，所以清零连续失败计数；但「线程重建总量」
+                // 是另一条独立的绝对上限（spawnHardCap），屏保每分钟休眠一次
+                // 时也不会无界堆线程。
+                self.resetCaptureCounters()
+                if self.spawnWorkers() {
+                    Log.info("显示器已唤醒，重建采集工作线程")
+                } else {
+                    self.lastSupervisorCount = self.capturedRaw
+                    self.lastSupervisorAt = now
+                }
+                return
+            }
+
+            // capturedRaw 只读一次：读两次之间 worker 可能又自增，
+            // delta 和基准就不是同一时刻的快照了。
+            let rawNow = self.capturedRaw
+            let dt = now - self.lastSupervisorAt
+            let delta = rawNow - self.lastSupervisorCount
+            self.lastSupervisorCount = rawNow
+            self.lastSupervisorAt = now
+            guard dt > 0.5 else { return }
+
+            let measuredFps = Double(delta) / dt
+            // 三分之一容忍：目标 50fps 时低于 ~17fps 才判为异常，
+            // 避免正常的采集抖动被当成停滞。
+            let tooSlow = measuredFps < self.cfg.captureHz / 3.0
+
+            if tooSlow {
+                let slow = self.bumpSlowStreak()
+                // 硬上限：真卡死时 worker 永不返回，重启只会堆线程。
+                // 到这里就彻底停手，把「继续重启」换成一条明确的告警。
+                // 注意判据是「真正重启的次数」，不是异常采样次数。
+                if self.captureRestartCount >= self.restartHardCap {
+                    if now - self.lastGiveUpLogAt > 300.0 {
+                        self.lastGiveUpLogAt = now
+                        Log.info(String(format: "采集已连续重启 %d 次仍未恢复（%.1ffps），停止自动重启。请退出并重开 SecDisplay",
+                                        self.captureRestartCount, measuredFps))
+                    }
+                    return
+                }
+                // 退避：前 4 次每 3 秒试一次；之后拉长到 30 秒一次。
+                if slow > 4 && now - self.lastRestartAt < 30.0 {
+                    return
+                }
+                self.lastRestartAt = now
+                // 先确认真的拉起了再计数、再记日志，避免出现「日志说重启了
+                // 第 21 次，实际因为总量上限没拉起来」这种自相矛盾。
+                guard self.spawnWorkers() else { return }
+                let n = self.bumpRestartCount()
+                // 每次真正重启都记一行。退避后重启频率已降到 30 秒一次，
+                // 不会刷屏；而这里恰恰是「画面一直不动」时唯一的线索，
+                // 之前用 %10 抽样反而会让它长期不出现。
+                if n <= 4 {
+                    Log.info(String(format: "截图采集异常（%.1ffps，目标 %.0ffps，第 %d 次重启）",
+                                    measuredFps, self.cfg.captureHz, n))
+                } else {
+                    Log.info(String(format: "截图采集持续异常（%.1ffps，已重启 %d 次），已降为 30 秒重试一次。若画面不动请重启发送端",
+                                    measuredFps, n))
+                }
+            } else {
+                if self.captureRestartCount > 0 {
+                    Log.info("截图采集已恢复正常（\(String(format: "%.0f", measuredFps))fps）")
+                    self.resetCaptureCounters()
+                }
             }
         }
         supervisor?.resume()
     }
 
-    private func spawnWorkers() {
+    /// 拉起采集工作线程。返回 false 表示已到总量上限，没有真的拉起。
+    @discardableResult
+    private func spawnWorkers() -> Bool {
+        // 防御：stop() 可能在 start() 的 await 之后、这里之前到达。
+        // 顶层代码是 @MainActor 隔离的，实际窗口很小，但不该依赖这个隐式前提。
+        guard !stopRequested else {
+            Log.info("已请求停止，跳过启动采集工作线程")
+            return false
+        }
+        // 绝对上限：卡在 await 里的 Task 永不返回，代次对它们无效。
+        // 这里按代次总量兜底，与「连续失败」是否已恢复无关。
+        let done = totalSpawnCount
+        if done >= spawnHardCap {
+            let now = CFAbsoluteTimeGetCurrent()
+            if now - lastGiveUpLogAt > 300.0 {
+                lastGiveUpLogAt = now
+                Log.info("采集线程已累计重建 \(done) 次，停止重建。请退出并重开 SecDisplay")
+            }
+            return false
+        }
         let workers = 4
+        let total = bumpTotalSpawns()
         let gen = bumpWorkerGen()
         lastSupervisorAt = CFAbsoluteTimeGetCurrent()
-        lastSupervisorCount = captured
-        Log.info("采集通道: SCScreenshotManager 轮询，\(workers) 路并发（代次 \(gen)）")
+        lastSupervisorCount = capturedRaw
+        Log.info("采集通道: SCScreenshotManager 轮询，\(workers) 路并发（代次 \(gen)，累计第 \(total) 次）")
         for i in 0..<workers {
             Task.detached(priority: .userInitiated) { [weak self] in
                 await self?.loop(index: i, gen: gen)
             }
         }
+        return true
     }
 
+    /// 停止采集。这是同步函数（只置标志 + 自增代次），调用方不需要
+    /// 放到 Task 里 —— 放进去反而让「采集是否停下」取决于调度器。
     func stop() {
+        genLock.lock()
+        _stopRequested = true
+        _workerGen &+= 1
+        genLock.unlock()
         running = false
-        _ = bumpWorkerGen()     // 让在跑的 worker 立刻退出
+        // 停掉看护，避免清理过程中还在判定停滞
+        supervisor?.cancel()
+        supervisor = nil
+    }
+
+    /// 当前 worker 是否仍应继续（代次未变且未请求停止）。
+    /// 借 genLock 建立内存屏障，避免 stop() 的写入对 worker 不可见。
+    private func stillCurrent(gen: Int) -> Bool {
+        genLock.lock(); defer { genLock.unlock() }
+        return _workerGen == gen && !_stopRequested
     }
 
     private func loop(index: Int, gen: Int) async {
-        while running && workerGen == gen {
+        while running && stillCurrent(gen: gen) {
             let t0 = CFAbsoluteTimeGetCurrent()
             do {
                 let content = try await currentContent()
@@ -1455,7 +1671,10 @@ final class ScreenshotCapture {
                 let now = CFAbsoluteTimeGetCurrent()
                 // 旧代次 worker 可能刚从一个长 await 里返回（单帧 60ms 甚至更久），
                 // 这里再确认一次代次/运行状态，避免逐个多发一帧干扰看护判断。
-                guard running && workerGen == gen else { return }
+                guard running && stillCurrent(gen: gen) else { return }
+                // 采集健康度计数：在 encode 之前自增，不含编码与排队时间。
+                // 看护用它判断采集本身是否正常，避免 VT 变慢时被误判成采集卡死。
+                bumpCapturedRaw()
                 let fw = CVPixelBufferGetWidth(pb)
                 let fh = CVPixelBufferGetHeight(pb)
                 let actualFmt = CVPixelBufferGetPixelFormatType(pb)
@@ -1469,6 +1688,7 @@ final class ScreenshotCapture {
                                         (actualFmt >> 24) & 0xFF, (actualFmt >> 16) & 0xFF,
                                         (actualFmt >> 8) & 0xFF, actualFmt & 0xFF)
                         let wantName = wantYUV ? "420v" : "BGRA"
+                        actualFormatCode = actualFmt   // 面板显示实测值，不显示配置值
                         Log.info("采集首帧实测: \(fw)x\(fh) fmt=\(f4) (期望 \(cfg.width)x\(cfg.height) \(wantName))")
                         if wantYUV && actualFmt != kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange
                             && actualFmt != kCVPixelFormatType_420YpCbCr8BiPlanarFullRange {
@@ -1487,7 +1707,9 @@ final class ScreenshotCapture {
                     if let h = Self.frameFingerprint(pb) {
                         if h == lastFrameHash {
                             if unchangedSince == 0 { unchangedSince = now }
-                            if now - unchangedSince > 8.0 && now - lastFreezeLogAt > 30.0 {
+                            // 静止桌面本来就会一直命中这里，5 分钟一条足够。
+                            // 原来 30 秒一条，挂机一整晚会多出上千行无用日志。
+                            if now - unchangedSince > 8.0 && now - lastFreezeLogAt > 300.0 {
                                 lastFreezeLogAt = now
                                 Log.info("提示: 采集内容已 \(Int(now - unchangedSince))s 无变化（帧仍以 \(Int(cfg.captureHz))fps 到达）。若 Windows 端画面也不动，说明源画面本身静止")
                             }
@@ -1592,14 +1814,15 @@ final class ScreenshotCapture {
         // 否则会继续用旧的 SCDisplay 绑定，抓到的是镜像源画面。
         if gCaptureRebuildRequested {
             gCaptureRebuildRequested = false
-            cachedContent = nil
-            cachedAt = 0
+            withRawLock { cachedContent = nil; cachedAt = 0 }
             Log.info("显示排列变化，刷新采集共享内容")
         }
-        if let c = cachedContent, now - cachedAt < 2.0 { return c }
+        // 缓存被 4 个 worker 并发访问。SCShareableContent 是类引用，
+        // 无同步的读写会撞上 retain/release，所以统一走 rawLock。
+        let (cached, cachedTime) = withRawLock { (cachedContent, cachedAt) }
+        if let c = cached, now - cachedTime < 2.0 { return c }
         let c = try await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: false)
-        cachedContent = c
-        cachedAt = now
+        withRawLock { cachedContent = c; cachedAt = now }
         return c
     }
 }
@@ -2634,6 +2857,8 @@ final class CursorImageTracker {
     init(sender: Sender) { self.sender = sender }
 
     func start() {
+        // 幂等：面板可以把开关关掉再打开，重复调用不能叠加定时器
+        guard timer == nil else { return }
         let t = DispatchSource.makeTimerSource(queue: queue)
         // 100ms 轮询足够跟上光标形状切换(箭头<->I型<->手型)，又不浪费 CPU
         t.schedule(deadline: .now(), repeating: .milliseconds(100), leeway: .milliseconds(20))
@@ -2773,6 +2998,11 @@ if presetName == nil, let rp = Bundle.main.resourcePath {
 /// 同样支持环境变量与 bundle 内资源文件两种来源 —— 从 Finder 启动的 .app
 /// 拿不到环境变量，没有这个文件的话省内存选项等于用户根本用不上。
 /// 写 Contents/Resources/pixfmt 内容为 420v 即可切换。
+///
+/// 注意 420v 的色域链路两端都没有锚点：本端采集侧设了 ITU-R 709，
+/// 但 VideoToolbox 不写 VUI 色彩描述，Windows 侧 D3D11 VideoProcessor
+/// 也没有显式 SetStreamColorSpace，最终用驱动默认矩阵。所以切到 420v
+/// 后如果发现偏色（发灰或偏青），属于已知问题，切回 bgra 即可。
 var pixelFormatChoice = ProcessInfo.processInfo.environment["SECDISPLAY_PIXFMT"]
 if pixelFormatChoice == nil, let rp = Bundle.main.resourcePath {
     let p = rp + "/pixfmt"
@@ -3175,7 +3405,7 @@ let rateCtl = RateController(encoder: encoder, targetMbps: cfg.bitrateMbps, capt
 
 // 帧率峰值跟踪：每秒采一次完整帧数，保留最近 10 秒的最大值。
 // 用户操作往往很短暂，只看 2 秒瞬时值容易错过。
-var fpsWindow: [(Double, Int)] = []
+var fpsWindow: [(Double, Double)] = []
 var lastCapCount = 0
 var lastCapTime = CFAbsoluteTimeGetCurrent()
 var peakFps: Double = 0
@@ -3190,9 +3420,11 @@ Timer.scheduledTimer(withTimeInterval: 1.0, repeats: true) { _ in
     lastCapCount = cap.captured
     lastCapTime = now
     let fps = Double(delta) / dt
-    fpsWindow.append((now, delta))
+    // 存真正的 fps 而不是「每个 tick 的帧数」：Timer 的间隔并不严格是 1 秒，
+    // 直接取帧数当 fps 会系统性偏高或偏低。
+    fpsWindow.append((now, fps))
     fpsWindow.removeAll { now - $0.0 > 10 }
-    peakFps = Double(fpsWindow.map { $0.1 }.max() ?? 0)
+    peakFps = fpsWindow.map { $0.1 }.max() ?? 0
 }
 
 // 统计
@@ -3228,8 +3460,10 @@ Timer.scheduledTimer(withTimeInterval: 2.0, repeats: true) { _ in
     lastCursorCount = cursor.sentCount
     let imgDelta = cursorImage.sentCount - lastCursorImageCount
     lastCursorImageCount = cursorImage.sentCount
-    Log.info(String(format: "采集 %d  峰值 %.0ffps  空闲 %d  静跳 %d  发送 %d  光标+%d  图像+%d  输入 %d  丢弃 %d  %.1f Mbps  在途 %d  采集延迟 %.1f  编码延迟 %.1f ms",
-                    cap.captured, peakFps, cap.idleFrameCount, cap.staticSkipCount, sender.sent, cursorDelta, imgDelta,
+    // 「空闲 / 静跳」两个计数只存在于未启用的 Capture 类里，恒为 0，
+    // 早就没有参考价值。换成采集异常计数，和面板那一行对应。
+    Log.info(String(format: "采集 %d  峰值 %.0ffps  异常 %d  发送 %d  光标+%d  图像+%d  输入 %d  丢弃 %d  %.1f Mbps  在途 %d  采集延迟 %.1f  编码延迟 %.1f ms",
+                    cap.captured, peakFps, cap.captureRestartCount, sender.sent, cursorDelta, imgDelta,
                     injector.eventCount, sender.dropped, mbps, sender.inFlight, capAvg, encAvg))
     cap.capLatSum = 0; cap.capLatCount = 0; cap.capLatMax = 0
     encoder.encLatSum = 0; encoder.encLatCount = 0; encoder.encLatMax = 0
@@ -3276,15 +3510,15 @@ func shutdown(signal sig: Int32) {
     shutdownLock.unlock()
 
     Log.info("收到信号 \(sig)，开始清理")
-    var stopped = false
-    Task {
-        cap.stop()
-        sender.conn?.cancel()
-        stopped = true
-    }
-    // 等采集停止，最多 5 秒（SCK 重建失败时 stopCapture 偶尔会很慢）
-    let stopDeadline = Date().addingTimeInterval(5.0)
-    while !stopped && Date() < stopDeadline {
+    // cap.stop() 是同步的（只置标志 + 自增代次 + 取消看护定时器），
+    // 直接调用即可。原来放进 Task 里等调度，若调度不到就会在采集仍在跑时
+    // 走到 vd.destroy()，destroy 被静默拒绝，留下孤儿虚拟屏。
+    cap.stop()
+    sender.conn?.cancel()
+    // 等采集停稳：worker 需要跑到下一次循环边界才会看到代次变化，
+    // 单帧采集约 60ms，给 1.5 秒足够；不再依赖跨线程的 stopped 标志。
+    let stopDeadline = Date().addingTimeInterval(1.5)
+    while Date() < stopDeadline {
         RunLoop.current.run(mode: .default, before: Date().addingTimeInterval(0.05))
     }
     // 采集停稳后再多等 1.2 秒，让 WindowServer 释放该虚拟屏的采集关联。
