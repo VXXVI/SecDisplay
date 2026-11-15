@@ -365,6 +365,12 @@ private:
             addr.sin_family = AF_INET;
             addr.sin_port = htons(port_);
             if (inet_pton(AF_INET, targetHost_.c_str(), &addr.sin_addr) != 1) {
+                ++connFailCount;
+                if (connFailCount == 1 || connFailCount % 30 == 0) {
+                    char msg[160];
+                    snprintf(msg, sizeof(msg), "WinHost: 无效目标 IP %s (仅支持 IPv4 地址)", targetHost_.c_str());
+                    EmitLog(msg);
+                }
                 closesocket(cs);
                 for (int i = 0; i < 20 && alive_.load(); ++i) Sleep(100);
                 continue;
@@ -383,9 +389,10 @@ private:
             if (sel <= 0 || FD_ISSET(cs, &efds) || soErr != 0) {
                 ++connFailCount;
                 if (connFailCount == 1 || connFailCount % 30 == 0) {
+                    int repErr = (sel == 0 && soErr == 0) ? WSAETIMEDOUT : (soErr ? soErr : WSAGetLastError());
                     char msg[160];
                     snprintf(msg, sizeof(msg), "WinHost: 连接 Mac 副屏 %s:%u 失败 (err=%d, 第%d次)",
-                             targetHost_.c_str(), port_, soErr ? soErr : WSAGetLastError(), connFailCount);
+                             targetHost_.c_str(), port_, repErr, connFailCount);
                     EmitLog(msg);
                 }
                 closesocket(cs);
@@ -1489,6 +1496,7 @@ private:
                             double encMs = (double)(t1.QuadPart - t0.QuadPart) * 1000.0 / (double)qpf.QuadPart;
                             stats_.lastEncMs = encMs;
                             stats_.framesEncoded++;
+                            staticIdrFailStreak = 0;
                             if (wantIdr && !isIdr) {
                                 forceKeyframe_.store(true);
                             }
