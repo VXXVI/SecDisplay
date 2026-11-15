@@ -91,7 +91,7 @@ public:
                 result = -3;
                 break;
             }
-            if (status & (DN_DRIVER_LOADED | DN_STARTED)) {
+            if ((status & DN_STARTED) && !(status & DN_HAS_PROBLEM)) {
                 if (outDesc) *outDesc = "Parsec VDD 就绪";
                 result = 0;
             } else if (status & DN_HAS_PROBLEM) {
@@ -143,6 +143,12 @@ public:
         }
 
         DWORD ver = IoControl(kIoctlVersion, nullptr, 0);
+        if (ver == (DWORD)-1) {
+            EmitLog("WinVDD: 读取驱动版本失败");
+            CloseHandle(handle_);
+            handle_ = INVALID_HANDLE_VALUE;
+            return false;
+        }
         {
             char msg[128];
             snprintf(msg, sizeof(msg), "WinVDD: 驱动已打开 version=0.%lu", ver);
@@ -235,11 +241,15 @@ public:
         if (keepAliveThread_.joinable()) keepAliveThread_.join();
 
         if (handle_ != INVALID_HANDLE_VALUE) {
-            if (vddIndex_ >= 0) {
+            if (vddIndex_ >= 0 && vddIndex_ <= 65535) {
                 UINT16 id16 = (UINT16)(((vddIndex_ & 0xFF) << 8) | ((vddIndex_ >> 8) & 0xFF));
-                IoControl(kIoctlRemove, &id16, sizeof(id16));
-                char msg[96];
-                snprintf(msg, sizeof(msg), "WinVDD: 已拔出虚拟显示器 index=%d", vddIndex_);
+                DWORD r = IoControl(kIoctlRemove, &id16, sizeof(id16));
+                char msg[128];
+                if (r == (DWORD)-1) {
+                    snprintf(msg, sizeof(msg), "WinVDD: 拔出虚拟显示器失败 index=%d", vddIndex_);
+                } else {
+                    snprintf(msg, sizeof(msg), "WinVDD: 已拔出虚拟显示器 index=%d", vddIndex_);
+                }
                 EmitLog(msg);
                 vddIndex_ = -1;
             }
@@ -283,9 +293,9 @@ public:
         if (b.deviceName.empty()) return false;
 
         Microsoft::WRL::ComPtr<IDXGIAdapter1> ad;
-        for (UINT ai = 0; fac->EnumAdapters1(ai, &ad) != DXGI_ERROR_NOT_FOUND; ++ai) {
+        for (UINT ai = 0; SUCCEEDED(fac->EnumAdapters1(ai, &ad)); ++ai) {
             Microsoft::WRL::ComPtr<IDXGIOutput> out;
-            for (UINT oi = 0; ad->EnumOutputs(oi, &out) != DXGI_ERROR_NOT_FOUND; ++oi) {
+            for (UINT oi = 0; SUCCEEDED(ad->EnumOutputs(oi, &out)); ++oi) {
                 DXGI_OUTPUT_DESC od{};
                 if (SUCCEEDED(out->GetDesc(&od)) && od.AttachedToDesktop) {
                     if (_wcsicmp(od.DeviceName, b.deviceName.c_str()) == 0) {
@@ -367,7 +377,7 @@ private:
         }
         if (!GetOverlappedResultEx(handle_, &ov, &xfer, 5000, FALSE)) {
             CancelIoEx(handle_, &ov);
-            GetOverlappedResult(handle_, &ov, &xfer, TRUE);
+            GetOverlappedResultEx(handle_, &ov, &xfer, 1000, FALSE);
             CloseHandle(ov.hEvent);
             return (DWORD)-1;
         }
@@ -437,8 +447,9 @@ private:
     }
 
     void ApplyDisplayMode(const std::wstring& devName, int w, int h, int hz) {
-        // 找主屏右边沿，把虚拟屏放到主屏右侧
-        LONG rightEdge = 0;
+        // 找其它已挂载屏幕的最右边沿，把虚拟屏放到主屏右侧
+        bool foundOther = false;
+        LONG rightEdge = LONG_MIN;
         for (DWORD i = 0; ; ++i) {
             DISPLAY_DEVICEW dd{}; dd.cb = sizeof(dd);
             if (!EnumDisplayDevicesW(nullptr, i, &dd, 0)) break;
@@ -447,10 +458,13 @@ private:
             DEVMODEW dm{}; dm.dmSize = sizeof(dm);
             if (EnumDisplaySettingsW(dd.DeviceName, ENUM_CURRENT_SETTINGS, &dm)) {
                 LONG r = dm.dmPosition.x + (LONG)dm.dmPelsWidth;
-                if (r > rightEdge) rightEdge = r;
+                if (!foundOther || r > rightEdge) {
+                    rightEdge = r;
+                    foundOther = true;
+                }
             }
         }
-        if (rightEdge <= 0) rightEdge = 2880;
+        if (!foundOther) rightEdge = 2880;
 
         auto tryMode = [&](DWORD reqW, DWORD reqH, DWORD reqHz) -> bool {
             DEVMODEW dm{}; dm.dmSize = sizeof(dm);
@@ -473,7 +487,9 @@ private:
             EmitLog("WinVDD: 目标分辨率不受支持，已回落 2560x1600@60");
             return;
         }
-        tryMode(1920, 1200, 60);
+        if (!tryMode(1920, 1200, 60)) {
+            EmitLog("WinVDD: 回落 1920x1200@60 也失败，保持驱动当前默认模式");
+        }
     }
 
     static bool ReadCurrentBounds(const std::wstring& devName, WinVddBounds* out) {

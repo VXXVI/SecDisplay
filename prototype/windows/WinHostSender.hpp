@@ -95,11 +95,11 @@ public:
         if (bitrateMbps < 10) bitrateMbps = 10;
         if (bitrateMbps > 200) bitrateMbps = 200;
         targetMbps_ = bitrateMbps;
-        curMbps_ = bitrateMbps;
+        curMbps_.store(bitrateMbps);
         port_ = port > 0 ? port : 9922;
 
         stats_.targetBitrateMbps = targetMbps_;
-        stats_.bitrateMbps = curMbps_;
+        stats_.bitrateMbps = bitrateMbps;
         stats_.fps = reqFps_;
 
         if (!vdd_.Start(reqW_, reqH_, reqFps_, logFn_)) {
@@ -111,6 +111,37 @@ public:
         stats_.height = b.height;
         stats_.fps = b.hz > 0 ? b.hz : reqFps_;
 
+        // 同步绑定并监听端口，端口冲突时立即失败回滚 VDD
+        SOCKET ls = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+        if (ls == INVALID_SOCKET) {
+            EmitLog("WinHost: 创建监听 socket 失败");
+            vdd_.Stop();
+            return false;
+        }
+        int reuse = 1;
+        setsockopt(ls, SOL_SOCKET, SO_REUSEADDR, (const char*)&reuse, sizeof(reuse));
+        sockaddr_in addr{};
+        addr.sin_family = AF_INET;
+        addr.sin_addr.s_addr = INADDR_ANY;
+        addr.sin_port = htons(port_);
+        if (bind(ls, (sockaddr*)&addr, sizeof(addr)) != 0 || listen(ls, 2) != 0) {
+            char msg[128];
+            snprintf(msg, sizeof(msg), "WinHost: 绑定/监听端口 %u 失败 err=%d", port_, WSAGetLastError());
+            EmitLog(msg);
+            closesocket(ls);
+            vdd_.Stop();
+            return false;
+        }
+        {
+            std::lock_guard<std::mutex> lk(sockMtx_);
+            listenSock_ = ls;
+        }
+        {
+            char msg[96];
+            snprintf(msg, sizeof(msg), "WinHost: 已监听端口 %u，等待 Mac 副屏连接", port_);
+            EmitLog(msg);
+        }
+
         alive_.store(true);
         acceptThread_ = std::thread(&WinHostSender::AcceptLoop, this);
         captureThread_ = std::thread(&WinHostSender::CaptureEncodeLoop, this);
@@ -120,17 +151,21 @@ public:
 
     void Stop() {
         alive_.store(false);
-        // 防止在 AcceptLoop select 期间从外部关闭 listenSock_ 引发未定义行为：
-        // AcceptLoop 每 250ms 醒来检查 alive_，先 join 线程再统一关闭句柄。
+        // 先 shutdown 唤醒阻塞中的 send/recv，再按 sendMtx_ -> sockMtx_ 顺序关闭 clientSock_，
+        // 避免 SendRawPacket 仍在 send(s) 时句柄被关闭复用；listenSock_ 等 acceptThread_ join 后关闭。
         SOCKET oldClient = INVALID_SOCKET;
         {
             std::lock_guard<std::mutex> lk(sockMtx_);
             oldClient = clientSock_;
-            clientSock_ = INVALID_SOCKET;
         }
-        if (oldClient != INVALID_SOCKET) {
-            shutdown(oldClient, SD_BOTH);
-            closesocket(oldClient);
+        if (oldClient != INVALID_SOCKET) shutdown(oldClient, SD_BOTH);
+        {
+            std::lock_guard<std::mutex> slk(sendMtx_);
+            std::lock_guard<std::mutex> lk(sockMtx_);
+            if (clientSock_ != INVALID_SOCKET) {
+                closesocket(clientSock_);
+                clientSock_ = INVALID_SOCKET;
+            }
         }
         stats_.clientConnected = false;
 
@@ -174,7 +209,7 @@ private:
     int reqH_ = 1600;
     int reqFps_ = 60;
     int targetMbps_ = 80;
-    int curMbps_ = 80;
+    std::atomic<int> curMbps_{80};
     uint16_t port_ = 9922;
 
     std::atomic<bool> alive_{false};
@@ -254,7 +289,7 @@ private:
             } else {
                 int err = WSAGetLastError();
                 if (err == WSAEINTR) continue;
-                DisconnectClient(s);
+                CloseClientUnderSendLock(s);
                 return false;
             }
         }
@@ -265,7 +300,8 @@ private:
         return false;
     }
 
-    void DisconnectClient(SOCKET expected) {
+    // 调用方已持有 sendMtx_
+    void CloseClientUnderSendLock(SOCKET expected) {
         std::lock_guard<std::mutex> lk(sockMtx_);
         if (clientSock_ == expected && expected != INVALID_SOCKET) {
             shutdown(clientSock_, SD_BOTH);
@@ -275,6 +311,13 @@ private:
             std::lock_guard<std::mutex> ilk(stats_.infoMtx);
             stats_.peerAddr = "--";
         }
+    }
+
+    void DisconnectClient(SOCKET expected) {
+        if (expected == INVALID_SOCKET) return;
+        shutdown(expected, SD_BOTH);
+        std::lock_guard<std::mutex> slk(sendMtx_);
+        CloseClientUnderSendLock(expected);
     }
 
     void SendSessionHeader(int w, int h, int fps) {
@@ -344,33 +387,12 @@ private:
 
     // ---- TCP 服务端接收与控制回传 ----
     void AcceptLoop() {
-        SOCKET ls = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
-        if (ls == INVALID_SOCKET) {
-            EmitLog("WinHost: 创建监听 socket 失败");
-            return;
-        }
-        int reuse = 1;
-        setsockopt(ls, SOL_SOCKET, SO_REUSEADDR, (const char*)&reuse, sizeof(reuse));
-        sockaddr_in addr{};
-        addr.sin_family = AF_INET;
-        addr.sin_addr.s_addr = INADDR_ANY;
-        addr.sin_port = htons(port_);
-        if (bind(ls, (sockaddr*)&addr, sizeof(addr)) != 0 || listen(ls, 2) != 0) {
-            char msg[128];
-            snprintf(msg, sizeof(msg), "WinHost: 绑定/监听端口 %u 失败 err=%d", port_, WSAGetLastError());
-            EmitLog(msg);
-            closesocket(ls);
-            return;
-        }
+        SOCKET ls = INVALID_SOCKET;
         {
             std::lock_guard<std::mutex> lk(sockMtx_);
-            listenSock_ = ls;
+            ls = listenSock_;
         }
-        {
-            char msg[96];
-            snprintf(msg, sizeof(msg), "WinHost: 已监听端口 %u，等待 Mac 副屏连接", port_);
-            EmitLog(msg);
-        }
+        if (ls == INVALID_SOCKET) return;
 
         while (alive_.load()) {
             fd_set rfds;
@@ -399,17 +421,23 @@ private:
             inet_ntop(AF_INET, &cliAddr.sin_addr, ipStr, sizeof(ipStr));
             std::string peer = std::string(ipStr) + ":" + std::to_string(ntohs(cliAddr.sin_port));
 
-            SOCKET oldSock = INVALID_SOCKET;
-            uint64_t epoch = 0;
+            SOCKET prevSock = INVALID_SOCKET;
             {
                 std::lock_guard<std::mutex> lk(sockMtx_);
-                oldSock = clientSock_;
+                prevSock = clientSock_;
+            }
+            if (prevSock != INVALID_SOCKET) shutdown(prevSock, SD_BOTH);
+
+            uint64_t epoch = 0;
+            {
+                std::lock_guard<std::mutex> slk(sendMtx_);
+                std::lock_guard<std::mutex> lk(sockMtx_);
+                SOCKET oldSock = clientSock_;
                 clientSock_ = cs;
                 epoch = ++connEpoch_;
-            }
-            if (oldSock != INVALID_SOCKET) {
-                shutdown(oldSock, SD_BOTH);
-                closesocket(oldSock);
+                if (oldSock != INVALID_SOCKET) {
+                    closesocket(oldSock);
+                }
             }
             {
                 std::lock_guard<std::mutex> ilk(stats_.infoMtx);
@@ -506,14 +534,14 @@ private:
 
     void AdjustAdaptiveBitrate(uint16_t presentP95, uint16_t sourceP95,
                                uint16_t presDrop, uint16_t pacedDrop) {
-        int cur = curMbps_;
+        int cur = curMbps_.load();
         int minMbps = std::max(15, targetMbps_ / 3);
         if (presDrop > 2 || pacedDrop > 2 || (presentP95 > sourceP95 + 25 && presentP95 > 45)) {
             cur = std::max(minMbps, (int)(cur * 0.78));
         } else if (presDrop == 0 && pacedDrop == 0 && cur < targetMbps_) {
             cur = std::min(targetMbps_, cur + std::max(2, targetMbps_ / 15));
         }
-        curMbps_ = cur;
+        curMbps_.store(cur);
         stats_.bitrateMbps = cur;
     }
 
@@ -664,17 +692,21 @@ private:
         bmi.bmiHeader.biCompression = BI_RGB;
 
         std::vector<uint8_t> pixels((size_t)w * (size_t)h * 4, 0);
+        bool dibOk = false;
         if (ii.hbmColor) {
-            GetDIBits(hdc, ii.hbmColor, 0, (UINT)h, pixels.data(), &bmi, DIB_RGB_COLORS);
-            bool hasAlpha = false;
-            for (size_t i = 3; i < pixels.size(); i += 4) {
-                if (pixels[i] != 0) { hasAlpha = true; break; }
-            }
-            if (!hasAlpha && ii.hbmMask) {
-                std::vector<uint8_t> mask((size_t)w * (size_t)h * 4, 0);
-                GetDIBits(hdc, ii.hbmMask, 0, (UINT)h, mask.data(), &bmi, DIB_RGB_COLORS);
-                for (size_t i = 0; i < pixels.size(); i += 4) {
-                    pixels[i + 3] = (mask[i] == 0) ? 255 : 0;
+            if (GetDIBits(hdc, ii.hbmColor, 0, (UINT)h, pixels.data(), &bmi, DIB_RGB_COLORS) > 0) {
+                dibOk = true;
+                bool hasAlpha = false;
+                for (size_t i = 3; i < pixels.size(); i += 4) {
+                    if (pixels[i] != 0) { hasAlpha = true; break; }
+                }
+                if (!hasAlpha && ii.hbmMask) {
+                    std::vector<uint8_t> mask((size_t)w * (size_t)h * 4, 0);
+                    if (GetDIBits(hdc, ii.hbmMask, 0, (UINT)h, mask.data(), &bmi, DIB_RGB_COLORS) > 0) {
+                        for (size_t i = 0; i < pixels.size(); i += 4) {
+                            pixels[i + 3] = (mask[i] == 0) ? 255 : 0;
+                        }
+                    }
                 }
             }
         } else if (ii.hbmMask) {
@@ -682,19 +714,21 @@ private:
             BITMAPINFO mbmi = bmi;
             mbmi.bmiHeader.biHeight = -(h * 2);
             std::vector<uint8_t> full((size_t)w * (size_t)h * 2 * 4, 0);
-            GetDIBits(hdc, ii.hbmMask, 0, (UINT)(h * 2), full.data(), &mbmi, DIB_RGB_COLORS);
-            size_t half = (size_t)w * (size_t)h * 4;
-            for (size_t i = 0; i < half; i += 4) {
-                uint8_t andB = full[i];
-                uint8_t xorB = full[half + i];
-                if (andB == 0) {
-                    uint8_t v = xorB ? 255 : 0;
-                    pixels[i] = v; pixels[i + 1] = v; pixels[i + 2] = v; pixels[i + 3] = 255;
-                } else if (xorB != 0) {
-                    // 反色像素（I 型光标常见）：用白描边黑/半透白示意
-                    pixels[i] = 20; pixels[i + 1] = 20; pixels[i + 2] = 20; pixels[i + 3] = 220;
-                } else {
-                    pixels[i] = pixels[i + 1] = pixels[i + 2] = pixels[i + 3] = 0;
+            if (GetDIBits(hdc, ii.hbmMask, 0, (UINT)(h * 2), full.data(), &mbmi, DIB_RGB_COLORS) > 0) {
+                dibOk = true;
+                size_t half = (size_t)w * (size_t)h * 4;
+                for (size_t i = 0; i < half; i += 4) {
+                    uint8_t andB = full[i];
+                    uint8_t xorB = full[half + i];
+                    if (andB == 0) {
+                        uint8_t v = xorB ? 255 : 0;
+                        pixels[i] = v; pixels[i + 1] = v; pixels[i + 2] = v; pixels[i + 3] = 255;
+                    } else if (xorB != 0) {
+                        // 反色像素（I 型光标常见）：用白描边黑/半透白示意
+                        pixels[i] = 20; pixels[i + 1] = 20; pixels[i + 2] = 20; pixels[i + 3] = 220;
+                    } else {
+                        pixels[i] = pixels[i + 1] = pixels[i + 2] = pixels[i + 3] = 0;
+                    }
                 }
             }
         }
@@ -702,6 +736,7 @@ private:
         DeleteDC(hdc);
         if (ii.hbmColor) DeleteObject(ii.hbmColor);
         if (ii.hbmMask) DeleteObject(ii.hbmMask);
+        if (!dibOk) return false;
 
         *outW = w;
         *outH = h;
@@ -736,9 +771,8 @@ private:
             out.insert(out.end(), nal, nal + len);
         }
 
-        bool Convert(const uint8_t* annexb, size_t size, std::vector<uint8_t>& outAvcc, bool* outIsIdr) {
-            outAvcc.clear();
-            if (outIsIdr) *outIsIdr = false;
+        // 追加转换一个 Annex-B 样本到 outAvcc（不清空已有数据，支持多输出 AU 拼接）
+        bool ConvertAppend(const uint8_t* annexb, size_t size, std::vector<uint8_t>& outAvcc, bool* outIsIdr) {
             if (!annexb || size < 4) return false;
 
             std::vector<std::pair<const uint8_t*, size_t>> nals;
@@ -751,11 +785,6 @@ private:
                 size_t nextScLen = 0;
                 size_t nextPos = FindStartCode(annexb, size, nalStart, &nextScLen);
                 size_t nalLen = nextPos - nalStart;
-                // 去掉尾随零字节填充
-                while (nalLen > 0 && annexb[nalStart + nalLen - 1] == 0) {
-                    // 仅去 Annex-B 对齐零？不破坏正常 RBSP 尾字节，保留原长
-                    break;
-                }
                 if (nalLen > 0) nals.emplace_back(annexb + nalStart, nalLen);
                 pos = nextPos;
                 scLen = nextScLen;
@@ -768,20 +797,20 @@ private:
                 else if (nt == 8) { pps.assign(pr.first, pr.first + pr.second); hasPps = true; }
                 else if (nt == 5) { isIdr = true; }
             }
-            if (outIsIdr) *outIsIdr = isIdr;
+            if (isIdr && outIsIdr) *outIsIdr = true;
 
             if (isIdr && !hasSps && !sps.empty() && !pps.empty()) {
                 AppendAvccNal(outAvcc, sps.data(), sps.size());
                 AppendAvccNal(outAvcc, pps.data(), pps.size());
             } else if (isIdr && !hasPps && !pps.empty() && hasSps) {
-                // sps 在流里，pps 补一份
                 AppendAvccNal(outAvcc, pps.data(), pps.size());
             }
 
+            const size_t before = outAvcc.size();
             for (auto& pr : nals) {
                 AppendAvccNal(outAvcc, pr.first, pr.second);
             }
-            return !outAvcc.empty();
+            return outAvcc.size() > before;
         }
     };
 
@@ -881,6 +910,7 @@ private:
                                    MFT_ENUM_FLAG_SYNCMFT | MFT_ENUM_FLAG_SORTANDFILTER,
                                    nullptr, &outInfo, &acts, &cnt);
             if (FAILED(hr) || cnt == 0) {
+                if (acts) CoTaskMemFree(acts);
                 if (logFn) logFn("WinHost: 未找到 H.264 编码器");
                 return false;
             }
@@ -1056,13 +1086,18 @@ private:
             D3D11_MAPPED_SUBRESOURCE mapped{};
             if (FAILED(ctx->Map(stagingBgra.Get(), 0, D3D11_MAP_READ, 0, &mapped))) return false;
 
-            DWORD nv12Size = (DWORD)(w * h * 3 / 2);
-            if (FAILED(MFCreateMemoryBuffer(nv12Size, &outBuf))) {
+            size_t uvW = (size_t)((w + 1) & ~1);
+            size_t uvH = (size_t)((h + 1) / 2);
+            DWORD nv12Size = (DWORD)((size_t)w * (size_t)h + uvW * uvH);
+            if (FAILED(MFCreateMemoryBuffer(nv12Size, &outBuf)) || !outBuf) {
                 ctx->Unmap(stagingBgra.Get(), 0);
                 return false;
             }
             BYTE* dst = nullptr;
-            outBuf->Lock(&dst, nullptr, nullptr);
+            if (FAILED(outBuf->Lock(&dst, nullptr, nullptr)) || !dst) {
+                ctx->Unmap(stagingBgra.Get(), 0);
+                return false;
+            }
             uint8_t* yPlane = dst;
             uint8_t* uvPlane = dst + (size_t)w * (size_t)h;
             for (int y = 0; y < h; ++y) {
@@ -1074,10 +1109,10 @@ private:
                     int r = row[x * 4 + 2];
                     int Y = ((47 * r + 157 * g + 16 * b + 128) >> 8) + 16;
                     yRow[x] = (uint8_t)std::clamp(Y, 16, 235);
-                    if ((y & 1) == 0 && (x & 1) == 0) {
+                    if ((y & 1) == 0 && (x & 1) == 0 && (size_t)x + 1 < uvW) {
                         int U = ((-26 * r - 87 * g + 112 * b + 128) >> 8) + 128;
                         int V = ((112 * r - 102 * g - 10 * b + 128) >> 8) + 128;
-                        size_t uvIdx = (size_t)(y / 2) * (size_t)w + (size_t)x;
+                        size_t uvIdx = (size_t)(y / 2) * uvW + (size_t)x;
                         uvPlane[uvIdx + 0] = (uint8_t)std::clamp(U, 16, 240);
                         uvPlane[uvIdx + 1] = (uint8_t)std::clamp(V, 16, 240);
                     }
@@ -1124,7 +1159,7 @@ private:
                 BYTE* p = nullptr;
                 DWORD len = 0;
                 if (SUCCEEDED(buf->Lock(&p, nullptr, &len)) && p && len > 0) {
-                    ok = avccConv.Convert(p, len, outAvcc, outIsIdr);
+                    ok = avccConv.ConvertAppend(p, len, outAvcc, outIsIdr);
                     buf->Unlock();
                 }
             }
@@ -1132,17 +1167,20 @@ private:
             return ok;
         }
 
-        bool EncodeTexture(ID3D11Texture2D* bgraTex, bool forceIdr, const std::atomic<bool>& aliveFlag, std::vector<uint8_t>& outAvcc, bool* outIsIdr) {
+        bool EncodeTexture(ID3D11Texture2D* bgraTex, bool forceIdr, const std::atomic<bool>& aliveFlag,
+                           std::vector<uint8_t>& outAvcc, bool* outIsIdr, LogFn* logFn = nullptr) {
             outAvcc.clear();
+            if (outIsIdr) *outIsIdr = false;
             if (!mft) return false;
 
             if (isAsync && evtGen) {
-                // 先排空挂起的事件，更新 needInput
-                for (int k = 0; k < 16 && needInput == 0; ++k) {
+                // 非阻塞排空挂起事件（最长 ~80ms），严禁阻塞 GetEvent(0) 防止 Stop() 死锁；
+                // 期间吐出的遗留 AU 直接并入 outAvcc，避免丢 P 帧引起花屏。
+                for (int k = 0; k < 80 && needInput == 0 && aliveFlag.load(); ++k) {
                     Microsoft::WRL::ComPtr<IMFMediaEvent> ev;
-                    HRESULT ehr = evtGen->GetEvent(k < 2 ? MF_EVENT_FLAG_NO_WAIT : 0, &ev);
+                    HRESULT ehr = evtGen->GetEvent(MF_EVENT_FLAG_NO_WAIT, &ev);
                     if (ehr == MF_E_NO_EVENTS_AVAILABLE) {
-                        if (k >= 2) break;
+                        Sleep(1);
                         continue;
                     }
                     if (FAILED(ehr) || !ev) break;
@@ -1150,32 +1188,35 @@ private:
                     ev->GetType(&met);
                     if (met == METransformNeedInput) ++needInput;
                     else if (met == METransformHaveOutput) {
-                        std::vector<uint8_t> tmp;
-                        bool tmpIdr = false;
-                        DrainOneOutput(tmp, &tmpIdr);
+                        DrainOneOutput(outAvcc, outIsIdr);
                     }
                 }
-                if (needInput <= 0) return false;
+                if (needInput <= 0) return !outAvcc.empty();
             }
 
             Microsoft::WRL::ComPtr<IMFSample> inSample;
             MFCreateSample(&inSample);
-            if (isHardware) {
-                if (!ConvertBgraToNv12(bgraTex)) return false;
+            bool usedGpuSurface = false;
+            if (isHardware && ConvertBgraToNv12(bgraTex)) {
                 Microsoft::WRL::ComPtr<IMFMediaBuffer> buf;
-                if (FAILED(MFCreateDXGISurfaceBuffer(__uuidof(ID3D11Texture2D), nv12Tex.Get(), 0, FALSE, &buf))) {
-                    return false;
+                if (SUCCEEDED(MFCreateDXGISurfaceBuffer(__uuidof(ID3D11Texture2D), nv12Tex.Get(), 0, FALSE, &buf))) {
+                    Microsoft::WRL::ComPtr<IMF2DBuffer> b2d;
+                    if (SUCCEEDED(buf.As(&b2d))) {
+                        DWORD clen = 0;
+                        b2d->GetContiguousLength(&clen);
+                        buf->SetCurrentLength(clen);
+                    }
+                    inSample->AddBuffer(buf.Get());
+                    usedGpuSurface = true;
                 }
-                Microsoft::WRL::ComPtr<IMF2DBuffer> b2d;
-                if (SUCCEEDED(buf.As(&b2d))) {
-                    DWORD clen = 0;
-                    b2d->GetContiguousLength(&clen);
-                    buf->SetCurrentLength(clen);
+            }
+            if (!usedGpuSurface) {
+                if (isHardware && logFn && *logFn) {
+                    (*logFn)("WinHost: GPU BGRA->NV12 转换不可用，回落 CPU NV12");
+                    isHardware = false;
                 }
-                inSample->AddBuffer(buf.Get());
-            } else {
                 Microsoft::WRL::ComPtr<IMFMediaBuffer> buf;
-                if (!BuildCpuNv12Buffer(bgraTex, buf)) return false;
+                if (!BuildCpuNv12Buffer(bgraTex, buf)) return !outAvcc.empty();
                 inSample->AddBuffer(buf.Get());
             }
 
@@ -1192,7 +1233,7 @@ private:
                 codecApi->SetValue(&CODECAPI_AVEncVideoForceKeyFrame, &vb);
             }
 
-            if (FAILED(mft->ProcessInput(0, inSample.Get(), 0))) return false;
+            if (FAILED(mft->ProcessInput(0, inSample.Get(), 0))) return !outAvcc.empty();
             if (isAsync) --needInput;
 
             if (isAsync && evtGen) {
@@ -1200,6 +1241,7 @@ private:
                     Microsoft::WRL::ComPtr<IMFMediaEvent> ev;
                     HRESULT ehr = evtGen->GetEvent(MF_EVENT_FLAG_NO_WAIT, &ev);
                     if (ehr == MF_E_NO_EVENTS_AVAILABLE) {
+                        if (!outAvcc.empty()) return true;
                         Sleep(1);
                         continue;
                     }
@@ -1209,19 +1251,17 @@ private:
                     if (met == METransformNeedInput) {
                         ++needInput;
                         if (tries > 6 && needInput > 0) {
-                            // 编码器需要下一帧才能吐出首包（B/P 预热），先返回让采集继续喂下一帧
-                            return false;
+                            return !outAvcc.empty();
                         }
                     } else if (met == METransformHaveOutput) {
-                        if (DrainOneOutput(outAvcc, outIsIdr) && !outAvcc.empty()) {
-                            return true;
-                        }
+                        DrainOneOutput(outAvcc, outIsIdr);
                     }
                 }
-                return false;
+                return !outAvcc.empty();
             }
 
-            return DrainOneOutput(outAvcc, outIsIdr);
+            DrainOneOutput(outAvcc, outIsIdr);
+            return !outAvcc.empty();
         }
     };
 
@@ -1273,7 +1313,7 @@ private:
             stats_.fps = encFps;
 
             MfH264Encoder enc;
-            if (!enc.Init(dev.Get(), ctx.Get(), capW, capH, encFps, curMbps_, logFn_)) {
+            if (!enc.Init(dev.Get(), ctx.Get(), capW, capH, encFps, curMbps_.load(), logFn_)) {
                 Sleep(1000);
                 continue;
             }
@@ -1291,7 +1331,7 @@ private:
             bool firstFrame = true;
 
             while (alive_.load()) {
-                enc.UpdateBitrateIfChanged(curMbps_);
+                enc.UpdateBitrateIfChanged(curMbps_.load());
 
                 DXGI_OUTDUPL_FRAME_INFO fi{};
                 Microsoft::WRL::ComPtr<IDXGIResource> res;
@@ -1345,7 +1385,7 @@ private:
                     bool wantIdr = forceKeyframe_.exchange(false);
                     std::vector<uint8_t> avcc;
                     bool isIdr = false;
-                    if (enc.EncodeTexture(tex.Get(), wantIdr, alive_, avcc, &isIdr) && !avcc.empty()) {
+                    if (enc.EncodeTexture(tex.Get(), wantIdr, alive_, avcc, &isIdr, &logFn_) && !avcc.empty()) {
                         QueryPerformanceCounter(&t1);
                         double encMs = (double)(t1.QuadPart - t0.QuadPart) * 1000.0 / (double)qpf.QuadPart;
                         stats_.lastEncMs = encMs;
