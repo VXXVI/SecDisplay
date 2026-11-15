@@ -2709,11 +2709,18 @@ final class FileTransferService {
     private var activeRecvs: [UInt32: RecvFile] = [:]
 
     private var nextTransferId: UInt32 = 1
+    private var activeEpoch = 0
     private var outQueue: [URL] = []
     private var isSending = false
     private var activeStatus = "等待接收端"
     private var recentHistory: [String] = []
     private var keepAliveTimer: DispatchSourceTimer?
+
+    private enum SendOutcome {
+        case sent
+        case localFailed
+        case connLost
+    }
 
     init() {
         let fm = FileManager.default
@@ -2869,6 +2876,7 @@ final class FileTransferService {
 
         stateLock.lock()
         _connected = true
+        activeEpoch = epoch
         activeStatus = "已连接（端口 \(listenPort)）· 可拖入文件直传"
         stateLock.unlock()
         notifyUI()
@@ -2940,6 +2948,7 @@ final class FileTransferService {
                 }
             }
             if isEOF || err != nil {
+                c.cancel()
                 self.onDisconnected()
                 return
             }
@@ -2978,16 +2987,17 @@ final class FileTransferService {
             guard payload.count >= 14 + nameLen else { return }
             let rawName = String(data: payload[14..<(14 + nameLen)], encoding: .utf8) ?? "file_\(id)"
             let safe = sanitizeFilename(rawName, fallbackId: id)
+            // 先清旧记录再建新临时文件，避免同 ID 重传误删刚打开的新句柄
+            if let prev = activeRecvs.removeValue(forKey: id) {
+                try? prev.handle.close()
+                try? FileManager.default.removeItem(at: prev.partURL)
+            }
             let partURL = inboxURL.appendingPathComponent(".secdisplay_tmp_\(id).part")
             FileManager.default.createFile(atPath: partURL.path, contents: nil)
             guard let h = try? FileHandle(forWritingTo: partURL) else {
                 Log.info("中转站创建临时文件失败: \(partURL.path)")
                 sendAck(id: id, ok: false)
                 return
-            }
-            if let prev = activeRecvs.removeValue(forKey: id) {
-                try? prev.handle.close()
-                try? FileManager.default.removeItem(at: prev.partURL)
             }
             activeRecvs[id] = RecvFile(id: id, safeName: safe, expectedSize: size,
                                        receivedSize: 0, partURL: partURL, handle: h,
@@ -3100,27 +3110,32 @@ final class FileTransferService {
             let tid = nextTransferId
             stateLock.unlock()
 
-            if !sendSingleFile(url: url, id: tid) {
-                // 断线失败时把当前文件塞回队头等待重连
+            switch sendSingleFile(url: url, id: tid) {
+            case .sent, .localFailed:
+                continue
+            case .connLost:
+                // 连接断开或已切换为新连接：重入队头；若已有新连接在线直接续发，不丢队
                 stateLock.lock()
-                if !_connected && !stopped {
+                if !stopped {
                     outQueue.insert(url, at: 0)
                 }
-                isSending = false
+                let canContinue = _connected && !stopped
+                if !canContinue { isSending = false }
                 stateLock.unlock()
+                if canContinue { continue }
                 notifyUI()
                 return
             }
         }
     }
 
-    private func sendSingleFile(url: URL, id: UInt32) -> Bool {
+    private func sendSingleFile(url: URL, id: UInt32) -> SendOutcome {
         guard let attrs = try? FileManager.default.attributesOfItem(atPath: url.path),
               let fileSize = (attrs[.size] as? NSNumber)?.uint64Value,
               let fh = try? FileHandle(forReadingFrom: url) else {
             Log.info("中转站无法读取文件: \(url.path)")
             updateStatus("读取失败: \(url.lastPathComponent)")
-            return true   // 跳过损坏文件，不阻塞后续队列
+            return .localFailed
         }
         defer { try? fh.close() }
 
@@ -3130,7 +3145,7 @@ final class FileTransferService {
             activeConn = self.conn
             epochSnap = self.connEpoch
         }
-        guard let c = activeConn else { return false }
+        guard let c = activeConn else { return .connLost }
 
         let nameData = Data(url.lastPathComponent.utf8.prefix(4096))
         var beginFrame = Data(capacity: 5 + 14 + nameData.count)
@@ -3149,13 +3164,17 @@ final class FileTransferService {
         updateStatus("发送中: \(fname) (0%)")
         Log.info("中转站开始发送 #\(id): \(fname) (\(fmtBytes(fileSize)))")
 
+        func connAlive() -> Bool {
+            stateLock.lock()
+            let ok = !stopped && _connected && activeEpoch == epochSnap
+            stateLock.unlock()
+            return ok
+        }
+
         func sendFrame(_ data: Data) -> Bool {
             cond.lock()
             while inFlight >= 4 && !sendFailed {
-                stateLock.lock()
-                let alive = !stopped && _connected
-                stateLock.unlock()
-                if !alive { sendFailed = true; break }
+                if !connAlive() { sendFailed = true; break }
                 cond.wait(until: Date().addingTimeInterval(0.2))
             }
             if sendFailed {
@@ -3179,22 +3198,21 @@ final class FileTransferService {
             return true
         }
 
-        if !sendFrame(beginFrame) { return false }
+        if !sendFrame(beginFrame) { return .connLost }
 
         var sentBytes: UInt64 = 0
+        var readErr = false
         var lastUiAt = CFAbsoluteTimeGetCurrent()
         let chunkCap = 262_144
         while true {
-            stateLock.lock()
-            let stillOk = !stopped && _connected
-            stateLock.unlock()
-            if !stillOk || sendFailed { break }
+            if !connAlive() || sendFailed { break }
 
             let chunk: Data
             do {
                 chunk = try fh.read(upToCount: chunkCap) ?? Data()
             } catch {
                 Log.info("中转站读文件失败: \(error)")
+                readErr = true
                 break
             }
             if chunk.isEmpty { break }
@@ -3218,7 +3236,13 @@ final class FileTransferService {
             }
         }
 
-        let complete = (sentBytes == fileSize) && !sendFailed
+        let complete = !readErr && !sendFailed && connAlive() && (sentBytes == fileSize)
+        if !connAlive() || sendFailed {
+            // 连接已断，不再尝试发 endFrame
+            updateStatus("发送中断: \(fname)")
+            return .connLost
+        }
+
         var endFrame = Data(capacity: 10)
         endFrame.append(Self.typeEnd)
         appendU32(&endFrame, 5)
@@ -3229,12 +3253,11 @@ final class FileTransferService {
         // 等所有在途包落网，确认发送完整再记账
         cond.lock()
         let waitUntil = Date().addingTimeInterval(5.0)
-        while inFlight > 0 && !sendFailed && Date() < waitUntil {
+        while inFlight > 0 && !sendFailed && connAlive() && Date() < waitUntil {
             cond.wait(until: Date().addingTimeInterval(0.1))
         }
         let ok = complete && !sendFailed && inFlight == 0
         cond.unlock()
-        _ = epochSnap
 
         if ok {
             let dt = max(0.001, CFAbsoluteTimeGetCurrent() - started)
@@ -3242,10 +3265,14 @@ final class FileTransferService {
             pushHistory("↑ \(fname) (\(fmtBytes(sentBytes)))")
             updateStatus(String(format: "已发送: %@ (%.0f MB/s)", fname, speed))
             Log.info("中转站发送完成 #\(id): \(fname) (\(fmtBytes(sentBytes)), \(String(format: "%.1f", speed)) MB/s)")
-            return true
+            return .sent
+        }
+        if readErr {
+            updateStatus("读取失败: \(fname)")
+            return .localFailed
         }
         updateStatus("发送中断: \(fname)")
-        return false
+        return .connLost
     }
 
     private func updateStatus(_ s: String) {
@@ -3295,7 +3322,10 @@ final class FileTransferService {
             let u = inboxURL.appendingPathComponent(cand)
             if !fm.fileExists(atPath: u.path) { return u }
         }
-        return inboxURL.appendingPathComponent("\(stem)_\(Int(CFAbsoluteTimeGetCurrent())).\(ext)")
+        let fallbackName = ext.isEmpty
+            ? "\(stem)_\(Int(CFAbsoluteTimeGetCurrent()))"
+            : "\(stem)_\(Int(CFAbsoluteTimeGetCurrent())).\(ext)"
+        return inboxURL.appendingPathComponent(fallbackName)
     }
 
     private func fmtBytes(_ n: UInt64) -> String {

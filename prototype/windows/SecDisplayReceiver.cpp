@@ -2162,7 +2162,7 @@ static void ExitFullscreen() {
 // 状态直接读 g_stats，不额外开线程；开关即时生效，不写回配置文件。
 // ---------------------------------------------------------------------------
 
-static HWND g_panel = nullptr;
+static std::atomic<HWND> g_panel{nullptr};
 static Presenter* g_presenter = nullptr;
 static std::atomic<bool> g_vsyncEnabled{true};
 static std::string g_peerHost = "10.10.10.1";
@@ -2249,7 +2249,8 @@ static void SetTransferStatus(const std::wstring& s) {
         std::lock_guard<std::mutex> lk(g_xferMtx);
         g_xferStatus = s;
     }
-    if (g_panel) PostMessageW(g_panel, WM_APP_XFER_UI, 0, 0);
+    HWND hp = g_panel.load();
+    if (hp && g_alive) PostMessageW(hp, WM_APP_XFER_UI, 0, 0);
 }
 
 static void EnqueueFileTransfer(const std::wstring& path) {
@@ -2266,7 +2267,8 @@ static void EnqueueFileTransfer(const std::wstring& path) {
         g_xferStatus = buf;
     }
     g_xferCv.notify_all();
-    if (g_panel) PostMessageW(g_panel, WM_APP_XFER_UI, 0, 0);
+    HWND hp = g_panel.load();
+    if (hp && g_alive) PostMessageW(hp, WM_APP_XFER_UI, 0, 0);
     Log("中转站加入发送队列: %s", ToUtf8(path.c_str()).c_str());
 }
 
@@ -3302,7 +3304,7 @@ static void ShowControlPanel() {
                          SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE);
             LayoutPanelControls(g_panel);
         }
-        Log("控制面板已创建 hwnd=%p", (void*)g_panel);
+        Log("控制面板已创建 hwnd=%p", (void*)g_panel.load());
         ShowWindow(g_panel, SW_SHOW);
         SetForegroundWindow(g_panel);
         UpdateControlPanel();
@@ -4751,15 +4753,18 @@ static bool XferSendAll(SOCKET s, std::mutex& mtx, const uint8_t* data, size_t l
 
 static bool XferRecvAll(SOCKET s, uint8_t* buf, size_t len) {
     size_t got = 0;
+    int idleTimeouts = 0;
     while (got < len && g_alive) {
         int r = recv(s, (char*)(buf + got), (int)std::min<size_t>(len - got, 1 << 20), 0);
         if (r > 0) {
             got += (size_t)r;
+            idleTimeouts = 0;
         } else if (r == 0) {
             return false;
         } else {
             int err = WSAGetLastError();
-            if (err == WSAETIMEDOUT) continue;
+            // Mac 每 15 秒发一次 PING；连续 45 秒无任何数据包视为静默断线（如拔雷电线）
+            if (err == WSAETIMEDOUT && ++idleTimeouts < 45) continue;
             return false;
         }
     }
@@ -4779,10 +4784,24 @@ static std::wstring SanitizeFilenameW(const std::string& utf8, uint32_t id) {
         }
         clean.push_back(c);
     }
+    // 去掉 Windows 文件名禁止的末尾空格与句点
+    while (!clean.empty() && (clean.back() == L' ' || clean.back() == L'.')) {
+        clean.pop_back();
+    }
     if (clean.empty() || clean == L"." || clean == L"..") {
         wchar_t fb[32];
         swprintf(fb, 32, L"file_%u", id);
         return fb;
+    }
+    // 避开 Windows DOS 设备保留名（CON / PRN / AUX / NUL / COM1..9 / LPT1..9）
+    size_t dot = clean.find(L'.');
+    std::wstring stem = (dot == std::wstring::npos) ? clean : clean.substr(0, dot);
+    std::wstring up;
+    for (wchar_t c : stem) up.push_back((wchar_t)towupper(c));
+    if (up == L"CON" || up == L"PRN" || up == L"AUX" || up == L"NUL" ||
+        (up.size() == 4 && (up.compare(0, 3, L"COM") == 0 || up.compare(0, 3, L"LPT") == 0) &&
+         up[3] >= L'1' && up[3] <= L'9')) {
+        clean = L"_" + clean;
     }
     return clean;
 }
@@ -4838,8 +4857,9 @@ static void TransferLoop(RunConfig cfg) {
         int bufSz = 4 * 1024 * 1024;
         setsockopt(sock, SOL_SOCKET, SO_SNDBUF, (const char*)&bufSz, sizeof(bufSz));
         setsockopt(sock, SOL_SOCKET, SO_RCVBUF, (const char*)&bufSz, sizeof(bufSz));
-        int nodelay = 1;
+        int nodelay = 1, keepalive = 1;
         setsockopt(sock, IPPROTO_TCP, TCP_NODELAY, (const char*)&nodelay, sizeof(nodelay));
+        setsockopt(sock, SOL_SOCKET, SO_KEEPALIVE, (const char*)&keepalive, sizeof(keepalive));
 
         sockaddr_in addr{};
         addr.sin_family = AF_INET;
@@ -4969,19 +4989,27 @@ static void TransferLoop(RunConfig cfg) {
                 }
                 CloseHandle(hf);
 
-                bool complete = !readErr && !netErr && (sentTotal == totalSize);
+                bool complete = !readErr && !netErr && xferAlive && g_alive && (sentTotal == totalSize);
+                if (netErr || !xferAlive || !g_alive) {
+                    // 连接已断：切勿补发 endFrame 或记发送成功，直接把未传完文件放回队头等重连
+                    if (g_alive) {
+                        std::lock_guard<std::mutex> lk(g_xferMtx);
+                        g_xferOutQ.push_front(path);
+                    }
+                    xferAlive = false;
+                    break;
+                }
+
                 std::vector<uint8_t> endFrame;
                 endFrame.push_back(XFER_END);
                 putU32(endFrame, 5);
                 putU32(endFrame, tid);
                 endFrame.push_back(complete ? 1 : 0);
                 if (!XferSendAll(sock, xferSendMtx, endFrame.data(), endFrame.size())) {
-                    netErr = true;
-                }
-
-                if (netErr) {
-                    std::lock_guard<std::mutex> lk(g_xferMtx);
-                    g_xferOutQ.push_front(path);
+                    if (g_alive) {
+                        std::lock_guard<std::mutex> lk(g_xferMtx);
+                        g_xferOutQ.push_front(path);
+                    }
                     xferAlive = false;
                     break;
                 }
@@ -5060,7 +5088,8 @@ static void TransferLoop(RunConfig cfg) {
                 uint32_t id = rdU32(payload.data());
                 uint32_t dlen = rdU32(payload.data() + 4);
                 auto it = recvs.find(id);
-                if (it == recvs.end() || len < 8 + dlen) continue;
+                // 无溢出检查：用 len - 8 而非 8 + dlen，防止 dlen 接近 0xFFFFFFFF 时回绕越界读
+                if (it == recvs.end() || dlen > len - 8) continue;
                 DWORD written = 0;
                 if (dlen > 0 && (!WriteFile(it->second.hf, payload.data() + 8, dlen, &written, nullptr) || written != dlen)) {
                     CloseHandle(it->second.hf);
@@ -5091,7 +5120,7 @@ static void TransferLoop(RunConfig cfg) {
                 CloseHandle(st.hf);
                 if (okFlag && st.received == st.expected) {
                     std::wstring dest = UniqueDestPathW(inbox, st.safeName);
-                    if (MoveFileExW(st.partPath.c_str(), dest.c_str(), MOVEFILE_REPLACE_EXISTING)) {
+                    if (MoveFileExW(st.partPath.c_str(), dest.c_str(), 0)) {
                         double dt = std::max(0.001, (double)(GetTickCount64() - st.started) / 1000.0);
                         double speed = (double)st.received / dt / 1048576.0;
                         size_t sl = dest.find_last_of(L"\\/");
@@ -5115,6 +5144,10 @@ static void TransferLoop(RunConfig cfg) {
             }
         }
 
+        // 先 shutdown 打破可能阻塞在 send 的 sendThread，再设标志并 join
+        g_xferConnected = false;
+        if (g_xferSock.load() == sock) g_xferSock = INVALID_SOCKET;
+        shutdown(sock, SD_BOTH);
         xferAlive = false;
         g_xferCv.notify_all();
         if (sendThread.joinable()) sendThread.join();
@@ -5124,9 +5157,6 @@ static void TransferLoop(RunConfig cfg) {
         }
         recvs.clear();
 
-        g_xferConnected = false;
-        if (g_xferSock.load() == sock) g_xferSock = INVALID_SOCKET;
-        shutdown(sock, SD_BOTH);
         closesocket(sock);
         SetTransferStatus(L"中转连接断开，2 秒后重连…");
         if (!g_alive) break;
@@ -5470,9 +5500,8 @@ int main(int argc, char** argv) {
         DispatchMessage(&msg);
     }
 
-    // 退出清理：托盘图标、热键、防熄屏声明必须在进程结束前移除
+    // 退出清理：先停网络/中转/输入线程，再毁控制面板窗口，消除跨线程访问 g_panel 竞态
     SetThreadExecutionState(ES_CONTINUOUS);
-    if (g_panel) { DestroyWindow(g_panel); g_panel = nullptr; }
     g_presenter = nullptr;
     TrayRemove();
     UnregisterHotKey(hwnd, HOTKEY_QUIT_ID);
@@ -5496,18 +5525,15 @@ int main(int argc, char** argv) {
         SOCKET xs = g_xferSock.load();
         if (xs != INVALID_SOCKET) shutdown(xs, SD_BOTH);
     }
-    // 关键：先掐断 socket，让阻塞在 recv 的收流线程立即返回。
-    // 否则「已连上 Mac 正常收流」时按退出，net.join() 会一直等那个
-    // 无超时的 recv，进程卡在退出途中，看起来像「点了退出没反应」。
-    // 配合 RecvAll 的 SO_RCVTIMEO(500ms) 双保险。
     {
         SOCKET s = g_sock.load();
         if (s != INVALID_SOCKET) shutdown(s, SD_BOTH);
     }
     if (net.joinable()) net.join();
     if (xfer.joinable()) xfer.join();
-    // cursorThread 已随「停用 SetCursorPos 抢光标」一起移除，勿再 join。
     if (inputThread.joinable()) inputThread.join();
+    HWND panelToDestroy = g_panel.exchange(nullptr);
+    if (panelToDestroy) { DestroyWindow(panelToDestroy); }
 
     WSACleanup();
     presenter.Shutdown();
