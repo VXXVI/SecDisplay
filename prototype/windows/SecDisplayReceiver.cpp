@@ -4269,40 +4269,45 @@ static void ResetShakeSamples() {
     g_shakeHead = 0;
 }
 
-// 收缩动画的一帧。返回 true 表示动画仍在进行，需要继续定时器。
-// 用 ease-out（1-(1-t)^3）让收缩前段快、尾段贴住原尺寸，观感比线性自然。
-static bool TickShakeShrink(int64_t now) {
-    if (!g_shakeActive) return false;
+static double EaseInOutCubic(double t) {
+    if (t <= 0.0) return 0.0;
+    if (t >= 1.0) return 1.0;
+    return (t < 0.5) ? (4.0 * t * t * t) : (1.0 - std::pow(-2.0 * t + 2.0, 3.0) * 0.5);
+}
 
-    // 关键：不能只等 DetectShake 来置 holding。
-    // DetectShake 只在 WM_APP_REMOTE_CURSOR 里被调用，而晃动结束的标准用法
-    // 就是「停手不再移动」——此后再无光标包，holding 永远不会被置上，
-    // 光标就会永久停在放大状态、定时器永久空转。
-    //
-    // 计时锚在「最后一次判定为晃动」而不是「最后一个光标包」：
-    // 晃完继续慢慢移动时位置包不断，锚在包时间上会让放大永久收不回来，
-    // 同时 16ms 定时器还会一直空转重建光标图。
-    //
-    // holdUntil 直接取 lastShake + kShakeHoldMs，不再叠加第二段：
-    // 原来这里是「静默 700 + hold 700」，实际要 1.4 秒才开始收缩。
-    if (!g_shakeHolding) {
-        if (now - g_shakeLastShakeMs < kShakeHoldMs) return true;   // 仍在晃动/刚晃完
-        g_shakeHolding = true;
-        g_shakeHoldUntil = g_shakeLastShakeMs + kShakeHoldMs;
-    }
-    if (now < g_shakeHoldUntil) return true;   // 保持期未到期
+// 晃动缩放动画（Grow -> Hold -> Shrink，双向 InOutCubic 缓动，使用亚毫秒级 QPC 时钟）。
+// 返回 true 表示动画或保持仍在进行，需要继续定时器。
+static bool TickShakeAnim(double nowQpc) {
+    if (!g_shakeActive || g_shakePhase == SHAKE_IDLE) return false;
 
-    const int64_t t0 = g_shakeHoldUntil;
-    const double p = (double)(now - t0) / (double)kShakeShrinkMs;
-    if (p >= 1.0) {
-        g_shakeActive = false;
-        g_shakeHolding = false;
-        g_shakeZoom = 1.0;
-        return false;
+    if (g_shakePhase == SHAKE_GROW) {
+        double p = (nowQpc - g_shakeAnimStartMs) / kShakeGrowMs;
+        if (p >= 1.0) {
+            g_shakeZoom = kShakeCursorZoom;
+            g_shakePhase = SHAKE_HOLD;
+        } else {
+            g_shakeZoom = g_shakeAnimFromZoom + (kShakeCursorZoom - g_shakeAnimFromZoom) * EaseInOutCubic(p);
+            return true;
+        }
     }
-    const double e = 1.0 - (1.0 - p) * (1.0 - p) * (1.0 - p);
-    g_shakeZoom = kShakeCursorZoom - (kShakeCursorZoom - 1.0) * e;
-    return true;
+    if (g_shakePhase == SHAKE_HOLD) {
+        if (nowQpc - g_shakeLastShakeQpcMs < kShakeHoldMs) return true;
+        g_shakePhase = SHAKE_SHRINK;
+        g_shakeAnimStartMs = nowQpc;
+        g_shakeAnimFromZoom = g_shakeZoom;
+    }
+    if (g_shakePhase == SHAKE_SHRINK) {
+        double p = (nowQpc - g_shakeAnimStartMs) / kShakeShrinkMs;
+        if (p >= 1.0) {
+            g_shakeActive = false;
+            g_shakePhase = SHAKE_IDLE;
+            g_shakeZoom = 1.0;
+            return false;
+        }
+        g_shakeZoom = g_shakeAnimFromZoom + (1.0 - g_shakeAnimFromZoom) * EaseInOutCubic(p);
+        return true;
+    }
+    return false;
 }
 
 // 当前应使用的缩放（千分比）。DPI 与晃动倍数合并在这里算，
