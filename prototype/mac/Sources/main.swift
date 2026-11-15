@@ -2603,7 +2603,12 @@ final class CursorImageTracker {
     private var pendingFingerprint: UInt64 = 0
     /// 上次观察到的连接代数，用于连接重建时强制重发
     private var lastEpoch = -1
-    private let maxDim = 128       // 光标不会超过 128 像素，超出则截断保护
+    private let maxDim = 128       // 光标不会超过 128 像素，超出则等比缩放到此上限
+    /// 抑制 macOS 系统「晃动鼠标指针以定位」产生的 4fps 临时放大光标帧，
+    /// 避免在 Windows 端 125Hz 晃动缩放动画期间出现双重放大与阶梯抖动；
+    /// 若放大持续超过 2.2 秒，则视为辅助功能永久放大设置，正常放行。
+    private var normalCursorMaxDim = 0
+    private var enlargedCursorSince: CFAbsoluteTime = 0
     /// 上次实际发送时刻，用于限流：光标形状在移动中可能在箭头/I型/手型间频繁切换，
     /// 每切一次就让接收端重建一次 HCURSOR，会造成光标卡顿。限制最小间隔。
     private var lastSendAt: CFAbsoluteTime = 0
@@ -2632,11 +2637,15 @@ final class CursorImageTracker {
         // 运行中拨开关没有任何效果。
         guard !disableCursorImage else {
             lastFingerprint = 0
+            normalCursorMaxDim = 0
+            enlargedCursorSince = 0
             return
         }
         guard sender.connected else {
             // 断开时清指纹，下次连上强制重发（新接收端没有旧光标）
             lastFingerprint = 0
+            normalCursorMaxDim = 0
+            enlargedCursorSince = 0
             return
         }
         guard let cur = NSCursor.currentSystem,
@@ -2649,11 +2658,38 @@ final class CursorImageTracker {
         // 接收端再按画面/逻辑尺寸的比例放大，视觉比例才和桌面元素一致。
         let targetW = Int(cur.image.size.width.rounded())
         let targetH = Int(cur.image.size.height.rounded())
-        let w = targetW > 0 ? min(targetW, maxDim) : min(cg.width, maxDim)
-        let h = targetH > 0 ? min(targetH, maxDim) : min(cg.height, maxDim)
-        guard w > 0, h > 0 else { return }
-        let scaleX = targetW > 0 ? Double(w) / Double(targetW) : 1.0
-        let scaleY = targetH > 0 ? Double(h) / Double(targetH) : 1.0
+        let rawW = targetW > 0 ? targetW : cg.width
+        let rawH = targetH > 0 ? targetH : cg.height
+        let rawMax = max(rawW, rawH)
+        guard rawW > 0, rawH > 0 else { return }
+
+        let now = CFAbsoluteTimeGetCurrent()
+        if normalCursorMaxDim == 0 {
+            enlargedCursorSince = 0
+            normalCursorMaxDim = rawMax
+        } else if rawMax <= 42 {
+            // 常规 1x 系统光标（如 23x22 I型 <-> 28x40 箭头）不高于 42pt，
+            // 直接放行并维护基线，绝不会在晃动期间把基线抬高到 43+。
+            enlargedCursorSince = 0
+            normalCursorMaxDim = rawMax
+        } else if rawMax <= Int(Double(normalCursorMaxDim) * 1.35) {
+            // 已处于永久大指针模式（例如无障碍 64pt+）时的正常形状切换
+            enlargedCursorSince = 0
+        } else {
+            if enlargedCursorSince == 0 {
+                enlargedCursorSince = now
+            }
+            if now - enlargedCursorSince < 2.2 {
+                return
+            }
+            normalCursorMaxDim = rawMax
+        }
+
+        let clampScale = rawMax > maxDim ? Double(maxDim) / Double(rawMax) : 1.0
+        let w = max(1, Int((Double(rawW) * clampScale).rounded()))
+        let h = max(1, Int((Double(rawH) * clampScale).rounded()))
+        let scaleX = targetW > 0 ? Double(w) / Double(targetW) : Double(w) / Double(cg.width)
+        let scaleY = targetH > 0 ? Double(h) / Double(targetH) : Double(h) / Double(cg.height)
         let hotX = Int((cur.hotSpot.x * scaleX).rounded())
         let hotY = Int((cur.hotSpot.y * scaleY).rounded())
 
@@ -2736,6 +2772,8 @@ final class FileTransferService {
     static let typeEnd:   UInt8 = 0x12
     static let typeAck:   UInt8 = 0x13
     static let typePing:  UInt8 = 0x14
+    static let typeText:  UInt8 = 0x15
+    static let maxTextBytes = 1024 * 1024 - 4
 
     private let netQueue = DispatchQueue(label: "SecDisplay.transfer.net")
     private let sendQueue = DispatchQueue(label: "SecDisplay.transfer.send")
@@ -2765,9 +2803,9 @@ final class FileTransferService {
 
     private var nextTransferId: UInt32 = 1
     private var activeEpoch = 0
-    private struct OutItem {
-        let url: URL
-        let deleteAfterSend: Bool
+    private enum OutItem {
+        case file(url: URL, deleteAfterSend: Bool)
+        case text(utf8: Data, preview: String)
     }
     private var outQueue: [OutItem] = []
     private var isSending = false
@@ -2854,7 +2892,11 @@ final class FileTransferService {
         stateLock.lock()
         stopped = true
         _connected = false
-        for item in outQueue where item.deleteAfterSend { toDelete.append(item.url) }
+        for item in outQueue {
+            if case .file(let url, let del) = item, del {
+                toDelete.append(url)
+            }
+        }
         outQueue.removeAll()
         stateLock.unlock()
         for u in toDelete { try? FileManager.default.removeItem(at: u) }
@@ -2892,6 +2934,49 @@ final class FileTransferService {
         }
     }
 
+    private func makeTextPreview(_ text: String) -> String {
+        let oneLine = text
+            .replacingOccurrences(of: "\r\n", with: " ")
+            .replacingOccurrences(of: "\n", with: " ")
+            .replacingOccurrences(of: "\r", with: " ")
+            .replacingOccurrences(of: "\t", with: " ")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        if oneLine.isEmpty { return "空白文本" }
+        if oneLine.count <= 24 { return oneLine }
+        return String(oneLine.prefix(24)) + "…"
+    }
+
+    func enqueueClipboardText(_ text: String) {
+        guard !text.isEmpty else { return }
+        let utf8 = Data(text.utf8)
+        if utf8.count > Self.maxTextBytes {
+            updateStatus("文本超过 1MB，请保存为文件发送", busy: false, progress: 0, speed: "")
+            showFeedback(kind: -1, title: "文本过大 (>1MB)", detail: "请改用文件发送")
+            Log.info("中转站拒绝过大文本 (\(utf8.count) B)")
+            return
+        }
+        let preview = makeTextPreview(text)
+        var shouldStart = false
+        var isStopped = false
+        stateLock.lock()
+        if stopped {
+            isStopped = true
+        } else {
+            outQueue.append(.text(utf8: utf8, preview: preview))
+            if !isSending {
+                isSending = true
+                shouldStart = true
+            }
+            activeStatus = _connected ? "待发送文本: \(preview)" : "已排队文本（等待连接）"
+        }
+        stateLock.unlock()
+        if isStopped { return }
+        notifyUI()
+        if shouldStart {
+            sendQueue.async { [weak self] in self?.drainSendQueue() }
+        }
+    }
+
     func enqueue(urls: [URL], deleteAfterSend: Bool = false) {
         let fm = FileManager.default
         var items: [OutItem] = []
@@ -2899,14 +2984,14 @@ final class FileTransferService {
             var isDir: ObjCBool = false
             guard fm.fileExists(atPath: u.path, isDirectory: &isDir) else { continue }
             if !isDir.boolValue {
-                items.append(OutItem(url: u, deleteAfterSend: deleteAfterSend))
+                items.append(.file(url: u, deleteAfterSend: deleteAfterSend))
             } else if let subItems = try? fm.contentsOfDirectory(at: u, includingPropertiesForKeys: [.isRegularFileKey],
                                                                   options: [.skipsHiddenFiles]) {
                 // 拖入文件夹时仅发送顶层常规文件，避免误扫庞大目录树
                 for sub in subItems {
                     var subDir: ObjCBool = false
                     if fm.fileExists(atPath: sub.path, isDirectory: &subDir), !subDir.boolValue {
-                        items.append(OutItem(url: sub, deleteAfterSend: false))
+                        items.append(.file(url: sub, deleteAfterSend: false))
                     }
                 }
             }
@@ -2925,16 +3010,18 @@ final class FileTransferService {
             }
             let queued = outQueue.count
             if _connected {
-                activeStatus = "待发送 \(queued) 个文件…"
+                activeStatus = "待发送 \(queued) 项…"
             } else {
-                activeStatus = "已排队 \(queued) 个文件（等待连接）"
+                activeStatus = "已排队 \(queued) 项（等待连接）"
             }
         }
         stateLock.unlock()
         if rejectedAfterStop {
             if deleteAfterSend {
-                for it in items where it.deleteAfterSend {
-                    try? fm.removeItem(at: it.url)
+                for it in items {
+                    if case .file(let url, let del) = it, del {
+                        try? fm.removeItem(at: url)
+                    }
                 }
             }
             return
@@ -3060,7 +3147,7 @@ final class FileTransferService {
         activeBusy = false
         activeProgress = 0
         activeSpeedText = ""
-        activeStatus = outQueue.isEmpty ? "等待接收端" : "连接断开，\(outQueue.count) 个文件等待重连"
+        activeStatus = outQueue.isEmpty ? "等待接收端" : "连接断开，\(outQueue.count) 项等待重连"
         stateLock.unlock()
         notifyUI()
     }
@@ -3216,6 +3303,38 @@ final class FileTransferService {
                 sendAck(id: id, ok: false)
             }
 
+        case Self.typeText:
+            guard payload.count >= 4 else { return }
+            let id = readU32(payload, 0)
+            let textData = payload[payload.index(payload.startIndex, offsetBy: 4)..<payload.endIndex]
+            guard !textData.isEmpty, let text = String(data: Data(textData), encoding: .utf8) else {
+                sendAck(id: id, ok: false)
+                return
+            }
+            let preview = makeTextPreview(text)
+            let byteCount = textData.count
+            let epochSnap = connEpoch
+            DispatchQueue.main.async { [weak self] in
+                guard let self else { return }
+                let pb = NSPasteboard.general
+                pb.clearContents()
+                let wrote = pb.setString(text, forType: .string)
+                if wrote {
+                    self.pushHistory("↓ 文本: \(preview)")
+                    self.updateStatus("已写入剪贴板: \(preview)", busy: false, progress: 1.0, speed: "")
+                    self.showFeedback(kind: 1, title: "已写入剪贴板", detail: preview)
+                    Log.info("中转站收到文本 #\(id) (\(byteCount) B)，已写入剪贴板")
+                } else {
+                    self.updateStatus("写入剪贴板失败: \(preview)", busy: false, progress: 0, speed: "")
+                    self.showFeedback(kind: -1, title: "写入剪贴板失败", detail: preview)
+                    Log.info("中转站收到文本 #\(id) (\(byteCount) B)，写入剪贴板失败")
+                }
+                self.netQueue.async {
+                    guard self.connEpoch == epochSnap else { return }
+                    self.sendAck(id: id, ok: wrote)
+                }
+            }
+
         case Self.typeAck:
             guard payload.count >= 5 else { return }
             let id = readU32(payload, 0)
@@ -3254,7 +3373,7 @@ final class FileTransferService {
             if stopped || !_connected || outQueue.isEmpty {
                 isSending = false
                 if !_connected && !outQueue.isEmpty {
-                    activeStatus = "等待接收端重连（排队 \(outQueue.count) 个）"
+                    activeStatus = "等待接收端重连（排队 \(outQueue.count) 项）"
                 } else if _connected && outQueue.isEmpty && activeStatus.hasPrefix("发送") {
                     activeStatus = "已连接（端口 \(listenPort)）· 可拖入文件直传"
                 }
@@ -3268,10 +3387,17 @@ final class FileTransferService {
             let tid = nextTransferId
             stateLock.unlock()
 
-            switch sendSingleFile(url: item.url, id: tid) {
+            let outcome: SendOutcome
+            switch item {
+            case .file(let url, _):
+                outcome = sendSingleFile(url: url, id: tid)
+            case .text(let utf8, let preview):
+                outcome = sendSingleText(utf8: utf8, preview: preview, id: tid)
+            }
+            switch outcome {
             case .sent, .localFailed:
-                if item.deleteAfterSend {
-                    try? FileManager.default.removeItem(at: item.url)
+                if case .file(let url, let del) = item, del {
+                    try? FileManager.default.removeItem(at: url)
                 }
                 continue
             case .connLost:
@@ -3279,8 +3405,8 @@ final class FileTransferService {
                 stateLock.lock()
                 if !stopped {
                     outQueue.insert(item, at: 0)
-                } else if item.deleteAfterSend {
-                    try? FileManager.default.removeItem(at: item.url)
+                } else if case .file(let url, let del) = item, del {
+                    try? FileManager.default.removeItem(at: url)
                 }
                 let canContinue = _connected && !stopped
                 if !canContinue { isSending = false }
@@ -3290,6 +3416,61 @@ final class FileTransferService {
                 return
             }
         }
+    }
+
+    private func sendSingleText(utf8: Data, preview: String, id: UInt32) -> SendOutcome {
+        var activeConn: NWConnection?
+        var epochSnap = 0
+        netQueue.sync {
+            activeConn = self.conn
+            epochSnap = self.connEpoch
+        }
+        guard let c = activeConn else { return .connLost }
+
+        var frame = Data(capacity: 5 + 4 + utf8.count)
+        frame.append(Self.typeText)
+        appendU32(&frame, UInt32(4 + utf8.count))
+        appendU32(&frame, id)
+        frame.append(utf8)
+
+        updateStatus("发送文本: \(preview)", busy: true, progress: 0.5, speed: "")
+
+        let cond = NSCondition()
+        var done = false
+        var sendErr: Error?
+        c.send(content: frame, completion: .contentProcessed { err in
+            cond.lock()
+            sendErr = err
+            done = true
+            cond.broadcast()
+            cond.unlock()
+        })
+
+        let waitUntil = Date().addingTimeInterval(5.0)
+        cond.lock()
+        while !done && Date() < waitUntil {
+            stateLock.lock()
+            let alive = !stopped && _connected && activeEpoch == epochSnap
+            stateLock.unlock()
+            if !alive { break }
+            cond.wait(until: Date().addingTimeInterval(0.1))
+        }
+        let ok = done && sendErr == nil
+        cond.unlock()
+
+        if ok {
+            pushHistory("↑ 文本: \(preview)")
+            updateStatus("已发送文本: \(preview)", busy: false, progress: 1.0, speed: "")
+            showFeedback(kind: 1, title: "已发送文本", detail: preview)
+            Log.info("中转站发送文本完成 #\(id) (\(utf8.count) B)")
+            return .sent
+        }
+        if let sendErr {
+            Log.info("中转站发送文本失败 #\(id): \(sendErr)")
+        }
+        updateStatus("发送文本中断: \(preview)", busy: false, progress: 0, speed: "")
+        showFeedback(kind: -1, title: "发送中断", detail: preview)
+        return .connLost
     }
 
     private func sendSingleFile(url: URL, id: UInt32) -> SendOutcome {

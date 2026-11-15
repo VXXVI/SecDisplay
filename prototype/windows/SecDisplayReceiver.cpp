@@ -428,7 +428,7 @@ static bool IsInCursorCache(HCURSOR c) {
 // 观感上就是「变小很慢、还很突兀」。
 static const int kShakeWinMs = 700;      // 观察窗口
 static const int kShakeMinReversals = 3; // 至少 3 次方向反转才算晃动
-static const int kShakeMinSpanPx = 180;  // 横向/纵向累计摆幅下限，防止细微抖动误触
+static const int kShakeMinSpanPx = 120;  // 横向/纵向累计摆幅下限，防止细微抖动误触
 static const double kShakeCursorZoom = 2.8;  // 晃动时的目标放大倍数（macOS ~2.8-3.0x）
 static const double kShakeGrowMs = 220.0;    // 平滑放大渐入时长（EaseOutCubic，首帧即起势）
 static const double kShakeHoldMs = 650.0;    // 停晃后保持放大的时长
@@ -2316,6 +2316,7 @@ static const int IDC_PANEL_PASTEXFER = 2033;
 static ULONG_PTR g_gdipToken = 0;
 
 static const UINT WM_APP_XFER_UI = WM_APP + 10;
+static const UINT WM_APP_SET_CLIP_TEXT = WM_APP + 11;
 
 // ---- 雷电双向文件中转站（独立 TCP 端口 port+1 = 9923）----
 static const uint8_t XFER_BEGIN = 0x10;
@@ -2323,11 +2324,24 @@ static const uint8_t XFER_CHUNK = 0x11;
 static const uint8_t XFER_END   = 0x12;
 static const uint8_t XFER_ACK   = 0x13;
 static const uint8_t XFER_PING  = 0x14;
+static const uint8_t XFER_TEXT  = 0x15;
+static const size_t kXferMaxTextBytes = 1024 * 1024 - 4;
 
 struct XferOutItem {
+    bool isText = false;
     std::wstring path;
     bool deleteAfterSend = false;
+    std::string textUtf8;
+    std::wstring preview;
 };
+struct PendingClipText {
+    uint32_t id = 0;
+    std::wstring text;
+    std::wstring preview;
+    size_t utf8Bytes = 0;
+};
+static std::mutex g_clipTextMtx;
+static std::deque<PendingClipText> g_clipTextQ;
 static std::atomic<bool> g_xferConnected{false};
 static std::atomic<SOCKET> g_xferSock{INVALID_SOCKET};
 static std::mutex g_xferMtx;
@@ -2413,6 +2427,69 @@ static void SetTransferFeedback(int kind, const std::wstring& title, const std::
     if (db && g_alive) PostMessageW(db, WM_APP_XFER_UI, 0, 0);
 }
 
+static std::wstring ToWideStrict(const char* utf8, int bytes) {
+    if (!utf8 || bytes <= 0) return {};
+    int len = ::MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, utf8, bytes, nullptr, 0);
+    if (len <= 0) return {};
+    std::wstring out((size_t)len, L'\0');
+    if (::MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, utf8, bytes, &out[0], len) <= 0) return {};
+    return out;
+}
+
+static std::string WideToUtf8N(const wchar_t* w, int chars) {
+    if (!w || chars <= 0) return {};
+    int len = ::WideCharToMultiByte(CP_UTF8, 0, w, chars, nullptr, 0, nullptr, nullptr);
+    if (len <= 0) return {};
+    std::string out((size_t)len, '\0');
+    ::WideCharToMultiByte(CP_UTF8, 0, w, chars, &out[0], len, nullptr, nullptr);
+    return out;
+}
+
+static std::wstring MakeTextPreviewW(const std::wstring& s) {
+    std::wstring one;
+    one.reserve(32);
+    bool started = false;
+    size_t cpCount = 0;
+    for (size_t i = 0; i < s.size(); ++i) {
+        wchar_t ch = s[i];
+        if (ch == L'\r' || ch == L'\n' || ch == L'\t') ch = L' ';
+        if (!started && ch == L' ') continue;
+        started = true;
+        if (cpCount >= 22) {
+            one += L"…";
+            break;
+        }
+        one.push_back(ch);
+        if (ch >= 0xD800 && ch <= 0xDBFF && i + 1 < s.size()) {
+            one.push_back(s[++i]);
+        }
+        ++cpCount;
+    }
+    return one.empty() ? L"空白文本" : one;
+}
+
+static void EnqueueTextTransfer(const std::string& utf8, const std::wstring& preview) {
+    if (utf8.empty()) return;
+    if (utf8.size() > kXferMaxTextBytes) {
+        SetTransferStatus(L"文本超过 1MB，请保存为文件发送");
+        SetTransferFeedback(-1, L"文本过大 (>1MB)", L"请改用文件发送");
+        Log("中转站拒绝过大文本 (%zu B)", utf8.size());
+        return;
+    }
+    bool conn = g_xferConnected.load();
+    {
+        std::lock_guard<std::mutex> lk(g_xferMtx);
+        g_xferOutQ.push_back(XferOutItem{ true, L"", false, utf8, preview });
+        g_xferStatus = conn ? (L"待发送文本: " + preview) : L"已排队文本（等待连接）";
+    }
+    g_xferCv.notify_all();
+    HWND hp = g_panel.load();
+    if (hp && g_alive) PostMessageW(hp, WM_APP_XFER_UI, 0, 0);
+    HWND db = g_dropBox.load();
+    if (db && g_alive) PostMessageW(db, WM_APP_XFER_UI, 0, 0);
+    Log("中转站加入文本发送队列 (%zu B)", utf8.size());
+}
+
 static void EnqueueFileTransfer(const std::wstring& path, bool deleteAfterSend = false) {
     DWORD attr = GetFileAttributesW(path.c_str());
     if (attr == INVALID_FILE_ATTRIBUTES || (attr & FILE_ATTRIBUTE_DIRECTORY)) {
@@ -2423,7 +2500,7 @@ static void EnqueueFileTransfer(const std::wstring& path, bool deleteAfterSend =
     bool conn = g_xferConnected.load();
     {
         std::lock_guard<std::mutex> lk(g_xferMtx);
-        g_xferOutQ.push_back(XferOutItem{ path, deleteAfterSend });
+        g_xferOutQ.push_back(XferOutItem{ false, path, deleteAfterSend, {}, {} });
         qSize = g_xferOutQ.size();
         wchar_t buf[128];
         swprintf(buf, 128, conn ? L"已加入发送队列 (%zu 个文件)…" : L"已排队 %zu 个文件（等待连接）", qSize);
@@ -2461,6 +2538,8 @@ static void PasteClipboardToTransfer(HWND owner) {
     }
     std::vector<std::wstring> files;
     std::wstring tempPngPath;
+    std::string clipTextUtf8;
+    std::wstring clipPreview;
 
     if (HANDLE hd = GetClipboardData(CF_HDROP)) {
         HDROP drop = (HDROP)GlobalLock(hd);
@@ -2581,6 +2660,35 @@ static void PasteClipboardToTransfer(HWND owner) {
         }
     }
     if (files.empty() && tempPngPath.empty()) {
+        if (HANDLE ht = GetClipboardData(CF_UNICODETEXT)) {
+            SIZE_T cb = GlobalSize(ht);
+            if (const wchar_t* ws = (const wchar_t*)GlobalLock(ht)) {
+                size_t maxChars = cb / sizeof(wchar_t);
+                size_t len = wcsnlen(ws, maxChars);
+                if (len > 0) {
+                    clipTextUtf8 = WideToUtf8N(ws, (int)len);
+                    clipPreview = MakeTextPreviewW(std::wstring(ws, len));
+                }
+                GlobalUnlock(ht);
+            }
+        } else if (HANDLE ha = GetClipboardData(CF_TEXT)) {
+            SIZE_T cb = GlobalSize(ha);
+            if (const char* as = (const char*)GlobalLock(ha)) {
+                size_t len = strnlen(as, cb);
+                if (len > 0) {
+                    int wlen = ::MultiByteToWideChar(CP_ACP, 0, as, (int)len, nullptr, 0);
+                    if (wlen > 0) {
+                        std::wstring ws((size_t)wlen, L'\0');
+                        ::MultiByteToWideChar(CP_ACP, 0, as, (int)len, &ws[0], wlen);
+                        clipTextUtf8 = WideToUtf8N(ws.data(), wlen);
+                        clipPreview = MakeTextPreviewW(ws);
+                    }
+                }
+                GlobalUnlock(ha);
+            }
+        }
+    }
+    if (files.empty() && tempPngPath.empty() && clipTextUtf8.empty()) {
         std::string fmts;
         UINT f = 0;
         while ((f = EnumClipboardFormats(f)) != 0) {
@@ -2590,7 +2698,7 @@ static void PasteClipboardToTransfer(HWND owner) {
             else fmts += std::to_string(f);
             if (fmts.size() > 180) break;
         }
-        Log("剪贴板粘贴无可用图片或文件，当前格式: [%s]", fmts.c_str());
+        Log("剪贴板粘贴无可用内容，当前格式: [%s]", fmts.c_str());
     }
     CloseClipboard();
 
@@ -2599,9 +2707,11 @@ static void PasteClipboardToTransfer(HWND owner) {
     } else if (!tempPngPath.empty()) {
         EnqueueFileTransfer(tempPngPath, true);
         Log("剪贴板截图已编码入队: %s", ToUtf8(tempPngPath.c_str()).c_str());
+    } else if (!clipTextUtf8.empty()) {
+        EnqueueTextTransfer(clipTextUtf8, clipPreview);
     } else {
-        SetTransferStatus(L"剪贴板中没有文件或截图");
-        SetTransferFeedback(-1, L"剪贴板无内容", L"请先复制文件或截图");
+        SetTransferStatus(L"剪贴板中没有文件、截图或文字");
+        SetTransferFeedback(-1, L"剪贴板无内容", L"请先复制文件、截图或文字");
     }
 }
 
@@ -4644,7 +4754,7 @@ static bool DetectShake(int64_t now, int x, int y) {
     // 200% DPI 下 180 物理像素只等于 90 逻辑像素、8px 只等于 4 逻辑像素，
     // 同一段手部晃动的物理距离在高 DPI 屏上门槛会减半，所以乘 WindowDpiScale。
     const double dpiScale = WindowDpiScale(g_hwnd);
-    const int minStepPx = (int)(8.0 * dpiScale + 0.5);
+    const int minStepPx = (int)(5.0 * dpiScale + 0.5);
     const int minSpanPx = (int)(kShakeMinSpanPx * dpiScale + 0.5);
     int reversalsX = 0, reversalsY = 0;
     int spanX = 0, spanY = 0;
@@ -4937,6 +5047,52 @@ static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
     case WM_APP_UPDATE_POWER:
         UpdateExecutionState();
         return 0;
+    case WM_APP_SET_CLIP_TEXT: {
+        std::deque<PendingClipText> batch;
+        {
+            std::lock_guard<std::mutex> lk(g_clipTextMtx);
+            batch.swap(g_clipTextQ);
+        }
+        if (batch.empty()) return 0;
+        const PendingClipText& latest = batch.back();
+        bool opened = false;
+        for (int attempt = 0; attempt < 3; ++attempt) {
+            if (OpenClipboard(h)) { opened = true; break; }
+            Sleep(10);
+        }
+        bool wrote = false;
+        if (opened) {
+            if (EmptyClipboard()) {
+                size_t bytes = (latest.text.size() + 1) * sizeof(wchar_t);
+                HGLOBAL hMem = GlobalAlloc(GMEM_MOVEABLE, bytes);
+                if (hMem) {
+                    void* dst = GlobalLock(hMem);
+                    if (dst) {
+                        memcpy(dst, latest.text.c_str(), bytes);
+                        GlobalUnlock(hMem);
+                        if (SetClipboardData(CF_UNICODETEXT, hMem)) {
+                            wrote = true;
+                        } else {
+                            GlobalFree(hMem);
+                        }
+                    } else {
+                        GlobalFree(hMem);
+                    }
+                }
+            }
+            CloseClipboard();
+        }
+        if (wrote) {
+            SetTransferStatus(L"已写入剪贴板: " + latest.preview, -1, L"");
+            SetTransferFeedback(1, L"已写入剪贴板", latest.preview);
+            Log("中转站收到文本 #%u (%zu B)，已写入剪贴板", latest.id, latest.utf8Bytes);
+        } else {
+            SetTransferStatus(L"写入剪贴板失败: " + latest.preview, -1, L"");
+            SetTransferFeedback(-1, L"写入剪贴板失败", latest.preview);
+            Log("中转站收到文本 #%u (%zu B)，写入剪贴板失败", latest.id, latest.utf8Bytes);
+        }
+        return 0;
+    }
     case WM_DISPLAYCHANGE:
     case WM_EXITSIZEMOVE:
         // 显示模式变化或窗口跨屏移动后，刷新率可能变了，--pace 的节拍要跟着更新
@@ -6089,6 +6245,27 @@ static void TransferLoop(RunConfig cfg) {
                     tid = g_xferNextId++;
                     if (g_xferNextId == 0) g_xferNextId = 1;
                 }
+                if (item.isText) {
+                    std::vector<uint8_t> frame;
+                    frame.reserve(5 + 4 + item.textUtf8.size());
+                    frame.push_back(XFER_TEXT);
+                    putU32(frame, (uint32_t)(4 + item.textUtf8.size()));
+                    putU32(frame, tid);
+                    frame.insert(frame.end(), item.textUtf8.begin(), item.textUtf8.end());
+                    SetTransferStatus(L"发送文本: " + item.preview, 0, L"");
+                    if (!XferSendAll(sock, xferSendMtx, frame.data(), frame.size())) {
+                        if (g_alive) {
+                            std::lock_guard<std::mutex> lk(g_xferMtx);
+                            g_xferOutQ.push_front(item);
+                        }
+                        xferAlive = false;
+                        break;
+                    }
+                    SetTransferStatus(L"已发送文本: " + item.preview, -1, L"");
+                    SetTransferFeedback(1, L"已发送文本", item.preview);
+                    Log("中转站发送文本完成 #%u (%zu B)", tid, item.textUtf8.size());
+                    continue;
+                }
                 const std::wstring& path = item.path;
 
                 HANDLE hf = CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ,
@@ -6342,6 +6519,32 @@ static void TransferLoop(RunConfig cfg) {
                     SetTransferFeedback(-1, L"接收中断", st.safeName);
                     sendAck(id, false);
                 }
+            } else if (type == XFER_TEXT && len >= 4) {
+                uint32_t id = rdU32(payload.data());
+                if (len == 4) {
+                    sendAck(id, false);
+                    continue;
+                }
+                std::wstring wtext = ToWideStrict((const char*)(payload.data() + 4), (int)(len - 4));
+                if (wtext.empty()) {
+                    Log("中转站收到文本 #%u 解码失败", id);
+                    sendAck(id, false);
+                    continue;
+                }
+                std::wstring preview = MakeTextPreviewW(wtext);
+                bool posted = false;
+                if (g_hwnd && g_alive) {
+                    {
+                        std::lock_guard<std::mutex> lk(g_clipTextMtx);
+                        g_clipTextQ.push_back(PendingClipText{ id, std::move(wtext), preview, (size_t)(len - 4) });
+                    }
+                    posted = (PostMessageW(g_hwnd, WM_APP_SET_CLIP_TEXT, 0, 0) != FALSE);
+                    if (!posted) {
+                        std::lock_guard<std::mutex> lk(g_clipTextMtx);
+                        if (!g_clipTextQ.empty() && g_clipTextQ.back().id == id) g_clipTextQ.pop_back();
+                    }
+                }
+                sendAck(id, posted);
             } else if (type == XFER_ACK && len >= 5) {
                 uint32_t ackId = rdU32(payload.data());
                 bool ok = (payload[4] == 1);
