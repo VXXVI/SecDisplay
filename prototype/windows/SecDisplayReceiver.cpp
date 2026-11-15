@@ -578,6 +578,7 @@ static const UINT ID_TRAY_TOGGLE = 1002;
 static const UINT ID_TRAY_ABOUT  = 1003;
 static const UINT ID_TRAY_MINIMIZE = 1004;
 static const UINT ID_TRAY_PANEL = 1005;
+static const UINT ID_TRAY_DROPBOX = 1006;
 static const int  HOTKEY_QUIT_ID = 1;
 static const int  HOTKEY_HIDE_ID = 2;   // Ctrl+Alt+H：最小化让位/还原，不退出
 // 用 W 版托盘结构与宽字符提示：A 版在 CP936 下会把 UTF-8 中文按 GBK 解码，
@@ -639,6 +640,7 @@ static void TrayShowMenu(HWND hwnd) {
     if (!menu) return;
     // W 版菜单 + 宽字符：绕开 CP936 对 UTF-8 中文的 GBK 误解码
     AppendMenuW(menu, MF_STRING, ID_TRAY_PANEL, L"控制面板");
+    AppendMenuW(menu, MF_STRING, ID_TRAY_DROPBOX, L"文件投递盒（悬浮窗）");
     AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
     AppendMenuW(menu, MF_STRING, ID_TRAY_TOGGLE, L"切换全屏 / 窗口  (F11)");
     AppendMenuW(menu, MF_STRING, ID_TRAY_MINIMIZE, L"最小化让位 / 还原  (Ctrl+Alt+H)");
@@ -2163,6 +2165,8 @@ static void ExitFullscreen() {
 // ---------------------------------------------------------------------------
 
 static std::atomic<HWND> g_panel{nullptr};
+static std::atomic<HWND> g_dropBox{nullptr};
+static std::atomic<bool> g_dropBoxPinned{true};
 static Presenter* g_presenter = nullptr;
 static std::atomic<bool> g_vsyncEnabled{true};
 static std::string g_peerHost = "10.10.10.1";
@@ -2191,6 +2195,7 @@ static const int IDC_PANEL_SHAKE    = 2028;
 static const int IDC_PANEL_KEEPON   = 2029;
 static const int IDC_PANEL_SENDFILE = 2030;
 static const int IDC_PANEL_OPENXFER = 2031;
+static const int IDC_PANEL_DROPBOX  = 2032;
 
 static const UINT WM_APP_XFER_UI = WM_APP + 10;
 
@@ -2207,6 +2212,10 @@ static std::mutex g_xferMtx;
 static std::condition_variable g_xferCv;
 static std::deque<std::wstring> g_xferOutQ;
 static std::wstring g_xferStatus = L"等待中转站连接 (端口 9923)…";
+static int g_xferPct = -1;
+static std::wstring g_xferSpeed;
+static std::wstring g_xferLastRecvPath;
+static std::wstring g_xferLastRecvName;
 static uint32_t g_xferNextId = 1;
 
 static std::wstring GetTransferInboxDir() {
@@ -2244,13 +2253,17 @@ static std::wstring FormatBytesW(uint64_t n) {
     return buf;
 }
 
-static void SetTransferStatus(const std::wstring& s) {
+static void SetTransferStatus(const std::wstring& s, int pct = -1, const std::wstring& speed = L"") {
     {
         std::lock_guard<std::mutex> lk(g_xferMtx);
         g_xferStatus = s;
+        g_xferPct = pct;
+        g_xferSpeed = speed;
     }
     HWND hp = g_panel.load();
     if (hp && g_alive) PostMessageW(hp, WM_APP_XFER_UI, 0, 0);
+    HWND db = g_dropBox.load();
+    if (db && g_alive) PostMessageW(db, WM_APP_XFER_UI, 0, 0);
 }
 
 static void EnqueueFileTransfer(const std::wstring& path) {
@@ -2269,6 +2282,8 @@ static void EnqueueFileTransfer(const std::wstring& path) {
     g_xferCv.notify_all();
     HWND hp = g_panel.load();
     if (hp && g_alive) PostMessageW(hp, WM_APP_XFER_UI, 0, 0);
+    HWND db = g_dropBox.load();
+    if (db && g_alive) PostMessageW(db, WM_APP_XFER_UI, 0, 0);
     Log("中转站加入发送队列: %s", ToUtf8(path.c_str()).c_str());
 }
 
@@ -2298,8 +2313,9 @@ static void PickAndSendFiles(HWND owner) {
     }
 }
 
-// 前向声明：面板要能立即把放大的光标收回（定义在 WndProc 之后）
+// 前向声明：面板要能立即把放大的光标收回，以及呼出悬浮投递盒
 static void RefreshCursorScale();
+static void ShowDropBoxWindow();
 
 static std::atomic<bool> g_panelTopmost{false};
 static std::atomic<ULONGLONG> g_connStartTick{0};
@@ -2918,7 +2934,7 @@ static void PaintControlPanel(HWND h) {
         SelectObject(hdc, ob); SelectObject(hdc, op);
         DeleteObject(xbr); DeleteObject(xpen);
 
-        RECT rxt{ S(52), S(329), S(600), S(353) };
+        RECT rxt{ S(52), S(329), S(550), S(353) };
         SelectObject(hdc, g_theme.fontSection);
         SetTextColor(hdc, titleCol);
         DrawTextW(hdc, g_panelData.xferConnected
@@ -2926,7 +2942,7 @@ static void PaintControlPanel(HWND h) {
                   : L"雷电文件中转站 · 等待连接 (9923)",
                   -1, &rxt, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
 
-        RECT rxs{ S(36), S(354), S(610), S(380) };
+        RECT rxs{ S(36), S(354), S(555), S(380) };
         SelectObject(hdc, g_theme.fontBody);
         SetTextColor(hdc, mutedCol);
         DrawTextW(hdc, g_panelData.xferStatusText.c_str(), -1, &rxs,
@@ -3018,9 +3034,10 @@ static void LayoutPanelControls(HWND h) {
         MoveWindow(c, S(x), S(y), S(w), S(ch), TRUE);
     };
 
-    // 中转站右侧按钮
-    mv(IDC_PANEL_SENDFILE, 624, 336, 148, 34);
-    mv(IDC_PANEL_OPENXFER, 782, 336, 140, 34);
+    // 中转站右侧按钮（发送文件 / 悬浮盒 / 打开目录）
+    mv(IDC_PANEL_SENDFILE, 566, 336, 128, 34);
+    mv(IDC_PANEL_DROPBOX,  702, 336, 106, 34);
+    mv(IDC_PANEL_OPENXFER, 816, 336, 106, 34);
 
     // 两行 4 列按钮：卡片宽 920 (20..940)，内边距 18 -> 38..922 (宽 884)，
     // 4 * 210 + 3 * 14 = 882，左右居中
@@ -3072,6 +3089,7 @@ static LRESULT CALLBACK PanelWndProc(HWND h, UINT msg, WPARAM w, LPARAM l) {
         };
 
         mkBtn(L"发送文件到 Mac", IDC_PANEL_SENDFILE);
+        mkBtn(L"悬浮投递盒", IDC_PANEL_DROPBOX);
         mkBtn(L"打开中转站", IDC_PANEL_OPENXFER);
         mkBtn(L"全屏显示", IDC_PANEL_FULL);
         mkBtn(L"窗口置顶", IDC_PANEL_TOP);
@@ -3160,6 +3178,9 @@ static LRESULT CALLBACK PanelWndProc(HWND h, UINT msg, WPARAM w, LPARAM l) {
         switch (LOWORD(w)) {
         case IDC_PANEL_SENDFILE:
             PickAndSendFiles(h);
+            return 0;
+        case IDC_PANEL_DROPBOX:
+            ShowDropBoxWindow();
             return 0;
         case IDC_PANEL_OPENXFER: {
             std::wstring dir = GetTransferInboxDir();
@@ -3253,7 +3274,6 @@ static LRESULT CALLBACK PanelWndProc(HWND h, UINT msg, WPARAM w, LPARAM l) {
     case WM_DESTROY:
         KillTimer(h, 1);
         g_hoverBtn = nullptr;
-        g_theme.ReleaseAll();
         return 0;
     }
     return DefWindowProcW(h, msg, w, l);
@@ -3310,6 +3330,415 @@ static void ShowControlPanel() {
         UpdateControlPanel();
     } else {
         Log("控制面板创建失败 %lu", GetLastError());
+    }
+}
+
+// ---- 悬浮文件投递盒（ArcZip Box 风格，全屏期间也可浮在角落边用边互传）----
+static int g_dbHot = 0;   // 0=无 1=图钉 2=关闭 3=投递区 4=已收文件胶囊
+
+static void ApplyDropBoxRoundCorners(HWND h, int dpi) {
+    RECT rc{};
+    GetWindowRect(h, &rc);
+    int w = rc.right - rc.left, ch = rc.bottom - rc.top;
+    // Win11 原生圆角 + 阴影
+    HMODULE dwm = LoadLibraryA("dwmapi.dll");
+    bool dwmOk = false;
+    if (dwm) {
+        typedef HRESULT (WINAPI *DwmSetAttrFn)(HWND, DWORD, LPCVOID, DWORD);
+        auto fn = (DwmSetAttrFn)GetProcAddress(dwm, "DwmSetWindowAttribute");
+        if (fn) {
+            DWORD pref = 2;   // DWMWCP_ROUND
+            if (SUCCEEDED(fn(h, 33, &pref, sizeof(pref)))) dwmOk = true;
+        }
+        FreeLibrary(dwm);
+    }
+    if (!dwmOk && w > 0 && ch > 0) {
+        int rad = DpiPx(16, dpi);
+        HRGN rgn = CreateRoundRectRgn(0, 0, w + 1, ch + 1, rad * 2, rad * 2);
+        if (rgn) SetWindowRgn(h, rgn, TRUE);
+    }
+}
+
+static void DropBoxLayoutRects(int dpi, RECT* rcPin, RECT* rcClose, RECT* rcBox, RECT* rcRecv) {
+    auto S = [&](int v) { return DpiPx(v, dpi); };
+    if (rcPin)   *rcPin   = RECT{ S(176), S(12),  S(202), S(38)  };
+    if (rcClose) *rcClose = RECT{ S(210), S(12),  S(236), S(38)  };
+    if (rcBox)   *rcBox   = RECT{ S(38),  S(66),  S(210), S(202) };
+    if (rcRecv)  *rcRecv  = RECT{ S(18),  S(214), S(230), S(248) };
+}
+
+static void PaintDropBox(HWND h) {
+    PAINTSTRUCT ps{};
+    HDC screenDc = BeginPaint(h, &ps);
+    RECT cli{};
+    GetClientRect(h, &cli);
+    const int cw = cli.right - cli.left, ch = cli.bottom - cli.top;
+    if (cw <= 0 || ch <= 0) { EndPaint(h, &ps); return; }
+
+    const int dpi = PanelWindowDpi(h);
+    g_theme.Ensure(dpi);
+    auto S = [&](int v) { return DpiPx(v, dpi); };
+
+    bool conn = g_xferConnected.load();
+    bool pinned = g_dropBoxPinned.load();
+    int pct = -1;
+    std::wstring status, speed, recvName;
+    {
+        std::lock_guard<std::mutex> lk(g_xferMtx);
+        pct = g_xferPct;
+        status = g_xferStatus;
+        speed = g_xferSpeed;
+        recvName = g_xferLastRecvName;
+    }
+
+    HDC hdc = CreateCompatibleDC(screenDc);
+    HBITMAP bmp = CreateCompatibleBitmap(screenDc, cw, ch);
+    HGDIOBJ oldBmp = SelectObject(hdc, bmp);
+    SetBkMode(hdc, TRANSPARENT);
+
+    // 1. 整体白底 + 顶部淡紫灰标题栏
+    FillRect(hdc, &cli, g_theme.cardBrush);
+    RECT topBar{ 0, 0, cw, S(50) };
+    HBRUSH topBr = CreateSolidBrush(RGB(178, 174, 198));
+    FillRect(hdc, &topBar, topBr);
+    DeleteObject(topBr);
+
+    // 应用图标
+    HICON hIcon = (HICON)LoadImageW(GetModuleHandleW(nullptr), MAKEINTRESOURCEW(1),
+                                    IMAGE_ICON, S(22), S(22), LR_DEFAULTCOLOR);
+    if (hIcon) {
+        DrawIconEx(hdc, S(14), S(14), hIcon, S(22), S(22), 0, nullptr, DI_NORMAL);
+        DestroyIcon(hIcon);
+    } else {
+        DrawPanelCard(hdc, S(14), S(14), S(22), S(22), S(6), RGB(255, 255, 255), RGB(210, 210, 224));
+    }
+
+    // 标题 + "Box" 胶囊
+    {
+        RECT rt{ S(44), S(8), S(168), S(28) };
+        SelectObject(hdc, g_theme.fontSection);
+        SetTextColor(hdc, RGB(32, 30, 42));
+        DrawTextW(hdc, L"SecDisplay", -1, &rt, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
+
+        DrawPanelCard(hdc, S(44), S(28), S(42), S(14), S(7), RGB(236, 234, 245), RGB(220, 216, 234));
+        COLORREF dotC = conn ? RGB(22, 163, 74) : RGB(148, 163, 184);
+        HPEN dp = CreatePen(PS_SOLID, 1, dotC);
+        HBRUSH db = CreateSolidBrush(dotC);
+        HGDIOBJ op = SelectObject(hdc, dp), ob = SelectObject(hdc, db);
+        Ellipse(hdc, S(49), S(32), S(55), S(38));
+        SelectObject(hdc, ob); SelectObject(hdc, op);
+        DeleteObject(db); DeleteObject(dp);
+
+        RECT rb{ S(56), S(27), S(84), S(42) };
+        SelectObject(hdc, g_theme.fontSmall);
+        SetTextColor(hdc, RGB(58, 55, 72));
+        DrawTextW(hdc, L"Box", -1, &rb, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+    }
+
+    // 圆形按钮：图钉 + 关闭
+    RECT rcPin{}, rcClose{}, rcBox{}, rcRecv{};
+    DropBoxLayoutRects(dpi, &rcPin, &rcClose, &rcBox, &rcRecv);
+    auto drawCircleBtn = [&](const RECT& r, COLORREF fill) {
+        HPEN p = CreatePen(PS_SOLID, 1, RGB(228, 226, 238));
+        HBRUSH b = CreateSolidBrush(fill);
+        HGDIOBJ op = SelectObject(hdc, p), ob = SelectObject(hdc, b);
+        Ellipse(hdc, r.left, r.top, r.right, r.bottom);
+        SelectObject(hdc, ob); SelectObject(hdc, op);
+        DeleteObject(b); DeleteObject(p);
+    };
+    drawCircleBtn(rcPin, g_dbHot == 1 ? RGB(228, 236, 254) : RGB(246, 245, 250));
+    {
+        // 矢量图钉图标
+        int cx = (rcPin.left + rcPin.right) / 2;
+        int cy = (rcPin.top + rcPin.bottom) / 2;
+        COLORREF pc = pinned ? RGB(37, 99, 235) : RGB(115, 118, 132);
+        HPEN pp = CreatePen(PS_SOLID, std::max(1, S(2)), pc);
+        HGDIOBJ op = SelectObject(hdc, pp);
+        MoveToEx(hdc, cx - S(4), cy - S(4), nullptr);
+        LineTo(hdc, cx + S(4), cy - S(4));
+        MoveToEx(hdc, cx, cy - S(4), nullptr);
+        LineTo(hdc, cx, cy + S(1));
+        MoveToEx(hdc, cx - S(5), cy + S(1), nullptr);
+        LineTo(hdc, cx + S(5), cy + S(1));
+        MoveToEx(hdc, cx, cy + S(1), nullptr);
+        LineTo(hdc, cx, cy + S(6));
+        SelectObject(hdc, op);
+        DeleteObject(pp);
+    }
+    drawCircleBtn(rcClose, g_dbHot == 2 ? RGB(254, 226, 226) : RGB(246, 245, 250));
+    {
+        int cx = (rcClose.left + rcClose.right) / 2;
+        int cy = (rcClose.top + rcClose.bottom) / 2;
+        int d = S(4);
+        HPEN cp = CreatePen(PS_SOLID, std::max(1, S(2)), g_dbHot == 2 ? RGB(185, 28, 28) : RGB(45, 45, 55));
+        HGDIOBJ op = SelectObject(hdc, cp);
+        MoveToEx(hdc, cx - d, cy - d, nullptr); LineTo(hdc, cx + d, cy + d);
+        MoveToEx(hdc, cx + d, cy - d, nullptr); LineTo(hdc, cx - d, cy + d);
+        SelectObject(hdc, op);
+        DeleteObject(cp);
+    }
+
+    // 2. 中央发光投递盒
+    const bool boxActive = (g_dbHot == 3 || pct >= 0);
+    // 外层柔和光晕轮廓
+    DrawPanelCard(hdc, rcBox.left - S(4), rcBox.top - S(4),
+                  (rcBox.right - rcBox.left) + S(8), (rcBox.bottom - rcBox.top) + S(8),
+                  S(14), boxActive ? RGB(239, 246, 255) : RGB(246, 247, 250),
+                  boxActive ? RGB(191, 219, 254) : RGB(238, 240, 245));
+    DrawPanelCard(hdc, rcBox.left, rcBox.top,
+                  rcBox.right - rcBox.left, rcBox.bottom - rcBox.top,
+                  S(12), boxActive ? RGB(229, 240, 255) : RGB(224, 226, 230),
+                  boxActive ? RGB(59, 130, 246) : RGB(212, 215, 222));
+
+    if (pct >= 0) {
+        wchar_t pbuf[32];
+        swprintf(pbuf, 32, L"%d%%", pct);
+        RECT rp{ rcBox.left, rcBox.top + S(26), rcBox.right, rcBox.top + S(68) };
+        SelectObject(hdc, g_theme.fontTitle);
+        SetTextColor(hdc, RGB(37, 99, 235));
+        DrawTextW(hdc, pbuf, -1, &rp, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+
+        int bx1 = rcBox.left + S(22), bx2 = rcBox.right - S(22), by1 = rcBox.top + S(76), bh = S(8);
+        DrawPanelCard(hdc, bx1, by1, bx2 - bx1, bh, bh / 2, RGB(203, 213, 225), RGB(203, 213, 225));
+        int fillW = (int)((bx2 - bx1) * std::min(100, std::max(0, pct)) / 100.0);
+        if (fillW > S(4)) {
+            DrawPanelCard(hdc, bx1, by1, fillW, bh, bh / 2, RGB(37, 99, 235), RGB(37, 99, 235));
+        }
+
+        RECT rs{ rcBox.left + S(8), rcBox.top + S(92), rcBox.right - S(8), rcBox.bottom - S(10) };
+        SelectObject(hdc, g_theme.fontSmall);
+        SetTextColor(hdc, RGB(71, 85, 105));
+        DrawTextW(hdc, speed.c_str(), -1, &rs, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+    } else {
+        // 居中收件箱 + 向下箭头矢量图标
+        int cx = (rcBox.left + rcBox.right) / 2;
+        int cy = (rcBox.top + rcBox.bottom) / 2 - S(8);
+        COLORREF ic = g_dbHot == 3 ? RGB(37, 99, 235) : RGB(130, 134, 142);
+        HPEN ip = CreatePen(PS_SOLID, std::max(1, S(2)), ic);
+        HGDIOBJ op = SelectObject(hdc, ip);
+        // 向下箭头
+        MoveToEx(hdc, cx, cy - S(22), nullptr); LineTo(hdc, cx, cy + S(2));
+        MoveToEx(hdc, cx - S(8), cy - S(6), nullptr); LineTo(hdc, cx, cy + S(2));
+        LineTo(hdc, cx + S(8), cy - S(6));
+        // 托盘收件箱（梯形+凹口）
+        MoveToEx(hdc, cx - S(14), cy - S(4), nullptr);
+        LineTo(hdc, cx - S(20), cy + S(8));
+        LineTo(hdc, cx - S(20), cy + S(22));
+        LineTo(hdc, cx + S(20), cy + S(22));
+        LineTo(hdc, cx + S(20), cy + S(8));
+        LineTo(hdc, cx + S(14), cy - S(4));
+        MoveToEx(hdc, cx - S(20), cy + S(8), nullptr);
+        LineTo(hdc, cx - S(8), cy + S(8));
+        LineTo(hdc, cx - S(5), cy + S(13));
+        LineTo(hdc, cx + S(5), cy + S(13));
+        LineTo(hdc, cx + S(8), cy + S(8));
+        LineTo(hdc, cx + S(20), cy + S(8));
+        SelectObject(hdc, op);
+        DeleteObject(ip);
+
+        RECT rh{ rcBox.left + S(8), rcBox.bottom - S(30), rcBox.right - S(8), rcBox.bottom - S(8) };
+        SelectObject(hdc, g_theme.fontSmall);
+        SetTextColor(hdc, g_dbHot == 3 ? RGB(37, 99, 235) : RGB(115, 120, 130));
+        DrawTextW(hdc, L"拖入或点击发送", -1, &rh, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+    }
+
+    // 3. 底部已收文件胶囊 / 状态文字
+    if (!recvName.empty() && pct < 0) {
+        DrawPanelCard(hdc, rcRecv.left, rcRecv.top,
+                      rcRecv.right - rcRecv.left, rcRecv.bottom - rcRecv.top,
+                      S(14), g_dbHot == 4 ? RGB(220, 252, 231) : RGB(236, 253, 245),
+                      RGB(167, 243, 208));
+        std::wstring label = L"↓ " + recvName;
+        RECT rr{ rcRecv.left + S(10), rcRecv.top, rcRecv.right - S(10), rcRecv.bottom };
+        SelectObject(hdc, g_theme.fontSmall);
+        SetTextColor(hdc, RGB(21, 128, 61));
+        DrawTextW(hdc, label.c_str(), -1, &rr,
+                  DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
+    } else {
+        RECT rr{ S(12), S(214), cw - S(12), ch - S(10) };
+        SelectObject(hdc, g_theme.fontSmall);
+        SetTextColor(hdc, RGB(100, 116, 139));
+        DrawTextW(hdc, status.c_str(), -1, &rr,
+                  DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
+    }
+
+    // 淡外框描边
+    {
+        HPEN bp = CreatePen(PS_SOLID, 1, RGB(214, 218, 228));
+        HGDIOBJ ob = SelectObject(hdc, GetStockObject(NULL_BRUSH));
+        HGDIOBJ op = SelectObject(hdc, bp);
+        Rectangle(hdc, 0, 0, cw, ch);
+        SelectObject(hdc, op); SelectObject(hdc, ob);
+        DeleteObject(bp);
+    }
+
+    BitBlt(screenDc, 0, 0, cw, ch, hdc, 0, 0, SRCCOPY);
+    SelectObject(hdc, oldBmp);
+    DeleteObject(bmp);
+    DeleteDC(hdc);
+    EndPaint(h, &ps);
+}
+
+static LRESULT CALLBACK DropBoxWndProc(HWND h, UINT msg, WPARAM w, LPARAM l) {
+    switch (msg) {
+    case WM_CREATE:
+        DragAcceptFiles(h, TRUE);
+        ApplyDropBoxRoundCorners(h, PanelWindowDpi(h));
+        return 0;
+    case WM_ERASEBKGND:
+        return 1;
+    case WM_PAINT:
+        PaintDropBox(h);
+        return 0;
+    case WM_APP_XFER_UI:
+        InvalidateRect(h, nullptr, FALSE);
+        return 0;
+    case WM_MOUSEMOVE: {
+        POINT pt{ GET_X_LPARAM(l), GET_Y_LPARAM(l) };
+        const int dpi = PanelWindowDpi(h);
+        RECT rcPin{}, rcClose{}, rcBox{}, rcRecv{};
+        DropBoxLayoutRects(dpi, &rcPin, &rcClose, &rcBox, &rcRecv);
+        int hot = 0;
+        if (PtInRect(&rcPin, pt)) hot = 1;
+        else if (PtInRect(&rcClose, pt)) hot = 2;
+        else if (PtInRect(&rcBox, pt)) hot = 3;
+        else if (PtInRect(&rcRecv, pt)) hot = 4;
+        if (hot != g_dbHot) {
+            g_dbHot = hot;
+            InvalidateRect(h, nullptr, FALSE);
+        }
+        TRACKMOUSEEVENT tme{ sizeof(tme), TME_LEAVE, h, 0 };
+        TrackMouseEvent(&tme);
+        return 0;
+    }
+    case WM_MOUSELEAVE:
+        if (g_dbHot != 0) {
+            g_dbHot = 0;
+            InvalidateRect(h, nullptr, FALSE);
+        }
+        return 0;
+    case WM_LBUTTONDOWN: {
+        POINT pt{ GET_X_LPARAM(l), GET_Y_LPARAM(l) };
+        const int dpi = PanelWindowDpi(h);
+        RECT rcPin{}, rcClose{}, rcBox{}, rcRecv{};
+        DropBoxLayoutRects(dpi, &rcPin, &rcClose, &rcBox, &rcRecv);
+        if (PtInRect(&rcPin, pt)) {
+            bool next = !g_dropBoxPinned.load();
+            g_dropBoxPinned = next;
+            SetWindowPos(h, next ? HWND_TOPMOST : HWND_NOTOPMOST, 0, 0, 0, 0,
+                         SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+            InvalidateRect(h, nullptr, FALSE);
+            Log("悬浮投递盒置顶: %s", next ? "开" : "关");
+            return 0;
+        }
+        if (PtInRect(&rcClose, pt)) {
+            ShowWindow(h, SW_HIDE);
+            return 0;
+        }
+        if (PtInRect(&rcBox, pt)) {
+            PickAndSendFiles(h);
+            return 0;
+        }
+        if (PtInRect(&rcRecv, pt)) {
+            std::wstring recvPath;
+            {
+                std::lock_guard<std::mutex> lk(g_xferMtx);
+                recvPath = g_xferLastRecvPath;
+            }
+            if (!recvPath.empty()) {
+                std::wstring arg = L"/select,\"" + recvPath + L"\"";
+                ShellExecuteW(nullptr, L"open", L"explorer.exe", arg.c_str(), nullptr, SW_SHOWNORMAL);
+            } else {
+                std::wstring dir = GetTransferInboxDir();
+                ShellExecuteW(nullptr, L"open", dir.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
+            }
+            return 0;
+        }
+        // 顶部紫灰标题栏空白区支持按住拖动整个悬浮盒
+        if (pt.y < DpiPx(50, dpi)) {
+            ReleaseCapture();
+            SendMessageW(h, WM_NCLBUTTONDOWN, HTCAPTION, 0);
+        }
+        return 0;
+    }
+    case WM_DROPFILES: {
+        HDROP drop = (HDROP)w;
+        UINT cnt = DragQueryFileW(drop, 0xFFFFFFFF, nullptr, 0);
+        for (UINT i = 0; i < cnt; ++i) {
+            UINT len = DragQueryFileW(drop, i, nullptr, 0);
+            if (len > 0 && len < 4096) {
+                std::wstring path(len + 1, L'\0');
+                if (DragQueryFileW(drop, i, &path[0], len + 1) > 0) {
+                    path.resize(wcslen(path.c_str()));
+                    EnqueueFileTransfer(path);
+                }
+            }
+        }
+        DragFinish(drop);
+        return 0;
+    }
+    case WM_DPICHANGED: {
+        const RECT* suggested = (const RECT*)l;
+        if (suggested) {
+            SetWindowPos(h, nullptr, suggested->left, suggested->top,
+                         suggested->right - suggested->left,
+                         suggested->bottom - suggested->top,
+                         SWP_NOZORDER | SWP_NOACTIVATE);
+        }
+        ApplyDropBoxRoundCorners(h, PanelWindowDpi(h));
+        InvalidateRect(h, nullptr, FALSE);
+        return 0;
+    }
+    case WM_CLOSE:
+        ShowWindow(h, SW_HIDE);
+        return 0;
+    }
+    return DefWindowProcW(h, msg, w, l);
+}
+
+static void ShowDropBoxWindow() {
+    HWND cur = g_dropBox.load();
+    if (cur) {
+        ShowWindow(cur, SW_SHOWNOACTIVATE);
+        SetWindowPos(cur, g_dropBoxPinned.load() ? HWND_TOPMOST : HWND_NOTOPMOST,
+                     0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+        InvalidateRect(cur, nullptr, FALSE);
+        return;
+    }
+
+    static bool registered = false;
+    if (!registered) {
+        WNDCLASSEXW wc{};
+        wc.cbSize = sizeof(wc);
+        wc.lpfnWndProc = DropBoxWndProc;
+        wc.hInstance = GetModuleHandleW(nullptr);
+        wc.hCursor = LoadCursorW(nullptr, (LPCWSTR)IDC_ARROW);
+        wc.hbrBackground = nullptr;
+        wc.lpszClassName = L"SecDisplayDropBox";
+        RegisterClassExW(&wc);
+        registered = true;
+    }
+
+    const int dpi = PanelWindowDpi(nullptr);
+    int w = DpiPx(248, dpi), hgt = DpiPx(266, dpi);
+    RECT wa{};
+    SystemParametersInfoW(SPI_GETWORKAREA, 0, &wa, 0);
+    int x = (wa.right > wa.left) ? (wa.right - w - DpiPx(24, dpi)) : (GetSystemMetrics(SM_CXSCREEN) - w - 24);
+    int y = (wa.bottom > wa.top) ? (wa.bottom - hgt - DpiPx(24, dpi)) : (GetSystemMetrics(SM_CYSCREEN) - hgt - 48);
+    DWORD exStyle = WS_EX_TOOLWINDOW | (g_dropBoxPinned.load() ? WS_EX_TOPMOST : 0);
+    HWND h = CreateWindowExW(exStyle, L"SecDisplayDropBox", L"SecDisplay Box",
+                             WS_POPUP | WS_CLIPCHILDREN, x, y, w, hgt,
+                             nullptr, nullptr, GetModuleHandleW(nullptr), nullptr);
+    if (h) {
+        g_dropBox = h;
+        const int realDpi = PanelWindowDpi(h);
+        if (realDpi != dpi) {
+            int rw = DpiPx(248, realDpi), rh = DpiPx(266, realDpi);
+            SetWindowPos(h, nullptr, 0, 0, rw, rh, SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE);
+            ApplyDropBoxRoundCorners(h, realDpi);
+        }
+        ShowWindow(h, SW_SHOWNOACTIVATE);
+        Log("Windows 悬浮投递盒已打开 hwnd=%p", (void*)h);
     }
 }
 
@@ -3852,7 +4281,8 @@ static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
         return 0;
     case WM_COMMAND:
         switch (LOWORD(w)) {
-        case ID_TRAY_PANEL:  ShowControlPanel(); return 0;
+        case ID_TRAY_PANEL:   ShowControlPanel(); return 0;
+        case ID_TRAY_DROPBOX: ShowDropBoxWindow(); return 0;
         case ID_TRAY_EXIT:   RequestQuit(); return 0;
         case ID_TRAY_TOGGLE:
             if (g_isFullscreen) ExitFullscreen(); else EnterFullscreen();
@@ -4943,7 +5373,7 @@ static void TransferLoop(RunConfig cfg) {
                 putU16(beginFrame, (uint16_t)baseU8.size());
                 beginFrame.insert(beginFrame.end(), baseU8.begin(), baseU8.end());
 
-                SetTransferStatus(L"发送中: " + baseW + L" (0%)");
+                SetTransferStatus(L"发送中: " + baseW + L" (0%)", 0, L"0 MB/s");
                 Log("中转站开始发送 #%u: %s (%llu B)", tid, baseU8.c_str(), (unsigned long long)totalSize);
                 ULONGLONG t0 = GetTickCount64();
                 ULONGLONG lastUi = t0;
@@ -4982,9 +5412,10 @@ static void TransferLoop(RunConfig cfg) {
                         double dt = std::max(0.01, (double)(now - t0) / 1000.0);
                         double speed = (double)sentTotal / dt / 1048576.0;
                         int pct = totalSize > 0 ? (int)((double)sentTotal * 100.0 / (double)totalSize) : 100;
-                        wchar_t sb[256];
+                        wchar_t sb[256], spdb[64];
                         swprintf(sb, 256, L"发送 %s · %d%% · %.0f MB/s", baseW.c_str(), pct, speed);
-                        SetTransferStatus(sb);
+                        swprintf(spdb, 64, L"%.0f MB/s", speed);
+                        SetTransferStatus(sb, pct, spdb);
                     }
                 }
                 CloseHandle(hf);
@@ -5019,10 +5450,10 @@ static void TransferLoop(RunConfig cfg) {
                     wchar_t sb[256];
                     swprintf(sb, 256, L"已发送: %s (%s · %.0f MB/s)",
                              baseW.c_str(), FormatBytesW(sentTotal).c_str(), speed);
-                    SetTransferStatus(sb);
+                    SetTransferStatus(sb, -1, L"");
                     Log("中转站发送完成 #%u: %s (%.1f MB/s)", tid, baseU8.c_str(), speed);
                 } else {
-                    SetTransferStatus(L"发送失败: " + baseW);
+                    SetTransferStatus(L"发送失败: " + baseW, -1, L"");
                 }
             }
         });
@@ -5082,7 +5513,7 @@ static void TransferLoop(RunConfig cfg) {
                 st.hf = hf; st.safeName = safe; st.partPath = partPath;
                 st.expected = size; st.started = GetTickCount64(); st.lastUi = st.started;
                 recvs[id] = st;
-                SetTransferStatus(L"正在接收: " + safe + L" (0%)");
+                SetTransferStatus(L"正在接收: " + safe + L" (0%)", 0, L"0 MB/s");
                 Log("中转站开始接收 #%u: %s (%llu B)", id, ToUtf8(safe.c_str()).c_str(), (unsigned long long)size);
             } else if (type == XFER_CHUNK && len >= 8) {
                 uint32_t id = rdU32(payload.data());
@@ -5106,9 +5537,10 @@ static void TransferLoop(RunConfig cfg) {
                     double speed = (double)it->second.received / dt / 1048576.0;
                     int pct = it->second.expected > 0
                         ? (int)((double)it->second.received * 100.0 / (double)it->second.expected) : 100;
-                    wchar_t sb[256];
+                    wchar_t sb[256], spdb[64];
                     swprintf(sb, 256, L"接收 %s · %d%% · %.0f MB/s", it->second.safeName.c_str(), pct, speed);
-                    SetTransferStatus(sb);
+                    swprintf(spdb, 64, L"%.0f MB/s", speed);
+                    SetTransferStatus(sb, pct, spdb);
                 }
             } else if (type == XFER_END && len >= 5) {
                 uint32_t id = rdU32(payload.data());
@@ -5125,10 +5557,15 @@ static void TransferLoop(RunConfig cfg) {
                         double speed = (double)st.received / dt / 1048576.0;
                         size_t sl = dest.find_last_of(L"\\/");
                         std::wstring finalName = (sl == std::wstring::npos) ? dest : dest.substr(sl + 1);
+                        {
+                            std::lock_guard<std::mutex> lk(g_xferMtx);
+                            g_xferLastRecvPath = dest;
+                            g_xferLastRecvName = finalName;
+                        }
                         wchar_t sb[256];
                         swprintf(sb, 256, L"已收到: %s (%s · %.0f MB/s)",
                                  finalName.c_str(), FormatBytesW(st.received).c_str(), speed);
-                        SetTransferStatus(sb);
+                        SetTransferStatus(sb, -1, L"");
                         Log("中转站接收完成 #%u: %s (%.1f MB/s)", id, ToUtf8(finalName.c_str()).c_str(), speed);
                         sendAck(id, true);
                     } else {
@@ -5534,6 +5971,9 @@ int main(int argc, char** argv) {
     if (inputThread.joinable()) inputThread.join();
     HWND panelToDestroy = g_panel.exchange(nullptr);
     if (panelToDestroy) { DestroyWindow(panelToDestroy); }
+    HWND dbToDestroy = g_dropBox.exchange(nullptr);
+    if (dbToDestroy) { DestroyWindow(dbToDestroy); }
+    g_theme.ReleaseAll();
 
     WSACleanup();
     presenter.Shutdown();

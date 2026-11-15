@@ -59,6 +59,13 @@ final class AppModel: ObservableObject {
     @Published var transferHistory: [String] = []
     @Published var transferInboxPath = ""
     @Published var transferDropTargeted = false
+    @Published var transferBusy = false
+    @Published var transferProgress: Double = 0
+    @Published var transferSpeed = ""
+    @Published var transferLastRecvURL: URL? = nil
+    @Published var transferLastRecvName = ""
+    @Published var dropBoxPinned = true
+    @Published var dropBoxHoverTargeted = false
 
     static let resolutions: [(label: String, w: Int, h: Int, lw: Int, lh: Int)] = [
         ("1600 × 1000 (1x)", 1600, 1000, 1600, 1000),
@@ -137,6 +144,11 @@ final class AppModel: ObservableObject {
         transferStatus = ts.statusText
         transferHistory = ts.history
         transferInboxPath = ts.inboxPath
+        transferBusy = ts.busy
+        transferProgress = ts.progress
+        transferSpeed = ts.speedText
+        transferLastRecvURL = ts.lastReceivedURL
+        transferLastRecvName = ts.lastReceivedName
     }
 }
 
@@ -307,6 +319,9 @@ struct StatusView: View {
                                 ? transferService.inboxURL.path
                                 : model.transferInboxPath
                             NSWorkspace.shared.open(URL(fileURLWithPath: path))
+                        }
+                        Button("悬浮盒") {
+                            showDropBoxPanel()
                         }
                     }
                     if !model.transferHistory.isEmpty {
@@ -589,4 +604,230 @@ func showControlPanel() {
         NSApp.activate(ignoringOtherApps: true)
         targetWindow.makeKeyAndOrderFront(nil)
     }
+}
+
+// MARK: - 悬浮文件投递盒（ArcZip Box 风格）
+
+private func openTransferFilePicker() {
+    let wasAccessory = NSApp.activationPolicy() == .accessory
+    if wasAccessory {
+        NSApp.setActivationPolicy(.regular)
+        NSApp.activate(ignoringOtherApps: true)
+    }
+    let panel = NSOpenPanel()
+    panel.title = "选择要发送到 Windows 的文件"
+    panel.canChooseFiles = true
+    panel.canChooseDirectories = false
+    panel.allowsMultipleSelection = true
+    if panel.runModal() == .OK {
+        transferService.enqueue(urls: panel.urls)
+    }
+    if wasAccessory && !isControlPanelVisible {
+        NSApp.setActivationPolicy(.accessory)
+    }
+}
+
+struct DropBoxView: View {
+    @ObservedObject var model = AppModel.shared
+
+    var body: some View {
+        VStack(spacing: 0) {
+            // 顶部柔和冷紫灰标题栏
+            HStack(spacing: 8) {
+                if let icon = NSApp.applicationIconImage {
+                    Image(nsImage: icon)
+                        .resizable()
+                        .frame(width: 24, height: 24)
+                        .clipShape(RoundedRectangle(cornerRadius: 6))
+                } else {
+                    Image(systemName: "display")
+                        .font(.system(size: 16, weight: .semibold))
+                }
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("SecDisplay")
+                        .font(.system(size: 13, weight: .semibold))
+                        .foregroundStyle(Color(red: 0.14, green: 0.14, blue: 0.18))
+                    HStack(spacing: 4) {
+                        Text("Box")
+                            .font(.system(size: 9, weight: .medium))
+                            .foregroundStyle(Color(red: 0.25, green: 0.25, blue: 0.32))
+                        Circle()
+                            .fill(model.transferConnected ? Color.green : Color.gray.opacity(0.6))
+                            .frame(width: 5, height: 5)
+                    }
+                    .padding(.horizontal, 6)
+                    .padding(.vertical, 1)
+                    .background(Capsule().fill(Color.white.opacity(0.65)))
+                }
+                Spacer()
+                Button(action: { toggleDropBoxPin() }) {
+                    Image(systemName: model.dropBoxPinned ? "pin.fill" : "pin")
+                        .font(.system(size: 11, weight: .medium))
+                        .foregroundStyle(model.dropBoxPinned
+                                         ? Color(red: 0.15, green: 0.35, blue: 0.85)
+                                         : Color(red: 0.25, green: 0.25, blue: 0.32))
+                        .frame(width: 24, height: 24)
+                        .background(Circle().fill(Color.white.opacity(0.85)))
+                }
+                .buttonStyle(.plain)
+                .help(model.dropBoxPinned ? "取消置顶" : "置顶悬浮")
+
+                Button(action: { hideDropBoxPanel() }) {
+                    Image(systemName: "xmark")
+                        .font(.system(size: 11, weight: .bold))
+                        .foregroundStyle(Color(red: 0.20, green: 0.20, blue: 0.25))
+                        .frame(width: 24, height: 24)
+                        .background(Circle().fill(Color.white.opacity(0.85)))
+                }
+                .buttonStyle(.plain)
+                .help("关闭投递盒")
+            }
+            .padding(.horizontal, 14)
+            .padding(.vertical, 10)
+            .background(Color(red: 0.70, green: 0.68, blue: 0.80))
+
+            // 下半部分白色拖放投递区
+            VStack(spacing: 8) {
+                Button(action: { openTransferFilePicker() }) {
+                    ZStack {
+                        RoundedRectangle(cornerRadius: 12)
+                            .fill(model.dropBoxHoverTargeted
+                                  ? Color(red: 0.88, green: 0.93, blue: 1.0)
+                                  : Color(red: 0.91, green: 0.92, blue: 0.94))
+                            .shadow(color: model.dropBoxHoverTargeted
+                                    ? Color.blue.opacity(0.22)
+                                    : Color.black.opacity(0.05),
+                                    radius: 10, x: 0, y: 2)
+                        RoundedRectangle(cornerRadius: 12)
+                            .stroke(model.dropBoxHoverTargeted
+                                    ? Color.blue.opacity(0.7)
+                                    : Color.clear,
+                                    lineWidth: 1.5)
+
+                        if model.transferBusy {
+                            VStack(spacing: 6) {
+                                ProgressView(value: model.transferProgress)
+                                    .progressViewStyle(.circular)
+                                Text(String(format: "%.0f%%  %@", model.transferProgress * 100.0, model.transferSpeed))
+                                    .font(.system(size: 11, weight: .semibold, design: .monospaced))
+                                    .foregroundStyle(Color(red: 0.15, green: 0.35, blue: 0.85))
+                            }
+                        } else {
+                            VStack(spacing: 6) {
+                                Image(systemName: "tray.and.arrow.down")
+                                    .font(.system(size: 30, weight: .light))
+                                    .foregroundStyle(model.dropBoxHoverTargeted
+                                                     ? Color.blue
+                                                     : Color(red: 0.48, green: 0.50, blue: 0.56))
+                                Text("拖入或点击发送")
+                                    .font(.system(size: 10))
+                                    .foregroundStyle(Color(red: 0.48, green: 0.50, blue: 0.56))
+                            }
+                        }
+                    }
+                    .frame(width: 146, height: 118)
+                }
+                .buttonStyle(.plain)
+
+                if let recvURL = model.transferLastRecvURL, !model.transferLastRecvName.isEmpty {
+                    HStack(spacing: 4) {
+                        Image(systemName: "arrow.down.circle.fill")
+                            .font(.system(size: 10))
+                            .foregroundStyle(.green)
+                        Text(model.transferLastRecvName)
+                            .font(.system(size: 10, weight: .medium))
+                            .foregroundStyle(Color(red: 0.15, green: 0.20, blue: 0.28))
+                            .lineLimit(1)
+                            .truncationMode(.middle)
+                    }
+                    .padding(.horizontal, 8)
+                    .padding(.vertical, 3)
+                    .background(Capsule().fill(Color(red: 0.93, green: 0.96, blue: 0.94)))
+                    .onTapGesture {
+                        NSWorkspace.shared.activateFileViewerSelecting([recvURL])
+                    }
+                    .onDrag {
+                        NSItemProvider(object: recvURL as NSURL)
+                    }
+                    .help("点击在 Finder 中定位，或直接拖出到其他应用")
+                } else {
+                    Text(model.transferStatus)
+                        .font(.system(size: 10))
+                        .foregroundStyle(Color.secondary)
+                        .lineLimit(1)
+                        .truncationMode(.middle)
+                }
+            }
+            .padding(14)
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
+            .background(Color.white)
+        }
+        .frame(width: 244, height: 256)
+        .clipShape(RoundedRectangle(cornerRadius: 18, style: .continuous))
+        .overlay(
+            RoundedRectangle(cornerRadius: 18, style: .continuous)
+                .stroke(Color.black.opacity(0.08), lineWidth: 1)
+        )
+        .onDrop(of: [.fileURL], isTargeted: $model.dropBoxHoverTargeted) { providers in
+            var accepted = false
+            for p in providers where p.canLoadObject(ofClass: URL.self) {
+                accepted = true
+                _ = p.loadObject(ofClass: URL.self) { url, _ in
+                    if let url { transferService.enqueue(urls: [url]) }
+                }
+            }
+            return accepted
+        }
+    }
+}
+
+private var dropBoxPanel: NSPanel?
+
+func toggleDropBoxPin() {
+    let next = !AppModel.shared.dropBoxPinned
+    AppModel.shared.dropBoxPinned = next
+    dropBoxPanel?.level = next ? .floating : .normal
+    Log.info("Mac 投递盒置顶: \(next ? "开" : "关")")
+}
+
+func hideDropBoxPanel() {
+    dropBoxPanel?.orderOut(nil)
+    Log.info("Mac 投递盒已隐藏")
+}
+
+func showDropBoxPanel() {
+    if let p = dropBoxPanel {
+        p.level = AppModel.shared.dropBoxPinned ? .floating : .normal
+        p.orderFrontRegardless()
+        return
+    }
+    let host = NSHostingView(rootView: DropBoxView())
+    let p = NSPanel(
+        contentRect: NSRect(x: 0, y: 0, width: 244, height: 256),
+        styleMask: [.borderless, .nonactivatingPanel],
+        backing: .buffered,
+        defer: false)
+    p.isFloatingPanel = true
+    p.level = AppModel.shared.dropBoxPinned ? .floating : .normal
+    p.isOpaque = false
+    p.backgroundColor = .clear
+    p.hasShadow = true
+    p.hidesOnDeactivate = false
+    p.isMovableByWindowBackground = true
+    p.isReleasedWhenClosed = false
+    p.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
+    p.contentView = host
+
+    let screen = NSScreen.screens.first { s in
+        abs(s.frame.origin.x) < 1 && abs(s.frame.origin.y) < 1
+    } ?? NSScreen.screens.first
+    if let s = screen {
+        let vf = s.visibleFrame
+        p.setFrameOrigin(NSPoint(x: vf.maxX - 244 - 28, y: vf.minY + 28))
+    } else {
+        p.center()
+    }
+    p.orderFrontRegardless()
+    dropBoxPanel = p
+    Log.info("Mac 文件投递盒已打开")
 }
