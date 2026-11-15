@@ -71,7 +71,8 @@ sign_ok() {
 # 用一个签了稳定身份的小探针查询，探针只在存在时编译一次并缓存。
 VDPROBE="$LOGDIR/.vdprobe.v2"
 vd_stale() {
-    if [ ! -x "$VDPROBE" ] || [ "$0" -nt "$VDPROBE" ]; then
+    if [ ! -x "$VDPROBE" ] || [ "./run.sh" -nt "$VDPROBE" ]; then
+        rm -f "$LOGDIR/.vdprobe"
         cat > "$VDPROBE.swift" <<'SWIFT'
 import CoreGraphics
 var n:UInt32=0; CGGetOnlineDisplayList(0,nil,&n)
