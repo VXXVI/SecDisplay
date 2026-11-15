@@ -238,7 +238,13 @@ var bitrateMbps = 60
 
 `VideoProcessorBlt` 的 NV12→BGRA 转换在部分驱动上有问题。记录下显卡型号，这是已知的驱动兼容性风险。
 
-如果是在 `Contents/Resources/pixfmt` 里切到 `420v` 之后才偏色，那是色域链路的问题：Mac 侧采集设了 ITU-R 709，但 VideoToolbox 不写 VUI 色彩描述，Windows 侧 D3D11 VideoProcessor 也没有显式设置 StreamColorSpace，两端都没有锚点，最终用驱动默认矩阵。把 `pixfmt` 改回 `bgra` 即可，代价是内存从 44MB 回到 136MB。
+两端已显式锚定 BT.709 矩阵与 sRGB 传递函数（Mac 端 VideoToolbox 写 VUI，Windows 端 `VideoProcessorSetStreamColorSpace` / `SetOutputColorSpace` 设 16-235 → 0-255）。若特定显卡驱动仍忽略色彩空间属性，可把 `Contents/Resources/pixfmt` 保持为 `bgra`。
+
+### Windows 端：投屏一段时间后会自动熄屏
+
+Windows 电源计划默认在无本地键鼠输入时关闭显示器（例如平衡模式下插电 10 分钟、电池 3 分钟）。Mac 端拦截并回放虚拟屏输入不会重置 Windows 本地空闲计时器。
+
+接收端现已在投屏且未最小化时自动声明 `SetThreadExecutionState(ES_DISPLAY_REQUIRED | ES_SYSTEM_REQUIRED)` 保持屏幕常亮，断连或最小化让位时释放。可在控制面板勾选或取消「保持屏幕常亮 (防熄屏)」。
 
 ### Mac 端：画面卡住不动 / 内存持续上涨
 
@@ -278,6 +284,4 @@ SecDisplay --cleanup-orphan
 
 **Windows 端已在真实机器上编译运行验证。** 分辨率 2880×1800、硬件解码（Microsoft H264 Video Decoder MFT）、D3D11 渲染均正常，但只在一种显卡和一种 Windows 版本上验证过。换机器仍需按上面的排障步骤走一遍。
 
-**420v 采集模式默认关闭。** 它把 Mac 端内存从 136MB 降到 44MB，代价是帧率掉一半（约 20~37fps），且色域没有锚点可能偏色。除非内存吃紧，否则保持 `bgra`。
-
-**`prototype/mac/Sources/main.swift` 里的 `Capture` 类（约 350 行）是死代码。** 它走 SCStream 路径，当前没有任何实例化点，实际采集走 `ScreenshotCapture`。保留是因为里面记了 SCStream 在 `CGVirtualDisplay` 上的实测结论。
+**420v 采集模式默认关闭。** 它把 Mac 端内存从 136MB 降到 44MB，代价是帧率掉一半（约 20~37fps）。除非内存吃紧，否则保持 `bgra`。

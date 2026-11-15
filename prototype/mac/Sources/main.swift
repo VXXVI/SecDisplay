@@ -735,6 +735,20 @@ final class Encoder {
             VTSessionSetProperty(s, key: kVTCompressionPropertyKey_MaxFrameDelayCount, value: 1 as CFNumber)
         }
 
+        // 色彩三键 VUI 锚点（BT.709 色域与矩阵 + sRGB 传递函数）。
+        // 原来不设这些键时，H.264 SPS 里不带 colour_description，BGRA 由 VT 自选、
+        // 420v 采集设了 709，导致两端默认矩阵不一致时偏色。显式写进会话与 VUI，
+        // 配合 Windows 侧 D3D11 VideoProcessor 的 BT.709 设置对齐整条色彩链路。
+        let stPrim = VTSessionSetProperty(s, key: kVTCompressionPropertyKey_ColorPrimaries,
+                                          value: kCVImageBufferColorPrimaries_ITU_R_709_2)
+        let stTrans = VTSessionSetProperty(s, key: kVTCompressionPropertyKey_TransferFunction,
+                                           value: kCVImageBufferTransferFunction_sRGB)
+        let stMat = VTSessionSetProperty(s, key: kVTCompressionPropertyKey_YCbCrMatrix,
+                                         value: kCVImageBufferYCbCrMatrix_ITU_R_709_2)
+        if stPrim != noErr || stTrans != noErr || stMat != noErr {
+            Log.info("警告: 编码器色彩属性设置未完全生效 prim=\(stPrim) trans=\(stTrans) mat=\(stMat)")
+        }
+
         VTCompressionSessionPrepareToEncodeFrames(s)
         Log.info("编码参数方案 \(variant)")
         return true
@@ -808,6 +822,20 @@ final class Encoder {
 
         frameSeq += 1
         let monotonicPTS = CMTime(value: frameSeq, timescale: CMTimeScale(max(1, Int(60))))
+
+        // 420v（VideoRange YUV）补齐像素缓冲色彩附件，确保与会话 VUI 一致
+        let fmt = CVPixelBufferGetPixelFormatType(pb)
+        if fmt == kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange ||
+           fmt == kCVPixelFormatType_420YpCbCr8BiPlanarFullRange {
+            if CVBufferCopyAttachment(pb, kCVImageBufferYCbCrMatrixKey, nil) == nil {
+                CVBufferSetAttachment(pb, kCVImageBufferColorPrimariesKey,
+                                      kCVImageBufferColorPrimaries_ITU_R_709_2, .shouldPropagate)
+                CVBufferSetAttachment(pb, kCVImageBufferTransferFunctionKey,
+                                      kCVImageBufferTransferFunction_sRGB, .shouldPropagate)
+                CVBufferSetAttachment(pb, kCVImageBufferYCbCrMatrixKey,
+                                      kCVImageBufferYCbCrMatrix_ITU_R_709_2, .shouldPropagate)
+            }
+        }
 
         var flags: VTEncodeInfoFlags = []
         let status = VTCompressionSessionEncodeFrame(
@@ -930,368 +958,6 @@ final class Encoder {
         onFrame?(out, isKey, captureTime)
     }
 
-}
-
-// MARK: - 抓屏（SCStream 路径，当前未启用）
-//
-// 注意：这个类目前没有任何实例化点，实际采集走下面的 ScreenshotCapture。
-// 保留它是因为里面记了 SCStream 在 CGVirtualDisplay 上的实测结论（见
-// startCompositeCapture 的注释），将来若要回到 SCStream 路径可直接参考。
-// 它的 idleFrameCount / staticSkipCount 因此恒为 0，不要拿去做面板指标。
-
-final class Capture: NSObject, SCStreamOutput, SCStreamDelegate {
-    let encoder: Encoder
-    private let cfg: Config
-    /// 虚拟屏 id 可能变化（重建虚拟屏后），每次重建流都重新问一次
-    private let displayIDProvider: () -> CGDirectDisplayID
-
-    var stream: SCStream?
-    var captured = 0
-    /// 采集段延迟：系统合成完成 → 我们拿到帧
-    var capLatSum: Double = 0
-    var capLatCount = 0
-    var capLatMax: Double = 0
-    var lastFrameTime: CFAbsoluteTime = 0
-    var idleFrames = 0
-
-    // --- 自愈 ---
-    private let ctl = DispatchQueue(label: "SecDisplay.capture.ctl")
-    private var watchdog: DispatchSourceTimer?
-    private var lastSeenCount = 0
-    /// 任何类型的回调都计数，用来区分「流死了」和「画面静止」
-    private var progressCount = 0
-    private(set) var idleFrameCount = 0
-    // --- 静止帧去重 ---
-    // 虚拟屏不会报 idle：静止桌面也按满帧率送 complete（实测 1 秒内只有
-    // 0.004% 像素变化，采集却跑 58fps）。编码器因此全速空转，白烧 CPU 和
-    // 带宽，视频帧还会把光标小包堵在 socket 后面。这里用步进采样对比上一帧，
-    // 差异极小时跳过编码。最长 0.5s 必编码一次，慢变化不会被永久压住。
-    private var prevSamples: [UInt8] = []
-    private var prevSampleKey = 0
-    private var lastEncodeAt: CFAbsoluteTime = 0
-    private(set) var staticSkipCount = 0
-    /// 调试落盘只做一次
-    private var dumpedOnce = false
-    /// 调试落盘节流
-    private var lastDumpAt: CFAbsoluteTime = 0
-    private var dumpSeq = 0
-    private var lastProgressAt = CFAbsoluteTimeGetCurrent()
-    private var needsRestart = false
-    private var didStartupRebuild = false
-    private var restarting = false
-    private var restartCount = 0
-    // 说明：不再用「无帧超时」判断流故障，理由见 tick()。
-
-    init(encoder: Encoder, cfg: Config, displayID: @escaping () -> CGDirectDisplayID) {
-        self.encoder = encoder
-        self.cfg = cfg
-        self.displayIDProvider = displayID
-        super.init()
-    }
-
-    /// 首次启动：失败会抛出，由调用方提示权限问题
-    func start() async throws {
-        try await buildStream()
-        startWatchdog()
-    }
-
-    private func buildStream() async throws {
-        if isCompositeMode {
-            startCompositeCapture()
-            return
-        }
-        let wantID = displayIDProvider()
-        let content = try await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: false)
-
-        // 选屏只认 EDID 三元组身份，不信易变的 displayID。
-        // Sidecar 接入/断开会让系统重新分配 CGDirectDisplayID，旧 id 可能失效
-        // 或被 AirPlay 屏复用；单靠 id 或「非主屏 + 宽度相等」会抓到 iPad / 别的虚拟屏。
-        // isOurVirtualDisplay 用 vendor/product/serial 精确锚定我们自己建的屏，
-        // 内建(0x610)、Sidecar(aapl/iPad)、GameViewer、Duet 都不会误命中。
-        let sckList = content.displays.map { d -> String in
-            String(format: "id=%u frame=(%.0f,%.0f %.0fx%.0f)", d.displayID,
-                   d.frame.origin.x, d.frame.origin.y, d.frame.width, d.frame.height)
-        }.joined(separator: " | ")
-        Log.info("SCK 显示列表: \(sckList)")
-
-        var target = content.displays.first(where: { isOurVirtualDisplay($0.displayID) })
-        // 兜底：极少数情况下三元组尚未就绪，再按创建时记下的 id 找一次。
-        if target == nil {
-            target = content.displays.first(where: { $0.displayID == wantID })
-        }
-        guard let display = target else {
-            let avail = content.displays.map { d -> String in
-                String(format: "id=%u vendor=0x%x model=0x%x",
-                       d.displayID,
-                       CGDisplayVendorNumber(d.displayID),
-                       CGDisplayModelNumber(d.displayID))
-            }
-            throw NSError(domain: "Capture", code: 1, userInfo: [
-                NSLocalizedDescriptionKey: "找不到 SecDisplay 虚拟屏（期望身份 vendor=0x\(String(kVDVendorID, radix:16))，" +
-                    "创建时 id=\(wantID)，当前可用: \(avail.joined(separator: ", "))）"
-            ])
-        }
-
-        // 记录 SCK 实际拿到的 SCDisplay 身份。历史上出现过「displayID 说是虚拟屏，
-        // 抓出来的却是 Sidecar 内容」的情况，这行日志能直接把两者对上。
-        Log.info(String(format: "采集目标 SCDisplay id=%u vendor=0x%x model=0x%x %dx%d",
-                        display.displayID,
-                        CGDisplayVendorNumber(display.displayID),
-                        CGDisplayModelNumber(display.displayID),
-                        display.width, display.height))
-        let filter = SCContentFilter(display: display, excludingWindows: [])
-        let c = SCStreamConfiguration()
-        c.width = cfg.width
-        c.height = cfg.height
-        // 采集帧率。编码器在 2880x1800 上大约只能稳定 45fps，
-        // 采集喂得更快只会在 VideoToolbox 内部堆积，延迟从 40ms 涨到 90ms。
-        // 用 SECDISPLAY_HZ 可以试不同档位。
-        let capHz = Double(ProcessInfo.processInfo.environment["SECDISPLAY_HZ"] ?? "") ?? cfg.captureHz
-        c.minimumFrameInterval = CMTime(value: 1, timescale: CMTimeScale(capHz))
-        // 队列深度直接决定 SCK 内部的缓冲帧数，也就直接决定延迟。
-        // 3 帧在 60fps 下约 50ms；越深越不容易丢帧，但延迟越高。
-        c.queueDepth = Int(ProcessInfo.processInfo.environment["SECDISPLAY_QD"] ?? "") ?? 3
-        c.pixelFormat = kCVPixelFormatType_32BGRA
-        // 光标不画进视频：视频帧率只有 45fps，指针会把延迟放大成拖影。
-        // 指针位置改由独立的轻量消息高频发送，客户端本地绘制。
-        c.showsCursor = false
-        c.scalesToFit = false
-        c.capturesAudio = false
-        c.preservesAspectRatio = true
-
-        let s = SCStream(filter: filter, configuration: c, delegate: self)
-        try s.addStreamOutput(self, type: .screen, sampleHandlerQueue: DispatchQueue(label: "SecDisplay.capture"))
-        try await s.startCapture()
-
-        stream = s
-        lastProgressAt = CFAbsoluteTimeGetCurrent()
-        lastSeenCount = progressCount
-        Log.info("抓屏已启动 displayID=\(display.displayID) \(cfg.width)x\(cfg.height)，采集上限 \(Int(capHz))fps")
-
-        // 虚拟屏刚上线时 SCK 的显示列表可能还没刷新，displayID 会映射到
-        // 内建屏的 IOSurface，导致送出去的是内建内容。启动 2 秒后再重建一次，
-        // 此时 WindowServer 已稳定，重新取 SCShareableContent 才能绑对屏。
-        if !didStartupRebuild {
-            didStartupRebuild = true
-            DispatchQueue.global().asyncAfter(deadline: .now() + 2.0) { [weak self] in
-                guard let self else { return }
-                self.ctl.async { self.needsRestart = true }
-                Log.info("启动 2 秒后重建采集流，刷新显示列表")
-            }
-        }
-    }
-
-    // MARK: - 合成抓屏（绕开虚拟屏显示管道）
-
-    // macOS 在 Sidecar 接入后会把虚拟屏的显示管道接到内建屏：
-    // CGDisplayMirrorsDisplay 报 0、排列文件也是扩展，但 SCK 抓
-    // displayID 拿到的就是内建画面。窗口服务器的合成层却是正确的
-    // （screencapture -R 能抓到虚拟屏自己的壁纸），所以直接抓虚拟屏
-    // 所在矩形的合成结果，完全绕开显示管道。
-    private var compositeTimer: DispatchSourceTimer?
-    private var compositeSeq: Int64 = 0
-    private let compositeQueue = DispatchQueue(label: "SecDisplay.capture.composite")
-
-    /// 合成抓屏（CGWindowListCreateImage）开关。
-    /// 注意：本类当前未被实例化，这个开关不生效；实际采集走 ScreenshotCapture。
-    private var isCompositeMode: Bool {
-        ProcessInfo.processInfo.environment["SECDISPLAY_CAPTURE"] != "sck"
-    }
-
-    private func startCompositeCapture() {
-        compositeTimer?.cancel()
-        let hz = Double(ProcessInfo.processInfo.environment["SECDISPLAY_HZ"] ?? "") ?? cfg.captureHz
-        let fps = max(1.0, hz)
-        let t = DispatchSource.makeTimerSource(queue: compositeQueue)
-        t.schedule(deadline: .now(), repeating: 1.0 / fps, leeway: .milliseconds(1))
-        t.setEventHandler { [weak self] in self?.captureCompositeFrame() }
-        t.resume()
-        compositeTimer = t
-        lastProgressAt = CFAbsoluteTimeGetCurrent()
-        Log.info("合成抓屏已启动，虚拟屏 id=\(displayIDProvider())，目标 \(Int(fps))fps")
-    }
-
-    // SDK 把 CGWindowListCreateImage 标成 unavailable，但符号还在，运行时取。
-    private typealias WindowImageFn = @convention(c) (CGRect, UInt32, UInt32, UInt32) -> Unmanaged<CGImage>?
-    private static let windowImageFn: WindowImageFn? = {
-        guard let sym = dlsym(UnsafeMutableRawPointer(bitPattern: -2), "CGWindowListCreateImage") else { return nil }
-        return unsafeBitCast(sym, to: WindowImageFn.self)
-    }()
-
-    private func captureCompositeFrame() {
-        let vd = displayIDProvider()
-        let rect = CGDisplayBounds(vd)
-        guard rect.width > 1, rect.height > 1 else { return }
-        let onScreen = CGWindowListOption.optionOnScreenOnly.rawValue
-        let imgOpts = CGWindowImageOption.bestResolution.rawValue | CGWindowImageOption.boundsIgnoreFraming.rawValue
-        guard let fn = Self.windowImageFn,
-              let cg = fn(rect, onScreen, 0, imgOpts)?.takeRetainedValue() else { return }
-        guard let pb = makeVideoFrame(from: cg, width: cfg.width, height: cfg.height) else { return }
-        let now = CFAbsoluteTimeGetCurrent()
-        captured += 1
-        progressCount += 1
-        lastFrameTime = now
-        lastEncodeAt = now
-        let nowMicros = UInt64(now * 1_000_000)
-        compositeSeq += 1
-        let hz = CMTimeScale(max(1.0, Double(cfg.captureHz)))
-        encoder.encode(pb, pts: CMTime(value: compositeSeq, timescale: hz), captureTimeMicros: nowMicros)
-    }
-
-    /// CGImage -> 420v CVPixelBuffer。先画进 BGRA，再用 vImage 转 YUV，
-    /// 编码器保持只吃 420v，不用改编码链路。
-    private func makeVideoFrame(from cg: CGImage, width: Int, height: Int) -> CVPixelBuffer? {
-        var bgra: CVPixelBuffer?
-        let attrs: [String: Any] = [kCVPixelBufferIOSurfacePropertiesKey as String: [:]]
-        guard CVPixelBufferCreate(kCFAllocatorDefault, width, height,
-                                  kCVPixelFormatType_32BGRA,
-                                  attrs as CFDictionary, &bgra) == kCVReturnSuccess,
-              let src = bgra else { return nil }
-        CVPixelBufferLockBaseAddress(src, [])
-        defer { CVPixelBufferUnlockBaseAddress(src, []) }
-        guard let base = CVPixelBufferGetBaseAddress(src) else { return nil }
-        let bitmapInfo = CGImageAlphaInfo.premultipliedFirst.rawValue | CGBitmapInfo.byteOrder32Little.rawValue
-        guard let ctx = CGContext(data: base, width: width, height: height,
-                                  bitsPerComponent: 8,
-                                  bytesPerRow: CVPixelBufferGetBytesPerRow(src),
-                                  space: CGColorSpaceCreateDeviceRGB(),
-                                  bitmapInfo: bitmapInfo) else { return nil }
-        ctx.interpolationQuality = .none
-        ctx.draw(cg, in: CGRect(x: 0, y: 0, width: width, height: height))
-
-        return src
-    }
-
-    // MARK: 看门狗
-
-    private func startWatchdog() {
-        watchdog?.cancel()
-        let t = DispatchSource.makeTimerSource(queue: ctl)
-        t.schedule(deadline: .now() + 1.0, repeating: 1.0)
-        t.setEventHandler { [weak self] in self?.tick() }
-        t.resume()
-        watchdog = t
-    }
-
-    private func tick() {
-        if restarting { return }
-        let now = CFAbsoluteTimeGetCurrent()
-        if progressCount != lastSeenCount {
-            lastSeenCount = progressCount
-            lastProgressAt = now
-        }
-        // 只在 ScreenCaptureKit 明确报告停止时重建。
-        // 虚拟屏空桌面时 SCK 可能完全不发回调（连 idle 帧都没有），
-        // 用「无帧超时」判断会把静止画面误杀；重建过程会让 WindowServer
-        // 重配置显示，反而把虚拟屏踢掉，实测 17 秒内必现。
-        if gCaptureRebuildRequested {
-            gCaptureRebuildRequested = false
-            needsRestart = true
-            Log.info("显示重配置，请求重建采集流")
-        }
-        guard needsRestart else { return }
-        Log.info("抓屏流已停止，准备重建")
-        needsRestart = false
-        restartStream()
-    }
-
-    /// 重建采集流。停旧的、重新取显示器、重新建流。
-    func restartStream() {
-        ctl.async { [weak self] in
-            guard let self, !self.restarting else { return }
-            self.restarting = true
-            self.compositeTimer?.cancel()
-            self.compositeTimer = nil
-            self.restartCount += 1
-            let n = self.restartCount
-
-            let old = self.stream
-            self.stream = nil
-            Task {
-                if let old { try? await old.stopCapture() }
-                // 给系统一点时间释放对旧流的引用
-                try? await Task.sleep(nanoseconds: 300_000_000)
-                do {
-                    try await self.buildStream()
-                    Log.info("抓屏流重建成功（第 \(n) 次）")
-                } catch {
-                    Log.info("抓屏流重建失败（第 \(n) 次）: \(error)")
-                    // 下次 tick 会再试
-                    self.lastProgressAt = CFAbsoluteTimeGetCurrent()
-                    self.needsRestart = true
-                }
-                self.restarting = false
-            }
-        }
-    }
-
-    /// 与上一帧做步进采样对比，返回 true 表示这一帧可以跳过编码。
-    private func shouldSkipStatic(_ pb: CVPixelBuffer) -> Bool {
-        // 用户要求满帧率：不再跳过静止帧。
-        // 之前的 0.5 秒兜底 + 96x60 采样会让静止桌面只有 2fps，
-        // 计数器、光标、小动画看起来一跳一跳。直连带宽和 M1 Pro 硬编都够，
-        // 改为全量编码，SCK 送多少帧就编多少帧。
-        return false
-    }
-
-    func stream(_ stream: SCStream, didOutputSampleBuffer sb: CMSampleBuffer, of type: SCStreamOutputType) {
-        guard type == .screen else { return }
-        guard let arr = CMSampleBufferGetSampleAttachmentsArray(sb, createIfNecessary: false) as? [[SCStreamFrameInfo: Any]],
-              let info = arr.first,
-              let rawStatus = info[.status] as? Int,
-              let status = SCFrameStatus(rawValue: rawStatus) else { return }
-
-        // 任何回调都说明流还活着，包括画面没变化时的 idle 帧。
-        // 只把 complete 帧送去编码，避免重复编码同一画面。
-        progressCount += 1
-
-        if status == .stopped {
-            Log.info("SCK 报告流已停止，触发重建")
-            needsRestart = true
-            return
-        }
-        guard status == .complete, let pb = CMSampleBufferGetImageBuffer(sb) else {
-            idleFrameCount += 1
-            return
-        }
-
-        captured += 1
-        lastFrameTime = CFAbsoluteTimeGetCurrent()
-
-        // 采集段延迟：样本 PTS 与主机时钟的差值。
-        // SCK 的 PTS 走主机时钟（mach 时基），不能直接和 CFAbsoluteTime 相减。
-        let pts = CMSampleBufferGetPresentationTimeStamp(sb)
-        let hostNow = CMClockGetTime(CMClockGetHostTimeClock())
-        let deltaSec = CMTimeGetSeconds(CMTimeSubtract(hostNow, pts))
-        if deltaSec.isFinite && deltaSec >= 0 && deltaSec < 2 {
-            let delayMs = deltaSec * 1000
-            capLatSum += delayMs
-            capLatCount += 1
-            if delayMs > capLatMax { capLatMax = delayMs }
-        }
-        let nowMicros = UInt64(CFAbsoluteTimeGetCurrent() * 1_000_000)
-        if let dumpPath = ProcessInfo.processInfo.environment["SECDISPLAY_DUMP_FRAME"],
-           !dumpPath.isEmpty,
-           CFAbsoluteTimeGetCurrent() - lastDumpAt >= 5.0 {
-            lastDumpAt = CFAbsoluteTimeGetCurrent()
-            dumpSeq += 1
-            let p = dumpPath.replacingOccurrences(of: ".png", with: "_\(dumpSeq).png")
-            dumpPixelBuffer(pb, to: p)
-            Log.info("已落盘采集帧 #\(dumpSeq) \(CVPixelBufferGetWidth(pb))x\(CVPixelBufferGetHeight(pb)) -> \(p)")
-        }
-        if shouldSkipStatic(pb) {
-            staticSkipCount += 1
-            return
-        }
-        lastEncodeAt = CFAbsoluteTimeGetCurrent()
-        encoder.encode(pb, pts: pts, captureTimeMicros: nowMicros)
-    }
-
-    func stream(_ stream: SCStream, didStopWithError error: Error) {
-        Log.info("抓屏停止: \(error)")
-        // ScreenCaptureKit 不会自己恢复，交给看门狗重建
-        ctl.async { [weak self] in self?.needsRestart = true }
-    }
 }
 
 // MARK: - 采集（截图轮询）
@@ -1841,11 +1507,16 @@ func makePixelBuffer(from img: CGImage) -> CVPixelBuffer? {
     guard CVPixelBufferCreate(nil, w, h, kCVPixelFormatType_32BGRA,
                               attrs as CFDictionary, &pb) == kCVReturnSuccess,
           let pb else { return nil }
+    CVBufferSetAttachment(pb, kCVImageBufferColorPrimariesKey,
+                          kCVImageBufferColorPrimaries_ITU_R_709_2, .shouldPropagate)
+    CVBufferSetAttachment(pb, kCVImageBufferTransferFunctionKey,
+                          kCVImageBufferTransferFunction_sRGB, .shouldPropagate)
     CVPixelBufferLockBaseAddress(pb, [])
     defer { CVPixelBufferUnlockBaseAddress(pb, []) }
+    let srgb = CGColorSpace(name: CGColorSpace.sRGB) ?? CGColorSpaceCreateDeviceRGB()
     guard let ctx = CGContext(data: CVPixelBufferGetBaseAddress(pb), width: w, height: h,
                               bitsPerComponent: 8, bytesPerRow: CVPixelBufferGetBytesPerRow(pb),
-                              space: CGColorSpaceCreateDeviceRGB(),
+                              space: srgb,
                               bitmapInfo: CGImageAlphaInfo.premultipliedFirst.rawValue
                                   | CGBitmapInfo.byteOrder32Little.rawValue)
     else { return nil }
@@ -2998,11 +2669,7 @@ if presetName == nil, let rp = Bundle.main.resourcePath {
 /// 同样支持环境变量与 bundle 内资源文件两种来源 —— 从 Finder 启动的 .app
 /// 拿不到环境变量，没有这个文件的话省内存选项等于用户根本用不上。
 /// 写 Contents/Resources/pixfmt 内容为 420v 即可切换。
-///
-/// 注意 420v 的色域链路两端都没有锚点：本端采集侧设了 ITU-R 709，
-/// 但 VideoToolbox 不写 VUI 色彩描述，Windows 侧 D3D11 VideoProcessor
-/// 也没有显式 SetStreamColorSpace，最终用驱动默认矩阵。所以切到 420v
-/// 后如果发现偏色（发灰或偏青），属于已知问题，切回 bgra 即可。
+/// 两端均已显式锚定 BT.709 矩阵与 sRGB 传递函数。
 var pixelFormatChoice = ProcessInfo.processInfo.environment["SECDISPLAY_PIXFMT"]
 if pixelFormatChoice == nil, let rp = Bundle.main.resourcePath {
     let p = rp + "/pixfmt"
@@ -3460,8 +3127,8 @@ Timer.scheduledTimer(withTimeInterval: 2.0, repeats: true) { _ in
     lastCursorCount = cursor.sentCount
     let imgDelta = cursorImage.sentCount - lastCursorImageCount
     lastCursorImageCount = cursorImage.sentCount
-    // 「空闲 / 静跳」两个计数只存在于未启用的 Capture 类里，恒为 0，
-    // 早就没有参考价值。换成采集异常计数，和面板那一行对应。
+    // 已移除早期 SCStream 死代码里恒为 0 的「空闲 / 静跳」计数，
+    // 换成采集异常计数，和面板那一行对应。
     Log.info(String(format: "采集 %d  峰值 %.0ffps  异常 %d  发送 %d  光标+%d  图像+%d  输入 %d  丢弃 %d  %.1f Mbps  在途 %d  采集延迟 %.1f  编码延迟 %.1f ms",
                     cap.captured, peakFps, cap.captureRestartCount, sender.sent, cursorDelta, imgDelta,
                     injector.eventCount, sender.dropped, mbps, sender.inFlight, capAvg, encAvg))
