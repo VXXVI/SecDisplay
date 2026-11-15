@@ -100,7 +100,7 @@ find_pid() {
             return
         fi
     fi
-    pgrep -f "screensender" | head -1
+    pgrep -f "$(pwd)/screensender" | head -1
 }
 
 case "${1:-start}" in

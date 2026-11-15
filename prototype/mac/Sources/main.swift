@@ -4173,6 +4173,12 @@ if appRole == .sender {
 } else {
     Log.info("SecDisplay 副屏模式启动: 监听端口 \(cfg.port)/\(cfg.port &+ 1)，等待 Windows 主控端连接")
     let rc = MacReceiverClient()
+    let allowedRaw = ProcessInfo.processInfo.environment["SECDISPLAY_ALLOWED_HOST"]
+        ?? UserDefaults.standard.string(forKey: "SecDisplayAllowedHost")
+        ?? ""
+    if !allowedRaw.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+        rc.setAllowedHosts(allowedRaw)
+    }
     macReceiverClient = rc
     rc.listen(port: cfg.port)
     transferService.listen(port: cfg.port &+ 1)
@@ -4421,7 +4427,7 @@ if appRole == .sender {
         lastCursorCount = cursor.sentCount
         let imgDelta = cursorImage.sentCount - lastCursorImageCount
         lastCursorImageCount = cursorImage.sentCount
-        Log.info(String(format: "采集 %d  峰值 %.0ffps  异常 %d  发送 %d  光标+%d  图像+%d  输入 %d  丢弃 %d  %.1f Mbps  在途 %d  采集延迟 %.1f  编码延迟 %.1f ms",
+        Log.info(String(format: "采集 %ld  峰值 %.0ffps  异常 %ld  发送 %ld  光标+%ld  图像+%ld  输入 %ld  丢弃 %ld  %.1f Mbps  在途 %ld  采集延迟 %.1f  编码延迟 %.1f ms",
                         cap.captured, peakFps, cap.captureRestartCount, sender.sent, cursorDelta, imgDelta,
                         injector.eventCount, sender.dropped, mbps, sender.inFlight, capAvg, encAvg))
         cap.capLatSum = 0; cap.capLatCount = 0; cap.capLatMax = 0
@@ -4432,7 +4438,7 @@ if appRole == .sender {
 } else {
     Timer.scheduledTimer(withTimeInterval: 5.0, repeats: true) { _ in
         guard let snap = macReceiverClient?.snapshot(), snap.connected else { return }
-        Log.info(String(format: "MacReceiver: %dx%d  %.1f fps  %.1f Mbps  p95 %.1f/%.1f ms  累计 %llu 帧  错误 %llu  丢帧 %llu  光标 %llu  输入 %llu",
+        Log.info(String(format: "MacReceiver: %ldx%ld  %.1f fps  %.1f Mbps  p95 %.1f/%.1f ms  累计 %llu 帧  错误 %llu  丢帧 %llu  光标 %llu  输入 %llu",
                         snap.width, snap.height, snap.decodeFps, snap.mbps,
                         snap.sourceP95, snap.presentP95,
                         snap.decodedFrames, snap.decodeErrors, snap.droppedFrames,
@@ -4840,13 +4846,14 @@ Timer.scheduledTimer(withTimeInterval: 1.0, repeats: true) { _ in
     if let info = statusInfoItem {
         if appRole == .receiver {
             if let snap = macReceiverClient?.snapshot() {
-                let st = snap.streaming ? "正在接收" : (snap.connected ? "已连接等待" : "等待 Windows 主控")
+                let st = snap.listenerError != nil ? "监听异常"
+                       : (snap.streaming ? "正在接收" : (snap.connected ? "已连接等待" : "等待 Windows 主控"))
                 info.title = String(format: "%@ · %.0f fps · %.1f Mbps", st, snap.decodeFps, snap.mbps)
             }
         } else if let encoder, let sender {
             let enc = encoder.encLatCount > 0 ? encoder.encLatSum / Double(encoder.encLatCount) : 0
             let conn = sender.connected ? "已连接" : "等待连接"
-            info.title = String(format: "%@ · %.0f fps · 编码 %.0f ms · %d 在途",
+            info.title = String(format: "%@ · %.0f fps · 编码 %.0f ms · %ld 在途",
                                 conn, peakFps, enc, sender.inFlight)
         }
     }
