@@ -2666,6 +2666,690 @@ final class CursorImageTracker {
     }
 }
 
+// MARK: - 雷电双向文件中转站（独立 TCP 端口，不阻塞视频与光标）
+
+struct TransferSnapshot {
+    var connected = false
+    var inboxPath = ""
+    var statusText = "等待连接"
+    var history: [String] = []
+}
+
+final class FileTransferService {
+    static let typeBegin: UInt8 = 0x10
+    static let typeChunk: UInt8 = 0x11
+    static let typeEnd:   UInt8 = 0x12
+    static let typeAck:   UInt8 = 0x13
+    static let typePing:  UInt8 = 0x14
+
+    private let netQueue = DispatchQueue(label: "SecDisplay.transfer.net")
+    private let sendQueue = DispatchQueue(label: "SecDisplay.transfer.send")
+    private let stateLock = NSLock()
+
+    private var listener: NWListener?
+    private var conn: NWConnection?
+    private var connEpoch = 0
+    private var _connected = false
+    private var recvBuf = Data()
+    private var listenPort: UInt16 = 9923
+    private var listenerRestartScheduled = false
+    private var stopped = false
+
+    let inboxURL: URL
+
+    private struct RecvFile {
+        let id: UInt32
+        let safeName: String
+        let expectedSize: UInt64
+        var receivedSize: UInt64 = 0
+        let partURL: URL
+        let handle: FileHandle
+        let startedAt: CFAbsoluteTime
+    }
+    private var activeRecvs: [UInt32: RecvFile] = [:]
+
+    private var nextTransferId: UInt32 = 1
+    private var activeEpoch = 0
+    private var outQueue: [URL] = []
+    private var isSending = false
+    private var activeStatus = "等待接收端"
+    private var recentHistory: [String] = []
+    private var keepAliveTimer: DispatchSourceTimer?
+
+    private enum SendOutcome {
+        case sent
+        case localFailed
+        case connLost
+    }
+
+    init() {
+        let fm = FileManager.default
+        let base = fm.urls(for: .downloadsDirectory, in: .userDomainMask).first
+            ?? URL(fileURLWithPath: NSHomeDirectory() + "/Downloads", isDirectory: true)
+        inboxURL = base.appendingPathComponent("SecDisplay-Transfer", isDirectory: true)
+        try? fm.createDirectory(at: inboxURL, withIntermediateDirectories: true)
+    }
+
+    func snapshot() -> TransferSnapshot {
+        stateLock.lock()
+        defer { stateLock.unlock() }
+        return TransferSnapshot(
+            connected: _connected,
+            inboxPath: inboxURL.path,
+            statusText: activeStatus,
+            history: recentHistory
+        )
+    }
+
+    func listen(port: UInt16) {
+        listenPort = port
+        netQueue.async { [weak self] in
+            self?.startListener()
+        }
+    }
+
+    func stop() {
+        stateLock.lock()
+        stopped = true
+        _connected = false
+        outQueue.removeAll()
+        stateLock.unlock()
+        netQueue.async { [weak self] in
+            guard let self else { return }
+            self.keepAliveTimer?.cancel()
+            self.keepAliveTimer = nil
+            self.cleanupActiveRecvs()
+            self.conn?.cancel()
+            self.conn = nil
+            self.listener?.cancel()
+            self.listener = nil
+        }
+    }
+
+    func enqueue(urls: [URL]) {
+        let fm = FileManager.default
+        var files: [URL] = []
+        for u in urls {
+            var isDir: ObjCBool = false
+            guard fm.fileExists(atPath: u.path, isDirectory: &isDir) else { continue }
+            if !isDir.boolValue {
+                files.append(u)
+            } else if let items = try? fm.contentsOfDirectory(at: u, includingPropertiesForKeys: [.isRegularFileKey],
+                                                               options: [.skipsHiddenFiles]) {
+                // 拖入文件夹时仅发送顶层常规文件，避免误扫庞大目录树
+                for sub in items {
+                    var subDir: ObjCBool = false
+                    if fm.fileExists(atPath: sub.path, isDirectory: &subDir), !subDir.boolValue {
+                        files.append(sub)
+                    }
+                }
+            }
+        }
+        guard !files.isEmpty else { return }
+        var shouldStart = false
+        stateLock.lock()
+        outQueue.append(contentsOf: files)
+        if !isSending {
+            isSending = true
+            shouldStart = true
+        }
+        let queued = outQueue.count
+        if _connected {
+            activeStatus = "待发送 \(queued) 个文件…"
+        } else {
+            activeStatus = "已排队 \(queued) 个文件（等待连接）"
+        }
+        stateLock.unlock()
+        notifyUI()
+        if shouldStart {
+            sendQueue.async { [weak self] in self?.drainSendQueue() }
+        }
+    }
+
+    private func startListener() {
+        stateLock.lock()
+        let isStopped = stopped
+        stateLock.unlock()
+        if isStopped { return }
+
+        let params = NWParameters.tcp
+        params.allowLocalEndpointReuse = true
+        if let tcp = params.defaultProtocolStack.transportProtocol as? NWProtocolTCP.Options {
+            tcp.connectionTimeout = 5
+            tcp.enableKeepalive = true
+            tcp.keepaliveIdle = 5
+        }
+        let l: NWListener
+        do {
+            guard let nwPort = NWEndpoint.Port(rawValue: listenPort) else { return }
+            l = try NWListener(using: params, on: nwPort)
+        } catch {
+            Log.info("中转站端口 \(listenPort) 监听失败: \(error)")
+            scheduleRestart()
+            return
+        }
+        self.listener = l
+        l.newConnectionHandler = { [weak self] c in
+            self?.acceptConnection(c)
+        }
+        l.stateUpdateHandler = { [weak self, weak l] st in
+            guard let self, let l, self.listener === l else { return }
+            switch st {
+            case .ready:
+                Log.info("雷电文件中转站已监听端口 \(self.listenPort) → \(self.inboxURL.path)")
+                self.listenerRestartScheduled = false
+            case .failed(let e):
+                Log.info("中转站监听失败: \(e)")
+                self.scheduleRestart()
+            case .cancelled:
+                break
+            default:
+                break
+            }
+        }
+        l.start(queue: netQueue)
+    }
+
+    private func scheduleRestart() {
+        stateLock.lock()
+        let isStopped = stopped
+        stateLock.unlock()
+        guard !isStopped, !listenerRestartScheduled else { return }
+        listenerRestartScheduled = true
+        netQueue.asyncAfter(deadline: .now() + 3.0) { [weak self] in
+            guard let self else { return }
+            self.listenerRestartScheduled = false
+            self.listener?.cancel()
+            self.listener = nil
+            self.startListener()
+        }
+    }
+
+    private func acceptConnection(_ c: NWConnection) {
+        connEpoch &+= 1
+        let epoch = connEpoch
+        let old = self.conn
+        self.conn = c
+        self.recvBuf.removeAll()
+        self.cleanupActiveRecvs()
+        old?.cancel()
+
+        stateLock.lock()
+        _connected = true
+        activeEpoch = epoch
+        activeStatus = "已连接（端口 \(listenPort)）· 可拖入文件直传"
+        stateLock.unlock()
+        notifyUI()
+        Log.info("中转站接收端已连接: \(String(describing: c.endpoint))")
+
+        c.stateUpdateHandler = { [weak self] st in
+            guard let self, self.connEpoch == epoch else { return }
+            switch st {
+            case .failed(let e):
+                Log.info("中转站连接断开: \(e)")
+                self.onDisconnected()
+            case .cancelled:
+                self.onDisconnected()
+            case .ready:
+                self.startKeepAlive(epoch: epoch)
+            default:
+                break
+            }
+        }
+        c.start(queue: netQueue)
+        receiveLoop(epoch: epoch)
+
+        // 若连接前已有排队文件，立刻续发
+        stateLock.lock()
+        let hasPending = !outQueue.isEmpty && !isSending
+        if hasPending { isSending = true }
+        stateLock.unlock()
+        if hasPending {
+            sendQueue.async { [weak self] in self?.drainSendQueue() }
+        }
+    }
+
+    private func onDisconnected() {
+        keepAliveTimer?.cancel()
+        keepAliveTimer = nil
+        cleanupActiveRecvs()
+        stateLock.lock()
+        _connected = false
+        activeStatus = outQueue.isEmpty ? "等待接收端" : "连接断开，\(outQueue.count) 个文件等待重连"
+        stateLock.unlock()
+        notifyUI()
+    }
+
+    private func startKeepAlive(epoch: Int) {
+        keepAliveTimer?.cancel()
+        let t = DispatchSource.makeTimerSource(queue: netQueue)
+        t.schedule(deadline: .now() + 15.0, repeating: 15.0)
+        t.setEventHandler { [weak self] in
+            guard let self, self.connEpoch == epoch, let c = self.conn else { return }
+            var frame = Data(capacity: 5)
+            frame.append(Self.typePing)
+            var zero: UInt32 = 0
+            withUnsafeBytes(of: &zero) { frame.append(contentsOf: $0) }
+            c.send(content: frame, completion: .contentProcessed { _ in })
+        }
+        t.resume()
+        keepAliveTimer = t
+    }
+
+    private func receiveLoop(epoch: Int) {
+        guard connEpoch == epoch, let c = conn else { return }
+        c.receive(minimumIncompleteLength: 1, maximumLength: 512 * 1024) { [weak self] data, _, isEOF, err in
+            guard let self, self.connEpoch == epoch else { return }
+            if let data, !data.isEmpty {
+                self.recvBuf.append(data)
+                if !self.parseFrames() {
+                    c.cancel()
+                    return
+                }
+            }
+            if isEOF || err != nil {
+                c.cancel()
+                self.onDisconnected()
+                return
+            }
+            self.receiveLoop(epoch: epoch)
+        }
+    }
+
+    private func parseFrames() -> Bool {
+        while recvBuf.count >= 5 {
+            let type = recvBuf[recvBuf.startIndex]
+            let b1 = UInt32(recvBuf[recvBuf.startIndex + 1])
+            let b2 = UInt32(recvBuf[recvBuf.startIndex + 2])
+            let b3 = UInt32(recvBuf[recvBuf.startIndex + 3])
+            let b4 = UInt32(recvBuf[recvBuf.startIndex + 4])
+            let payloadLen = Int((b1 << 24) | (b2 << 16) | (b3 << 8) | b4)
+            if payloadLen > 1024 * 1024 {
+                Log.info("中转站收到异常大帧 len=\(payloadLen)，断开保护")
+                return false
+            }
+            guard recvBuf.count >= 5 + payloadLen else { break }
+            let start = recvBuf.startIndex + 5
+            let payload = recvBuf[start..<(start + payloadLen)]
+            recvBuf.removeSubrange(recvBuf.startIndex..<(start + payloadLen))
+            handleFrame(type: type, payload: Data(payload))
+        }
+        return true
+    }
+
+    private func handleFrame(type: UInt8, payload: Data) {
+        switch type {
+        case Self.typeBegin:
+            guard payload.count >= 14 else { return }
+            let id = readU32(payload, 0)
+            let size = readU64(payload, 4)
+            let nameLen = Int(readU16(payload, 12))
+            guard payload.count >= 14 + nameLen else { return }
+            let rawName = String(data: payload[14..<(14 + nameLen)], encoding: .utf8) ?? "file_\(id)"
+            let safe = sanitizeFilename(rawName, fallbackId: id)
+            // 先清旧记录再建新临时文件，避免同 ID 重传误删刚打开的新句柄
+            if let prev = activeRecvs.removeValue(forKey: id) {
+                try? prev.handle.close()
+                try? FileManager.default.removeItem(at: prev.partURL)
+            }
+            let partURL = inboxURL.appendingPathComponent(".secdisplay_tmp_\(id).part")
+            FileManager.default.createFile(atPath: partURL.path, contents: nil)
+            guard let h = try? FileHandle(forWritingTo: partURL) else {
+                Log.info("中转站创建临时文件失败: \(partURL.path)")
+                sendAck(id: id, ok: false)
+                return
+            }
+            activeRecvs[id] = RecvFile(id: id, safeName: safe, expectedSize: size,
+                                       receivedSize: 0, partURL: partURL, handle: h,
+                                       startedAt: CFAbsoluteTimeGetCurrent())
+            updateStatus("正在接收: \(safe) (0%)")
+            Log.info("中转站开始接收 #\(id): \(safe) (\(fmtBytes(size)))")
+
+        case Self.typeChunk:
+            guard payload.count >= 8 else { return }
+            let id = readU32(payload, 0)
+            let dataLen = Int(readU32(payload, 4))
+            guard payload.count >= 8 + dataLen, var rf = activeRecvs[id] else { return }
+            let chunk = payload[8..<(8 + dataLen)]
+            do {
+                try rf.handle.write(contentsOf: chunk)
+            } catch {
+                Log.info("中转站写文件失败 #\(id): \(error)")
+                try? rf.handle.close()
+                try? FileManager.default.removeItem(at: rf.partURL)
+                activeRecvs.removeValue(forKey: id)
+                sendAck(id: id, ok: false)
+                return
+            }
+            rf.receivedSize += UInt64(dataLen)
+            activeRecvs[id] = rf
+            let dt = max(0.01, CFAbsoluteTimeGetCurrent() - rf.startedAt)
+            let mbps = Double(rf.receivedSize) / dt / 1_048_576.0
+            let pct = rf.expectedSize > 0 ? Int(Double(rf.receivedSize) * 100.0 / Double(rf.expectedSize)) : 100
+            updateStatus(String(format: "接收 %@ · %d%% · %.0f MB/s", rf.safeName, pct, mbps))
+
+        case Self.typeEnd:
+            guard payload.count >= 5 else { return }
+            let id = readU32(payload, 0)
+            let okFlag = payload[4] == 1
+            guard let rf = activeRecvs.removeValue(forKey: id) else { return }
+            try? rf.handle.synchronize()
+            try? rf.handle.close()
+            if okFlag && rf.receivedSize == rf.expectedSize {
+                let dest = uniqueDestURL(safeName: rf.safeName)
+                do {
+                    try FileManager.default.moveItem(at: rf.partURL, to: dest)
+                    let dt = max(0.001, CFAbsoluteTimeGetCurrent() - rf.startedAt)
+                    let speed = Double(rf.receivedSize) / dt / 1_048_576.0
+                    let item = "↓ \(dest.lastPathComponent) (\(fmtBytes(rf.receivedSize)))"
+                    pushHistory(item)
+                    updateStatus(String(format: "已收到: %@ (%.0f MB/s)", dest.lastPathComponent, speed))
+                    Log.info("中转站接收完成: \(dest.path) (\(fmtBytes(rf.receivedSize)), \(String(format: "%.1f", speed)) MB/s)")
+                    sendAck(id: id, ok: true)
+                } catch {
+                    try? FileManager.default.removeItem(at: rf.partURL)
+                    updateStatus("保存失败: \(rf.safeName)")
+                    Log.info("中转站重命名失败: \(error)")
+                    sendAck(id: id, ok: false)
+                }
+            } else {
+                try? FileManager.default.removeItem(at: rf.partURL)
+                updateStatus("接收未完成: \(rf.safeName)")
+                Log.info("中转站接收中断 #\(id): \(rf.safeName) \(rf.receivedSize)/\(rf.expectedSize)")
+                sendAck(id: id, ok: false)
+            }
+
+        case Self.typeAck:
+            guard payload.count >= 5 else { return }
+            let id = readU32(payload, 0)
+            let ok = payload[4] == 1
+            if !ok {
+                Log.info("中转站对端落盘失败 #\(id)")
+            }
+
+        default:
+            break
+        }
+    }
+
+    private func sendAck(id: UInt32, ok: Bool) {
+        guard let c = conn else { return }
+        var p = Data(capacity: 10)
+        p.append(Self.typeAck)
+        appendU32(&p, 5)
+        appendU32(&p, id)
+        p.append(ok ? 1 : 0)
+        c.send(content: p, completion: .contentProcessed { _ in })
+    }
+
+    private func cleanupActiveRecvs() {
+        for (_, rf) in activeRecvs {
+            try? rf.handle.close()
+            try? FileManager.default.removeItem(at: rf.partURL)
+        }
+        activeRecvs.removeAll()
+    }
+
+    private func drainSendQueue() {
+        while true {
+            stateLock.lock()
+            if stopped || !_connected || outQueue.isEmpty {
+                isSending = false
+                if !_connected && !outQueue.isEmpty {
+                    activeStatus = "等待接收端重连（排队 \(outQueue.count) 个）"
+                } else if _connected && outQueue.isEmpty && activeStatus.hasPrefix("发送") {
+                    activeStatus = "已连接（端口 \(listenPort)）· 可拖入文件直传"
+                }
+                stateLock.unlock()
+                notifyUI()
+                return
+            }
+            let url = outQueue.removeFirst()
+            nextTransferId &+= 1
+            if nextTransferId == 0 { nextTransferId = 1 }
+            let tid = nextTransferId
+            stateLock.unlock()
+
+            switch sendSingleFile(url: url, id: tid) {
+            case .sent, .localFailed:
+                continue
+            case .connLost:
+                // 连接断开或已切换为新连接：重入队头；若已有新连接在线直接续发，不丢队
+                stateLock.lock()
+                if !stopped {
+                    outQueue.insert(url, at: 0)
+                }
+                let canContinue = _connected && !stopped
+                if !canContinue { isSending = false }
+                stateLock.unlock()
+                if canContinue { continue }
+                notifyUI()
+                return
+            }
+        }
+    }
+
+    private func sendSingleFile(url: URL, id: UInt32) -> SendOutcome {
+        guard let attrs = try? FileManager.default.attributesOfItem(atPath: url.path),
+              let fileSize = (attrs[.size] as? NSNumber)?.uint64Value,
+              let fh = try? FileHandle(forReadingFrom: url) else {
+            Log.info("中转站无法读取文件: \(url.path)")
+            updateStatus("读取失败: \(url.lastPathComponent)")
+            return .localFailed
+        }
+        defer { try? fh.close() }
+
+        var activeConn: NWConnection?
+        var epochSnap = 0
+        netQueue.sync {
+            activeConn = self.conn
+            epochSnap = self.connEpoch
+        }
+        guard let c = activeConn else { return .connLost }
+
+        let nameData = Data(url.lastPathComponent.utf8.prefix(4096))
+        var beginFrame = Data(capacity: 5 + 14 + nameData.count)
+        beginFrame.append(Self.typeBegin)
+        appendU32(&beginFrame, UInt32(14 + nameData.count))
+        appendU32(&beginFrame, id)
+        appendU64(&beginFrame, fileSize)
+        appendU16(&beginFrame, UInt16(nameData.count))
+        beginFrame.append(nameData)
+
+        let cond = NSCondition()
+        var inFlight = 0
+        var sendFailed = false
+        let started = CFAbsoluteTimeGetCurrent()
+        let fname = url.lastPathComponent
+        updateStatus("发送中: \(fname) (0%)")
+        Log.info("中转站开始发送 #\(id): \(fname) (\(fmtBytes(fileSize)))")
+
+        func connAlive() -> Bool {
+            stateLock.lock()
+            let ok = !stopped && _connected && activeEpoch == epochSnap
+            stateLock.unlock()
+            return ok
+        }
+
+        func sendFrame(_ data: Data) -> Bool {
+            cond.lock()
+            while inFlight >= 4 && !sendFailed {
+                if !connAlive() { sendFailed = true; break }
+                cond.wait(until: Date().addingTimeInterval(0.2))
+            }
+            if sendFailed {
+                cond.unlock()
+                return false
+            }
+            inFlight += 1
+            cond.unlock()
+
+            c.send(content: data, completion: .contentProcessed { [weak self] err in
+                cond.lock()
+                inFlight = max(0, inFlight - 1)
+                if err != nil {
+                    sendFailed = true
+                    Log.info("中转站发送 chunk 失败: \(err!)")
+                }
+                cond.broadcast()
+                cond.unlock()
+                _ = self
+            })
+            return true
+        }
+
+        if !sendFrame(beginFrame) { return .connLost }
+
+        var sentBytes: UInt64 = 0
+        var readErr = false
+        var lastUiAt = CFAbsoluteTimeGetCurrent()
+        let chunkCap = 262_144
+        while true {
+            if !connAlive() || sendFailed { break }
+
+            let chunk: Data
+            do {
+                chunk = try fh.read(upToCount: chunkCap) ?? Data()
+            } catch {
+                Log.info("中转站读文件失败: \(error)")
+                readErr = true
+                break
+            }
+            if chunk.isEmpty { break }
+
+            var frame = Data(capacity: 5 + 8 + chunk.count)
+            frame.append(Self.typeChunk)
+            appendU32(&frame, UInt32(8 + chunk.count))
+            appendU32(&frame, id)
+            appendU32(&frame, UInt32(chunk.count))
+            frame.append(chunk)
+            if !sendFrame(frame) { break }
+
+            sentBytes += UInt64(chunk.count)
+            let now = CFAbsoluteTimeGetCurrent()
+            if now - lastUiAt >= 0.2 {
+                lastUiAt = now
+                let dt = max(0.01, now - started)
+                let speed = Double(sentBytes) / dt / 1_048_576.0
+                let pct = fileSize > 0 ? Int(Double(sentBytes) * 100.0 / Double(fileSize)) : 100
+                updateStatus(String(format: "发送 %@ · %d%% · %.0f MB/s", fname, pct, speed))
+            }
+        }
+
+        let complete = !readErr && !sendFailed && connAlive() && (sentBytes == fileSize)
+        if !connAlive() || sendFailed {
+            // 连接已断，不再尝试发 endFrame
+            updateStatus("发送中断: \(fname)")
+            return .connLost
+        }
+
+        var endFrame = Data(capacity: 10)
+        endFrame.append(Self.typeEnd)
+        appendU32(&endFrame, 5)
+        appendU32(&endFrame, id)
+        endFrame.append(complete ? 1 : 0)
+        _ = sendFrame(endFrame)
+
+        // 等所有在途包落网，确认发送完整再记账
+        cond.lock()
+        let waitUntil = Date().addingTimeInterval(5.0)
+        while inFlight > 0 && !sendFailed && connAlive() && Date() < waitUntil {
+            cond.wait(until: Date().addingTimeInterval(0.1))
+        }
+        let ok = complete && !sendFailed && inFlight == 0
+        cond.unlock()
+
+        if ok {
+            let dt = max(0.001, CFAbsoluteTimeGetCurrent() - started)
+            let speed = Double(sentBytes) / dt / 1_048_576.0
+            pushHistory("↑ \(fname) (\(fmtBytes(sentBytes)))")
+            updateStatus(String(format: "已发送: %@ (%.0f MB/s)", fname, speed))
+            Log.info("中转站发送完成 #\(id): \(fname) (\(fmtBytes(sentBytes)), \(String(format: "%.1f", speed)) MB/s)")
+            return .sent
+        }
+        if readErr {
+            updateStatus("读取失败: \(fname)")
+            return .localFailed
+        }
+        updateStatus("发送中断: \(fname)")
+        return .connLost
+    }
+
+    private func updateStatus(_ s: String) {
+        stateLock.lock()
+        activeStatus = s
+        stateLock.unlock()
+        notifyUI()
+    }
+
+    private func pushHistory(_ item: String) {
+        stateLock.lock()
+        recentHistory.insert(item, at: 0)
+        if recentHistory.count > 4 { recentHistory.removeLast(recentHistory.count - 4) }
+        stateLock.unlock()
+        notifyUI()
+    }
+
+    private func notifyUI() {
+        DispatchQueue.main.async {
+            AppModel.shared.refreshTransferOnly()
+        }
+    }
+
+    private func sanitizeFilename(_ raw: String, fallbackId: UInt32) -> String {
+        let unified = raw.replacingOccurrences(of: "\\", with: "/")
+        let last = unified.split(separator: "/").last.map(String.init) ?? ""
+        let cleaned = last.filter { c in
+            guard let scalar = c.unicodeScalars.first else { return false }
+            if scalar.value < 0x20 || scalar.value == 0x7f { return false }
+            return c != ":" && c != "/" && c != "\\"
+        }
+        if cleaned.isEmpty || cleaned == "." || cleaned == ".." {
+            return "file_\(fallbackId)"
+        }
+        return cleaned
+    }
+
+    private func uniqueDestURL(safeName: String) -> URL {
+        let fm = FileManager.default
+        let first = inboxURL.appendingPathComponent(safeName)
+        if !fm.fileExists(atPath: first.path) { return first }
+        let ns = safeName as NSString
+        let ext = ns.pathExtension
+        let stem = ns.deletingPathExtension
+        for idx in 1...9999 {
+            let cand = ext.isEmpty ? "\(stem) (\(idx))" : "\(stem) (\(idx)).\(ext)"
+            let u = inboxURL.appendingPathComponent(cand)
+            if !fm.fileExists(atPath: u.path) { return u }
+        }
+        let fallbackName = ext.isEmpty
+            ? "\(stem)_\(Int(CFAbsoluteTimeGetCurrent()))"
+            : "\(stem)_\(Int(CFAbsoluteTimeGetCurrent())).\(ext)"
+        return inboxURL.appendingPathComponent(fallbackName)
+    }
+
+    private func fmtBytes(_ n: UInt64) -> String {
+        if n >= 1_073_741_824 { return String(format: "%.2f GB", Double(n) / 1_073_741_824.0) }
+        if n >= 1_048_576 { return String(format: "%.1f MB", Double(n) / 1_048_576.0) }
+        if n >= 1024 { return String(format: "%.0f KB", Double(n) / 1024.0) }
+        return "\(n) B"
+    }
+
+    private func appendU16(_ d: inout Data, _ v: UInt16) { var be = v.bigEndian; withUnsafeBytes(of: &be) { d.append(contentsOf: $0) } }
+    private func appendU32(_ d: inout Data, _ v: UInt32) { var be = v.bigEndian; withUnsafeBytes(of: &be) { d.append(contentsOf: $0) } }
+    private func appendU64(_ d: inout Data, _ v: UInt64) { var be = v.bigEndian; withUnsafeBytes(of: &be) { d.append(contentsOf: $0) } }
+    private func readU16(_ d: Data, _ o: Int) -> UInt16 {
+        (UInt16(d[d.startIndex + o]) << 8) | UInt16(d[d.startIndex + o + 1])
+    }
+    private func readU32(_ d: Data, _ o: Int) -> UInt32 {
+        (UInt32(d[d.startIndex + o]) << 24) | (UInt32(d[d.startIndex + o + 1]) << 16)
+        | (UInt32(d[d.startIndex + o + 2]) << 8) | UInt32(d[d.startIndex + o + 3])
+    }
+    private func readU64(_ d: Data, _ o: Int) -> UInt64 {
+        (UInt64(readU32(d, o)) << 32) | UInt64(readU32(d, o + 4))
+    }
+}
+
 // MARK: - 孤儿虚拟屏清理
 
 /// 触发 WindowServer 做一轮完整显示重配置，清掉 owner 已死的虚拟屏。
@@ -2886,6 +3570,10 @@ Log.info("在线显示器身份: \(idList.joined(separator: "  "))")
 // 不能只 requestKeyframe：静止画面没有下一帧，标志永远消费不掉，接收端一直黑屏。
 sender.onKeyframeRequest = { encoder.forceEncodeLastFrame() }
 sender.listen(port: cfg.port)
+
+// 雷电双向文件中转站（独立端口 9923，大文件传输不阻塞 9922 视频与光标）
+let transferService = FileTransferService()
+transferService.listen(port: cfg.port &+ 1)
 
 // 输入回传：Windows 侧的鼠标事件在 Mac 上重放
 // 需要「辅助功能」权限，没有的话 CGEvent 注入会被系统静默丢弃
@@ -3239,6 +3927,7 @@ func shutdown(signal sig: Int32) {
     // 直接调用即可。原来放进 Task 里等调度，若调度不到就会在采集仍在跑时
     // 走到 vd.destroy()，destroy 被静默拒绝，留下孤儿虚拟屏。
     cap.stop()
+    transferService.stop()
     sender.conn?.cancel()
     // 等采集停稳：worker 需要跑到下一次循环边界才会看到代次变化，
     // 单帧采集约 60ms，给 1.5 秒足够；不再依赖跨线程的 stopped 标志。

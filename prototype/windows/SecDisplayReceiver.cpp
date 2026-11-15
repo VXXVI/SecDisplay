@@ -31,6 +31,8 @@
 #include <psapi.h>         // GetProcessMemoryInfo（控制面板显示进程内存）
 #include <winsock2.h>
 #include <ws2tcpip.h>
+#include <commdlg.h>
+#include <shlobj.h>
 #include <d3d11.h>
 #include <d3d11_1.h>
 #include <d3d11_4.h>
@@ -72,6 +74,7 @@
 #pragma comment(lib, "ole32.lib")
 #pragma comment(lib, "user32.lib")
 #pragma comment(lib, "shell32.lib")
+#pragma comment(lib, "comdlg32.lib")
 #pragma comment(lib, "gdi32.lib")   // ApplyCursorImage 的 CreateDIBSection/CreateBitmap/DeleteObject
 
 using Microsoft::WRL::ComPtr;
@@ -2159,7 +2162,7 @@ static void ExitFullscreen() {
 // 状态直接读 g_stats，不额外开线程；开关即时生效，不写回配置文件。
 // ---------------------------------------------------------------------------
 
-static HWND g_panel = nullptr;
+static std::atomic<HWND> g_panel{nullptr};
 static Presenter* g_presenter = nullptr;
 static std::atomic<bool> g_vsyncEnabled{true};
 static std::string g_peerHost = "10.10.10.1";
@@ -2186,6 +2189,114 @@ static const int IDC_PANEL_CFG      = 2019;
 static const int IDC_PANEL_COPY     = 2023;
 static const int IDC_PANEL_SHAKE    = 2028;
 static const int IDC_PANEL_KEEPON   = 2029;
+static const int IDC_PANEL_SENDFILE = 2030;
+static const int IDC_PANEL_OPENXFER = 2031;
+
+static const UINT WM_APP_XFER_UI = WM_APP + 10;
+
+// ---- 雷电双向文件中转站（独立 TCP 端口 port+1 = 9923）----
+static const uint8_t XFER_BEGIN = 0x10;
+static const uint8_t XFER_CHUNK = 0x11;
+static const uint8_t XFER_END   = 0x12;
+static const uint8_t XFER_ACK   = 0x13;
+static const uint8_t XFER_PING  = 0x14;
+
+static std::atomic<bool> g_xferConnected{false};
+static std::atomic<SOCKET> g_xferSock{INVALID_SOCKET};
+static std::mutex g_xferMtx;
+static std::condition_variable g_xferCv;
+static std::deque<std::wstring> g_xferOutQ;
+static std::wstring g_xferStatus = L"等待中转站连接 (端口 9923)…";
+static uint32_t g_xferNextId = 1;
+
+static std::wstring GetTransferInboxDir() {
+    static std::wstring cached;
+    static std::mutex dirMtx;
+    std::lock_guard<std::mutex> lk(dirMtx);
+    if (!cached.empty()) return cached;
+
+    wchar_t desk[MAX_PATH] = {};
+    std::wstring base;
+    if (SUCCEEDED(SHGetFolderPathW(nullptr, CSIDL_DESKTOPDIRECTORY, nullptr, SHGFP_TYPE_CURRENT, desk)) && desk[0]) {
+        base = desk;
+    } else {
+        wchar_t exe[MAX_PATH] = {};
+        DWORD n = GetModuleFileNameW(nullptr, exe, MAX_PATH);
+        if (n > 0 && n < MAX_PATH) {
+            std::wstring p(exe, n);
+            size_t pos = p.find_last_of(L"\\/");
+            base = (pos != std::wstring::npos) ? p.substr(0, pos) : L".";
+        } else {
+            base = L".";
+        }
+    }
+    cached = base + L"\\SecDisplay-Transfer";
+    CreateDirectoryW(cached.c_str(), nullptr);
+    return cached;
+}
+
+static std::wstring FormatBytesW(uint64_t n) {
+    wchar_t buf[64];
+    if (n >= 1073741824ull) { swprintf(buf, 64, L"%.2f GB", (double)n / 1073741824.0); }
+    else if (n >= 1048576ull) { swprintf(buf, 64, L"%.1f MB", (double)n / 1048576.0); }
+    else if (n >= 1024ull) { swprintf(buf, 64, L"%.0f KB", (double)n / 1024.0); }
+    else { swprintf(buf, 64, L"%llu B", (unsigned long long)n); }
+    return buf;
+}
+
+static void SetTransferStatus(const std::wstring& s) {
+    {
+        std::lock_guard<std::mutex> lk(g_xferMtx);
+        g_xferStatus = s;
+    }
+    HWND hp = g_panel.load();
+    if (hp && g_alive) PostMessageW(hp, WM_APP_XFER_UI, 0, 0);
+}
+
+static void EnqueueFileTransfer(const std::wstring& path) {
+    DWORD attr = GetFileAttributesW(path.c_str());
+    if (attr == INVALID_FILE_ATTRIBUTES || (attr & FILE_ATTRIBUTE_DIRECTORY)) return;
+    size_t qSize = 0;
+    bool conn = g_xferConnected.load();
+    {
+        std::lock_guard<std::mutex> lk(g_xferMtx);
+        g_xferOutQ.push_back(path);
+        qSize = g_xferOutQ.size();
+        wchar_t buf[128];
+        swprintf(buf, 128, conn ? L"已加入发送队列 (%zu 个文件)…" : L"已排队 %zu 个文件（等待连接）", qSize);
+        g_xferStatus = buf;
+    }
+    g_xferCv.notify_all();
+    HWND hp = g_panel.load();
+    if (hp && g_alive) PostMessageW(hp, WM_APP_XFER_UI, 0, 0);
+    Log("中转站加入发送队列: %s", ToUtf8(path.c_str()).c_str());
+}
+
+static void PickAndSendFiles(HWND owner) {
+    std::vector<wchar_t> buf(65536, 0);
+    OPENFILENAMEW ofn{};
+    ofn.lStructSize = sizeof(ofn);
+    ofn.hwndOwner = owner;
+    ofn.lpstrFilter = L"所有文件 (*.*)\0*.*\0";
+    ofn.lpstrFile = buf.data();
+    ofn.nMaxFile = (DWORD)buf.size();
+    ofn.lpstrTitle = L"选择要通过雷电线发送到 Mac 的文件";
+    ofn.Flags = OFN_EXPLORER | OFN_ALLOWMULTISELECT | OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST | OFN_NOCHANGEDIR;
+    if (!GetOpenFileNameW(&ofn)) return;
+
+    const wchar_t* p = buf.data();
+    std::wstring first = p;
+    p += first.size() + 1;
+    if (*p == 0) {
+        EnqueueFileTransfer(first);
+    } else {
+        while (*p) {
+            std::wstring name = p;
+            EnqueueFileTransfer(first + L"\\" + name);
+            p += name.size() + 1;
+        }
+    }
+}
 
 // 前向声明：面板要能立即把放大的光标收回（定义在 WndProc 之后）
 static void RefreshCursorScale();
@@ -2325,6 +2436,8 @@ struct PanelSnapshot {
     std::wstring gpuMemText = L"--";
     std::wstring keepOnText = L"已开启 (防熄屏)";
     bool keepOnActive = true;
+    bool xferConnected = false;
+    std::wstring xferStatusText = L"等待中转站连接…";
 };
 
 static PanelSnapshot g_panelData;
@@ -2617,6 +2730,12 @@ static void UpdateControlPanel() {
     g_panelData.keepOnText = !g_keepScreenOn.load() ? L"已关闭"
                            : (keepActive ? L"常亮生效中" : L"待命（未投屏）");
 
+    g_panelData.xferConnected = g_xferConnected.load();
+    {
+        std::lock_guard<std::mutex> lk(g_xferMtx);
+        g_panelData.xferStatusText = g_xferStatus;
+    }
+
     SetWindowTextW(GetDlgItem(g_panel, IDC_PANEL_FULL),
                    g_isFullscreen ? L"回到窗口" : L"全屏显示");
     SetWindowTextW(GetDlgItem(g_panel, IDC_PANEL_TOP),
@@ -2787,23 +2906,50 @@ static void PaintControlPanel(HWND h) {
                   g_panelData.keepOnActive ? okCol : mutedCol);
     }
 
-    // 3. 底部控制区卡片 (20, 320, 920, 172)
-    DrawPanelCard(hdc, S(20), S(320), S(920), S(172), S(8), cardFill, cardBorder);
+    // 3. 雷电双向文件中转站卡片 (20, 320, 920, 66)
+    DrawPanelCard(hdc, S(20), S(320), S(920), S(66), S(8), cardFill, cardBorder);
+    {
+        COLORREF xCol = g_panelData.xferConnected ? okCol : RGB(148, 163, 184);
+        int xd = S(8), xdx = S(36), xdy = S(333) + (S(20) - xd) / 2;
+        HPEN xpen = CreatePen(PS_SOLID, 1, xCol);
+        HBRUSH xbr = CreateSolidBrush(xCol);
+        HGDIOBJ op = SelectObject(hdc, xpen), ob = SelectObject(hdc, xbr);
+        Ellipse(hdc, xdx, xdy, xdx + xd, xdy + xd);
+        SelectObject(hdc, ob); SelectObject(hdc, op);
+        DeleteObject(xbr); DeleteObject(xpen);
+
+        RECT rxt{ S(52), S(329), S(600), S(353) };
+        SelectObject(hdc, g_theme.fontSection);
+        SetTextColor(hdc, titleCol);
+        DrawTextW(hdc, g_panelData.xferConnected
+                  ? L"雷电文件中转站 · 已连接 (9923)"
+                  : L"雷电文件中转站 · 等待连接 (9923)",
+                  -1, &rxt, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
+
+        RECT rxs{ S(36), S(354), S(610), S(380) };
+        SelectObject(hdc, g_theme.fontBody);
+        SetTextColor(hdc, mutedCol);
+        DrawTextW(hdc, g_panelData.xferStatusText.c_str(), -1, &rxs,
+                  DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
+    }
+
+    // 4. 底部控制区卡片 (20, 398, 920, 172)
+    DrawPanelCard(hdc, S(20), S(398), S(920), S(172), S(8), cardFill, cardBorder);
     {
         HPEN sp = CreatePen(PS_SOLID, 1, sepColor);
         HGDIOBJ op = SelectObject(hdc, sp);
-        MoveToEx(hdc, S(38), S(432), nullptr);
-        LineTo(hdc, S(922), S(432));
+        MoveToEx(hdc, S(38), S(510), nullptr);
+        LineTo(hdc, S(922), S(510));
         SelectObject(hdc, op);
         DeleteObject(sp);
     }
 
-    // 4. 最底部快捷键提示 (20, 498, 920, 26)
+    // 5. 最底部快捷键提示 (20, 576, 920, 26)
     {
-        RECT rf{ S(20), S(498), S(940), S(524) };
+        RECT rf{ S(20), S(576), S(940), S(602) };
         SelectObject(hdc, g_theme.fontSmall);
         SetTextColor(hdc, mutedCol);
-        DrawTextW(hdc, L"Esc 退出投屏    ·    Ctrl+Alt+H 最小化让位    ·    F11 切换全屏",
+        DrawTextW(hdc, L"Esc 退出投屏    ·    Ctrl+Alt+H 最小化让位    ·    F11 切换全屏    ·    拖入文件即可直传 Mac",
                   -1, &rf, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
     }
 
@@ -2872,25 +3018,29 @@ static void LayoutPanelControls(HWND h) {
         MoveWindow(c, S(x), S(y), S(w), S(ch), TRUE);
     };
 
+    // 中转站右侧按钮
+    mv(IDC_PANEL_SENDFILE, 624, 336, 148, 34);
+    mv(IDC_PANEL_OPENXFER, 782, 336, 140, 34);
+
     // 两行 4 列按钮：卡片宽 920 (20..940)，内边距 18 -> 38..922 (宽 884)，
     // 4 * 210 + 3 * 14 = 882，左右居中
     const int bx[4] = { 39, 263, 487, 711 };
     const int bw = 210, bh = 36;
-    mv(IDC_PANEL_FULL,   bx[0], 338, bw, bh);
-    mv(IDC_PANEL_TOP,    bx[1], 338, bw, bh);
-    mv(IDC_PANEL_KEY,    bx[2], 338, bw, bh);
-    mv(IDC_PANEL_RECONN, bx[3], 338, bw, bh);
-    mv(IDC_PANEL_LOG,    bx[0], 384, bw, bh);
-    mv(IDC_PANEL_CFG,    bx[1], 384, bw, bh);
-    mv(IDC_PANEL_COPY,   bx[2], 384, bw, bh);
-    mv(IDC_PANEL_EXIT,   bx[3], 384, bw, bh);
+    mv(IDC_PANEL_FULL,   bx[0], 416, bw, bh);
+    mv(IDC_PANEL_TOP,    bx[1], 416, bw, bh);
+    mv(IDC_PANEL_KEY,    bx[2], 416, bw, bh);
+    mv(IDC_PANEL_RECONN, bx[3], 416, bw, bh);
+    mv(IDC_PANEL_LOG,    bx[0], 462, bw, bh);
+    mv(IDC_PANEL_CFG,    bx[1], 462, bw, bh);
+    mv(IDC_PANEL_COPY,   bx[2], 462, bw, bh);
+    mv(IDC_PANEL_EXIT,   bx[3], 462, bw, bh);
 
     // 5 个选项开关均匀排在分隔线下方
-    mv(IDC_PANEL_VSYNC,    39,  446, 130, 28);
-    mv(IDC_PANEL_PACE,     185, 446, 130, 28);
-    mv(IDC_PANEL_FEEDBACK, 331, 446, 130, 28);
-    mv(IDC_PANEL_SHAKE,    477, 446, 165, 28);
-    mv(IDC_PANEL_KEEPON,   658, 446, 250, 28);
+    mv(IDC_PANEL_VSYNC,    39,  524, 130, 28);
+    mv(IDC_PANEL_PACE,     185, 524, 130, 28);
+    mv(IDC_PANEL_FEEDBACK, 331, 524, 130, 28);
+    mv(IDC_PANEL_SHAKE,    477, 524, 165, 28);
+    mv(IDC_PANEL_KEEPON,   658, 524, 250, 28);
 }
 
 static LRESULT CALLBACK PanelWndProc(HWND h, UINT msg, WPARAM w, LPARAM l) {
@@ -2921,6 +3071,8 @@ static LRESULT CALLBACK PanelWndProc(HWND h, UINT msg, WPARAM w, LPARAM l) {
             return c;
         };
 
+        mkBtn(L"发送文件到 Mac", IDC_PANEL_SENDFILE);
+        mkBtn(L"打开中转站", IDC_PANEL_OPENXFER);
         mkBtn(L"全屏显示", IDC_PANEL_FULL);
         mkBtn(L"窗口置顶", IDC_PANEL_TOP);
         mkBtn(L"强制关键帧", IDC_PANEL_KEY);
@@ -2936,10 +3088,30 @@ static LRESULT CALLBACK PanelWndProc(HWND h, UINT msg, WPARAM w, LPARAM l) {
         mkChk(L"晃动找光标", IDC_PANEL_SHAKE, g_shakeEnabled.load());
         mkChk(L"保持屏幕常亮 (防熄屏)", IDC_PANEL_KEEPON, g_keepScreenOn.load());
 
+        DragAcceptFiles(h, TRUE);
         LayoutPanelControls(h);
         SetTimer(h, 1, 1000, nullptr);
         return 0;
     }
+    case WM_DROPFILES: {
+        HDROP drop = (HDROP)w;
+        UINT cnt = DragQueryFileW(drop, 0xFFFFFFFF, nullptr, 0);
+        for (UINT i = 0; i < cnt; ++i) {
+            UINT len = DragQueryFileW(drop, i, nullptr, 0);
+            if (len > 0 && len < 4096) {
+                std::wstring path(len + 1, L'\0');
+                if (DragQueryFileW(drop, i, &path[0], len + 1) > 0) {
+                    path.resize(wcslen(path.c_str()));
+                    EnqueueFileTransfer(path);
+                }
+            }
+        }
+        DragFinish(drop);
+        return 0;
+    }
+    case WM_APP_XFER_UI:
+        UpdateControlPanel();
+        return 0;
     case WM_ERASEBKGND:
         return 1;
     case WM_PAINT:
@@ -2986,6 +3158,14 @@ static LRESULT CALLBACK PanelWndProc(HWND h, UINT msg, WPARAM w, LPARAM l) {
         return (LRESULT)g_theme.cardBrush;
     case WM_COMMAND:
         switch (LOWORD(w)) {
+        case IDC_PANEL_SENDFILE:
+            PickAndSendFiles(h);
+            return 0;
+        case IDC_PANEL_OPENXFER: {
+            std::wstring dir = GetTransferInboxDir();
+            ShellExecuteW(nullptr, L"open", dir.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
+            return 0;
+        }
         case IDC_PANEL_FULL:
             if (g_hwnd) PostMessageW(g_hwnd, WM_COMMAND, ID_TRAY_TOGGLE, 0);
             return 0;
@@ -3105,7 +3285,7 @@ static void ShowControlPanel() {
 
     const int dpi = PanelWindowDpi(nullptr);
     DWORD style = WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX | WS_CLIPCHILDREN;
-    RECT rc{ 0, 0, DpiPx(960, dpi), DpiPx(534, dpi) };
+    RECT rc{ 0, 0, DpiPx(960, dpi), DpiPx(612, dpi) };
     AdjustRectDpi(&rc, style, WS_EX_APPWINDOW, dpi);
     int w = rc.right - rc.left;
     int hgt = rc.bottom - rc.top;
@@ -3118,13 +3298,13 @@ static void ShowControlPanel() {
         // 创建后校准一次真实所在屏幕 DPI，避免多屏 DPI 不同时窗口外框与内绘比例错配
         const int realDpi = PanelWindowDpi(g_panel);
         if (realDpi != dpi) {
-            RECT r2{ 0, 0, DpiPx(960, realDpi), DpiPx(534, realDpi) };
+            RECT r2{ 0, 0, DpiPx(960, realDpi), DpiPx(612, realDpi) };
             AdjustRectDpi(&r2, style, WS_EX_APPWINDOW, realDpi);
             SetWindowPos(g_panel, nullptr, 0, 0, r2.right - r2.left, r2.bottom - r2.top,
                          SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE);
             LayoutPanelControls(g_panel);
         }
-        Log("控制面板已创建 hwnd=%p", (void*)g_panel);
+        Log("控制面板已创建 hwnd=%p", (void*)g_panel.load());
         ShowWindow(g_panel, SW_SHOW);
         SetForegroundWindow(g_panel);
         UpdateControlPanel();
@@ -4557,6 +4737,435 @@ static void NetworkLoop(RunConfig cfg, Graphics* gfx, Presenter* presenter) {
 }
 
 // ---------------------------------------------------------------------------
+// 雷电双向文件中转站客户端（独立 TCP 端口 port+1 = 9923）
+// ---------------------------------------------------------------------------
+
+static bool XferSendAll(SOCKET s, std::mutex& mtx, const uint8_t* data, size_t len) {
+    std::lock_guard<std::mutex> lk(mtx);
+    size_t sent = 0;
+    while (sent < len && g_alive) {
+        int r = send(s, (const char*)(data + sent), (int)std::min<size_t>(len - sent, 1 << 20), 0);
+        if (r <= 0) return false;
+        sent += (size_t)r;
+    }
+    return sent == len;
+}
+
+static bool XferRecvAll(SOCKET s, uint8_t* buf, size_t len) {
+    size_t got = 0;
+    int idleTimeouts = 0;
+    while (got < len && g_alive) {
+        int r = recv(s, (char*)(buf + got), (int)std::min<size_t>(len - got, 1 << 20), 0);
+        if (r > 0) {
+            got += (size_t)r;
+            idleTimeouts = 0;
+        } else if (r == 0) {
+            return false;
+        } else {
+            int err = WSAGetLastError();
+            // Mac 每 15 秒发一次 PING；连续 45 秒无任何数据包视为静默断线（如拔雷电线）
+            if (err == WSAETIMEDOUT && ++idleTimeouts < 45) continue;
+            return false;
+        }
+    }
+    return got == len;
+}
+
+static std::wstring SanitizeFilenameW(const std::string& utf8, uint32_t id) {
+    std::wstring w = ToWide(utf8.c_str(), (int)utf8.size());
+    size_t pos = w.find_last_of(L"\\/");
+    if (pos != std::wstring::npos) w = w.substr(pos + 1);
+    std::wstring clean;
+    clean.reserve(w.size());
+    for (wchar_t c : w) {
+        if (c < 0x20 || c == 0x7f || c == L':' || c == L'*' || c == L'?' ||
+            c == L'"' || c == L'<' || c == L'>' || c == L'|' || c == L'/' || c == L'\\') {
+            continue;
+        }
+        clean.push_back(c);
+    }
+    // 去掉 Windows 文件名禁止的末尾空格与句点
+    while (!clean.empty() && (clean.back() == L' ' || clean.back() == L'.')) {
+        clean.pop_back();
+    }
+    if (clean.empty() || clean == L"." || clean == L"..") {
+        wchar_t fb[32];
+        swprintf(fb, 32, L"file_%u", id);
+        return fb;
+    }
+    // 避开 Windows DOS 设备保留名（CON / PRN / AUX / NUL / COM1..9 / LPT1..9）
+    size_t dot = clean.find(L'.');
+    std::wstring stem = (dot == std::wstring::npos) ? clean : clean.substr(0, dot);
+    std::wstring up;
+    for (wchar_t c : stem) up.push_back((wchar_t)towupper(c));
+    if (up == L"CON" || up == L"PRN" || up == L"AUX" || up == L"NUL" ||
+        (up.size() == 4 && (up.compare(0, 3, L"COM") == 0 || up.compare(0, 3, L"LPT") == 0) &&
+         up[3] >= L'1' && up[3] <= L'9')) {
+        clean = L"_" + clean;
+    }
+    return clean;
+}
+
+static std::wstring UniqueDestPathW(const std::wstring& dir, const std::wstring& name) {
+    std::wstring first = dir + L"\\" + name;
+    if (GetFileAttributesW(first.c_str()) == INVALID_FILE_ATTRIBUTES) return first;
+    size_t dot = name.find_last_of(L'.');
+    std::wstring stem = (dot == std::wstring::npos) ? name : name.substr(0, dot);
+    std::wstring ext  = (dot == std::wstring::npos) ? L"" : name.substr(dot);
+    for (int i = 1; i <= 9999; ++i) {
+        wchar_t idx[32];
+        swprintf(idx, 32, L" (%d)", i);
+        std::wstring cand = dir + L"\\" + stem + idx + ext;
+        if (GetFileAttributesW(cand.c_str()) == INVALID_FILE_ATTRIBUTES) return cand;
+    }
+    wchar_t ts[32];
+    swprintf(ts, 32, L"_%llu", (unsigned long long)GetTickCount64());
+    return dir + L"\\" + stem + ts + ext;
+}
+
+static void TransferLoop(RunConfig cfg) {
+    const uint16_t xferPort = (uint16_t)(cfg.port + 1);
+    const std::wstring inbox = GetTransferInboxDir();
+    Log("中转站线程启动: 目标 %s:%d，目录 %s",
+        cfg.host.c_str(), xferPort, ToUtf8(inbox.c_str()).c_str());
+
+    auto putU16 = [](std::vector<uint8_t>& v, uint16_t x) {
+        v.push_back((uint8_t)(x >> 8)); v.push_back((uint8_t)(x & 0xFF));
+    };
+    auto putU32 = [](std::vector<uint8_t>& v, uint32_t x) {
+        v.push_back((uint8_t)((x >> 24) & 0xFF)); v.push_back((uint8_t)((x >> 16) & 0xFF));
+        v.push_back((uint8_t)((x >> 8) & 0xFF));  v.push_back((uint8_t)(x & 0xFF));
+    };
+    auto putU64 = [&](std::vector<uint8_t>& v, uint64_t x) {
+        putU32(v, (uint32_t)(x >> 32));
+        putU32(v, (uint32_t)(x & 0xFFFFFFFFu));
+    };
+    auto rdU16 = [](const uint8_t* p) -> uint16_t {
+        return ((uint16_t)p[0] << 8) | p[1];
+    };
+    auto rdU32 = [](const uint8_t* p) -> uint32_t {
+        return ((uint32_t)p[0] << 24) | ((uint32_t)p[1] << 16) | ((uint32_t)p[2] << 8) | p[3];
+    };
+    auto rdU64 = [&](const uint8_t* p) -> uint64_t {
+        return ((uint64_t)rdU32(p) << 32) | rdU32(p + 4);
+    };
+
+    while (g_alive) {
+        SOCKET sock = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+        if (sock == INVALID_SOCKET) { SleepAlive(2000); continue; }
+
+        int bufSz = 4 * 1024 * 1024;
+        setsockopt(sock, SOL_SOCKET, SO_SNDBUF, (const char*)&bufSz, sizeof(bufSz));
+        setsockopt(sock, SOL_SOCKET, SO_RCVBUF, (const char*)&bufSz, sizeof(bufSz));
+        int nodelay = 1, keepalive = 1;
+        setsockopt(sock, IPPROTO_TCP, TCP_NODELAY, (const char*)&nodelay, sizeof(nodelay));
+        setsockopt(sock, SOL_SOCKET, SO_KEEPALIVE, (const char*)&keepalive, sizeof(keepalive));
+
+        sockaddr_in addr{};
+        addr.sin_family = AF_INET;
+        addr.sin_port = htons(xferPort);
+        if (inet_pton(AF_INET, cfg.host.c_str(), &addr.sin_addr) != 1) {
+            closesocket(sock);
+            SleepAlive(3000);
+            continue;
+        }
+
+        u_long nb = 1;
+        ioctlsocket(sock, FIONBIO, &nb);
+        connect(sock, (sockaddr*)&addr, sizeof(addr));
+        fd_set wfds, efds;
+        FD_ZERO(&wfds); FD_ZERO(&efds);
+        FD_SET(sock, &wfds); FD_SET(sock, &efds);
+        timeval tv{ 2, 0 };
+        int sel = select(0, nullptr, &wfds, &efds, &tv);
+        int soErr = 0; int soLen = sizeof(soErr);
+        getsockopt(sock, SOL_SOCKET, SO_ERROR, (char*)&soErr, &soLen);
+        if (sel <= 0 || FD_ISSET(sock, &efds) || soErr != 0) {
+            closesocket(sock);
+            SleepAlive(2000);
+            continue;
+        }
+        nb = 0;
+        ioctlsocket(sock, FIONBIO, &nb);
+
+        DWORD rcvTo = 1000, sndTo = 5000;
+        setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, (const char*)&rcvTo, sizeof(rcvTo));
+        setsockopt(sock, SOL_SOCKET, SO_SNDTIMEO, (const char*)&sndTo, sizeof(sndTo));
+
+        g_xferSock = sock;
+        g_xferConnected = true;
+        SetTransferStatus(L"已连接 · 可拖入文件或点击「发送文件到 Mac」");
+        Log("中转站已连接 %s:%d", cfg.host.c_str(), xferPort);
+
+        std::atomic<bool> xferAlive{ true };
+        std::mutex xferSendMtx;
+
+        std::thread sendThread([&] {
+            std::vector<uint8_t> readBuf(262144);
+            while (g_alive && xferAlive) {
+                std::wstring path;
+                uint32_t tid = 0;
+                {
+                    std::unique_lock<std::mutex> lk(g_xferMtx);
+                    g_xferCv.wait_for(lk, std::chrono::milliseconds(500), [&] {
+                        return !g_alive || !xferAlive || !g_xferOutQ.empty();
+                    });
+                    if (!g_alive || !xferAlive) break;
+                    if (g_xferOutQ.empty()) continue;
+                    path = g_xferOutQ.front();
+                    g_xferOutQ.pop_front();
+                    tid = g_xferNextId++;
+                    if (g_xferNextId == 0) g_xferNextId = 1;
+                }
+
+                HANDLE hf = CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ,
+                                        nullptr, OPEN_EXISTING, FILE_FLAG_SEQUENTIAL_SCAN, nullptr);
+                if (hf == INVALID_HANDLE_VALUE) {
+                    Log("中转站打开文件失败: %s (%lu)", ToUtf8(path.c_str()).c_str(), GetLastError());
+                    SetTransferStatus(L"无法读取所选文件");
+                    continue;
+                }
+                LARGE_INTEGER li{};
+                if (!GetFileSizeEx(hf, &li)) { CloseHandle(hf); continue; }
+                uint64_t totalSize = (uint64_t)li.QuadPart;
+
+                size_t slash = path.find_last_of(L"\\/");
+                std::wstring baseW = (slash == std::wstring::npos) ? path : path.substr(slash + 1);
+                std::string baseU8 = ToUtf8(baseW.c_str());
+                if (baseU8.size() > 4096) baseU8.resize(4096);
+
+                std::vector<uint8_t> beginFrame;
+                beginFrame.reserve(5 + 14 + baseU8.size());
+                beginFrame.push_back(XFER_BEGIN);
+                putU32(beginFrame, (uint32_t)(14 + baseU8.size()));
+                putU32(beginFrame, tid);
+                putU64(beginFrame, totalSize);
+                putU16(beginFrame, (uint16_t)baseU8.size());
+                beginFrame.insert(beginFrame.end(), baseU8.begin(), baseU8.end());
+
+                SetTransferStatus(L"发送中: " + baseW + L" (0%)");
+                Log("中转站开始发送 #%u: %s (%llu B)", tid, baseU8.c_str(), (unsigned long long)totalSize);
+                ULONGLONG t0 = GetTickCount64();
+                ULONGLONG lastUi = t0;
+
+                if (!XferSendAll(sock, xferSendMtx, beginFrame.data(), beginFrame.size())) {
+                    CloseHandle(hf);
+                    { std::lock_guard<std::mutex> lk(g_xferMtx); g_xferOutQ.push_front(path); }
+                    xferAlive = false;
+                    break;
+                }
+
+                uint64_t sentTotal = 0;
+                bool readErr = false, netErr = false;
+                while (g_alive && xferAlive) {
+                    DWORD nRead = 0;
+                    if (!ReadFile(hf, readBuf.data(), (DWORD)readBuf.size(), &nRead, nullptr)) {
+                        readErr = true;
+                        break;
+                    }
+                    if (nRead == 0) break;
+                    std::vector<uint8_t> frame;
+                    frame.reserve(5 + 8 + nRead);
+                    frame.push_back(XFER_CHUNK);
+                    putU32(frame, (uint32_t)(8 + nRead));
+                    putU32(frame, tid);
+                    putU32(frame, (uint32_t)nRead);
+                    frame.insert(frame.end(), readBuf.begin(), readBuf.begin() + nRead);
+                    if (!XferSendAll(sock, xferSendMtx, frame.data(), frame.size())) {
+                        netErr = true;
+                        break;
+                    }
+                    sentTotal += nRead;
+                    ULONGLONG now = GetTickCount64();
+                    if (now - lastUi >= 200) {
+                        lastUi = now;
+                        double dt = std::max(0.01, (double)(now - t0) / 1000.0);
+                        double speed = (double)sentTotal / dt / 1048576.0;
+                        int pct = totalSize > 0 ? (int)((double)sentTotal * 100.0 / (double)totalSize) : 100;
+                        wchar_t sb[256];
+                        swprintf(sb, 256, L"发送 %s · %d%% · %.0f MB/s", baseW.c_str(), pct, speed);
+                        SetTransferStatus(sb);
+                    }
+                }
+                CloseHandle(hf);
+
+                bool complete = !readErr && !netErr && xferAlive && g_alive && (sentTotal == totalSize);
+                if (netErr || !xferAlive || !g_alive) {
+                    // 连接已断：切勿补发 endFrame 或记发送成功，直接把未传完文件放回队头等重连
+                    if (g_alive) {
+                        std::lock_guard<std::mutex> lk(g_xferMtx);
+                        g_xferOutQ.push_front(path);
+                    }
+                    xferAlive = false;
+                    break;
+                }
+
+                std::vector<uint8_t> endFrame;
+                endFrame.push_back(XFER_END);
+                putU32(endFrame, 5);
+                putU32(endFrame, tid);
+                endFrame.push_back(complete ? 1 : 0);
+                if (!XferSendAll(sock, xferSendMtx, endFrame.data(), endFrame.size())) {
+                    if (g_alive) {
+                        std::lock_guard<std::mutex> lk(g_xferMtx);
+                        g_xferOutQ.push_front(path);
+                    }
+                    xferAlive = false;
+                    break;
+                }
+                if (complete) {
+                    double dt = std::max(0.001, (double)(GetTickCount64() - t0) / 1000.0);
+                    double speed = (double)sentTotal / dt / 1048576.0;
+                    wchar_t sb[256];
+                    swprintf(sb, 256, L"已发送: %s (%s · %.0f MB/s)",
+                             baseW.c_str(), FormatBytesW(sentTotal).c_str(), speed);
+                    SetTransferStatus(sb);
+                    Log("中转站发送完成 #%u: %s (%.1f MB/s)", tid, baseU8.c_str(), speed);
+                } else {
+                    SetTransferStatus(L"发送失败: " + baseW);
+                }
+            }
+        });
+
+        struct RecvState {
+            HANDLE hf = INVALID_HANDLE_VALUE;
+            std::wstring safeName;
+            std::wstring partPath;
+            uint64_t expected = 0;
+            uint64_t received = 0;
+            ULONGLONG started = 0;
+            ULONGLONG lastUi = 0;
+        };
+        std::unordered_map<uint32_t, RecvState> recvs;
+        auto sendAck = [&](uint32_t id, bool ok) {
+            std::vector<uint8_t> f;
+            f.push_back(XFER_ACK);
+            putU32(f, 5);
+            putU32(f, id);
+            f.push_back(ok ? 1 : 0);
+            XferSendAll(sock, xferSendMtx, f.data(), f.size());
+        };
+
+        std::vector<uint8_t> payload;
+        while (g_alive && xferAlive) {
+            uint8_t hdr[5];
+            if (!XferRecvAll(sock, hdr, 5)) break;
+            uint8_t type = hdr[0];
+            uint32_t len = rdU32(hdr + 1);
+            if (len > 1024 * 1024) { Log("中转站收到异常大帧 %u", len); break; }
+            payload.resize(len);
+            if (len > 0 && !XferRecvAll(sock, payload.data(), len)) break;
+
+            if (type == XFER_BEGIN && len >= 14) {
+                uint32_t id = rdU32(payload.data());
+                uint64_t size = rdU64(payload.data() + 4);
+                uint16_t nameLen = rdU16(payload.data() + 12);
+                if (len < (uint32_t)(14 + nameLen)) continue;
+                std::string raw((const char*)(payload.data() + 14), nameLen);
+                std::wstring safe = SanitizeFilenameW(raw, id);
+                if (recvs.count(id)) {
+                    if (recvs[id].hf != INVALID_HANDLE_VALUE) CloseHandle(recvs[id].hf);
+                    DeleteFileW(recvs[id].partPath.c_str());
+                    recvs.erase(id);
+                }
+                wchar_t partName[64];
+                swprintf(partName, 64, L"\\.secdisplay_tmp_%u.part", id);
+                std::wstring partPath = inbox + partName;
+                HANDLE hf = CreateFileW(partPath.c_str(), GENERIC_WRITE, 0, nullptr,
+                                        CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+                if (hf == INVALID_HANDLE_VALUE) {
+                    Log("中转站创建临时文件失败 %lu", GetLastError());
+                    sendAck(id, false);
+                    continue;
+                }
+                RecvState st{};
+                st.hf = hf; st.safeName = safe; st.partPath = partPath;
+                st.expected = size; st.started = GetTickCount64(); st.lastUi = st.started;
+                recvs[id] = st;
+                SetTransferStatus(L"正在接收: " + safe + L" (0%)");
+                Log("中转站开始接收 #%u: %s (%llu B)", id, ToUtf8(safe.c_str()).c_str(), (unsigned long long)size);
+            } else if (type == XFER_CHUNK && len >= 8) {
+                uint32_t id = rdU32(payload.data());
+                uint32_t dlen = rdU32(payload.data() + 4);
+                auto it = recvs.find(id);
+                // 无溢出检查：用 len - 8 而非 8 + dlen，防止 dlen 接近 0xFFFFFFFF 时回绕越界读
+                if (it == recvs.end() || dlen > len - 8) continue;
+                DWORD written = 0;
+                if (dlen > 0 && (!WriteFile(it->second.hf, payload.data() + 8, dlen, &written, nullptr) || written != dlen)) {
+                    CloseHandle(it->second.hf);
+                    DeleteFileW(it->second.partPath.c_str());
+                    recvs.erase(it);
+                    sendAck(id, false);
+                    continue;
+                }
+                it->second.received += dlen;
+                ULONGLONG now = GetTickCount64();
+                if (now - it->second.lastUi >= 200) {
+                    it->second.lastUi = now;
+                    double dt = std::max(0.01, (double)(now - it->second.started) / 1000.0);
+                    double speed = (double)it->second.received / dt / 1048576.0;
+                    int pct = it->second.expected > 0
+                        ? (int)((double)it->second.received * 100.0 / (double)it->second.expected) : 100;
+                    wchar_t sb[256];
+                    swprintf(sb, 256, L"接收 %s · %d%% · %.0f MB/s", it->second.safeName.c_str(), pct, speed);
+                    SetTransferStatus(sb);
+                }
+            } else if (type == XFER_END && len >= 5) {
+                uint32_t id = rdU32(payload.data());
+                bool okFlag = (payload[4] == 1);
+                auto it = recvs.find(id);
+                if (it == recvs.end()) continue;
+                RecvState st = it->second;
+                recvs.erase(it);
+                CloseHandle(st.hf);
+                if (okFlag && st.received == st.expected) {
+                    std::wstring dest = UniqueDestPathW(inbox, st.safeName);
+                    if (MoveFileExW(st.partPath.c_str(), dest.c_str(), 0)) {
+                        double dt = std::max(0.001, (double)(GetTickCount64() - st.started) / 1000.0);
+                        double speed = (double)st.received / dt / 1048576.0;
+                        size_t sl = dest.find_last_of(L"\\/");
+                        std::wstring finalName = (sl == std::wstring::npos) ? dest : dest.substr(sl + 1);
+                        wchar_t sb[256];
+                        swprintf(sb, 256, L"已收到: %s (%s · %.0f MB/s)",
+                                 finalName.c_str(), FormatBytesW(st.received).c_str(), speed);
+                        SetTransferStatus(sb);
+                        Log("中转站接收完成 #%u: %s (%.1f MB/s)", id, ToUtf8(finalName.c_str()).c_str(), speed);
+                        sendAck(id, true);
+                    } else {
+                        DeleteFileW(st.partPath.c_str());
+                        SetTransferStatus(L"保存失败: " + st.safeName);
+                        sendAck(id, false);
+                    }
+                } else {
+                    DeleteFileW(st.partPath.c_str());
+                    SetTransferStatus(L"接收未完成: " + st.safeName);
+                    sendAck(id, false);
+                }
+            }
+        }
+
+        // 先 shutdown 打破可能阻塞在 send 的 sendThread，再设标志并 join
+        g_xferConnected = false;
+        if (g_xferSock.load() == sock) g_xferSock = INVALID_SOCKET;
+        shutdown(sock, SD_BOTH);
+        xferAlive = false;
+        g_xferCv.notify_all();
+        if (sendThread.joinable()) sendThread.join();
+        for (auto& kv : recvs) {
+            if (kv.second.hf != INVALID_HANDLE_VALUE) CloseHandle(kv.second.hf);
+            DeleteFileW(kv.second.partPath.c_str());
+        }
+        recvs.clear();
+
+        closesocket(sock);
+        SetTransferStatus(L"中转连接断开，2 秒后重连…");
+        if (!g_alive) break;
+        SleepAlive(2000);
+    }
+    Log("中转站线程退出");
+}
+
+// ---------------------------------------------------------------------------
 // 主流程
 // ---------------------------------------------------------------------------
 
@@ -4883,6 +5492,7 @@ int main(int argc, char** argv) {
     });
 
     std::thread net(NetworkLoop, cfg, &gfx, &presenter);
+    std::thread xfer(TransferLoop, cfg);
 
     MSG msg;
     while (GetMessage(&msg, nullptr, 0, 0)) {
@@ -4890,9 +5500,8 @@ int main(int argc, char** argv) {
         DispatchMessage(&msg);
     }
 
-    // 退出清理：托盘图标、热键、防熄屏声明必须在进程结束前移除
+    // 退出清理：先停网络/中转/输入线程，再毁控制面板窗口，消除跨线程访问 g_panel 竞态
     SetThreadExecutionState(ES_CONTINUOUS);
-    if (g_panel) { DestroyWindow(g_panel); g_panel = nullptr; }
     g_presenter = nullptr;
     TrayRemove();
     UnregisterHotKey(hwnd, HOTKEY_QUIT_ID);
@@ -4911,17 +5520,20 @@ int main(int argc, char** argv) {
     if (g_hintBrush) { DeleteObject(g_hintBrush); g_hintBrush = nullptr; }
     if (g_hintHwnd)  { DestroyWindow(g_hintHwnd); g_hintHwnd = nullptr; }
     g_alive = false;
-    // 关键：先掐断 socket，让阻塞在 recv 的收流线程立即返回。
-    // 否则「已连上 Mac 正常收流」时按退出，net.join() 会一直等那个
-    // 无超时的 recv，进程卡在退出途中，看起来像「点了退出没反应」。
-    // 配合 RecvAll 的 SO_RCVTIMEO(500ms) 双保险。
+    g_xferCv.notify_all();
+    {
+        SOCKET xs = g_xferSock.load();
+        if (xs != INVALID_SOCKET) shutdown(xs, SD_BOTH);
+    }
     {
         SOCKET s = g_sock.load();
         if (s != INVALID_SOCKET) shutdown(s, SD_BOTH);
     }
     if (net.joinable()) net.join();
-    // cursorThread 已随「停用 SetCursorPos 抢光标」一起移除，勿再 join。
+    if (xfer.joinable()) xfer.join();
     if (inputThread.joinable()) inputThread.join();
+    HWND panelToDestroy = g_panel.exchange(nullptr);
+    if (panelToDestroy) { DestroyWindow(panelToDestroy); }
 
     WSACleanup();
     presenter.Shutdown();

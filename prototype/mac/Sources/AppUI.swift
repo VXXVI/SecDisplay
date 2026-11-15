@@ -5,6 +5,7 @@
 
 import SwiftUI
 import AppKit
+import UniformTypeIdentifiers
 
 /// 面板共享状态
 final class AppModel: ObservableObject {
@@ -51,6 +52,13 @@ final class AppModel: ObservableObject {
     /// 光标的发送计数（位置 / 图像）
     @Published var cursorPosSent = 0
     @Published var cursorImgSent = 0
+
+    // ---- 雷电文件中转站 ----
+    @Published var transferConnected = false
+    @Published var transferStatus = "等待连接"
+    @Published var transferHistory: [String] = []
+    @Published var transferInboxPath = ""
+    @Published var transferDropTargeted = false
 
     static let resolutions: [(label: String, w: Int, h: Int, lw: Int, lh: Int)] = [
         ("1600 × 1000 (1x)", 1600, 1000, 1600, 1000),
@@ -120,6 +128,15 @@ final class AppModel: ObservableObject {
         peer = sender.peerDescription
         cursorPosSent = cursor.sentCount
         cursorImgSent = cursorImage.sentCount
+        refreshTransferOnly()
+    }
+
+    func refreshTransferOnly() {
+        let ts = transferService.snapshot()
+        transferConnected = ts.connected
+        transferStatus = ts.statusText
+        transferHistory = ts.history
+        transferInboxPath = ts.inboxPath
     }
 }
 
@@ -261,6 +278,64 @@ struct StatusView: View {
                     StatRow(label: "位置 / 图像", value: "\(model.cursorPosSent) / \(model.cursorImgSent)")
                 }
 
+                // 雷电文件中转站
+                SectionHeader(title: "雷电文件中转站")
+                VStack(alignment: .leading, spacing: 6) {
+                    HStack(spacing: 6) {
+                        Circle()
+                            .fill(model.transferConnected ? Color.green : Color.secondary.opacity(0.4))
+                            .frame(width: 7, height: 7)
+                        Text(model.transferStatus)
+                            .font(.system(size: 11))
+                            .foregroundStyle(.secondary)
+                            .lineLimit(1)
+                            .truncationMode(.middle)
+                    }
+                    HStack(spacing: 8) {
+                        Button("发送文件到 Win…") {
+                            let panel = NSOpenPanel()
+                            panel.title = "选择要发送到 Windows 的文件"
+                            panel.canChooseFiles = true
+                            panel.canChooseDirectories = false
+                            panel.allowsMultipleSelection = true
+                            if panel.runModal() == .OK {
+                                transferService.enqueue(urls: panel.urls)
+                            }
+                        }
+                        Button("打开中转站") {
+                            let path = model.transferInboxPath.isEmpty
+                                ? transferService.inboxURL.path
+                                : model.transferInboxPath
+                            NSWorkspace.shared.open(URL(fileURLWithPath: path))
+                        }
+                    }
+                    if !model.transferHistory.isEmpty {
+                        VStack(alignment: .leading, spacing: 2) {
+                            ForEach(Array(model.transferHistory.prefix(3).enumerated()), id: \.offset) { _, line in
+                                Text(line)
+                                    .font(.system(size: 10, design: .monospaced))
+                                    .foregroundStyle(.secondary)
+                                    .lineLimit(1)
+                                    .truncationMode(.middle)
+                            }
+                        }
+                    } else {
+                        Text("把文件拖到此面板即可直接发送到 Windows")
+                            .font(.system(size: 10))
+                            .foregroundStyle(.tertiary)
+                    }
+                }
+                .padding(10)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .background(
+                    RoundedRectangle(cornerRadius: 8)
+                        .fill(model.transferDropTargeted ? Color.accentColor.opacity(0.12) : Color.secondary.opacity(0.08))
+                )
+                .overlay(
+                    RoundedRectangle(cornerRadius: 8)
+                        .stroke(model.transferDropTargeted ? Color.accentColor : Color.clear, lineWidth: 1.5)
+                )
+
                 Divider()
 
                 // 设置
@@ -329,6 +404,16 @@ struct StatusView: View {
         // 自己管顶部让位，就不要 SwiftUI 再叠一次安全区
         .ignoresSafeArea(.container, edges: .top)
         .frame(width: 400, height: 620)
+        .onDrop(of: [.fileURL], isTargeted: $model.transferDropTargeted) { providers in
+            var accepted = false
+            for p in providers where p.canLoadObject(ofClass: URL.self) {
+                accepted = true
+                _ = p.loadObject(ofClass: URL.self) { url, _ in
+                    if let url { transferService.enqueue(urls: [url]) }
+                }
+            }
+            return accepted
+        }
     }
 }
 
