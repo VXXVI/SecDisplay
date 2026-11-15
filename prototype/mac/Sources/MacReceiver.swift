@@ -203,6 +203,7 @@ final class VideoToolboxDecoder {
 
     var onDecodedFrame: ((CVPixelBuffer, Int, Int) -> Void)?
     var onDecodeError: (() -> Void)?
+    var onFrameDropped: (() -> Void)?
     var onNeedKeyframe: (() -> Void)?
 
     func reset() {
@@ -335,6 +336,7 @@ final class VideoToolboxDecoder {
             onDecodedFrame?(pb, w, h)
         } else if st3 == noErr && infoFlags.contains(.frameDropped) {
             pendingDecodedPB = nil
+            onFrameDropped?()
             onNeedKeyframe?()
         } else {
             pendingDecodedPB = nil
@@ -510,6 +512,12 @@ final class MacReceiverClient {
             guard let self else { return }
             self.stateLock.lock()
             self._decodeErrors &+= 1
+            self.stateLock.unlock()
+        }
+        decoder.onFrameDropped = { [weak self] in
+            guard let self else { return }
+            self.stateLock.lock()
+            self._droppedFrames &+= 1
             self.stateLock.unlock()
         }
         decoder.onNeedKeyframe = { [weak self] in
@@ -814,7 +822,7 @@ final class MacReceiverClient {
             } else {
                 if !Self.isPrivateOrLinkLocal(peerHost) {
                     rejectReason = "非本地/私有网段来源"
-                } else if curConnected && !curHost.isEmpty && curHost != peerHost {
+                } else if !curHost.isEmpty && curHost != peerHost && (curConnected || self.conn != nil) {
                     rejectReason = "已有主控 \(curHost) 在线，拒绝异地抢占"
                 }
             }
@@ -832,6 +840,7 @@ final class MacReceiverClient {
         let epoch = connEpoch
         stateLock.lock()
         _latestEpoch = epoch
+        _activePeerHost = peerHost
         _rejectedPeer = nil
         stateLock.unlock()
         feedbackTimer?.cancel()
@@ -1307,6 +1316,7 @@ final class ReceiverCanvasView: NSView {
         CATransaction.begin()
         CATransaction.setDisableActions(true)
         videoLayer.contents = nil
+        cursorLayer.contents = nil
         cursorLayer.isHidden = true
         CATransaction.commit()
         currentPixelBuffer = nil

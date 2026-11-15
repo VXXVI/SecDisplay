@@ -3054,7 +3054,7 @@ static void CopyDiagnostics() {
         swprintf(buf, 2048,
             L"SecDisplay 诊断（主控发送端 Win→Mac）\r\n"
             L"状态: %s\r\n"
-            L"虚拟屏(VDD): %s%hs%s\r\n"
+            L"虚拟屏(VDD): %s%hs%s%hs\r\n"
             L"Mac 副屏: %hs\r\n"
             L"虚拟屏分辨率: %dx%d @ %dHz\r\n"
             L"连接时长: %llu 秒\r\n"
@@ -3069,9 +3069,10 @@ static void CopyDiagnostics() {
             vddOk ? L"已挂载" : L"未就绪",
             hostErr.empty() ? "" : " (",
             hostErr.empty() ? L"" : ToWide(hostErr.c_str(), (int)hostErr.size()).c_str(),
+            hostErr.empty() ? "" : ")",
             peerStr.c_str(),
             hs.width.load(), hs.height.load(), hs.fps.load(), hUp,
-            g_uiFps.load(), g_uiMbps.load(), hs.bitrateMbps.load(),
+            g_uiFps.load(), g_uiMbps.load(), hs.targetBitrateMbps.load(),
             hs.lastEncMs.load(),
             (unsigned long long)hs.encodeFail.load(),
             (unsigned long long)hs.fenceTimeouts.load(),
@@ -3170,7 +3171,7 @@ static void UpdateControlPanel() {
         bool staticIdle = connected && sentF > 0 && lastTx > 0 && (GetTickCount64() - lastTx > 1500ULL);
         bool streaming = connected && sentF > 0;
         if (!vddOk) {
-            g_panelData.state = 0;
+            g_panelData.state = 3;
             g_panelData.statusText = L"虚拟屏异常 · 请检查 Parsec VDD 或点击重挂";
         } else if (streaming) {
             g_panelData.state = 2;
@@ -3204,7 +3205,7 @@ static void UpdateControlPanel() {
 
         swprintf(buf, 256, L"%.1f fps", fps);
         g_panelData.fpsText = buf;
-        swprintf(buf, 256, L"%.1f Mbps (目标 %dM)", mbps, hs.bitrateMbps.load());
+        swprintf(buf, 256, L"%.1f Mbps (目标 %dM)", mbps, hs.targetBitrateMbps.load());
         g_panelData.mbpsText = buf;
 
         swprintf(buf, 256, L"%.2f ms", hs.lastEncMs.load());
@@ -3530,7 +3531,9 @@ static void PaintControlPanel(HWND h) {
 
     // 1. 顶部状态横幅 (20, 12, 920, 44)
     DrawPanelCard(hdc, S(20), S(12), S(920), S(44), S(8), cardFill, cardBorder);
-    COLORREF dotCol = g_panelData.state == 2 ? okCol : (g_panelData.state == 1 ? warnCol : RGB(148, 163, 184));
+    COLORREF dotCol = g_panelData.state == 2 ? okCol
+                    : (g_panelData.state == 1 ? warnCol
+                    : (g_panelData.state == 3 ? errCol : RGB(148, 163, 184)));
     {
         int d = S(10), dx = S(38), dy = S(12) + (S(44) - d) / 2;
         HPEN dp = CreatePen(PS_SOLID, 1, dotCol);
@@ -3581,7 +3584,8 @@ static void PaintControlPanel(HWND h) {
         const bool hm = g_hostMode.load();
         const wchar_t* shortSt = g_panelData.state == 2 ? (hm ? L"主控推送中" : L"正在接收")
                                : (g_panelData.state == 1 ? (hm ? L"准备推流" : L"等待首帧")
-                                                         : (hm ? L"等待重连" : L"等待重连"));
+                               : (g_panelData.state == 3 ? L"虚拟屏异常"
+                                                         : (hm ? L"主控待命" : L"等待重连")));
         DrawKVRow(hdc, px, rowY, pw, rh, L"连接状态", shortSt, dotCol);
         DrawKVRow(hdc, px, rowY + step * 1, pw, rh, L"对端地址", g_panelData.peerText.c_str(), valCol);
         DrawKVRow(hdc, px, rowY + step * 2, pw, rh, L"分辨率",   g_panelData.sizeText.c_str(), valCol);

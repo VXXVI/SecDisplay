@@ -15,7 +15,7 @@
 set -u
 cd "$(dirname "$0")"
 
-BIN=./screensender
+BIN="$PWD/screensender"
 LOGDIR=logs
 PIDFILE=/tmp/secdisplay-sender.pid
 SIGN_ID=com.secdisplay.screensender

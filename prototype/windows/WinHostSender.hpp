@@ -109,11 +109,11 @@ public:
         reqFps_ = (fps >= 24 && fps <= 144) ? fps : 60;
         if (bitrateMbps < 10) bitrateMbps = 10;
         if (bitrateMbps > 200) bitrateMbps = 200;
-        targetMbps_ = bitrateMbps;
+        targetMbps_.store(bitrateMbps);
         curMbps_.store(bitrateMbps);
         port_ = port > 0 ? port : 9922;
 
-        stats_.targetBitrateMbps = targetMbps_;
+        stats_.targetBitrateMbps = bitrateMbps;
         stats_.bitrateMbps = bitrateMbps;
         stats_.fps = reqFps_;
         stats_.lastSentTick = 0;
@@ -160,7 +160,7 @@ public:
         return true;
     }
 
-    // 不断虚拟屏的快速重连：仅关闭当前 TCP 套接字，ConnectLoop 在 1.5s 内自动重连
+    // 不断虚拟屏的快速重连：仅关闭当前 TCP 套接字，ConnectLoop 在 1.5~3.5s 内自动重连
     void RestartConnection() {
         std::lock_guard<std::mutex> slk(sendMtx_);
         SOCKET cur = INVALID_SOCKET;
@@ -175,21 +175,21 @@ public:
     }
 
     bool SetResolution(int width, int height, int hz = 0) {
-        int useHz = (hz >= 24 && hz <= 240) ? hz : reqFps_;
+        int useHz = ClampHz(hz, reqFps_);
         if (!vdd_.SetMode(width, height, useHz)) return false;
         WinVddBounds b = vdd_.Bounds();
         reqW_ = b.width;
         reqH_ = b.height;
         stats_.width = b.width;
         stats_.height = b.height;
-        stats_.fps = (b.hz >= 24 && b.hz <= 240) ? b.hz : useHz;
+        stats_.fps = ClampHz(b.hz, useHz);
         forceKeyframe_.store(true);
         return true;
     }
 
     void SetTargetMbps(int mbps) {
         int clamped = std::clamp(mbps, 10, 200);
-        targetMbps_ = clamped;
+        targetMbps_.store(clamped);
         curMbps_.store(clamped);
         stats_.targetBitrateMbps = clamped;
         stats_.bitrateMbps = clamped;
@@ -215,6 +215,7 @@ public:
         if (captureThread_.joinable()) captureThread_.join();
         if (cursorThread_.joinable()) cursorThread_.join();
 
+        ReleaseAllInputs();
         vdd_.Stop();
         EmitLog("WinHost: 发送端已停止");
     }
@@ -239,11 +240,15 @@ private:
     WinHostStats stats_;
     LogFn logFn_;
 
+    static int ClampHz(int hz, int fallback) {
+        return (hz >= 24 && hz <= 240) ? hz : fallback;
+    }
+
     std::string targetHost_ = "10.10.10.1";
     int reqW_ = 2560;
     int reqH_ = 1600;
     int reqFps_ = 60;
-    int targetMbps_ = 80;
+    std::atomic<int> targetMbps_{80};
     std::atomic<int> curMbps_{80};
     uint16_t port_ = 9922;
 
@@ -561,9 +566,9 @@ private:
             } else {
                 int err = WSAGetLastError();
                 if (err == WSAETIMEDOUT || err == WSAEINTR) {
-                    // Mac 端每 2 秒发送一次 0x07 反馈；连续 15 秒无任何对端回包判定链路已死
-                    if (GetTickCount64() - lastRxTick >= 15000ULL) {
-                        EmitLog("WinHost: 超过 15 秒未收到 Mac 副屏心跳/反馈，主动重连");
+                    // Mac 端每 2 秒发送一次 0x07 反馈；连续 30 秒无任何对端回包判定链路已死
+                    if (GetTickCount64() - lastRxTick >= 30000ULL) {
+                        EmitLog("WinHost: 超过 30 秒未收到 Mac 副屏心跳/反馈，主动重连");
                         break;
                     }
                     continue;
@@ -625,12 +630,13 @@ private:
 
     void AdjustAdaptiveBitrate(uint16_t presentP95, uint16_t sourceP95,
                                uint16_t presDrop, uint16_t pacedDrop) {
+        int tgt = targetMbps_.load();
         int cur = curMbps_.load();
-        int minMbps = std::max(15, targetMbps_ / 3);
+        int minMbps = std::max(15, tgt / 3);
         if (presDrop > 2 || pacedDrop > 2 || (presentP95 > sourceP95 + 25 && presentP95 > 45)) {
             cur = std::max(minMbps, (int)(cur * 0.78));
-        } else if (presDrop == 0 && pacedDrop == 0 && cur < targetMbps_) {
-            cur = std::min(targetMbps_, cur + std::max(2, targetMbps_ / 15));
+        } else if (presDrop == 0 && pacedDrop == 0 && cur < tgt) {
+            cur = std::min(tgt, cur + std::max(2, tgt / 15));
         }
         curMbps_.store(cur);
         stats_.bitrateMbps = cur;
@@ -721,7 +727,9 @@ private:
 
         {
             std::lock_guard<std::mutex> ilk(inputMtx_);
-            uint64_t k = ((uint64_t)(flags & 0x01) << 32) | ((uint64_t)vk << 16) | (uint64_t)scan;
+            uint64_t k = (vk != 0)
+                ? (uint64_t)vk
+                : (0x8000000000000000ULL | ((uint64_t)(flags & 0x01) << 32) | (uint64_t)scan);
             if (down) {
                 heldKeys_[k] = HeldKeyEntry{ vk, scan, flags };
             } else {
@@ -994,6 +1002,7 @@ private:
         Microsoft::WRL::ComPtr<ICodecAPI> codecApi;
         bool isAsync = false;
         bool isHardware = false;
+        int gpuConvFailStreak = 0;
         int needInput = 0;
         int w = 0, h = 0, fps = 60, mbps = 80;
         int lastAppliedMbps = 0;
@@ -1025,6 +1034,7 @@ private:
             dxgiMgr.Reset();
             ctx.Reset();
             dev.Reset();
+            gpuConvFailStreak = 0;
             needInput = 0;
         }
 
@@ -1327,13 +1337,21 @@ private:
                     if (qhr != S_FALSE) break;
                     if (spin < 20) Sleep(0); else Sleep(1);
                 }
-                if (!done && stats) {
-                    uint64_t cnt = ++stats->fenceTimeouts;
-                    if ((cnt == 1 || cnt % 30 == 0) && logFn && *logFn) {
-                        char msg[128];
-                        snprintf(msg, sizeof(msg), "WinHost: VideoProcessor 围栏等待超时 (累计 %llu 次)",
-                                 (unsigned long long)cnt);
-                        (*logFn)(msg);
+                if (!done) {
+                    // D3D11 规定同一 query 在未返回 S_OK 前不能再次 End，超时必须销毁并重建 query
+                    vpFence.Reset();
+                    D3D11_QUERY_DESC qd{ D3D11_QUERY_EVENT, 0 };
+                    if (dev && FAILED(dev->CreateQuery(&qd, &vpFence))) {
+                        vpFence.Reset();
+                    }
+                    if (stats) {
+                        uint64_t cnt = ++stats->fenceTimeouts;
+                        if ((cnt == 1 || cnt % 30 == 0) && logFn && *logFn) {
+                            char msg[128];
+                            snprintf(msg, sizeof(msg), "WinHost: VideoProcessor 围栏等待超时，已重建查询对象 (累计 %llu 次)",
+                                     (unsigned long long)cnt);
+                            (*logFn)(msg);
+                        }
                     }
                 }
             } else {
@@ -1471,6 +1489,7 @@ private:
             bool usedGpuSurface = false;
             if (isHardware) {
                 if (ID3D11Texture2D* nv12Surf = ConvertBgraToNv12(bgraTex, stats, logFn)) {
+                    gpuConvFailStreak = 0;
                     Microsoft::WRL::ComPtr<IMFMediaBuffer> buf;
                     if (SUCCEEDED(MFCreateDXGISurfaceBuffer(__uuidof(ID3D11Texture2D), nv12Surf, 0, FALSE, &buf))) {
                         Microsoft::WRL::ComPtr<IMF2DBuffer> b2d;
@@ -1485,9 +1504,15 @@ private:
                 }
             }
             if (!usedGpuSurface) {
-                if (isHardware && logFn && *logFn) {
-                    (*logFn)("WinHost: GPU BGRA->NV12 转换不可用，回落 CPU NV12");
-                    isHardware = false;
+                if (isHardware) {
+                    ++gpuConvFailStreak;
+                    // 仅当 VideoProcessor 本身未就绪或连续多次失败才永久切回 CPU，避免单次瞬时失败永久降级
+                    if (!vp || gpuConvFailStreak >= 10) {
+                        if (logFn && *logFn) {
+                            (*logFn)("WinHost: GPU BGRA->NV12 转换连续不可用，回落 CPU NV12");
+                        }
+                        isHardware = false;
+                    }
                 }
                 Microsoft::WRL::ComPtr<IMFMediaBuffer> buf;
                 if (!BuildCpuNv12Buffer(bgraTex, buf)) return !outAvcc.empty();
@@ -1605,7 +1630,7 @@ private:
 
             stats_.width = capW;
             stats_.height = capH;
-            int encFps = (b.hz >= 24 && b.hz <= 240) ? b.hz : reqFps_;
+            int encFps = ClampHz(b.hz, reqFps_);
             stats_.fps = encFps;
 
             MfH264Encoder enc;
@@ -1613,7 +1638,6 @@ private:
                 backoffSleep("H.264 编码器初始化失败", E_FAIL);
                 continue;
             }
-            initFailStreak = 0;
             {
                 std::lock_guard<std::mutex> lk(stats_.infoMtx);
                 stats_.encoderName = enc.friendlyName;
@@ -1632,6 +1656,8 @@ private:
             bool hasCachedBgra = false;
             int encFailStreak = 0;
             int badFormatCount = 0;
+            bool sessionHealthy = false;
+            bool needBackoff = false;
 
             while (alive_.load()) {
                 enc.UpdateBitrateIfChanged(curMbps_.load());
@@ -1668,6 +1694,10 @@ private:
                 hr = dup->AcquireNextFrame(16, &fi, &res);
 
                 if (hr == DXGI_ERROR_WAIT_TIMEOUT) {
+                    if (!sessionHealthy) {
+                        sessionHealthy = true;
+                        initFailStreak = 0;
+                    }
                     if (stats_.clientConnected.load()) {
                         if (forceKeyframe_.load() && hasCachedBgra && enc.bgraCopy) {
                             forceKeyframe_.store(false);
@@ -1707,9 +1737,7 @@ private:
                 }
 
                 if (hr == DXGI_ERROR_ACCESS_LOST || FAILED(hr)) {
-                    char msg[128];
-                    snprintf(msg, sizeof(msg), "WinHost: DXGI 输出上下文变更 (hr=0x%08X)，重建采集", (unsigned int)hr);
-                    EmitLog(msg);
+                    needBackoff = true;
                     break;
                 }
 
@@ -1717,6 +1745,10 @@ private:
                 res.As(&tex);
                 bool hasImage = (firstFrame || fi.LastPresentTime.QuadPart != 0 || fi.AccumulatedFrames > 0);
                 if (tex && hasImage) {
+                    if (!sessionHealthy) {
+                        sessionHealthy = true;
+                        initFailStreak = 0;
+                    }
                     firstFrame = false;
                     D3D11_TEXTURE2D_DESC td{};
                     tex->GetDesc(&td);
@@ -1725,6 +1757,7 @@ private:
                         snprintf(msg, sizeof(msg), "WinHost: 分辨率变更 %ux%u -> 重建采集编码", td.Width, td.Height);
                         EmitLog(msg);
                         dup->ReleaseFrame();
+                        needBackoff = true;
                         break;
                     }
                     if (td.Format != DXGI_FORMAT_B8G8R8A8_UNORM) {
@@ -1769,6 +1802,7 @@ private:
                             if (++encFailStreak >= 30) {
                                 EmitLog("WinHost: 编码连续失败 30 次，重建采集与编码器");
                                 dup->ReleaseFrame();
+                                needBackoff = true;
                                 break;
                             }
                         }
@@ -1777,6 +1811,9 @@ private:
                 dup->ReleaseFrame();
             }
             enc.Shutdown();
+            if (needBackoff && alive_.load()) {
+                backoffSleep("采集/编码上下文重建退避", hr);
+            }
         }
 
         if (didCo) CoUninitialize();

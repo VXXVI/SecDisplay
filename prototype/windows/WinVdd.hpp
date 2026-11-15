@@ -221,6 +221,7 @@ public:
         }
 
         // 把虚拟屏放置在主屏右侧并设置请求分辨率
+        lastDpiPercent_ = targetDpiPercent;
         ApplyDisplayMode(devName, width, height, hz);
         ApplyDisplayDpiScale(devName, targetDpiPercent);
 
@@ -236,6 +237,7 @@ public:
         }
         {
             std::lock_guard<std::mutex> lk(mtx_);
+            ++modeGen_;
             bounds_ = b;
             active_ = true;
         }
@@ -254,6 +256,7 @@ public:
             std::lock_guard<std::mutex> lk(mtx_);
             if (!active_ || bounds_.deviceName.empty()) return false;
             devName = bounds_.deviceName;
+            ++modeGen_;
         }
         if (width <= 0) width = 2880;
         if (height <= 0) height = 1800;
@@ -262,20 +265,31 @@ public:
             EmitLog("WinVDD: 写入 HKLM\\SOFTWARE\\Parsec\\vdd\\0 失败（需管理员权限），动态切分可能回落");
         }
         ApplyDisplayMode(devName, width, height, hz);
+        ApplyDisplayDpiScale(devName, lastDpiPercent_);
         WinVddBounds b{};
         b.deviceName = devName;
-        if (!ReadCurrentBounds(devName, &b)) return false;
+        if (!ReadCurrentBounds(devName, &b)) {
+            EmitLog("WinVDD: 动态切换分辨率后读回显示模式失败");
+            return false;
+        }
         {
             std::lock_guard<std::mutex> lk(mtx_);
             if (active_ && bounds_.deviceName == devName) {
+                ++modeGen_;
                 bounds_ = b;
             }
         }
-        char msg[160];
-        snprintf(msg, sizeof(msg), "WinVDD: 已动态切换虚拟屏 %dx%d @ %dHz",
-                 b.width, b.height, b.hz);
+        char msg[192];
+        if (b.width != width || b.height != height) {
+            snprintf(msg, sizeof(msg),
+                     "WinVDD: 请求 %dx%d 未完全生效，当前实际 %dx%d @ %dHz（如需新自定义模式请点重挂虚拟屏）",
+                     width, height, b.width, b.height, b.hz);
+        } else {
+            snprintf(msg, sizeof(msg), "WinVDD: 已动态切换虚拟屏 %dx%d @ %dHz",
+                     b.width, b.height, b.hz);
+        }
         EmitLog(msg);
-        return true;
+        return (b.width == width && b.height == height);
     }
 
     void Stop() {
@@ -305,8 +319,15 @@ public:
     }
 
     bool IsActive() const {
-        std::lock_guard<std::mutex> lk(mtx_);
-        return active_;
+        std::wstring devName;
+        {
+            std::lock_guard<std::mutex> lk(mtx_);
+            if (!active_) return false;
+            devName = bounds_.deviceName;
+        }
+        if (devName.empty()) return false;
+        WinVddBounds probe{};
+        return ReadCurrentBounds(devName, &probe);
     }
 
     WinVddBounds Bounds() const {
@@ -318,17 +339,19 @@ public:
     WinVddBounds RefreshBounds() {
         std::wstring devName;
         WinVddBounds fallback{};
+        uint64_t gen = 0;
         {
             std::lock_guard<std::mutex> lk(mtx_);
             if (!active_ || bounds_.deviceName.empty()) return bounds_;
             devName = bounds_.deviceName;
             fallback = bounds_;
+            gen = modeGen_;
         }
         WinVddBounds nb{};
         nb.deviceName = devName;
         if (ReadCurrentBounds(devName, &nb)) {
             std::lock_guard<std::mutex> lk(mtx_);
-            if (active_ && bounds_.deviceName == devName) {
+            if (active_ && bounds_.deviceName == devName && modeGen_ == gen) {
                 bounds_ = nb;
             }
             return nb;
@@ -376,6 +399,8 @@ private:
     mutable std::mutex mtx_;
     WinVddBounds bounds_{};
     bool active_ = false;
+    uint64_t modeGen_ = 0;
+    int lastDpiPercent_ = 0;
     LogFn logFn_;
 
     void EmitLog(const char* s) {
