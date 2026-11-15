@@ -1,34 +1,40 @@
-# SecDisplay 接收端配置。
+# SecDisplay Windows 端配置文件（支持副屏接收端与主控发送端双角色）。
 # 放在 SecDisplayReceiver.exe 同目录，文件名 config.ini。
-# 命令行参数优先级更高，临时覆盖不用改这里。
+# 命令行参数优先级高于本文件，临时覆盖不用改这里。
 
+# Mac 的 IP 或主机名（两个角色下 Windows 均主动连接该地址）
 host=10.10.10.1
 port=9922
 
-# 初始尺寸只是提示。新版 Mac 发送端连接后会发会话头，
-# 接收端按实际虚拟屏尺寸自动重建，切档不用再改这里。
+# ---- 角色切换 ----
+# receiver = Windows 当副屏（默认，Mac 主屏 -> Windows）
+# sender   = Mac 当 Windows 副屏（Windows 虚拟屏 -> Mac）
+mode=receiver
+
+# ---- 副屏接收端参数（mode=receiver 时生效）----
+# 初始窗口尺寸；连接后会自动跟随 Mac 会话头调整
 width=2880
 height=1800
-
+# 可选坐标基准覆盖（一般无需填写，保持注释即可）
+# coordw=1440
+# coordh=900
 # 1=全屏，0=窗口
 fullscreen=0
-
 # 1=垂直同步（均匀），0=免同步（低延迟）
 vsync=1
-
 # 抖动缓冲，默认关
 pace=0
-
 # 0x07 健康度回传，默认关
 feedback=0
 
-# 角色模式: receiver=Windows当副屏(默认), sender=Mac当Windows副屏
-mode=receiver
-# Windows 主控模式虚拟屏分辨率、帧率上限与目标码率（Mbps）
+# ---- 主控发送端参数（mode=sender 时生效）----
+# 虚拟扩展屏分辨率（需先安装 Parsec Virtual Display Adapter）、帧率上限、目标码率与 DPI
 hostwidth=2880
 hostheight=1800
 fps=60
 bitrate=50
+# 虚拟屏 DPI 缩放百分比（0=跟随系统推荐，可选 100~300）
+hostdpi=0
 
 # 日志文件，相对路径按进程工作目录
-log=logs\ssh-receiver.log
+log=logs\receiver.log

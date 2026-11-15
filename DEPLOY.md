@@ -92,19 +92,28 @@ swiftc -O Sources/RequestPermission.swift -o reqperm
 
 ### 3.2 编译启动
 
+打包为 `.app`（长期使用推荐，内置本地网络与屏幕录制权限声明）：
+
 ```bash
-swiftc -O Sources/ScreenSender.swift -o screensender
-./screensender
+cd prototype/mac
+./build_app.sh
+open SecDisplay.app
 ```
 
-正常输出：
+命令行方式：
 
+```bash
+swiftc -O Sources/main.swift Sources/AppUI.swift Sources/MacReceiver.swift -o screensender
+./screensender --mode sender
 ```
-[xxx] 虚拟屏就绪 id=38 2560x1600
-[xxx] SecDisplay 服务已启动，Ctrl-C 退出
-[xxx] 监听端口 9922，等待接收端连接
-[xxx] 抓屏已启动 2560x1600@60
+
+若启用「Mac 当副屏」模式（Windows 主控 → Mac 显示）：
+
+```bash
+./screensender --mode receiver
 ```
+
+也可在运行后通过 Mac 菜单栏面板顶部的「Mac 当主屏 / Mac 当副屏」分段开关一键切换。
 
 ### 3.3 摆放虚拟屏
 
@@ -151,13 +160,21 @@ cl /EHsc /std:c++17 /O2 SecDisplayReceiver.cpp
 
 ### 4.2 运行
 
+默认接收端模式（Mac 当主屏，Windows 当副屏）：
+
 ```cmd
-SecDisplayReceiver.exe 192.168.77.1 9922 2560 1600
+SecDisplayReceiver.exe 192.168.77.1 9922 2880 1800
 ```
 
-参数依次是：Mac 的 IP、端口、宽、高。
+参数依次是：Mac 的 IP、端口、宽、高。也可在同目录放置 `config.ini`（参考 `config.ini.example`）免参数启动。
 
-窗口会全屏置顶。按 **Esc** 退出。
+反向主控模式（Windows 当主屏，Mac 当副屏，需先安装 Parsec VDD 驱动）：
+
+```cmd
+SecDisplayReceiver.exe --mode sender --host-size 2880 1800 --fps 60 --bitrate 50 192.168.77.1 9922
+```
+
+窗口模式下可直接在控制面板顶部切换角色。按 **F11** 切换全屏。
 
 ### 4.3 确认出画
 
@@ -180,28 +197,26 @@ D3D11 设备就绪（已绑定 MF 硬件解码管理器）
 
 ## 第五步：调参
 
-参数在 `prototype/mac/Sources/ScreenSender.swift` 顶部的 `Config`。
+Mac 端可通过菜单栏面板、`prototype/mac/preset.sh` 或环境变量调整；Windows 端可通过同目录 `config.ini`（参考 `prototype/windows/config.ini.example`）调整。
 
 ### 分辨率必须对齐
 
-**Mac 端 `width`/`height` 必须等于 Windows 屏的物理像素**，否则会缩放，文字必糊。
+**正向模式下 Mac 端虚拟屏 `width`/`height` 应匹配或整数倍于 Windows 屏物理像素，反向模式下 Windows `hostwidth`/`hostheight` 建议设为 `2880x1800` 对齐 MacBook Retina 16:10**，否则缩放后文字会模糊。
 
 查 Windows 屏的物理分辨率：`设置 → 系统 → 显示 → 显示器分辨率`。
 
 | Windows 屏 | width | height | logicalWidth | logicalHeight |
 |---|---|---|---|---|
-| **2240x1400**（Lenovo 82NC 常见）| 2240 | 1400 | 2240 | 1400 |
-| **2880x1800**（Lenovo 82NC 高刷版）| 2880 | 1800 | 1440 | 900（开 Retina）|
-| 1920x1080 | 1920 | 1080 | 1920 | 1080 |
-| 2560x1600 | 2560 | 1600 | 2560 | 1600 |
+| **2880x1800**（16:10 Retina 推荐）| 2880 | 1800 | 1440 | 900（开 2x Retina）|
+| **2560x1600** | 2560 | 1600 | 1280 | 800（开 2x Retina）|
+| **2240x1400** | 2240 | 1400 | 1120 | 700 |
+| **1920x1080** | 1920 | 1080 | 1920 | 1080 |
 
-`logicalWidth/Height` 设成一半时开启 2x 渲染，界面元素会大一倍，更清晰。
+`logicalWidth/Height` 设成一半时开启 2x 渲染，界面元素比例自然且文字最锐利。
 
 ### 码率
 
-```swift
-var bitrateMbps = 60
-```
+正向模式可通过 `SECDISPLAY_MBPS` 调整（默认 180）；反向模式可通过 `config.ini` 的 `bitrate=`（默认 50，PeakConstrainedVBR）或 Windows 主控面板底栏 `30M / 50M / 80M` 按钮实时切换：
 
 | 内容 | 建议 |
 |---|---|
