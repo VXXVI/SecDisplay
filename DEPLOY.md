@@ -238,6 +238,33 @@ var bitrateMbps = 60
 
 `VideoProcessorBlt` 的 NV12→BGRA 转换在部分驱动上有问题。记录下显卡型号，这是已知的驱动兼容性风险。
 
+如果是在 `Contents/Resources/pixfmt` 里切到 `420v` 之后才偏色，那是色域链路的问题：Mac 侧采集设了 ITU-R 709，但 VideoToolbox 不写 VUI 色彩描述，Windows 侧 D3D11 VideoProcessor 也没有显式设置 StreamColorSpace，两端都没有锚点，最终用驱动默认矩阵。把 `pixfmt` 改回 `bgra` 即可，代价是内存从 44MB 回到 136MB。
+
+### Mac 端：画面卡住不动 / 内存持续上涨
+
+`SCScreenshotManager` 并发轮询有两个已知故障模式：整体卡死（完成回调永不返回），和半卡死（偶尔回一帧但远低于目标帧率）。看护会按实测帧率判断，连续异常时重启工作线程。
+
+日志里看这两行：
+
+```
+截图采集异常（0.0fps，目标 50fps，第 1 次重启）
+截图采集持续异常（0.0fps，连续 15 次），已降为 30 秒重试一次。若画面不动请重启发送端
+```
+
+前 4 次每 3 秒重试一次，之后降为 30 秒一次。出现第二行说明 SCK 已经彻底不可用，重启发送端最快。
+
+显示器休眠时不会判为故障（日志会打「显示器已休眠，暂停采集判活」），唤醒后自动恢复。如果你看到休眠期间日志里反复出现「截图采集异常」，说明这个版本之前的构建，升级即可。
+
+面板「采集异常」那一行显示的是连续异常次数，正常时是「无」。
+
+### Mac 端：退出后残留一块虚拟屏
+
+`CDVirtualDisplayDestroy` 在采集还挂着时会被静默拒绝。正常退出会先停采集再销毁，等 1.5 秒。如果进程被 `kill -9`，会留下孤儿屏。
+
+```
+SecDisplay --cleanup-orphan
+```
+
 ### 两端都正常但延迟高
 
 1. `ping` 确认网络延迟，超过 1ms 就先查网络
@@ -248,6 +275,8 @@ var bitrateMbps = 60
 
 ## 当前已知风险
 
-**Windows 端从未在真实 Windows 机器上编译运行过。** 代码经过两轮审查，逻辑和 API 用法核对过，但没有编译器验证。
+**Windows 端已在真实机器上编译运行验证。** 分辨率 2880×1800、硬件解码（Microsoft H264 Video Decoder MFT）、D3D11 渲染均正常，但只在一种显卡和一种 Windows 版本上验证过。换机器仍需按上面的排障步骤走一遍。
 
-首次运行大概率需要调，重点看启动日志停在哪一步。详细审查记录见 `research/REVIEW-01-code-audit.md`。
+**420v 采集模式默认关闭。** 它把 Mac 端内存从 136MB 降到 44MB，代价是帧率掉一半（约 20~37fps），且色域没有锚点可能偏色。除非内存吃紧，否则保持 `bgra`。
+
+**`prototype/mac/Sources/main.swift` 里的 `Capture` 类（约 350 行）是死代码。** 它走 SCStream 路径，当前没有任何实例化点，实际采集走 `ScreenshotCapture`。保留是因为里面记了 SCStream 在 `CGVirtualDisplay` 上的实测结论。
