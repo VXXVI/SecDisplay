@@ -770,10 +770,7 @@ final class Encoder {
     private let lastBufferLock = NSLock()
 
     func encode(_ pb: CVPixelBuffer, pts: CMTime, captureTimeMicros: UInt64) {
-        lastBufferLock.lock()
-        lastPixelBuffer = pb
-        lastBufferLock.unlock()
-        encodeInternal(pb, captureTimeMicros: captureTimeMicros)
+        encodeInternal(pb, captureTimeMicros: captureTimeMicros, updateLast: true)
     }
 
     /// 用最后一帧强制补一个 IDR。
@@ -791,7 +788,7 @@ final class Encoder {
             return
         }
         requestKeyframe()   // 让 encodeInternal 把这一帧编成 IDR
-        encodeInternal(pb, captureTimeMicros: UInt64(CFAbsoluteTimeGetCurrent() * 1_000_000))
+        encodeInternal(pb, captureTimeMicros: UInt64(CFAbsoluteTimeGetCurrent() * 1_000_000), updateLast: false)
     }
 
     /// 串行化编码调用。采集线程和关键帧补发可能并发进来，
@@ -806,11 +803,16 @@ final class Encoder {
         lastBufferLock.unlock()
     }
 
-    private func encodeInternal(_ pb: CVPixelBuffer, captureTimeMicros: UInt64) {
+    private func encodeInternal(_ pb: CVPixelBuffer, captureTimeMicros: UInt64, updateLast: Bool) {
         encodeLock.lock()
         defer { encodeLock.unlock() }
         guard let s = session else { return }
         guard CVPixelBufferGetWidth(pb) == Int(width) && CVPixelBufferGetHeight(pb) == Int(height) else { return }
+        if updateLast {
+            lastBufferLock.lock()
+            lastPixelBuffer = pb
+            lastBufferLock.unlock()
+        }
         // 时间戳随帧走：经 sourceFrameRefcon 传给输出回调，避免跨线程共享变量。
         // 堆上分配一个 box，由 emit 负责释放；即使帧被编码器丢弃也不会泄漏
         //（VT 保证每个 refcon 都会在输出或丢弃时被回调一次）。
@@ -1324,8 +1326,7 @@ final class ScreenshotCapture {
                 // 所以默认仍走 captureImage（原路径），
                 // 需要压内存（4K 屏/低内存机器）时用 SECDISPLAY_PIXFMT=420v 显式切换。
                 let wantYUV = pixelFormatChoice == "420v"
-                let targetW = cfg.width
-                let targetH = cfg.height
+                let (targetW, targetH, _, _) = currentVideoSizeSnapshot()
                 let pb: CVPixelBuffer
                 if wantYUV {
                     let c = SCStreamConfiguration()
@@ -3772,12 +3773,21 @@ func logicalDisplayBounds(_ id: CGDirectDisplayID) -> CGRect {
     return b
 }
 
+let cfgStateLock = NSLock()
+
+func currentVideoSizeSnapshot() -> (w: Int, h: Int, lw: Int, lh: Int) {
+    cfgStateLock.lock()
+    defer { cfgStateLock.unlock() }
+    return (cfg.width, cfg.height, cfg.logicalWidth, cfg.logicalHeight)
+}
+
 let injector = InputInjector()
 gMouse = injector
 sender.onInput = { x, y, buttons, wheel in
+    let snap = currentVideoSizeSnapshot()
     injector.handle(x: x, y: y, buttons: buttons, wheel: wheel,
                     bounds: logicalDisplayBounds(vd.displayID),
-                    videoW: cfg.width, videoH: cfg.height)
+                    videoW: snap.w, videoH: snap.h)
 }
 
 // 键盘回放：Windows 侧 0x09 包 → macOS CGEvent 键盘事件
@@ -3794,7 +3804,10 @@ let vb = logicalDisplayBounds(vd.displayID)
 Log.info("坐标基准: 逻辑点 \(Int(vb.width))x\(Int(vb.height)) * \(String(format: "%.2f", vdBackingScale))x → 线上 \(cfg.width)x\(cfg.height)，原点 (\(Int(vb.minX)), \(Int(vb.minY)))")
 let cursor = CursorTracker(sender: sender,
                            bounds: { logicalDisplayBounds(vd.displayID) },
-                           videoSize: { (cfg.width, cfg.height) })
+                           videoSize: {
+                               let snap = currentVideoSizeSnapshot()
+                               return (snap.w, snap.h)
+                           })
 // 真实光标图像：形状变化时才发，让副屏显示 Mac 的光标而非固定 Windows 箭头
 // 真实光标图像（0x05）。SECDISPLAY_NOCURSORIMG=1 可整体关闭，
 // 用于 A/B 判断「光标卡顿是否由接收端反复重建光标引起」——关掉后回退 Windows 标准箭头。
@@ -3860,6 +3873,10 @@ final class RateController {
     func updateTargetMbps(_ mbps: Int) {
         targetMbps = mbps
         current = mbps
+        probeMbps = nil
+        highRounds = 0
+        lowRounds = 0
+        idleRounds = 0
     }
     private var current: Int
     private var highRounds = 0
@@ -4478,7 +4495,9 @@ private func registerGlobalDropBoxHotKey() {
             let flags = event.flags
             let mods = flags.intersection([.maskControl, .maskAlternate, .maskCommand, .maskShift])
             if keyCode == Int64(kVK_ANSI_B) && mods == [.maskControl, .maskAlternate] {
-                DispatchQueue.main.async { toggleDropBoxPanel() }
+                if event.getIntegerValueField(.keyboardEventAutorepeat) == 0 {
+                    DispatchQueue.main.async { toggleDropBoxPanel() }
+                }
                 return nil
             }
             return Unmanaged.passUnretained(event)
@@ -4496,14 +4515,16 @@ private func registerGlobalDropBoxHotKey() {
     // 无辅助功能权限时降级为 NSEvent 全局/本地监听
     globalDropBoxKeyMon = NSEvent.addGlobalMonitorForEvents(matching: .keyDown) { ev in
         let mods = ev.modifierFlags.intersection([.control, .option, .command, .shift])
-        if ev.keyCode == UInt16(kVK_ANSI_B) && mods == [.control, .option] {
+        if !ev.isARepeat && ev.keyCode == UInt16(kVK_ANSI_B) && mods == [.control, .option] {
             DispatchQueue.main.async { toggleDropBoxPanel() }
         }
     }
     localDropBoxKeyMon = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { ev in
         let mods = ev.modifierFlags.intersection([.control, .option, .command, .shift])
         if ev.keyCode == UInt16(kVK_ANSI_B) && mods == [.control, .option] {
-            DispatchQueue.main.async { toggleDropBoxPanel() }
+            if !ev.isARepeat {
+                DispatchQueue.main.async { toggleDropBoxPanel() }
+            }
             return nil
         }
         return ev
@@ -4519,23 +4540,30 @@ DispatchQueue.main.async {
         let pw = m.pixelWidth, ph = m.pixelHeight
         let lw = m.width, lh = m.height
         guard pw >= 320, ph >= 200, lw > 0, lh > 0 else { return }
-        guard pw != cfg.width || ph != cfg.height || lw != cfg.logicalWidth || lh != cfg.logicalHeight else { return }
-        let oldW = cfg.width, oldH = cfg.height
+        let snap = currentVideoSizeSnapshot()
+        guard pw != snap.w || ph != snap.h || lw != snap.lw || lh != snap.lh else { return }
+        let oldW = snap.w, oldH = snap.h
+        let pixelsPerSec = Double(pw * ph) * cfg.captureHz
+        let newMbps = max(30, min(200, Int(pixelsPerSec * 0.6 / 1_000_000)))
+        if pw != oldW || ph != oldH {
+            guard encoder.reconfigure(width: pw, height: ph, bitrateMbps: newMbps, captureHz: cfg.captureHz) else {
+                Log.info("警告: 分辨率变更 \(oldW)x\(oldH) → \(pw)x\(ph) 重建编码器失败，保持原配置")
+                return
+            }
+        }
+        cfgStateLock.lock()
         cfg.width = pw
         cfg.height = ph
         cfg.logicalWidth = lw
         cfg.logicalHeight = lh
-        vdBackingScale = Double(pw) / Double(lw)
-        let pixelsPerSec = Double(pw * ph) * cfg.captureHz
-        let newMbps = max(30, min(200, Int(pixelsPerSec * 0.6 / 1_000_000)))
         cfg.bitrateMbps = newMbps
+        vdBackingScale = Double(pw) / Double(lw)
+        cfgStateLock.unlock()
         Log.info("检测到虚拟屏分辨率变化: \(oldW)x\(oldH) → \(pw)x\(ph) (逻辑 \(lw)x\(lh) scale=\(String(format: "%.2f", vdBackingScale)))")
         if pw != oldW || ph != oldH {
-            if encoder.reconfigure(width: pw, height: ph, bitrateMbps: newMbps, captureHz: cfg.captureHz) {
-                rateCtl.updateTargetMbps(newMbps)
-                gCaptureRebuildRequested = true
-                sender.updateSessionInfo(width: pw, height: ph, fps: Int(cfg.captureHz.rounded()))
-            }
+            rateCtl.updateTargetMbps(newMbps)
+            gCaptureRebuildRequested = true
+            sender.updateSessionInfo(width: pw, height: ph, fps: Int(cfg.captureHz.rounded()))
         }
         AppModel.shared.refresh()
     }

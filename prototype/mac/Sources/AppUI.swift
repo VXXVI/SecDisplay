@@ -97,15 +97,16 @@ final class AppModel: ObservableObject {
         mbps = lastMbps
         inFlight = sender.inFlight
         dropped = sender.dropped
-        width = cfg.width
-        height = cfg.height
+        let snap = currentVideoSizeSnapshot()
+        width = snap.w
+        height = snap.h
         scale = vdBackingScale
         cursorHz = cursor.targetHz
         cursorImageOn = !disableCursorImage
         presetName = mainPresetLabel()
         logLine = Log.currentPath
         suppressResolutionChange = true
-        resolutionIndex = AppModel.resolutions.firstIndex { $0.w == cfg.width && $0.h == cfg.height && $0.lw == cfg.logicalWidth && $0.lh == cfg.logicalHeight } ?? -1
+        resolutionIndex = AppModel.resolutions.firstIndex { $0.w == snap.w && $0.h == snap.h && $0.lw == snap.lw && $0.lh == snap.lh } ?? -1
         suppressResolutionChange = false
 
         // 链路与对端
@@ -486,9 +487,13 @@ func copyDiagnostics() {
     Log.info("面板: 诊断信息已复制到剪贴板")
 }
 
+private var isRestartingResolution = false
+
 /// 切换分辨率：虚拟屏和编码器都在启动时按尺寸建好，改尺寸只能重建进程。
 /// 命令行启动走 run.sh restart；.app 启动时没有 run.sh，直接重启自身。
 func restartWithResolution(_ w: Int, _ h: Int, _ lw: Int, _ lh: Int) {
+    guard !isRestartingResolution else { return }
+    isRestartingResolution = true
     let dir = FileManager.default.currentDirectoryPath
     let pid = ProcessInfo.processInfo.processIdentifier
     Log.info("面板切换分辨率 \(w)x\(h)，准备重启")
@@ -676,7 +681,9 @@ func pasteClipboardToTransfer() {
         Log.info("剪贴板粘贴文件(NSFilenames): \(urls.count) 个")
         return
     }
-    if let png = pb.data(forType: .png) {
+    if let png = pb.data(forType: .png),
+       png.count >= 8,
+       png.prefix(8) == Data([0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A]) {
         transferService.enqueueClipboardImageData(png)
         Log.info("剪贴板粘贴 PNG 截图 (\(png.count) B)")
         return
