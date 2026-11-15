@@ -2673,6 +2673,11 @@ struct TransferSnapshot {
     var inboxPath = ""
     var statusText = "等待连接"
     var history: [String] = []
+    var busy = false
+    var progress: Double = 0
+    var speedText = ""
+    var lastReceivedURL: URL? = nil
+    var lastReceivedName = ""
 }
 
 final class FileTransferService {
@@ -2714,6 +2719,11 @@ final class FileTransferService {
     private var isSending = false
     private var activeStatus = "等待接收端"
     private var recentHistory: [String] = []
+    private var activeBusy = false
+    private var activeProgress: Double = 0
+    private var activeSpeedText = ""
+    private var lastRecvURL: URL? = nil
+    private var lastRecvName = ""
     private var keepAliveTimer: DispatchSourceTimer?
 
     private enum SendOutcome {
@@ -2737,7 +2747,12 @@ final class FileTransferService {
             connected: _connected,
             inboxPath: inboxURL.path,
             statusText: activeStatus,
-            history: recentHistory
+            history: recentHistory,
+            busy: activeBusy,
+            progress: activeProgress,
+            speedText: activeSpeedText,
+            lastReceivedURL: lastRecvURL,
+            lastReceivedName: lastRecvName
         )
     }
 
@@ -2877,6 +2892,9 @@ final class FileTransferService {
         stateLock.lock()
         _connected = true
         activeEpoch = epoch
+        activeBusy = false
+        activeProgress = 0
+        activeSpeedText = ""
         activeStatus = "已连接（端口 \(listenPort)）· 可拖入文件直传"
         stateLock.unlock()
         notifyUI()
@@ -2915,6 +2933,9 @@ final class FileTransferService {
         cleanupActiveRecvs()
         stateLock.lock()
         _connected = false
+        activeBusy = false
+        activeProgress = 0
+        activeSpeedText = ""
         activeStatus = outQueue.isEmpty ? "等待接收端" : "连接断开，\(outQueue.count) 个文件等待重连"
         stateLock.unlock()
         notifyUI()
@@ -3002,7 +3023,7 @@ final class FileTransferService {
             activeRecvs[id] = RecvFile(id: id, safeName: safe, expectedSize: size,
                                        receivedSize: 0, partURL: partURL, handle: h,
                                        startedAt: CFAbsoluteTimeGetCurrent())
-            updateStatus("正在接收: \(safe) (0%)")
+            updateStatus("正在接收: \(safe) (0%)", busy: true, progress: 0, speed: "")
             Log.info("中转站开始接收 #\(id): \(safe) (\(fmtBytes(size)))")
 
         case Self.typeChunk:
@@ -3025,8 +3046,10 @@ final class FileTransferService {
             activeRecvs[id] = rf
             let dt = max(0.01, CFAbsoluteTimeGetCurrent() - rf.startedAt)
             let mbps = Double(rf.receivedSize) / dt / 1_048_576.0
-            let pct = rf.expectedSize > 0 ? Int(Double(rf.receivedSize) * 100.0 / Double(rf.expectedSize)) : 100
-            updateStatus(String(format: "接收 %@ · %d%% · %.0f MB/s", rf.safeName, pct, mbps))
+            let frac = rf.expectedSize > 0 ? min(1.0, Double(rf.receivedSize) / Double(rf.expectedSize)) : 1.0
+            let pct = Int(frac * 100.0)
+            updateStatus(String(format: "接收 %@ · %d%% · %.0f MB/s", rf.safeName, pct, mbps),
+                         busy: true, progress: frac, speed: String(format: "%.0f MB/s", mbps))
 
         case Self.typeEnd:
             guard payload.count >= 5 else { return }
@@ -3042,19 +3065,24 @@ final class FileTransferService {
                     let dt = max(0.001, CFAbsoluteTimeGetCurrent() - rf.startedAt)
                     let speed = Double(rf.receivedSize) / dt / 1_048_576.0
                     let item = "↓ \(dest.lastPathComponent) (\(fmtBytes(rf.receivedSize)))"
+                    stateLock.lock()
+                    lastRecvURL = dest
+                    lastRecvName = dest.lastPathComponent
+                    stateLock.unlock()
                     pushHistory(item)
-                    updateStatus(String(format: "已收到: %@ (%.0f MB/s)", dest.lastPathComponent, speed))
+                    updateStatus(String(format: "已收到: %@ (%.0f MB/s)", dest.lastPathComponent, speed),
+                                 busy: false, progress: 1.0, speed: String(format: "%.0f MB/s", speed))
                     Log.info("中转站接收完成: \(dest.path) (\(fmtBytes(rf.receivedSize)), \(String(format: "%.1f", speed)) MB/s)")
                     sendAck(id: id, ok: true)
                 } catch {
                     try? FileManager.default.removeItem(at: rf.partURL)
-                    updateStatus("保存失败: \(rf.safeName)")
+                    updateStatus("保存失败: \(rf.safeName)", busy: false, progress: 0, speed: "")
                     Log.info("中转站重命名失败: \(error)")
                     sendAck(id: id, ok: false)
                 }
             } else {
                 try? FileManager.default.removeItem(at: rf.partURL)
-                updateStatus("接收未完成: \(rf.safeName)")
+                updateStatus("接收未完成: \(rf.safeName)", busy: false, progress: 0, speed: "")
                 Log.info("中转站接收中断 #\(id): \(rf.safeName) \(rf.receivedSize)/\(rf.expectedSize)")
                 sendAck(id: id, ok: false)
             }
@@ -3134,7 +3162,7 @@ final class FileTransferService {
               let fileSize = (attrs[.size] as? NSNumber)?.uint64Value,
               let fh = try? FileHandle(forReadingFrom: url) else {
             Log.info("中转站无法读取文件: \(url.path)")
-            updateStatus("读取失败: \(url.lastPathComponent)")
+            updateStatus("读取失败: \(url.lastPathComponent)", busy: false, progress: 0, speed: "")
             return .localFailed
         }
         defer { try? fh.close() }
@@ -3161,7 +3189,7 @@ final class FileTransferService {
         var sendFailed = false
         let started = CFAbsoluteTimeGetCurrent()
         let fname = url.lastPathComponent
-        updateStatus("发送中: \(fname) (0%)")
+        updateStatus("发送中: \(fname) (0%)", busy: true, progress: 0, speed: "")
         Log.info("中转站开始发送 #\(id): \(fname) (\(fmtBytes(fileSize)))")
 
         func connAlive() -> Bool {
@@ -3231,15 +3259,17 @@ final class FileTransferService {
                 lastUiAt = now
                 let dt = max(0.01, now - started)
                 let speed = Double(sentBytes) / dt / 1_048_576.0
-                let pct = fileSize > 0 ? Int(Double(sentBytes) * 100.0 / Double(fileSize)) : 100
-                updateStatus(String(format: "发送 %@ · %d%% · %.0f MB/s", fname, pct, speed))
+                let frac = fileSize > 0 ? min(1.0, Double(sentBytes) / Double(fileSize)) : 1.0
+                let pct = Int(frac * 100.0)
+                updateStatus(String(format: "发送 %@ · %d%% · %.0f MB/s", fname, pct, speed),
+                             busy: true, progress: frac, speed: String(format: "%.0f MB/s", speed))
             }
         }
 
         let complete = !readErr && !sendFailed && connAlive() && (sentBytes == fileSize)
         if !connAlive() || sendFailed {
             // 连接已断，不再尝试发 endFrame
-            updateStatus("发送中断: \(fname)")
+            updateStatus("发送中断: \(fname)", busy: false, progress: 0, speed: "")
             return .connLost
         }
 
@@ -3263,21 +3293,25 @@ final class FileTransferService {
             let dt = max(0.001, CFAbsoluteTimeGetCurrent() - started)
             let speed = Double(sentBytes) / dt / 1_048_576.0
             pushHistory("↑ \(fname) (\(fmtBytes(sentBytes)))")
-            updateStatus(String(format: "已发送: %@ (%.0f MB/s)", fname, speed))
+            updateStatus(String(format: "已发送: %@ (%.0f MB/s)", fname, speed),
+                         busy: false, progress: 1.0, speed: String(format: "%.0f MB/s", speed))
             Log.info("中转站发送完成 #\(id): \(fname) (\(fmtBytes(sentBytes)), \(String(format: "%.1f", speed)) MB/s)")
             return .sent
         }
         if readErr {
-            updateStatus("读取失败: \(fname)")
+            updateStatus("读取失败: \(fname)", busy: false, progress: 0, speed: "")
             return .localFailed
         }
-        updateStatus("发送中断: \(fname)")
+        updateStatus("发送中断: \(fname)", busy: false, progress: 0, speed: "")
         return .connLost
     }
 
-    private func updateStatus(_ s: String) {
+    private func updateStatus(_ s: String, busy: Bool = false, progress: Double = 0, speed: String = "") {
         stateLock.lock()
         activeStatus = s
+        activeBusy = busy
+        activeProgress = progress
+        activeSpeedText = speed
         stateLock.unlock()
         notifyUI()
     }
@@ -4128,6 +4162,11 @@ final class StatusMenuTarget: NSObject, NSMenuItemValidation {
         showControlPanel()
     }
 
+    @objc func openDropBox() {
+        Log.info("菜单栏请求打开文件投递盒")
+        showDropBoxPanel()
+    }
+
     /// 状态栏按钮点击：左键打开控制面板，右键（或 Control+左键）弹快捷菜单。
     @objc func handleClick(_ sender: Any?) {
         guard let button = statusItem?.button else { return }
@@ -4215,6 +4254,11 @@ func setupStatusBar() -> NSApplication {
     open.target = statusMenuTarget
     open.isEnabled = true
     menu.addItem(open)
+
+    let box = NSMenuItem(title: "文件投递盒…", action: #selector(StatusMenuTarget.openDropBox), keyEquivalent: "b")
+    box.target = statusMenuTarget
+    box.isEnabled = true
+    menu.addItem(box)
     menu.addItem(.separator())
 
     let quit = NSMenuItem(title: "退出 SecDisplay", action: #selector(StatusMenuTarget.quit), keyEquivalent: "q")
