@@ -2715,7 +2715,11 @@ final class FileTransferService {
 
     private var nextTransferId: UInt32 = 1
     private var activeEpoch = 0
-    private var outQueue: [URL] = []
+    private struct OutItem {
+        let url: URL
+        let deleteAfterSend: Bool
+    }
+    private var outQueue: [OutItem] = []
     private var isSending = false
     private var activeStatus = "等待接收端"
     private var recentHistory: [String] = []
@@ -2764,11 +2768,14 @@ final class FileTransferService {
     }
 
     func stop() {
+        var toDelete: [URL] = []
         stateLock.lock()
         stopped = true
         _connected = false
+        for item in outQueue where item.deleteAfterSend { toDelete.append(item.url) }
         outQueue.removeAll()
         stateLock.unlock()
+        for u in toDelete { try? FileManager.default.removeItem(at: u) }
         netQueue.async { [weak self] in
             guard let self else { return }
             self.keepAliveTimer?.cancel()
@@ -2781,29 +2788,43 @@ final class FileTransferService {
         }
     }
 
-    func enqueue(urls: [URL]) {
+    func enqueueClipboardImageData(_ pngData: Data) {
+        let df = DateFormatter()
+        df.dateFormat = "yyyyMMdd_HHmmss_SSS"
+        let name = "Screenshot_\(df.string(from: Date())).png"
+        let tmp = FileManager.default.temporaryDirectory.appendingPathComponent(name)
+        do {
+            try pngData.write(to: tmp, options: .atomic)
+            enqueue(urls: [tmp], deleteAfterSend: true)
+        } catch {
+            Log.info("中转站写临时截图失败: \(error)")
+            updateStatus("剪贴板截图写入失败", busy: false, progress: 0, speed: "")
+        }
+    }
+
+    func enqueue(urls: [URL], deleteAfterSend: Bool = false) {
         let fm = FileManager.default
-        var files: [URL] = []
+        var items: [OutItem] = []
         for u in urls {
             var isDir: ObjCBool = false
             guard fm.fileExists(atPath: u.path, isDirectory: &isDir) else { continue }
             if !isDir.boolValue {
-                files.append(u)
-            } else if let items = try? fm.contentsOfDirectory(at: u, includingPropertiesForKeys: [.isRegularFileKey],
-                                                               options: [.skipsHiddenFiles]) {
+                items.append(OutItem(url: u, deleteAfterSend: deleteAfterSend))
+            } else if let subItems = try? fm.contentsOfDirectory(at: u, includingPropertiesForKeys: [.isRegularFileKey],
+                                                                  options: [.skipsHiddenFiles]) {
                 // 拖入文件夹时仅发送顶层常规文件，避免误扫庞大目录树
-                for sub in items {
+                for sub in subItems {
                     var subDir: ObjCBool = false
                     if fm.fileExists(atPath: sub.path, isDirectory: &subDir), !subDir.boolValue {
-                        files.append(sub)
+                        items.append(OutItem(url: sub, deleteAfterSend: false))
                     }
                 }
             }
         }
-        guard !files.isEmpty else { return }
+        guard !items.isEmpty else { return }
         var shouldStart = false
         stateLock.lock()
-        outQueue.append(contentsOf: files)
+        outQueue.append(contentsOf: items)
         if !isSending {
             isSending = true
             shouldStart = true
@@ -3132,20 +3153,25 @@ final class FileTransferService {
                 notifyUI()
                 return
             }
-            let url = outQueue.removeFirst()
+            let item = outQueue.removeFirst()
             nextTransferId &+= 1
             if nextTransferId == 0 { nextTransferId = 1 }
             let tid = nextTransferId
             stateLock.unlock()
 
-            switch sendSingleFile(url: url, id: tid) {
+            switch sendSingleFile(url: item.url, id: tid) {
             case .sent, .localFailed:
+                if item.deleteAfterSend {
+                    try? FileManager.default.removeItem(at: item.url)
+                }
                 continue
             case .connLost:
                 // 连接断开或已切换为新连接：重入队头；若已有新连接在线直接续发，不丢队
                 stateLock.lock()
                 if !stopped {
-                    outQueue.insert(url, at: 0)
+                    outQueue.insert(item, at: 0)
+                } else if item.deleteAfterSend {
+                    try? FileManager.default.removeItem(at: item.url)
                 }
                 let canContinue = _connected && !stopped
                 if !canContinue { isSending = false }

@@ -304,17 +304,13 @@ struct StatusView: View {
                             .truncationMode(.middle)
                     }
                     HStack(spacing: 8) {
-                        Button("发送文件到 Win…") {
-                            let panel = NSOpenPanel()
-                            panel.title = "选择要发送到 Windows 的文件"
-                            panel.canChooseFiles = true
-                            panel.canChooseDirectories = false
-                            panel.allowsMultipleSelection = true
-                            if panel.runModal() == .OK {
-                                transferService.enqueue(urls: panel.urls)
-                            }
+                        Button("发送文件…") {
+                            openTransferFilePicker()
                         }
-                        Button("打开中转站") {
+                        Button("粘贴发送") {
+                            pasteClipboardToTransfer()
+                        }
+                        Button("打开目录") {
                             let path = model.transferInboxPath.isEmpty
                                 ? transferService.inboxURL.path
                                 : model.transferInboxPath
@@ -558,6 +554,7 @@ private func placeOnUserScreen(_ w: NSWindow) {
 
 /// 打开/前置控制面板
 func showControlPanel() {
+    ensurePasteKeyMonitor()
     // 平时以 .accessory 常驻菜单栏；打开面板时切成 .regular 让 App 可成为前台，
     // 并在下一个主循环轮次补一次 activate，等 WindowServer 完成策略切换后再聚焦。
     Log.info("打开控制面板请求")
@@ -633,6 +630,56 @@ private func openTransferFilePicker() {
     }
 }
 
+/// 粘贴剪贴板中的文件或截图（Cmd+V 或按钮触发）直传到 Windows
+func pasteClipboardToTransfer() {
+    let pb = NSPasteboard.general
+    if let urls = pb.readObjects(forClasses: [NSURL.self],
+                                 options: [.urlReadingFileURLsOnly: true]) as? [URL],
+       !urls.isEmpty {
+        transferService.enqueue(urls: urls)
+        Log.info("剪贴板粘贴文件: \(urls.count) 个")
+        return
+    }
+    if let png = pb.data(forType: .png) {
+        transferService.enqueueClipboardImageData(png)
+        Log.info("剪贴板粘贴 PNG 截图 (\(png.count) B)")
+        return
+    }
+    if let tiff = pb.data(forType: .tiff),
+       let rep = NSBitmapImageRep(data: tiff),
+       let png = rep.representation(using: .png, properties: [:]) {
+        transferService.enqueueClipboardImageData(png)
+        Log.info("剪贴板粘贴截图转 PNG (\(png.count) B)")
+        return
+    }
+    if let img = NSImage(pasteboard: pb),
+       let tiff = img.tiffRepresentation,
+       let rep = NSBitmapImageRep(data: tiff),
+       let png = rep.representation(using: .png, properties: [:]) {
+        transferService.enqueueClipboardImageData(png)
+        Log.info("剪贴板粘贴 NSImage 截图 (\(png.count) B)")
+        return
+    }
+    AppModel.shared.transferStatus = "剪贴板里没有文件或截图"
+}
+
+private var pasteKeyMonitor: Any?
+
+private func ensurePasteKeyMonitor() {
+    guard pasteKeyMonitor == nil else { return }
+    pasteKeyMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { ev in
+        let cmd = ev.modifierFlags.intersection(.deviceIndependentFlagsMask) == .command
+        if cmd, ev.charactersIgnoringModifiers?.lowercased() == "v" {
+            let panelActive = (panelWindow?.isKeyWindow == true) || (dropBoxPanel?.isKeyWindow == true)
+            if panelActive {
+                pasteClipboardToTransfer()
+                return nil
+            }
+        }
+        return ev
+    }
+}
+
 struct DropBoxView: View {
     @ObservedObject var model = AppModel.shared
 
@@ -666,6 +713,16 @@ struct DropBoxView: View {
                     .background(Capsule().fill(Color.white.opacity(0.65)))
                 }
                 Spacer()
+                Button(action: { pasteClipboardToTransfer() }) {
+                    Image(systemName: "doc.on.clipboard")
+                        .font(.system(size: 11, weight: .medium))
+                        .foregroundStyle(Color(red: 0.25, green: 0.25, blue: 0.32))
+                        .frame(width: 24, height: 24)
+                        .background(Circle().fill(Color.white.opacity(0.85)))
+                }
+                .buttonStyle(.plain)
+                .help("粘贴剪贴板截图/文件发送 (⌘V)")
+
                 Button(action: { toggleDropBoxPin() }) {
                     Image(systemName: model.dropBoxPinned ? "pin.fill" : "pin")
                         .font(.system(size: 11, weight: .medium))
@@ -804,6 +861,7 @@ func hideDropBoxPanel() {
 }
 
 func showDropBoxPanel() {
+    ensurePasteKeyMonitor()
     if let p = dropBoxPanel {
         p.level = AppModel.shared.dropBoxPinned ? .floating : .normal
         p.orderFrontRegardless()
