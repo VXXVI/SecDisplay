@@ -528,13 +528,13 @@ final class MacReceiverClient {
         }
     }
 
-    func snapshot() -> MacReceiverSnapshot {
+    func snapshot(sampleRates: Bool = false) -> MacReceiverSnapshot {
         stateLock.lock()
         defer { stateLock.unlock() }
         let now = CFAbsoluteTimeGetCurrent()
         if _windowStartAt == 0 {
             _windowStartAt = now
-        } else {
+        } else if sampleRates {
             let dt = now - _windowStartAt
             if dt >= 0.8 {
                 _lastDecodeFps = Double(_framesInWindow) / dt
@@ -655,6 +655,8 @@ final class MacReceiverClient {
 
         connEpoch &+= 1
         let epoch = connEpoch
+        feedbackTimer?.cancel()
+        feedbackTimer = nil
         let old = self.conn
         self.conn = c
         self.recvBuf.removeAll()
@@ -669,6 +671,9 @@ final class MacReceiverClient {
                 self.stateLock.lock()
                 self._connected = true
                 self._streaming = false
+                self._sessW = 0
+                self._sessH = 0
+                self._sessFps = 0
                 self.peerDesc = ep
                 self._connStartAt = CFAbsoluteTimeGetCurrent()
                 self._windowStartAt = CFAbsoluteTimeGetCurrent()
@@ -1009,6 +1014,7 @@ final class ReceiverCanvasView: NSView {
     private var heldKeys = Set<UInt16>()
     private var heldModifiers = Set<UInt16>()
     private var trackingArea: NSTrackingArea?
+    /// 强持有当前展示中的 CVPixelBuffer，防止 VideoToolbox 的 CVPixelBufferPool 在 CALayer 仍在渲染该 IOSurface 时提前回收复用
     private var currentPixelBuffer: CVPixelBuffer?
 
     private static let invisibleCursor: NSCursor = {
