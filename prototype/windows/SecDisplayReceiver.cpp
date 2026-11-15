@@ -27,6 +27,7 @@
 #define _CRT_SECURE_NO_WARNINGS   // fopen/strncpy 等标准函数在 MSVC 下会被警告
 #include <windows.h>
 #include <windowsx.h>
+#include <mmsystem.h>      // timeBeginPeriod(1) 高精度动画定时器
 #include <shellapi.h>      // 系统托盘 Shell_NotifyIcon
 #include <psapi.h>         // GetProcessMemoryInfo（控制面板显示进程内存）
 #include <winsock2.h>
@@ -79,6 +80,7 @@
 #pragma comment(lib, "shell32.lib")
 #pragma comment(lib, "comdlg32.lib")
 #pragma comment(lib, "gdiplus.lib")
+#pragma comment(lib, "winmm.lib")
 #pragma comment(lib, "gdi32.lib")   // ApplyCursorImage 的 CreateDIBSection/CreateBitmap/DeleteObject
 
 #ifdef _MSC_VER
@@ -428,10 +430,10 @@ static const int kShakeWinMs = 700;      // 观察窗口
 static const int kShakeMinReversals = 3; // 至少 3 次方向反转才算晃动
 static const int kShakeMinSpanPx = 180;  // 横向/纵向累计摆幅下限，防止细微抖动误触
 static const double kShakeCursorZoom = 2.8;  // 晃动时的目标放大倍数（macOS ~2.8-3.0x）
-static const double kShakeGrowMs = 170.0;    // 平滑放大渐入时长（InOutCubic）
+static const double kShakeGrowMs = 220.0;    // 平滑放大渐入时长（EaseOutCubic，首帧即起势）
 static const double kShakeHoldMs = 650.0;    // 停晃后保持放大的时长
-static const double kShakeShrinkMs = 240.0;  // 平滑收缩时长（InOutCubic）
-static const int kShakeTickMs = 12;          // ~83Hz 高频动画刷新，配合 QPC 消除顿挫
+static const double kShakeShrinkMs = 300.0;  // 平滑收缩时长（EaseInOutCubic）
+static const int kShakeTickMs = 8;           // ~125Hz 高频动画刷新，配合 timeBeginPeriod(1) + QPC 消除顿挫
 static const UINT_PTR kShakeTimer = 4004;
 struct ShakeSample { int64_t t; int x; int y; };
 // 环容量按「发送侧最高 240Hz × 700ms ≈ 170 个样本」留足余量，
@@ -450,6 +452,17 @@ static double g_shakeAnimStartMs = 0.0;
 static double g_shakeAnimFromZoom = 1.0;
 // 最后一次「判定为正在晃动」的高精度 QPC 时刻（亚毫秒，不受 GetTickCount64 15.6ms 跳变影响）
 static double g_shakeLastShakeQpcMs = 0.0;
+static double g_shakeLastRefreshQpcMs = 0.0;
+static bool g_shakeTimePeriodOn = false;
+
+static void SetShakeTimePeriod(bool enable) {
+    if (enable && !g_shakeTimePeriodOn) {
+        if (timeBeginPeriod(1) == TIMERR_NOERROR) g_shakeTimePeriodOn = true;
+    } else if (!enable && g_shakeTimePeriodOn) {
+        timeEndPeriod(1);
+        g_shakeTimePeriodOn = false;
+    }
+}
 
 // 输入回传：把窗口内的鼠标位置和按键状态发给 Mac，由它重放事件。
 // 不再用 SetCursorPos 搬本机光标——那会和用户自己的鼠标抢位置，
@@ -3660,6 +3673,7 @@ static LRESULT CALLBACK PanelWndProc(HWND h, UINT msg, WPARAM w, LPARAM l) {
                 // 定时器是建在主窗口上的（SetTimer(g_hwnd, ...)），
                 // 用面板句柄 KillTimer 杀不掉，必须用 g_hwnd。
                 if (g_hwnd) KillTimer(g_hwnd, kShakeTimer);
+                SetShakeTimePeriod(false);
                 RefreshCursorScale();
             }
             Log("控制面板: 晃动找光标 %s", on ? "开" : "关");
@@ -4676,8 +4690,10 @@ static bool DetectShake(int64_t now, int x, int y) {
             g_shakePhase = SHAKE_GROW;
             g_shakeAnimStartMs = nowQpc;
             g_shakeAnimFromZoom = g_shakeZoom;
+            SetShakeTimePeriod(true);
             if (SetTimer(g_hwnd, kShakeTimer, kShakeTickMs, nullptr) == 0) {
                 Log("警告: 创建晃动定时器失败，放弃本次放大");
+                SetShakeTimePeriod(false);
                 g_shakeActive = false;
                 g_shakePhase = SHAKE_IDLE;
                 g_shakeZoom = 1.0;
@@ -4700,13 +4716,20 @@ static void ResetShakeSamples() {
     g_shakeHead = 0;
 }
 
+static double EaseOutCubic(double t) {
+    if (t <= 0.0) return 0.0;
+    if (t >= 1.0) return 1.0;
+    double u = 1.0 - t;
+    return 1.0 - u * u * u;
+}
+
 static double EaseInOutCubic(double t) {
     if (t <= 0.0) return 0.0;
     if (t >= 1.0) return 1.0;
     return (t < 0.5) ? (4.0 * t * t * t) : (1.0 - std::pow(-2.0 * t + 2.0, 3.0) * 0.5);
 }
 
-// 晃动缩放动画（Grow -> Hold -> Shrink，双向 InOutCubic 缓动，使用亚毫秒级 QPC 时钟）。
+// 晃动缩放动画（Grow[EaseOutCubic] -> Hold -> Shrink[EaseInOutCubic]，使用亚毫秒级 QPC 时钟）。
 // 返回 true 表示动画或保持仍在进行，需要继续定时器。
 static bool TickShakeAnim(double nowQpc) {
     if (!g_shakeActive || g_shakePhase == SHAKE_IDLE) return false;
@@ -4717,7 +4740,7 @@ static bool TickShakeAnim(double nowQpc) {
             g_shakeZoom = kShakeCursorZoom;
             g_shakePhase = SHAKE_HOLD;
         } else {
-            g_shakeZoom = g_shakeAnimFromZoom + (kShakeCursorZoom - g_shakeAnimFromZoom) * EaseInOutCubic(p);
+            g_shakeZoom = g_shakeAnimFromZoom + (kShakeCursorZoom - g_shakeAnimFromZoom) * EaseOutCubic(p);
             return true;
         }
     }
@@ -4760,6 +4783,24 @@ static void RefreshCursorScale() {
         g_cursorImage.pending = true;
     }
     ApplyCursorImage();
+}
+
+// 在鼠标移动消息（Mac 0x03 或本机 WM_MOUSEMOVE）里直接以 ~125Hz 推进晃动缩放帧，
+// 避免高频移动期间低优先级 WM_TIMER 被消息队列饿死导致放大瞬间跳变。
+static void DriveShakeStep(int screenX, int screenY) {
+    const int64_t nowMs = GetTickCount64();
+    const bool wasActive = g_shakeActive;
+    DetectShake(nowMs, screenX, screenY);
+    if (g_shakeActive) {
+        const double nowQpc = QpcNowMs();
+        if (!wasActive || (nowQpc - g_shakeLastRefreshQpcMs >= 7.5)) {
+            g_shakeLastRefreshQpcMs = nowQpc;
+            TickShakeAnim(nowQpc);
+            RefreshCursorScale();
+        }
+    } else if (wasActive) {
+        RefreshCursorScale();
+    }
 }
 
 // 查询窗口所在显示器的当前刷新率。启动、显示模式变化、窗口跨屏移动时都用它。
@@ -4856,11 +4897,14 @@ static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
             return 0;
         }
         if (w == kShakeTimer) {
-            const bool keep = TickShakeAnim(QpcNowMs());
+            const double nowQpc = QpcNowMs();
+            g_shakeLastRefreshQpcMs = nowQpc;
+            const bool keep = TickShakeAnim(nowQpc);
             RefreshCursorScale();
             if (!keep) {
                 Log("晃动结束，光标已恢复原尺寸");
                 KillTimer(h, kShakeTimer);
+                SetShakeTimePeriod(false);
             }
             return 0;
         }
@@ -4945,15 +4989,8 @@ static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
         RecordRemoteTarget(sx, sy, nowMoveMs);
         SetCursorPos(sx, sy);
 
-        // 晃动检测：触发或状态切换时交由 kShakeTimer 按 InOutCubic 曲线平滑推进缩放
-        {
-            const int64_t nowMs = GetTickCount64();
-            const bool wasActive = g_shakeActive;
-            DetectShake(nowMs, sx, sy);
-            if (g_shakeActive != wasActive) {
-                RefreshCursorScale();
-            }
-        }
+        // 晃动检测与高频推进：触发期间直接在光标消息内同步推进缩放曲线，避免 WM_TIMER 饿死
+        DriveShakeStep(sx, sy);
         return 0;
     }
     case WM_TRAY:
@@ -5058,6 +5095,7 @@ static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
             g_moveX = vx;
             g_moveY = vy;
             g_moveDirty = true;
+            DriveShakeStep(pt.x, pt.y);
         }
         return 0;
     }
@@ -6699,6 +6737,7 @@ int main(int argc, char** argv) {
 
     // 退出清理：先停网络/中转/输入线程，再毁控制面板窗口，消除跨线程访问 g_panel 竞态
     SetThreadExecutionState(ES_CONTINUOUS);
+    SetShakeTimePeriod(false);
     g_presenter = nullptr;
     TrayRemove();
     UnregisterHotKey(hwnd, HOTKEY_QUIT_ID);

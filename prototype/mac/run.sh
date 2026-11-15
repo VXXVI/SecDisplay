@@ -77,7 +77,8 @@ import CoreGraphics
 var n:UInt32=0; CGGetOnlineDisplayList(0,nil,&n)
 var ids=[CGDirectDisplayID](repeating:0,count:Int(n)); CGGetOnlineDisplayList(n,&ids,&n)
 for id in ids.prefix(Int(n)) {
-    if CGDisplayVendorNumber(id)==0xEEEE && CGDisplayModelNumber(id)==0x5344 {
+    let v = CGDisplayVendorNumber(id), m = CGDisplayModelNumber(id), s = CGDisplaySerialNumber(id)
+    if (v==0x0610 && m==0x9221 && s==0x53445344) || (v==0xEEEE && m==0x5344) {
         print("STALE"); exit(0)
     }
 }

@@ -63,12 +63,18 @@ setvbuf(stdout, nil, _IONBF, 0)
 // 旧值 0x2B3 来历不明，且与某些虚拟适配器可能重叠，改用自定义号。
 // CGVirtualDisplay 与 AirPlay/Sidecar 共用同一套私有 API，displayID 会随
 // Sidecar 插拔漂移或复用，只有 EDID 三元组稳定可靠。
-let kVDVendorID: UInt32  = 0xEEEE
-let kVDProductID: UInt32 = 0x5344   // 'SD'
-let kVDSerialNum: UInt32 = 0x0001
+// Apple vendor 0x0610 + 16:10 Cinema Display 槽位 0x9221（该产品槽位不覆写 DisplayProductName，
+// 因此在 macOS 显示器/控制中心里既保留 "SecDisplay" 名称，又具备苹果显示器图标而非通用黑框图标），
+// 再配合专属序列号 0x53445344('SDSD') 精确锚定，绝不与真实物理显示器冲突。
+let kVDVendorID: UInt32  = 0x0610
+let kVDProductID: UInt32 = 0x9221
+let kVDSerialNum: UInt32 = 0x53445344
 
-// 升级前的旧身份（0x2B3/0x1000/1）。异常退出可能留下这种残留屏，
+// 升级前的旧身份（0xEEEE/0x5344/1 与 0x2B3/0x1000/1）。异常退出可能留下这种残留屏，
 // 仅用于残留检测与告警，绝不作为采集目标，避免把旧残留当成自己的屏抓进去。
+let kLegacyVDVendorID: UInt32  = 0xEEEE
+let kLegacyVDProductID: UInt32 = 0x5344
+let kLegacyVDSerialNum: UInt32 = 0x0001
 let kOldVDVendorID: UInt32  = 0x02B3
 let kOldVDProductID: UInt32 = 0x1000
 let kOldVDSerialNum: UInt32 = 0x0001
@@ -83,6 +89,9 @@ func isOurVirtualDisplay(_ id: CGDirectDisplayID) -> Bool {
 /// 是否 SecDisplay 建的屏（含升级前旧身份），仅用于残留告警。
 func isAnySecDisplay(_ id: CGDirectDisplayID) -> Bool {
     isOurVirtualDisplay(id) ||
+    (CGDisplayVendorNumber(id) == kLegacyVDVendorID &&
+     CGDisplayModelNumber(id) == kLegacyVDProductID &&
+     CGDisplaySerialNumber(id) == kLegacyVDSerialNum) ||
     (CGDisplayVendorNumber(id) == kOldVDVendorID &&
      CGDisplayModelNumber(id) == kOldVDProductID &&
      CGDisplaySerialNumber(id) == kOldVDSerialNum)
