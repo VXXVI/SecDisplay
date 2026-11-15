@@ -5611,10 +5611,10 @@ static void ParseArgs(int argc, char** argv, RunConfig& cfg) {
             }
         }
     }
-    if (cfg.width <= 0) cfg.width = 2880;
-    if (cfg.height <= 0) cfg.height = 1800;
-    if (cfg.hostWidth <= 0) cfg.hostWidth = 2880;
-    if (cfg.hostHeight <= 0) cfg.hostHeight = 1800;
+    if (cfg.width <= 0 || cfg.width > 7680) cfg.width = 2880;
+    if (cfg.height <= 0 || cfg.height > 4320) cfg.height = 1800;
+    if (cfg.hostWidth <= 0 || cfg.hostWidth > 7680) cfg.hostWidth = 2880;
+    if (cfg.hostHeight <= 0 || cfg.hostHeight > 4320) cfg.hostHeight = 1800;
     if (cfg.port <= 0 || cfg.port > 65535) cfg.port = 9922;
     if (cfg.hostFps < 24 || cfg.hostFps > 144) cfg.hostFps = 60;
     if (cfg.hostBitrateMbps < 10 || cfg.hostBitrateMbps > 200) cfg.hostBitrateMbps = 50;

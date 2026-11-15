@@ -346,6 +346,7 @@ private:
 
     // ---- TCP 主动连接 Mac 副屏（绕开 macOS 本地网络 TCC 对出站连接的阻断）----
     void ConnectLoop() {
+        int connFailCount = 0;
         while (alive_.load()) {
             SOCKET cs = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
             if (cs == INVALID_SOCKET) {
@@ -380,10 +381,18 @@ private:
             int soErr = 0; int soLen = sizeof(soErr);
             getsockopt(cs, SOL_SOCKET, SO_ERROR, (char*)&soErr, &soLen);
             if (sel <= 0 || FD_ISSET(cs, &efds) || soErr != 0) {
+                ++connFailCount;
+                if (connFailCount == 1 || connFailCount % 30 == 0) {
+                    char msg[160];
+                    snprintf(msg, sizeof(msg), "WinHost: 连接 Mac 副屏 %s:%u 失败 (err=%d, 第%d次)",
+                             targetHost_.c_str(), port_, soErr ? soErr : WSAGetLastError(), connFailCount);
+                    EmitLog(msg);
+                }
                 closesocket(cs);
                 for (int i = 0; i < 15 && alive_.load(); ++i) Sleep(100);
                 continue;
             }
+            connFailCount = 0;
             nb = 0;
             ioctlsocket(cs, FIONBIO, &nb);
 
@@ -409,10 +418,14 @@ private:
                 std::lock_guard<std::mutex> ilk(stats_.infoMtx);
                 stats_.peerAddr = peer;
             }
-            stats_.clientConnected = true;
             stats_.connStartTick = GetTickCount64();
             lastPayloadUs_.store(0);
             forceKeyframe_.store(true);
+
+            // 先发会话头再置 clientConnected=true，确保 0x06 总是早于首帧 0x01 到达
+            WinVddBounds b = vdd_.Bounds();
+            SendSessionHeader(b.width, b.height, b.hz > 0 ? b.hz : reqFps_);
+            stats_.clientConnected = true;
 
             {
                 char msg[128];
@@ -420,8 +433,6 @@ private:
                 EmitLog(msg);
             }
 
-            WinVddBounds b = vdd_.Bounds();
-            SendSessionHeader(b.width, b.height, b.hz > 0 ? b.hz : reqFps_);
             ClientRecvLoop(cs, epoch);
 
             if (!alive_.load()) break;
@@ -1040,6 +1051,10 @@ private:
             v.vt = VT_UI4;
             v.ulVal = (ULONG)newMbps * 1000000UL;
             if (SUCCEEDED(codecApi->SetValue(&CODECAPI_AVEncCommonMeanBitRate, &v))) {
+                VARIANT vmax{};
+                vmax.vt = VT_UI4;
+                vmax.ulVal = (ULONG)std::min(160, newMbps * 3 / 2) * 1000000UL;
+                codecApi->SetValue(&CODECAPI_AVEncCommonMaxBitRate, &vmax);
                 lastAppliedMbps = newMbps;
             }
         }
@@ -1371,6 +1386,7 @@ private:
             uint64_t lastStatBytes = stats_.bytesSent.load();
             bool firstFrame = true;
             bool hasCachedBgra = false;
+            int staticIdrFailStreak = 0;
 
             while (alive_.load()) {
                 enc.UpdateBitrateIfChanged(curMbps_.load());
@@ -1409,12 +1425,18 @@ private:
                             std::vector<uint8_t> avcc;
                             bool isIdr = false;
                             if (enc.EncodeTexture(enc.bgraCopy.Get(), true, alive_, avcc, &isIdr, &logFn_) && !avcc.empty()) {
+                                staticIdrFailStreak = 0;
                                 stats_.framesEncoded++;
                                 SendVideoAvcc(avcc, capUs);
                                 if (!isIdr) forceKeyframe_.store(true);
                                 continue;
                             } else {
+                                stats_.encodeFail++;
                                 forceKeyframe_.store(true);
+                                if (++staticIdrFailStreak >= 30) {
+                                    EmitLog("WinHost: 静止桌面补关键帧连续失败 30 次，重建采集与编码器");
+                                    break;
+                                }
                             }
                         }
                         ULONGLONG nowTick = GetTickCount64();
