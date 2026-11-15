@@ -18,6 +18,8 @@ final class AppModel: ObservableObject {
     @Published var inFlight = 0
     @Published var dropped = 0
     @Published var skipped = 0
+    /// 采集连续重启次数。>0 表示 SCK 采集异常、看护正在重试。
+    @Published var captureRestarts = 0
     @Published var width = 0
     @Published var height = 0
     @Published var scale: Double = 1.0
@@ -98,7 +100,13 @@ final class AppModel: ObservableObject {
         clientPresentP95 = fb.presentP95
         clientQueueMs = max(0, fb.presentP95 - fb.sourceP95)
         clientPresentDrop = fb.presentDrop
-        capturePath = (pixelFormatChoice == "420v" ? "420v" : "BGRA") + " · 4 路"
+        // 采集通道显示实测格式。SCK 可能忽略 pixelFormat 仍给 BGRA，
+        // 这时显示配置值会骗人（日志里那条「内存收益失效」的警告就白打了）。
+        // 还没采到帧时显示请求值加问号，提示尚未确认。
+        let wantName = pixelFormatChoice == "420v" ? "420v" : "BGRA"
+        let actual = cap.actualFormat
+        capturePath = (actual.isEmpty ? "\(wantName)?" : actual) + " · 4 路"
+        captureRestarts = cap.captureRestartStreak
         totalSent = UInt64(max(0, sender.totalSent))
         uptimeSec = CFAbsoluteTimeGetCurrent() - appStartTime
         peer = sender.peerDescription
@@ -166,8 +174,13 @@ struct StatusView: View {
     }
 
     var body: some View {
-        ScrollView {
-            VStack(alignment: .leading, spacing: 14) {
+        // 窗口是 .fullSizeContentView + 透明标题栏，内容会从窗口最上沿开始画，
+        // 正好压在红绿灯按钮上。用一个固定高度的占位把标题栏高度让出来 ——
+        // 放在 ScrollView 外面，不会跟着滚走。
+        VStack(spacing: 0) {
+            Color.clear.frame(height: 28)
+            ScrollView {
+                VStack(alignment: .leading, spacing: 14) {
                 // 头部
                 HStack(spacing: 10) {
                     Circle()
@@ -199,7 +212,11 @@ struct StatusView: View {
                     StatRow(label: "采集延迟", value: String(format: "%.1f ms", model.capMs))
                     StatRow(label: "编码延迟", value: String(format: "%.1f ms", model.encMs))
                     StatRow(label: "画质档位", value: model.presetName)
-                    StatRow(label: "静止跳过", value: "\(model.skipped)")
+                    // 采集重启次数：>0 说明 SCK 采集异常、看护正在重试。
+                    // 原来这行显示「静止跳过」，但那个计数只存在于死代码里恒为 0。
+                    StatRow(label: "采集重启", value: model.captureRestarts == 0
+                            ? "正常" : "\(model.captureRestarts) 次",
+                            warn: model.captureRestarts > 0 ? .orange : nil)
                 }
 
                 // 码率控制
@@ -260,6 +277,10 @@ struct StatusView: View {
                     get: { model.cursorImageOn },
                     set: { on in
                         disableCursorImage = !on
+                        // 启动时若带 SECDISPLAY_NOCURSORIMG=1，CursorImageTracker 的
+                        // 定时器从未创建；只改标志位会让开关显示 ON 却一帧都不发。
+                        // 打开时补一次 start()（内部幂等）。
+                        if on { cursorImage.start() }
                         Log.info(on ? "面板开启光标图像(0x05)" : "面板关闭光标图像(0x05)")
                     }))
                     .toggleStyle(.switch)
@@ -289,10 +310,8 @@ struct StatusView: View {
                 }
             }
             .padding(18)
-            // 窗口是 .fullSizeContentView + 透明标题栏，ScrollView 会顶到
-            // 窗口最上沿，把「已连接」那一行压到红绿灯按钮底下。
-            // 额外让出标题栏高度。
-            .padding(.top, 6)
+            }
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
         }
         .frame(width: 400, height: 620)
     }
