@@ -662,13 +662,14 @@ final class Encoder {
     }
 
     func start() -> Bool {
-        // EnableLowLatencyRateControl 并非恒优。实测（tools/EncLatency.swift，M1 Pro）：
-        //   2240x1400@60  开=34~37ms 关=21~23ms（关更好）
-        //   2880x1800@45  开=44~50ms 关=35~36ms（关更好）
-        //   1920x1200@60  开=9ms     关=14ms   （开更好）
-        // 规律：分辨率接近编码器吞吐上限时该开关反而拖慢（同 Sunshine #5814）。
-        // 默认保持开启（低分辨率/未知场景收益确定）；高分辨率档可用
-        // SECDISPLAY_NOLOWLAT=1 关闭，供真机 A/B。
+        guard let s = createSession(width: width, height: height, bitrate: bitrate, captureHz: captureHz) else {
+            return false
+        }
+        session = s
+        return true
+    }
+
+    private func createSession(width w: Int32, height h: Int32, bitrate br: Int, captureHz hz: Double) -> VTCompressionSession? {
         var spec: [String: Any] = [:]
         let noLowLat = ProcessInfo.processInfo.environment["SECDISPLAY_NOLOWLAT"] == "1"
         if !noLowLat {
@@ -681,8 +682,8 @@ final class Encoder {
                 (pixelFormatChoice == "420v"
                     ? kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange
                     : kCVPixelFormatType_32BGRA),
-            kCVPixelBufferWidthKey as String: width,
-            kCVPixelBufferHeightKey as String: height,
+            kCVPixelBufferWidthKey as String: w,
+            kCVPixelBufferHeightKey as String: h,
             kCVPixelBufferIOSurfacePropertiesKey as String: [:],
         ]
         let cb: VTCompressionOutputCallback = { ref, sourceFrameRefcon, status, _, sample in
@@ -698,52 +699,44 @@ final class Encoder {
             }
             enc.emit(sample, refcon: sourceFrameRefcon)
         }
+        var newSession: VTCompressionSession?
         let st = VTCompressionSessionCreate(
-            allocator: kCFAllocatorDefault, width: width, height: height,
+            allocator: kCFAllocatorDefault, width: w, height: h,
             codecType: kCMVideoCodecType_H264,
             encoderSpecification: spec as CFDictionary,
             imageBufferAttributes: attrs as CFDictionary,
             compressedDataAllocator: nil, outputCallback: cb,
             refcon: Unmanaged.passUnretained(self).toOpaque(),
-            compressionSessionOut: &session)
-        guard st == noErr, let s = session else {
-            Log.info("编码器创建失败 \(st)"); return false
+            compressionSessionOut: &newSession)
+        guard st == noErr, let s = newSession else {
+            Log.info("编码器创建失败 \(st)"); return nil
         }
         let env = ProcessInfo.processInfo.environment
         let variant = env["SECDISPLAY_ENC"] ?? "A"
 
         VTSessionSetProperty(s, key: kVTCompressionPropertyKey_RealTime, value: kCFBooleanTrue)
         VTSessionSetProperty(s, key: kVTCompressionPropertyKey_ProfileLevel, value: kVTProfileLevel_H264_High_AutoLevel)
-        VTSessionSetProperty(s, key: kVTCompressionPropertyKey_ExpectedFrameRate, value: NSNumber(value: captureHz))
-        // GOP 长度。600 帧在 55fps 下约 11 秒，实测每 12 秒一次编码延迟尖峰
-        // (38~70ms)，表现为「间歇性卡一下」。TCP 不丢包，关键帧只在
-        // 新客户端连上时按 0x02 请求补发，所以可以拉长。用 SECDISPLAY_GOP 覆盖。
+        VTSessionSetProperty(s, key: kVTCompressionPropertyKey_ExpectedFrameRate, value: NSNumber(value: hz))
         let gop = Int(ProcessInfo.processInfo.environment["SECDISPLAY_GOP"] ?? "") ?? 3000
         VTSessionSetProperty(s, key: kVTCompressionPropertyKey_MaxKeyFrameInterval, value: gop as CFNumber)
 
         switch variant {
         case "B":
-            // 不设码率与帧延迟，交给低延迟 rate control
             break
         case "C":
             VTSessionSetProperty(s, key: kVTCompressionPropertyKey_MaxFrameDelayCount, value: 0 as CFNumber)
         case "D":
-            // 用 DataRateLimits 代替 AverageBitRate
-            let limits: [NSNumber] = [NSNumber(value: bitrate / 8), NSNumber(value: 1.0)]
+            let limits: [NSNumber] = [NSNumber(value: br / 8), NSNumber(value: 1.0)]
             VTSessionSetProperty(s, key: kVTCompressionPropertyKey_DataRateLimits, value: limits as CFArray)
         case "E":
             VTSessionSetProperty(s, key: kVTCompressionPropertyKey_AllowFrameReordering, value: kCFBooleanFalse)
             VTSessionSetProperty(s, key: kVTCompressionPropertyKey_PrioritizeEncodingSpeedOverQuality, value: kCFBooleanTrue)
-        default:  // A：原样
+        default:
             VTSessionSetProperty(s, key: kVTCompressionPropertyKey_AllowFrameReordering, value: kCFBooleanFalse)
-            VTSessionSetProperty(s, key: kVTCompressionPropertyKey_AverageBitRate, value: bitrate as CFNumber)
+            VTSessionSetProperty(s, key: kVTCompressionPropertyKey_AverageBitRate, value: br as CFNumber)
             VTSessionSetProperty(s, key: kVTCompressionPropertyKey_MaxFrameDelayCount, value: 1 as CFNumber)
         }
 
-        // 色彩三键 VUI 锚点（BT.709 色域与矩阵 + sRGB 传递函数）。
-        // 原来不设这些键时，H.264 SPS 里不带 colour_description，BGRA 由 VT 自选、
-        // 420v 采集设了 709，导致两端默认矩阵不一致时偏色。显式写进会话与 VUI，
-        // 配合 Windows 侧 D3D11 VideoProcessor 的 BT.709 设置对齐整条色彩链路。
         let stPrim = VTSessionSetProperty(s, key: kVTCompressionPropertyKey_ColorPrimaries,
                                           value: kCVImageBufferColorPrimaries_ITU_R_709_2)
         let stTrans = VTSessionSetProperty(s, key: kVTCompressionPropertyKey_TransferFunction,
@@ -756,7 +749,7 @@ final class Encoder {
 
         VTCompressionSessionPrepareToEncodeFrames(s)
         Log.info("编码参数方案 \(variant)")
-        return true
+        return s
     }
 
     /// 自增帧序号，用作编码 PTS。
@@ -890,22 +883,29 @@ final class Encoder {
         if let s = session { VTCompressionSessionCompleteFrames(s, untilPresentationTimeStamp: .invalid) }
     }
 
-    /// 虚拟屏在系统设置中切换分辨率时，原地重建 VTCompressionSession 同步对齐新尺寸
+    /// 虚拟屏在系统设置中切换分辨率时，先新建会话再替换旧会话，失败时原编码器完整保留
     func reconfigure(width: Int, height: Int, bitrateMbps: Int, captureHz: Double) -> Bool {
         encodeLock.lock()
         defer { encodeLock.unlock() }
+        let newW = Int32(width)
+        let newH = Int32(height)
+        let newBr = bitrateMbps * 1_000_000
+        let newHz = max(1, captureHz)
+        guard let next = createSession(width: newW, height: newH, bitrate: newBr, captureHz: newHz) else {
+            return false
+        }
         if let old = session {
             VTCompressionSessionCompleteFrames(old, untilPresentationTimeStamp: .invalid)
             VTCompressionSessionInvalidate(old)
-            session = nil
         }
-        self.width = Int32(width)
-        self.height = Int32(height)
-        self.bitrate = bitrateMbps * 1_000_000
-        self.captureHz = max(1, captureHz)
+        session = next
+        self.width = newW
+        self.height = newH
+        self.bitrate = newBr
+        self.captureHz = newHz
         self.currentMbps = bitrateMbps
         releaseLastFrame()
-        return start()
+        return true
     }
 
     /// 编码管线延迟统计：从采集时间戳到编码输出回调
@@ -1382,16 +1382,16 @@ final class ScreenshotCapture {
                                         (actualFmt >> 8) & 0xFF, actualFmt & 0xFF)
                         let wantName = wantYUV ? "420v" : "BGRA"
                         actualFormatCode = actualFmt   // 面板显示实测值，不显示配置值
-                        Log.info("采集首帧实测: \(fw)x\(fh) fmt=\(f4) (期望 \(cfg.width)x\(cfg.height) \(wantName))")
+                        Log.info("采集首帧实测: \(fw)x\(fh) fmt=\(f4) (期望 \(targetW)x\(targetH) \(wantName))")
                         if wantYUV && actualFmt != kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange
                             && actualFmt != kCVPixelFormatType_420YpCbCr8BiPlanarFullRange {
                             Log.info("警告: 采集实际格式是 \(f4) 而非 420v，VT 会额外做一次全屏转换，内存收益失效")
                         }
-                    } else if (fw != cfg.width || fh != cfg.height)
+                    } else if (fw != targetW || fh != targetH)
                                 && now - lastSizeWarnAt > 2.0 {
                         // 限流：尺寸偏移时每帧都打会淹日志并拖慢 encodeQueue 临界区
                         lastSizeWarnAt = now
-                        Log.info("警告: 采集帧尺寸偏移 \(fw)x\(fh) != \(cfg.width)x\(cfg.height)")
+                        Log.info("警告: 采集帧尺寸偏移 \(fw)x\(fh) != \(targetW)x\(targetH)")
                     }
                     // 内容冻结诊断：帧在来但画面完全不变时记一条日志。
                     // 只在日志里报，不重启 —— 静止桌面本来就不变，重启会误伤，
@@ -3877,6 +3877,8 @@ final class RateController {
         highRounds = 0
         lowRounds = 0
         idleRounds = 0
+        revertCooldownUntil = 0
+        lastDownAt = 0
     }
     private var current: Int
     private var highRounds = 0
