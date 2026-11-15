@@ -2301,9 +2301,23 @@ static void UpdateControlPanel() {
         lastDecoded = decoded;
         lastBytes = bytes;
         lastTick = now;
+    } else if (decoded < lastDecoded || bytes < lastBytes) {
+        // 重连时 g_stats 被清零。必须重建基准，否则下面的差值会算出负数，
+        // 而且基准再也追不上来，帧率会永久冻在旧值。
+        lastDecoded = decoded;
+        lastBytes = bytes;
+        lastTick = now;
+        fps = 0.0;
+        mbps = 0.0;
     } else {
         double dt = (double)(now - lastTick) / 1000.0;
-        if (dt >= 0.2 && decoded >= lastDecoded && bytes >= lastBytes) {
+        // dt 太大说明面板刚被重新打开（隐藏期间定时器已停），
+        // 那段时间的平均值没有参考价值，只重建基准。
+        if (dt >= 5.0) {
+            lastDecoded = decoded;
+            lastBytes = bytes;
+            lastTick = now;
+        } else if (dt >= 0.2) {
             fps = (double)(decoded - lastDecoded) / dt;
             mbps = (double)(bytes - lastBytes) * 8.0 / dt / 1e6;
             lastDecoded = decoded;
