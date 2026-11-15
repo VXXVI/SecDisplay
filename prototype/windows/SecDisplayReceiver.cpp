@@ -1778,6 +1778,7 @@ bool Presenter::CreateProcessor() {
 
     // 输出按等比装进交换链，装不满的地方由 VideoProcessor 用背景色填黑边。
     RECT dst = FitRect(cropW, cropH, width_, height_);
+    videoCtx_->VideoProcessorSetStreamDestRect(processor_.Get(), 0, TRUE, &dst);
     const bool letterbox = dst.left > 0 || dst.top > 0 ||
                            dst.right < width_ || dst.bottom < height_;
     if (letterbox) {
@@ -2393,52 +2394,115 @@ static void PasteClipboardToTransfer(HWND owner) {
             GlobalUnlock(hd);
         }
     } else {
-        // 检查剪贴板截图（CF_BITMAP / CF_DIB）并无损编码为 PNG 发送
-        std::unique_ptr<Gdiplus::Bitmap> bmp;
-        if (HBITMAP hbm = (HBITMAP)GetClipboardData(CF_BITMAP)) {
-            bmp.reset(Gdiplus::Bitmap::FromHBITMAP(hbm, nullptr));
-        } else if (HANDLE hdib = GetClipboardData(CF_DIB)) {
-            SIZE_T cb = GlobalSize(hdib);
-            if (cb >= sizeof(BITMAPINFOHEADER)) {
-                if (void* ptr = GlobalLock(hdib)) {
-                    const BITMAPINFO* bmi = (const BITMAPINFO*)ptr;
-                    DWORD hdrSize = bmi->bmiHeader.biSize;
-                    if (hdrSize >= sizeof(BITMAPINFOHEADER) && hdrSize <= cb) {
-                        size_t palBytes = 0;
-                        // 仅标准 40 字节 BITMAPINFOHEADER 在结构体外附加 3 个 DWORD 掩码；V4/V5 已内嵌
-                        if (hdrSize == sizeof(BITMAPINFOHEADER) && bmi->bmiHeader.biCompression == BI_BITFIELDS) {
-                            palBytes += 3 * sizeof(DWORD);
+        auto makeTmpPngPath = []() -> std::wstring {
+            wchar_t tmpDir[MAX_PATH] = {};
+            if (GetTempPathW(MAX_PATH, tmpDir) == 0) return {};
+            SYSTEMTIME st{};
+            GetLocalTime(&st);
+            wchar_t fname[96];
+            swprintf(fname, 96, L"Screenshot_%04d%02d%02d_%02d%02d%02d_%03d.png",
+                     st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute, st.wSecond, st.wMilliseconds);
+            return std::wstring(tmpDir) + fname;
+        };
+
+        // 1. 优先读取截图软件直写的原始 "PNG" / "image/png" 格式（Snipaste / PixPin / Win+Shift+S / 微信等）
+        static const UINT fmtPng = RegisterClipboardFormatW(L"PNG");
+        static const UINT fmtMimePng = RegisterClipboardFormatW(L"image/png");
+        UINT pngFmts[2] = { fmtPng, fmtMimePng };
+        for (UINT pf : pngFmts) {
+            if (!pf) continue;
+            if (HANDLE hp = GetClipboardData(pf)) {
+                SIZE_T cb = GlobalSize(hp);
+                if (cb >= 8) {
+                    if (const void* ptr = GlobalLock(hp)) {
+                        std::wstring cand = makeTmpPngPath();
+                        if (!cand.empty()) {
+                            HANDLE hf = CreateFileW(cand.c_str(), GENERIC_WRITE, 0, nullptr,
+                                                    CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+                            if (hf != INVALID_HANDLE_VALUE) {
+                                DWORD wr = 0;
+                                if (WriteFile(hf, ptr, (DWORD)cb, &wr, nullptr) && wr == (DWORD)cb) {
+                                    tempPngPath = cand;
+                                } else {
+                                    CloseHandle(hf);
+                                    DeleteFileW(cand.c_str());
+                                    hf = INVALID_HANDLE_VALUE;
+                                }
+                                if (hf != INVALID_HANDLE_VALUE) CloseHandle(hf);
+                            }
                         }
-                        if (bmi->bmiHeader.biBitCount <= 8) {
-                            DWORD nCol = bmi->bmiHeader.biClrUsed ? bmi->bmiHeader.biClrUsed : (1u << bmi->bmiHeader.biBitCount);
-                            palBytes += (size_t)nCol * sizeof(RGBQUAD);
-                        } else if (bmi->bmiHeader.biClrUsed > 0) {
-                            palBytes += (size_t)bmi->bmiHeader.biClrUsed * sizeof(RGBQUAD);
-                        }
-                        if ((size_t)hdrSize + palBytes <= cb) {
-                            const void* bits = (const uint8_t*)ptr + hdrSize + palBytes;
-                            bmp.reset(Gdiplus::Bitmap::FromBITMAPINFO(bmi, (void*)bits));
-                        }
+                        GlobalUnlock(hp);
                     }
-                    GlobalUnlock(hdib);
                 }
+                if (!tempPngPath.empty()) break;
             }
         }
-        CLSID pngClsid{};
-        if (bmp && bmp->GetLastStatus() == Gdiplus::Ok && GetPngEncoderClsid(&pngClsid)) {
-            wchar_t tmpDir[MAX_PATH] = {};
-            if (GetTempPathW(MAX_PATH, tmpDir) > 0) {
-                SYSTEMTIME st{};
-                GetLocalTime(&st);
-                wchar_t fname[96];
-                swprintf(fname, 96, L"Screenshot_%04d%02d%02d_%02d%02d%02d_%03d.png",
-                         st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute, st.wSecond, st.wMilliseconds);
-                std::wstring candidate = std::wstring(tmpDir) + fname;
-                if (bmp->Save(candidate.c_str(), &pngClsid, nullptr) == Gdiplus::Ok) {
+
+        // 2. 若无原始 PNG，优先按 CF_DIB / CF_DIBV5 读取（避开 FromHBITMAP 对 32bpp 透明位图的兼容坑）
+        if (tempPngPath.empty()) {
+            std::unique_ptr<Gdiplus::Bitmap> bmp;
+            UINT dibFmts[2] = { CF_DIB, CF_DIBV5 };
+            for (UINT df : dibFmts) {
+                if (HANDLE hdib = GetClipboardData(df)) {
+                    SIZE_T cb = GlobalSize(hdib);
+                    if (cb >= sizeof(BITMAPINFOHEADER)) {
+                        if (void* ptr = GlobalLock(hdib)) {
+                            const BITMAPINFO* bmi = (const BITMAPINFO*)ptr;
+                            DWORD hdrSize = bmi->bmiHeader.biSize;
+                            if (hdrSize >= sizeof(BITMAPINFOHEADER) && hdrSize <= cb) {
+                                size_t palBytes = 0;
+                                // 仅标准 40 字节 BITMAPINFOHEADER 在结构体外附加 3 个 DWORD 掩码；V4/V5 已内嵌
+                                if (hdrSize == sizeof(BITMAPINFOHEADER) && bmi->bmiHeader.biCompression == BI_BITFIELDS) {
+                                    palBytes += 3 * sizeof(DWORD);
+                                }
+                                if (bmi->bmiHeader.biBitCount <= 8) {
+                                    DWORD nCol = bmi->bmiHeader.biClrUsed ? bmi->bmiHeader.biClrUsed : (1u << bmi->bmiHeader.biBitCount);
+                                    palBytes += (size_t)nCol * sizeof(RGBQUAD);
+                                } else if (bmi->bmiHeader.biClrUsed > 0) {
+                                    palBytes += (size_t)bmi->bmiHeader.biClrUsed * sizeof(RGBQUAD);
+                                }
+                                if ((size_t)hdrSize + palBytes <= cb) {
+                                    const void* bits = (const uint8_t*)ptr + hdrSize + palBytes;
+                                    std::unique_ptr<Gdiplus::Bitmap> candBmp(Gdiplus::Bitmap::FromBITMAPINFO(bmi, (void*)bits));
+                                    if (candBmp && candBmp->GetLastStatus() == Gdiplus::Ok) {
+                                        bmp = std::move(candBmp);
+                                    }
+                                }
+                            }
+                            GlobalUnlock(hdib);
+                        }
+                    }
+                    if (bmp) break;
+                }
+            }
+            if (!bmp) {
+                if (HBITMAP hbm = (HBITMAP)GetClipboardData(CF_BITMAP)) {
+                    std::unique_ptr<Gdiplus::Bitmap> candBmp(Gdiplus::Bitmap::FromHBITMAP(hbm, nullptr));
+                    if (candBmp && candBmp->GetLastStatus() == Gdiplus::Ok) {
+                        bmp = std::move(candBmp);
+                    }
+                }
+            }
+            CLSID pngClsid{};
+            if (bmp && bmp->GetLastStatus() == Gdiplus::Ok && GetPngEncoderClsid(&pngClsid)) {
+                std::wstring candidate = makeTmpPngPath();
+                if (!candidate.empty() && bmp->Save(candidate.c_str(), &pngClsid, nullptr) == Gdiplus::Ok) {
                     tempPngPath = candidate;
                 }
             }
         }
+    }
+    if (files.empty() && tempPngPath.empty()) {
+        std::string fmts;
+        UINT f = 0;
+        while ((f = EnumClipboardFormats(f)) != 0) {
+            if (!fmts.empty()) fmts += ",";
+            wchar_t fn[64] = {};
+            if (GetClipboardFormatNameW(f, fn, 64) > 0) fmts += ToUtf8(fn);
+            else fmts += std::to_string(f);
+            if (fmts.size() > 180) break;
+        }
+        Log("剪贴板粘贴无可用图片或文件，当前格式: [%s]", fmts.c_str());
     }
     CloseClipboard();
 
@@ -4258,6 +4322,9 @@ static void ToggleDropBoxWindow() {
         Log("悬浮投递盒已通过快捷键隐藏");
     } else {
         ShowDropBoxWindow();
+        if (HWND db = g_dropBox.load()) {
+            SetForegroundWindow(db);
+        }
     }
 }
 
@@ -5186,17 +5253,28 @@ static void NetworkLoop(RunConfig cfg, Graphics* gfx, Presenter* presenter) {
     // 交换链改尺寸失败过的尺寸，避免每次重连都反复尝试同一个值
     int failedW = 0, failedH = 0;
     while (g_alive) {
-        // 会话头切档：尺寸与当前管线不同就重建解码器、交换链与窗口
+        // 会话头切档：流尺寸变化时重建解码器与处理器；全屏模式下交换链保持显示器客户区尺寸不变，
+        // 由 VideoProcessorBlt 按 FitRect 等比铺满整屏，不再把交换链缩成小分辨率导致只占左上角。
         int sw = g_sessW.load(), sh = g_sessH.load();
         if (sw > 0 && sh > 0 && (sw != cfg.width || sh != cfg.height) &&
             !(sw == failedW && sh == failedH)) {
-            if (presenter->Resize(sw, sh)) {
+            int outW = sw, outH = sh;
+            if (g_isFullscreen && g_hwnd) {
+                RECT crc{};
+                if (GetClientRect(g_hwnd, &crc) && (crc.right - crc.left) >= 64 && (crc.bottom - crc.top) >= 64) {
+                    outW = crc.right - crc.left;
+                    outH = crc.bottom - crc.top;
+                }
+            }
+            const int prevDW = g_displayW.load(), prevDH = g_displayH.load();
+            g_displayW = sw; g_displayH = sh;
+            if (presenter->Resize(outW, outH) && presenter->SetSourceSize(sw, sh)) {
                 cfg.width = sw; cfg.height = sh;
-                g_displayW = sw; g_displayH = sh;
                 if (cfg.coordW <= 0) { g_coordW = sw; g_coordH = sh; }
-                ResizeWindowForVideo(sw, sh);
-                Log("按会话头切换管线尺寸: %dx%d", sw, sh);
+                if (!g_isFullscreen) ResizeWindowForVideo(sw, sh);
+                Log("按会话头切换管线尺寸: 流 %dx%d  输出 %dx%d", sw, sh, outW, outH);
             } else {
+                g_displayW = prevDW; g_displayH = prevDH;
                 failedW = sw; failedH = sh;
             }
         }
