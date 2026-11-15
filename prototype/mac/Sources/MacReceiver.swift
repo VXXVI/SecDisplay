@@ -609,6 +609,7 @@ final class MacReceiverClient {
                 self._presIntervalsMs.removeAll()
                 self._lastFrameRecvAt = 0
                 self._lastPresentAt = 0
+                self._lastFbDrops = self._droppedFrames &+ self._decodeErrors
                 self.stateLock.unlock()
                 self.startFeedbackTimer(epoch: epoch)
                 self.sendKeyframeRequest(throttled: false)
