@@ -32,6 +32,7 @@ import Darwin
 import ImageIO
 import CoreImage
 import UniformTypeIdentifiers
+import Carbon
 
 /// 调试用：把采集到的 CVPixelBuffer 落盘成 PNG，用来核对「发送端到底抓了什么」。
 /// SCK 可能给 BGRA 也可能给 YUV，走 CoreImage 转换最稳。
@@ -2678,6 +2679,10 @@ struct TransferSnapshot {
     var speedText = ""
     var lastReceivedURL: URL? = nil
     var lastReceivedName = ""
+    /// 短时交互回执：0=无 1=成功 -1=失败（约 2.2 秒后自动回待机）
+    var feedbackKind = 0
+    var feedbackTitle = ""
+    var feedbackDetail = ""
 }
 
 final class FileTransferService {
@@ -2728,6 +2733,10 @@ final class FileTransferService {
     private var activeSpeedText = ""
     private var lastRecvURL: URL? = nil
     private var lastRecvName = ""
+    private var activeFeedbackKind = 0
+    private var activeFeedbackTitle = ""
+    private var activeFeedbackDetail = ""
+    private var feedbackSeq: UInt64 = 0
     private var keepAliveTimer: DispatchSourceTimer?
 
     private enum SendOutcome {
@@ -2756,8 +2765,36 @@ final class FileTransferService {
             progress: activeProgress,
             speedText: activeSpeedText,
             lastReceivedURL: lastRecvURL,
-            lastReceivedName: lastRecvName
+            lastReceivedName: lastRecvName,
+            feedbackKind: activeFeedbackKind,
+            feedbackTitle: activeFeedbackTitle,
+            feedbackDetail: activeFeedbackDetail
         )
+    }
+
+    func showFeedback(kind: Int, title: String, detail: String = "") {
+        stateLock.lock()
+        feedbackSeq &+= 1
+        let seq = feedbackSeq
+        activeFeedbackKind = kind
+        activeFeedbackTitle = title
+        activeFeedbackDetail = detail
+        stateLock.unlock()
+        notifyUI()
+        if kind != 0 {
+            DispatchQueue.main.asyncAfter(deadline: .now() + 2.2) { [weak self] in
+                guard let self else { return }
+                self.stateLock.lock()
+                let clear = (self.feedbackSeq == seq)
+                if clear {
+                    self.activeFeedbackKind = 0
+                    self.activeFeedbackTitle = ""
+                    self.activeFeedbackDetail = ""
+                }
+                self.stateLock.unlock()
+                if clear { self.notifyUI() }
+            }
+        }
     }
 
     func listen(port: UInt16) {
@@ -3081,6 +3118,8 @@ final class FileTransferService {
                 try? rf.handle.close()
                 try? FileManager.default.removeItem(at: rf.partURL)
                 activeRecvs.removeValue(forKey: id)
+                updateStatus("保存失败: \(rf.safeName)", busy: false, progress: 0, speed: "")
+                showFeedback(kind: -1, title: "保存失败", detail: rf.safeName)
                 sendAck(id: id, ok: false)
                 return
             }
@@ -3114,17 +3153,20 @@ final class FileTransferService {
                     pushHistory(item)
                     updateStatus(String(format: "已收到: %@ (%.0f MB/s)", dest.lastPathComponent, speed),
                                  busy: false, progress: 1.0, speed: String(format: "%.0f MB/s", speed))
+                    showFeedback(kind: 1, title: "收到文件", detail: dest.lastPathComponent)
                     Log.info("中转站接收完成: \(dest.path) (\(fmtBytes(rf.receivedSize)), \(String(format: "%.1f", speed)) MB/s)")
                     sendAck(id: id, ok: true)
                 } catch {
                     try? FileManager.default.removeItem(at: rf.partURL)
                     updateStatus("保存失败: \(rf.safeName)", busy: false, progress: 0, speed: "")
+                    showFeedback(kind: -1, title: "保存失败", detail: rf.safeName)
                     Log.info("中转站重命名失败: \(error)")
                     sendAck(id: id, ok: false)
                 }
             } else {
                 try? FileManager.default.removeItem(at: rf.partURL)
                 updateStatus("接收未完成: \(rf.safeName)", busy: false, progress: 0, speed: "")
+                showFeedback(kind: -1, title: "接收中断", detail: rf.safeName)
                 Log.info("中转站接收中断 #\(id): \(rf.safeName) \(rf.receivedSize)/\(rf.expectedSize)")
                 sendAck(id: id, ok: false)
             }
@@ -3135,6 +3177,7 @@ final class FileTransferService {
             let ok = payload[4] == 1
             if !ok {
                 Log.info("中转站对端落盘失败 #\(id)")
+                showFeedback(kind: -1, title: "对端保存失败", detail: "")
             }
 
         default:
@@ -3210,6 +3253,7 @@ final class FileTransferService {
               let fh = try? FileHandle(forReadingFrom: url) else {
             Log.info("中转站无法读取文件: \(url.path)")
             updateStatus("读取失败: \(url.lastPathComponent)", busy: false, progress: 0, speed: "")
+            showFeedback(kind: -1, title: "读取失败", detail: url.lastPathComponent)
             return .localFailed
         }
         defer { try? fh.close() }
@@ -3273,7 +3317,11 @@ final class FileTransferService {
             return true
         }
 
-        if !sendFrame(beginFrame) { return .connLost }
+        if !sendFrame(beginFrame) {
+            updateStatus("发送中断: \(fname)", busy: false, progress: 0, speed: "")
+            showFeedback(kind: -1, title: "发送中断", detail: fname)
+            return .connLost
+        }
 
         var sentBytes: UInt64 = 0
         var readErr = false
@@ -3317,6 +3365,7 @@ final class FileTransferService {
         if !connAlive() || sendFailed {
             // 连接已断，不再尝试发 endFrame
             updateStatus("发送中断: \(fname)", busy: false, progress: 0, speed: "")
+            showFeedback(kind: -1, title: "发送中断", detail: fname)
             return .connLost
         }
 
@@ -3342,14 +3391,17 @@ final class FileTransferService {
             pushHistory("↑ \(fname) (\(fmtBytes(sentBytes)))")
             updateStatus(String(format: "已发送: %@ (%.0f MB/s)", fname, speed),
                          busy: false, progress: 1.0, speed: String(format: "%.0f MB/s", speed))
+            showFeedback(kind: 1, title: String(format: "已发送 · %.0f MB/s", speed), detail: fname)
             Log.info("中转站发送完成 #\(id): \(fname) (\(fmtBytes(sentBytes)), \(String(format: "%.1f", speed)) MB/s)")
             return .sent
         }
         if readErr {
             updateStatus("读取失败: \(fname)", busy: false, progress: 0, speed: "")
+            showFeedback(kind: -1, title: "读取失败", detail: fname)
             return .localFailed
         }
         updateStatus("发送中断: \(fname)", busy: false, progress: 0, speed: "")
+        showFeedback(kind: -1, title: "发送中断", detail: fname)
         return .connLost
     }
 
@@ -3359,6 +3411,12 @@ final class FileTransferService {
         activeBusy = busy
         activeProgress = progress
         activeSpeedText = speed
+        if busy {
+            feedbackSeq &+= 1
+            activeFeedbackKind = 0
+            activeFeedbackTitle = ""
+            activeFeedbackDetail = ""
+        }
         stateLock.unlock()
         notifyUI()
     }
@@ -4302,7 +4360,7 @@ func setupStatusBar() -> NSApplication {
     open.isEnabled = true
     menu.addItem(open)
 
-    let box = NSMenuItem(title: "文件投递盒…", action: #selector(StatusMenuTarget.openDropBox), keyEquivalent: "b")
+    let box = NSMenuItem(title: "文件投递盒… (Ctrl+Opt+B)", action: #selector(StatusMenuTarget.openDropBox), keyEquivalent: "b")
     box.target = statusMenuTarget
     box.isEnabled = true
     menu.addItem(box)
@@ -4358,6 +4416,31 @@ if let rp = Bundle.main.resourcePath,
 } else {
     Log.info("构建标记: 无（命令行构建或旧包）")
 }
+nonisolated(unsafe) private var globalDropBoxHotKey: EventHotKeyRef?
+nonisolated(unsafe) private var globalHotKeyHandler: EventHandlerRef?
+
+private func registerGlobalDropBoxHotKey() {
+    var spec = EventTypeSpec(eventClass: OSType(kEventClassKeyboard), eventKind: UInt32(kEventHotKeyPressed))
+    InstallEventHandler(GetApplicationEventTarget(), { _, event, _ -> OSStatus in
+        var hkID = EventHotKeyID()
+        GetEventParameter(event, EventParamName(kEventParamDirectObject),
+                          EventParamType(typeEventHotKeyID), nil,
+                          MemoryLayout<EventHotKeyID>.size, nil, &hkID)
+        if hkID.signature == 0x53444258 && hkID.id == 1 {
+            DispatchQueue.main.async { toggleDropBoxPanel() }
+        }
+        return noErr
+    }, 1, &spec, nil, &globalHotKeyHandler)
+    let id = EventHotKeyID(signature: 0x53444258, id: 1) // 'SDBX'
+    let st = RegisterEventHotKey(UInt32(kVK_ANSI_B), UInt32(controlKey | optionKey),
+                                 id, GetApplicationEventTarget(), 0, &globalDropBoxHotKey)
+    if st == noErr {
+        Log.info("全局快捷键 Ctrl+Opt+B 已注册（一键呼出/隐藏投递盒）")
+    } else {
+        Log.info("全局快捷键 Ctrl+Opt+B 注册失败: \(st)")
+    }
+}
+
 // 等 statusApp.run() 启动主事件循环后再注册全局鼠标监视器与光标图像轮询，
 // 避免在 NSApplication 初始化之前抢先建立 SkyLight 事件通道导致窗口点击失灵。
 DispatchQueue.main.async {
@@ -4365,6 +4448,7 @@ DispatchQueue.main.async {
     if !disableCursorImage {
         cursorImage.start()
     }
+    registerGlobalDropBoxHotKey()
 }
 
 // 调试用：SECDISPLAY_SHOW_PANEL=1 启动后直接打开面板，便于不点菜单也能验证 UI。

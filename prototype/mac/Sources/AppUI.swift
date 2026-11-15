@@ -64,6 +64,9 @@ final class AppModel: ObservableObject {
     @Published var transferSpeed = ""
     @Published var transferLastRecvURL: URL? = nil
     @Published var transferLastRecvName = ""
+    @Published var transferFeedbackKind = 0
+    @Published var transferFeedbackTitle = ""
+    @Published var transferFeedbackDetail = ""
     @Published var dropBoxPinned = true
     @Published var dropBoxHoverTargeted = false
 
@@ -149,6 +152,9 @@ final class AppModel: ObservableObject {
         transferSpeed = ts.speedText
         transferLastRecvURL = ts.lastReceivedURL
         transferLastRecvName = ts.lastReceivedName
+        transferFeedbackKind = ts.feedbackKind
+        transferFeedbackTitle = ts.feedbackTitle
+        transferFeedbackDetail = ts.feedbackDetail
     }
 }
 
@@ -302,6 +308,28 @@ struct StatusView: View {
                             .foregroundStyle(.secondary)
                             .lineLimit(1)
                             .truncationMode(.middle)
+                    }
+                    if model.transferBusy {
+                        HStack(spacing: 8) {
+                            ProgressView(value: model.transferProgress)
+                                .progressViewStyle(.linear)
+                            Text(String(format: "%.0f%% %@", model.transferProgress * 100.0, model.transferSpeed))
+                                .font(.system(size: 10, weight: .medium, design: .monospaced))
+                                .foregroundStyle(accent)
+                        }
+                    } else if model.transferFeedbackKind != 0 {
+                        HStack(spacing: 5) {
+                            Image(systemName: model.transferFeedbackKind > 0 ? "checkmark.circle.fill" : "xmark.circle.fill")
+                                .font(.system(size: 11))
+                                .foregroundStyle(model.transferFeedbackKind > 0 ? .green : .red)
+                            Text(model.transferFeedbackDetail.isEmpty
+                                 ? model.transferFeedbackTitle
+                                 : "\(model.transferFeedbackTitle) · \(model.transferFeedbackDetail)")
+                                .font(.system(size: 10, weight: .medium))
+                                .foregroundStyle(model.transferFeedbackKind > 0 ? Color.green : Color.red)
+                                .lineLimit(1)
+                                .truncationMode(.middle)
+                        }
                     }
                     HStack(spacing: 8) {
                         Button("发送文件…") {
@@ -660,7 +688,7 @@ func pasteClipboardToTransfer() {
         Log.info("剪贴板粘贴 NSImage 截图 (\(png.count) B)")
         return
     }
-    AppModel.shared.transferStatus = "剪贴板里没有文件或截图"
+    transferService.showFeedback(kind: -1, title: "剪贴板无内容", detail: "请先复制文件或截图")
 }
 
 private var pasteKeyMonitor: Any?
@@ -754,26 +782,44 @@ struct DropBoxView: View {
                 Button(action: { openTransferFilePicker() }) {
                     ZStack {
                         RoundedRectangle(cornerRadius: 12)
-                            .fill(model.dropBoxHoverTargeted
-                                  ? Color(red: 0.88, green: 0.93, blue: 1.0)
-                                  : Color(red: 0.91, green: 0.92, blue: 0.94))
-                            .shadow(color: model.dropBoxHoverTargeted
-                                    ? Color.blue.opacity(0.22)
-                                    : Color.black.opacity(0.05),
-                                    radius: 10, x: 0, y: 2)
+                            .fill(dropBoxZoneFill)
+                            .shadow(color: dropBoxZoneGlow, radius: 10, x: 0, y: 2)
                         RoundedRectangle(cornerRadius: 12)
-                            .stroke(model.dropBoxHoverTargeted
-                                    ? Color.blue.opacity(0.7)
-                                    : Color.clear,
-                                    lineWidth: 1.5)
+                            .stroke(dropBoxZoneStroke, lineWidth: 1.5)
 
                         if model.transferBusy {
                             VStack(spacing: 6) {
                                 ProgressView(value: model.transferProgress)
                                     .progressViewStyle(.circular)
+                                ProgressView(value: model.transferProgress)
+                                    .progressViewStyle(.linear)
+                                    .frame(width: 96)
                                 Text(String(format: "%.0f%%  %@", model.transferProgress * 100.0, model.transferSpeed))
                                     .font(.system(size: 11, weight: .semibold, design: .monospaced))
                                     .foregroundStyle(Color(red: 0.15, green: 0.35, blue: 0.85))
+                            }
+                        } else if model.transferFeedbackKind != 0 {
+                            VStack(spacing: 5) {
+                                Image(systemName: model.transferFeedbackKind > 0
+                                      ? "checkmark.circle.fill"
+                                      : "xmark.circle.fill")
+                                    .font(.system(size: 28, weight: .medium))
+                                    .foregroundStyle(model.transferFeedbackKind > 0
+                                                     ? Color(red: 0.12, green: 0.65, blue: 0.34)
+                                                     : Color(red: 0.85, green: 0.22, blue: 0.22))
+                                Text(model.transferFeedbackTitle)
+                                    .font(.system(size: 11, weight: .semibold))
+                                    .foregroundStyle(model.transferFeedbackKind > 0
+                                                     ? Color(red: 0.08, green: 0.50, blue: 0.24)
+                                                     : Color(red: 0.72, green: 0.15, blue: 0.15))
+                                if !model.transferFeedbackDetail.isEmpty {
+                                    Text(model.transferFeedbackDetail)
+                                        .font(.system(size: 9.5))
+                                        .foregroundStyle(.secondary)
+                                        .lineLimit(1)
+                                        .truncationMode(.middle)
+                                        .padding(.horizontal, 10)
+                                }
                             }
                         } else {
                             VStack(spacing: 6) {
@@ -788,7 +834,9 @@ struct DropBoxView: View {
                             }
                         }
                     }
-                    .frame(width: 146, height: 118)
+                    .animation(.easeInOut(duration: 0.18), value: model.transferFeedbackKind)
+                    .animation(.easeInOut(duration: 0.18), value: model.transferBusy)
+                    .frame(width: 152, height: 118)
                 }
                 .buttonStyle(.plain)
                 // 仅在投递区接收拖放，避免从下方已收文件胶囊拖出未出窗口时被自身误接回传
@@ -825,7 +873,9 @@ struct DropBoxView: View {
                     }
                     .help("点击在 Finder 中定位，或直接拖出到其他应用")
                 } else {
-                    Text(model.transferStatus)
+                    Text((model.transferConnected && model.transferStatus.hasPrefix("已连接"))
+                         ? "⌃⌥B 呼出 · ⌘V 粘贴截图"
+                         : model.transferStatus)
                         .font(.system(size: 10))
                         .foregroundStyle(Color.secondary)
                         .lineLimit(1)
@@ -842,6 +892,46 @@ struct DropBoxView: View {
             RoundedRectangle(cornerRadius: 18, style: .continuous)
                 .stroke(Color.black.opacity(0.08), lineWidth: 1)
         )
+        .help("按住空白处可自由拖动位置 · ⌃⌥B 一键呼出/隐藏")
+    }
+
+    private var dropBoxZoneFill: Color {
+        if model.dropBoxHoverTargeted || model.transferBusy {
+            return Color(red: 0.88, green: 0.93, blue: 1.0)
+        }
+        if model.transferFeedbackKind > 0 {
+            return Color(red: 0.91, green: 0.98, blue: 0.94)
+        }
+        if model.transferFeedbackKind < 0 {
+            return Color(red: 0.99, green: 0.93, blue: 0.93)
+        }
+        return Color(red: 0.91, green: 0.92, blue: 0.94)
+    }
+
+    private var dropBoxZoneStroke: Color {
+        if model.dropBoxHoverTargeted || model.transferBusy {
+            return Color.blue.opacity(0.7)
+        }
+        if model.transferFeedbackKind > 0 {
+            return Color.green.opacity(0.65)
+        }
+        if model.transferFeedbackKind < 0 {
+            return Color.red.opacity(0.65)
+        }
+        return Color.clear
+    }
+
+    private var dropBoxZoneGlow: Color {
+        if model.dropBoxHoverTargeted || model.transferBusy {
+            return Color.blue.opacity(0.22)
+        }
+        if model.transferFeedbackKind > 0 {
+            return Color.green.opacity(0.20)
+        }
+        if model.transferFeedbackKind < 0 {
+            return Color.red.opacity(0.20)
+        }
+        return Color.black.opacity(0.05)
     }
 }
 
@@ -860,9 +950,28 @@ func hideDropBoxPanel() {
     Log.info("Mac 投递盒已隐藏")
 }
 
+func toggleDropBoxPanel() {
+    if let p = dropBoxPanel, p.isVisible {
+        hideDropBoxPanel()
+    } else {
+        showDropBoxPanel()
+    }
+}
+
 func showDropBoxPanel() {
     ensurePasteKeyMonitor()
     if let p = dropBoxPanel {
+        // 若此前所在副屏已断开导致窗口跑出所有屏幕，自动拉回主屏右下角；否则保留用户拖动的位置
+        let onAnyScreen = NSScreen.screens.contains { $0.visibleFrame.intersects(p.frame) }
+        if !onAnyScreen {
+            let screen = NSScreen.screens.first { s in
+                abs(s.frame.origin.x) < 1 && abs(s.frame.origin.y) < 1
+            } ?? NSScreen.screens.first
+            if let s = screen {
+                let vf = s.visibleFrame
+                p.setFrameOrigin(NSPoint(x: vf.maxX - 244 - 28, y: vf.minY + 28))
+            }
+        }
         p.level = AppModel.shared.dropBoxPinned ? .floating : .normal
         p.orderFrontRegardless()
         return
