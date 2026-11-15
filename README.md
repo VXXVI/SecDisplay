@@ -44,7 +44,7 @@ Windows (主动连接 <Mac IP>)                  Mac (监听 9922/9923)
 
 ### 1. Mac 端构建与权限
 
-首次运行前，在「系统设置 → 隐私与安全性 → 屏幕录制」与「辅助功能」中授予权限，可先跑探测工具确认：
+首次运行前，在「系统设置 → 隐私与安全性 → 屏幕录制」与「辅助功能」中授予权限，可先探测屏幕录制权限：
 
 ```bash
 cd prototype/mac
@@ -52,12 +52,12 @@ swiftc -O Sources/RequestPermission.swift -o reqperm
 ./reqperm
 ```
 
-推荐打包为 `.app`（保留 TCC 权限与 `NSLocalNetworkUsageDescription` 声明）：
+推荐打包并安装到 `/Applications/SecDisplay.app`（保留 TCC 权限与 `NSLocalNetworkUsageDescription` 声明）：
 
 ```bash
 cd prototype/mac
 ./build_app.sh
-open SecDisplay.app
+open /Applications/SecDisplay.app
 ```
 
 命令行后台脚本方式：
@@ -157,7 +157,7 @@ ping -c 5 10.10.10.2
 
 ## 常见问题与虚拟屏清理
 
-- **Mac 端异常退出残留虚拟屏**：正常退出会自动等待采集停稳后销毁虚拟屏；若被强杀导致残留，可执行 `SecDisplay --cleanup-orphan`（或 `SECDISPLAY_CLEANUP_ORPHAN=1 ./run.sh start`），必要时注销重登即可回收。
+- **Mac 端异常退出残留虚拟屏**：正常退出会自动等待采集停稳后销毁虚拟屏；若被强杀导致残留，可执行 `/Applications/SecDisplay.app/Contents/MacOS/SecDisplay --cleanup-orphan`（或 `SECDISPLAY_CLEANUP_ORPHAN=1 ./run.sh start`），必要时注销重登即可回收。
 - **Mac 副屏安全防抢占**：副屏接收模式下 `9922` 默认仅放行私有/链路本地/Tailscale 网段，且在已有主控连接时拒绝不同来源 IP 抢占当前会话；也可在面板填写允许接入的 Windows IP 白名单。
 - **Windows 主控端 2880x1800 自定义模式**：若驱动尚未注册 `2880x1800`，以管理员权限启动一次即可自动写入 `HKLM\SOFTWARE\Parsec\vdd\0`；若虚拟屏开启了 HDR 导致格式非 `BGRA8`，请在系统显示设置中关闭该屏 HDR。
 
@@ -171,7 +171,7 @@ prototype/mac/
     main.swift                Mac 端主入口（正向发送、9923 中转站、信号与生命周期）
     AppUI.swift               菜单栏与 SwiftUI 控制面板、悬浮投递盒、角色切换
     MacReceiver.swift         Mac 副屏接收端（9922 监听、VideoToolbox 硬解、MacKeyMap 键鼠回传）
-    RequestPermission.swift   屏幕录制/辅助功能权限探测工具
+    RequestPermission.swift   屏幕录制权限探测工具
     VirtualDisplay.swift      独立虚拟屏探测模块
   build_app.sh                打包与代码签名生成 SecDisplay.app
   run.sh / preset.sh          命令行管理与画质切档脚本

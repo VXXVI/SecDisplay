@@ -92,12 +92,12 @@ swiftc -O Sources/RequestPermission.swift -o reqperm
 
 ### 3.2 编译启动
 
-打包为 `.app`（长期使用推荐，内置本地网络与屏幕录制权限声明）：
+打包并安装到 `/Applications/SecDisplay.app`（长期使用推荐，内置本地网络与屏幕录制权限声明；加 `--no-install` 时产物保留在 `$TMPDIR` 临时目录）：
 
 ```bash
 cd prototype/mac
 ./build_app.sh
-open SecDisplay.app
+open /Applications/SecDisplay.app
 ```
 
 命令行方式：
@@ -153,7 +153,8 @@ https://visualstudio.microsoft.com/zh-hans/downloads/
 
 ```cmd
 cd prototype\windows
-cl /EHsc /std:c++17 /O2 SecDisplayReceiver.cpp
+rc /nologo /fo SecDisplayReceiver.res SecDisplayReceiver.rc
+cl /nologo /EHsc /std:c++17 /O2 /utf-8 SecDisplayReceiver.cpp SecDisplayReceiver.res /Fe:SecDisplayReceiver.exe
 ```
 
 库都在代码里用 `#pragma comment` 自动链接，不用手动指定。
@@ -184,9 +185,9 @@ SecDisplayReceiver.exe --mode sender --host-size 2880 1800 --fps 60 --bitrate 50
 D3D11 设备就绪（已绑定 MF 硬件解码管理器）
 免垂直同步呈现: 支持
 呈现器就绪
-解码器就绪 2560x1600（硬件）
+解码器就绪 2880x1800（硬件）
 连接 192.168.77.1:9922 ...
-已连接，目标 2560x1600
+已连接，目标 2880x1800
 已注入 SPS(28) PPS(8)
 输出类型已重建，继续解码
 ```
@@ -284,7 +285,7 @@ Windows 电源计划默认在无本地键鼠输入时关闭显示器（例如平
 `CDVirtualDisplayDestroy` 在采集还挂着时会被静默拒绝。正常退出会先停采集再销毁，等 1.5 秒。如果进程被 `kill -9`，会留下孤儿屏。
 
 ```
-SecDisplay --cleanup-orphan
+/Applications/SecDisplay.app/Contents/MacOS/SecDisplay --cleanup-orphan
 ```
 
 ### 雷电双向文件中转站

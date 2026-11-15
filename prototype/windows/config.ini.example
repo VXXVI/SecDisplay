@@ -2,7 +2,7 @@
 # 放在 SecDisplayReceiver.exe 同目录，文件名 config.ini。
 # 命令行参数优先级高于本文件，临时覆盖不用改这里。
 
-# Mac 的 IP 或主机名（两个角色下 Windows 均主动连接该地址）
+# Mac 的 IPv4 字面量地址（接收模式与 9923 中转均要求 IPv4，如 10.10.10.1）
 host=10.10.10.1
 port=9922
 
@@ -28,7 +28,7 @@ pace=0
 feedback=0
 
 # ---- 主控发送端参数（mode=sender 时生效）----
-# 虚拟扩展屏分辨率（需先安装 Parsec Virtual Display Adapter）、帧率上限、目标码率与 DPI
+# 虚拟扩展屏分辨率（需先安装 Parsec Virtual Display Adapter）、帧率上限 (24~144)、目标码率 (10~200 Mbps) 与 DPI
 hostwidth=2880
 hostheight=1800
 fps=60
