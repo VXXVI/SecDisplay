@@ -125,10 +125,14 @@ static int g_presentRingCount = 0;
 // 亚毫秒时钟：GetTickCount64 在 Windows 上约 15.6ms 粒度，
 // 会把 11/22ms 的 vsync 量化抹成 16/31ms，必须用 QPC。
 static double QpcNowMs() {
-    static LARGE_INTEGER freq{};
-    if (!freq.QuadPart) QueryPerformanceFrequency(&freq);
+    // C++11 magic static 保证多线程首次调用时的初始化安全
+    static const double invFreqMs = []() {
+        LARGE_INTEGER f{};
+        QueryPerformanceFrequency(&f);
+        return (f.QuadPart > 0) ? (1000.0 / (double)f.QuadPart) : 0.0;
+    }();
     LARGE_INTEGER c; QueryPerformanceCounter(&c);
-    return (double)c.QuadPart * 1000.0 / (double)freq.QuadPart;
+    return (double)c.QuadPart * invFreqMs;
 }
 
 static double g_lastPresentMs = 0.0;   // 仅呈现线程写；重连时复位，避免断线时长污染 p95
@@ -2347,18 +2351,30 @@ static void PasteClipboardToTransfer(HWND owner) {
         if (HBITMAP hbm = (HBITMAP)GetClipboardData(CF_BITMAP)) {
             bmp.reset(Gdiplus::Bitmap::FromHBITMAP(hbm, nullptr));
         } else if (HANDLE hdib = GetClipboardData(CF_DIB)) {
-            if (void* ptr = GlobalLock(hdib)) {
-                BITMAPINFO* bmi = (BITMAPINFO*)ptr;
-                size_t palBytes = 0;
-                if (bmi->bmiHeader.biBitCount <= 8) {
-                    DWORD nCol = bmi->bmiHeader.biClrUsed ? bmi->bmiHeader.biClrUsed : (1u << bmi->bmiHeader.biBitCount);
-                    palBytes = nCol * sizeof(RGBQUAD);
-                } else if (bmi->bmiHeader.biCompression == BI_BITFIELDS) {
-                    palBytes = 3 * sizeof(DWORD);
+            SIZE_T cb = GlobalSize(hdib);
+            if (cb >= sizeof(BITMAPINFOHEADER)) {
+                if (void* ptr = GlobalLock(hdib)) {
+                    const BITMAPINFO* bmi = (const BITMAPINFO*)ptr;
+                    DWORD hdrSize = bmi->bmiHeader.biSize;
+                    if (hdrSize >= sizeof(BITMAPINFOHEADER) && hdrSize <= cb) {
+                        size_t palBytes = 0;
+                        // 仅标准 40 字节 BITMAPINFOHEADER 在结构体外附加 3 个 DWORD 掩码；V4/V5 已内嵌
+                        if (hdrSize == sizeof(BITMAPINFOHEADER) && bmi->bmiHeader.biCompression == BI_BITFIELDS) {
+                            palBytes += 3 * sizeof(DWORD);
+                        }
+                        if (bmi->bmiHeader.biBitCount <= 8) {
+                            DWORD nCol = bmi->bmiHeader.biClrUsed ? bmi->bmiHeader.biClrUsed : (1u << bmi->bmiHeader.biBitCount);
+                            palBytes += (size_t)nCol * sizeof(RGBQUAD);
+                        } else if (bmi->bmiHeader.biClrUsed > 0) {
+                            palBytes += (size_t)bmi->bmiHeader.biClrUsed * sizeof(RGBQUAD);
+                        }
+                        if ((size_t)hdrSize + palBytes <= cb) {
+                            const void* bits = (const uint8_t*)ptr + hdrSize + palBytes;
+                            bmp.reset(Gdiplus::Bitmap::FromBITMAPINFO(bmi, (void*)bits));
+                        }
+                    }
+                    GlobalUnlock(hdib);
                 }
-                void* bits = (uint8_t*)ptr + bmi->bmiHeader.biSize + palBytes;
-                bmp.reset(Gdiplus::Bitmap::FromBITMAPINFO(bmi, bits));
-                GlobalUnlock(hdib);
             }
         }
         CLSID pngClsid{};
@@ -6199,8 +6215,11 @@ int main(int argc, char** argv) {
 
     MSG msg;
     while (GetMessage(&msg, nullptr, 0, 0)) {
-        // 控制面板或悬浮投递盒处于激活态时，拦截 Ctrl+V 一键发送剪贴板截图/文件
-        if (msg.message == WM_KEYDOWN && msg.wParam == 'V' && (GetKeyState(VK_CONTROL) & 0x8000)) {
+        // 控制面板或悬浮投递盒处于激活态时，拦截纯 Ctrl+V 一键发送剪贴板截图/文件
+        if (msg.message == WM_KEYDOWN && msg.wParam == 'V' &&
+            (GetKeyState(VK_CONTROL) & 0x8000) &&
+            !(GetKeyState(VK_MENU) & 0x8000) &&
+            !(GetKeyState(VK_SHIFT) & 0x8000)) {
             HWND act = GetActiveWindow();
             HWND hp = g_panel.load();
             HWND db = g_dropBox.load();

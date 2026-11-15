@@ -2788,10 +2788,18 @@ final class FileTransferService {
         }
     }
 
+    private var tempSeq: UInt32 = 0
+
     func enqueueClipboardImageData(_ pngData: Data) {
         let df = DateFormatter()
         df.dateFormat = "yyyyMMdd_HHmmss_SSS"
-        let name = "Screenshot_\(df.string(from: Date())).png"
+        stateLock.lock()
+        tempSeq &+= 1
+        let seq = tempSeq
+        let isStopped = stopped
+        stateLock.unlock()
+        if isStopped { return }
+        let name = "Screenshot_\(df.string(from: Date()))_\(seq).png"
         let tmp = FileManager.default.temporaryDirectory.appendingPathComponent(name)
         do {
             try pngData.write(to: tmp, options: .atomic)
@@ -2823,19 +2831,32 @@ final class FileTransferService {
         }
         guard !items.isEmpty else { return }
         var shouldStart = false
+        var rejectedAfterStop = false
         stateLock.lock()
-        outQueue.append(contentsOf: items)
-        if !isSending {
-            isSending = true
-            shouldStart = true
-        }
-        let queued = outQueue.count
-        if _connected {
-            activeStatus = "待发送 \(queued) 个文件…"
+        if stopped {
+            rejectedAfterStop = true
         } else {
-            activeStatus = "已排队 \(queued) 个文件（等待连接）"
+            outQueue.append(contentsOf: items)
+            if !isSending {
+                isSending = true
+                shouldStart = true
+            }
+            let queued = outQueue.count
+            if _connected {
+                activeStatus = "待发送 \(queued) 个文件…"
+            } else {
+                activeStatus = "已排队 \(queued) 个文件（等待连接）"
+            }
         }
         stateLock.unlock()
+        if rejectedAfterStop {
+            if deleteAfterSend {
+                for it in items where it.deleteAfterSend {
+                    try? fm.removeItem(at: it.url)
+                }
+            }
+            return
+        }
         notifyUI()
         if shouldStart {
             sendQueue.async { [weak self] in self?.drainSendQueue() }
