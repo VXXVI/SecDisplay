@@ -4100,9 +4100,7 @@ func vdStillOnline() -> Bool {
     CGGetOnlineDisplayList(32, nil, &n)
     var ids = [CGDirectDisplayID](repeating: 0, count: Int(n))
     CGGetOnlineDisplayList(n, &ids, &n)
-    return ids.prefix(Int(n)).contains {
-        CGDisplayVendorNumber($0) == kVDVendorID && CGDisplayModelNumber($0) == kVDProductID
-    }
+    return ids.prefix(Int(n)).contains { isOurVirtualDisplay($0) }
 }
 
 /// 有序退出：先停采集并断开连接，再销毁虚拟屏。

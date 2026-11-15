@@ -69,9 +69,9 @@ sign_ok() {
 
 # 是否还有 SecDisplay 虚拟屏残留在线（按 EDID 三元组识别，不误伤 Sidecar）。
 # 用一个签了稳定身份的小探针查询，探针只在存在时编译一次并缓存。
-VDPROBE="$LOGDIR/.vdprobe"
+VDPROBE="$LOGDIR/.vdprobe.v2"
 vd_stale() {
-    if [ ! -x "$VDPROBE" ]; then
+    if [ ! -x "$VDPROBE" ] || [ "$0" -nt "$VDPROBE" ]; then
         cat > "$VDPROBE.swift" <<'SWIFT'
 import CoreGraphics
 var n:UInt32=0; CGGetOnlineDisplayList(0,nil,&n)

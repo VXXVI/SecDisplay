@@ -4795,11 +4795,18 @@ static void DriveShakeStep(int screenX, int screenY) {
         const double nowQpc = QpcNowMs();
         if (!wasActive || (nowQpc - g_shakeLastRefreshQpcMs >= 7.5)) {
             g_shakeLastRefreshQpcMs = nowQpc;
-            TickShakeAnim(nowQpc);
+            const bool keep = TickShakeAnim(nowQpc);
             RefreshCursorScale();
+            if (!keep) {
+                Log("晃动结束，光标已恢复原尺寸");
+                if (g_hwnd) KillTimer(g_hwnd, kShakeTimer);
+                SetShakeTimePeriod(false);
+            }
         }
     } else if (wasActive) {
         RefreshCursorScale();
+        if (g_hwnd) KillTimer(g_hwnd, kShakeTimer);
+        SetShakeTimePeriod(false);
     }
 }
 
