@@ -33,6 +33,8 @@
 #include <ws2tcpip.h>
 #include <commdlg.h>
 #include <shlobj.h>
+#include <objidl.h>
+#include <gdiplus.h>
 #include <d3d11.h>
 #include <d3d11_1.h>
 #include <d3d11_4.h>
@@ -63,6 +65,7 @@
 #include <mutex>
 #include <chrono>
 #include <condition_variable>
+#include <memory>
 
 #pragma comment(lib, "ws2_32.lib")
 #pragma comment(lib, "psapi.lib")
@@ -75,6 +78,7 @@
 #pragma comment(lib, "user32.lib")
 #pragma comment(lib, "shell32.lib")
 #pragma comment(lib, "comdlg32.lib")
+#pragma comment(lib, "gdiplus.lib")
 #pragma comment(lib, "gdi32.lib")   // ApplyCursorImage 的 CreateDIBSection/CreateBitmap/DeleteObject
 
 using Microsoft::WRL::ComPtr;
@@ -121,10 +125,14 @@ static int g_presentRingCount = 0;
 // 亚毫秒时钟：GetTickCount64 在 Windows 上约 15.6ms 粒度，
 // 会把 11/22ms 的 vsync 量化抹成 16/31ms，必须用 QPC。
 static double QpcNowMs() {
-    static LARGE_INTEGER freq{};
-    if (!freq.QuadPart) QueryPerformanceFrequency(&freq);
+    // C++11 magic static 保证多线程首次调用时的初始化安全
+    static const double invFreqMs = []() {
+        LARGE_INTEGER f{};
+        QueryPerformanceFrequency(&f);
+        return (f.QuadPart > 0) ? (1000.0 / (double)f.QuadPart) : 0.0;
+    }();
     LARGE_INTEGER c; QueryPerformanceCounter(&c);
-    return (double)c.QuadPart * 1000.0 / (double)freq.QuadPart;
+    return (double)c.QuadPart * invFreqMs;
 }
 
 static double g_lastPresentMs = 0.0;   // 仅呈现线程写；重连时复位，避免断线时长污染 p95
@@ -399,10 +407,11 @@ static bool IsInCursorCache(HCURSOR c) {
 static const int kShakeWinMs = 700;      // 观察窗口
 static const int kShakeMinReversals = 3; // 至少 3 次方向反转才算晃动
 static const int kShakeMinSpanPx = 180;  // 横向/纵向累计摆幅下限，防止细微抖动误触
-static const double kShakeCursorZoom = 2.5;  // 晃动时的放大倍数
-static const int64_t kShakeHoldMs = 700;     // 停手后保持放大的时长，之后开始收缩
-static const int kShakeShrinkMs = 260;       // 收缩动画时长
-static const int kShakeTickMs = 16;          // 动画帧间隔（约 60fps）
+static const double kShakeCursorZoom = 2.8;  // 晃动时的目标放大倍数（macOS ~2.8-3.0x）
+static const double kShakeGrowMs = 170.0;    // 平滑放大渐入时长（InOutCubic）
+static const double kShakeHoldMs = 650.0;    // 停晃后保持放大的时长
+static const double kShakeShrinkMs = 240.0;  // 平滑收缩时长（InOutCubic）
+static const int kShakeTickMs = 12;          // ~83Hz 高频动画刷新，配合 QPC 消除顿挫
 static const UINT_PTR kShakeTimer = 4004;
 struct ShakeSample { int64_t t; int x; int y; };
 // 环容量按「发送侧最高 240Hz × 700ms ≈ 170 个样本」留足余量，
@@ -411,17 +420,16 @@ static const int kShakeCap = 256;
 static ShakeSample g_shakeBuf[kShakeCap];
 static int g_shakeCount = 0;
 static int g_shakeHead = 0;
-// 放大状态与收缩进度。zoom 是当前实际倍数，收缩动画期间在 1.0~kShakeCursorZoom 之间插值。
+enum ShakePhase { SHAKE_IDLE = 0, SHAKE_GROW = 1, SHAKE_HOLD = 2, SHAKE_SHRINK = 3 };
+static ShakePhase g_shakePhase = SHAKE_IDLE;
 static bool g_shakeActive = false;
 // 晃动找光标总开关（可在控制面板关闭）
 static std::atomic<bool> g_shakeEnabled{true};
-// 最后一次「判定为正在晃动」的时刻。收缩计时锚在这个时间上，而不是锚在
-// 最后一个光标包上：晃完继续慢慢移动光标时位置包不会断，用包时间判断
-// 「是否还在动」会让放大状态永久收不回来。
-static int64_t g_shakeLastShakeMs = 0;
 static double g_shakeZoom = 1.0;
-static bool g_shakeHolding = false;      // 已停止晃动、正在等待保持期结束
-static int64_t g_shakeHoldUntil = 0;
+static double g_shakeAnimStartMs = 0.0;
+static double g_shakeAnimFromZoom = 1.0;
+// 最后一次「判定为正在晃动」的高精度 QPC 时刻（亚毫秒，不受 GetTickCount64 15.6ms 跳变影响）
+static double g_shakeLastShakeQpcMs = 0.0;
 
 // 输入回传：把窗口内的鼠标位置和按键状态发给 Mac，由它重放事件。
 // 不再用 SetCursorPos 搬本机光标——那会和用户自己的鼠标抢位置，
@@ -2196,6 +2204,9 @@ static const int IDC_PANEL_KEEPON   = 2029;
 static const int IDC_PANEL_SENDFILE = 2030;
 static const int IDC_PANEL_OPENXFER = 2031;
 static const int IDC_PANEL_DROPBOX  = 2032;
+static const int IDC_PANEL_PASTEXFER = 2033;
+
+static ULONG_PTR g_gdipToken = 0;
 
 static const UINT WM_APP_XFER_UI = WM_APP + 10;
 
@@ -2206,11 +2217,15 @@ static const uint8_t XFER_END   = 0x12;
 static const uint8_t XFER_ACK   = 0x13;
 static const uint8_t XFER_PING  = 0x14;
 
+struct XferOutItem {
+    std::wstring path;
+    bool deleteAfterSend = false;
+};
 static std::atomic<bool> g_xferConnected{false};
 static std::atomic<SOCKET> g_xferSock{INVALID_SOCKET};
 static std::mutex g_xferMtx;
 static std::condition_variable g_xferCv;
-static std::deque<std::wstring> g_xferOutQ;
+static std::deque<XferOutItem> g_xferOutQ;
 static std::wstring g_xferStatus = L"等待中转站连接 (端口 9923)…";
 static int g_xferPct = -1;
 static std::wstring g_xferSpeed;
@@ -2266,14 +2281,17 @@ static void SetTransferStatus(const std::wstring& s, int pct = -1, const std::ws
     if (db && g_alive) PostMessageW(db, WM_APP_XFER_UI, 0, 0);
 }
 
-static void EnqueueFileTransfer(const std::wstring& path) {
+static void EnqueueFileTransfer(const std::wstring& path, bool deleteAfterSend = false) {
     DWORD attr = GetFileAttributesW(path.c_str());
-    if (attr == INVALID_FILE_ATTRIBUTES || (attr & FILE_ATTRIBUTE_DIRECTORY)) return;
+    if (attr == INVALID_FILE_ATTRIBUTES || (attr & FILE_ATTRIBUTE_DIRECTORY)) {
+        if (deleteAfterSend) DeleteFileW(path.c_str());
+        return;
+    }
     size_t qSize = 0;
     bool conn = g_xferConnected.load();
     {
         std::lock_guard<std::mutex> lk(g_xferMtx);
-        g_xferOutQ.push_back(path);
+        g_xferOutQ.push_back(XferOutItem{ path, deleteAfterSend });
         qSize = g_xferOutQ.size();
         wchar_t buf[128];
         swprintf(buf, 128, conn ? L"已加入发送队列 (%zu 个文件)…" : L"已排队 %zu 个文件（等待连接）", qSize);
@@ -2285,6 +2303,106 @@ static void EnqueueFileTransfer(const std::wstring& path) {
     HWND db = g_dropBox.load();
     if (db && g_alive) PostMessageW(db, WM_APP_XFER_UI, 0, 0);
     Log("中转站加入发送队列: %s", ToUtf8(path.c_str()).c_str());
+}
+
+static bool GetPngEncoderClsid(CLSID* outClsid) {
+    UINT num = 0, size = 0;
+    Gdiplus::GetImageEncodersSize(&num, &size);
+    if (size == 0) return false;
+    std::vector<uint8_t> buf(size);
+    auto* pInfo = (Gdiplus::ImageCodecInfo*)buf.data();
+    if (Gdiplus::GetImageEncoders(num, size, pInfo) != Gdiplus::Ok) return false;
+    for (UINT i = 0; i < num; ++i) {
+        if (wcscmp(pInfo[i].MimeType, L"image/png") == 0) {
+            *outClsid = pInfo[i].Clsid;
+            return true;
+        }
+    }
+    return false;
+}
+
+static void PasteClipboardToTransfer(HWND owner) {
+    if (!OpenClipboard(owner)) {
+        SetTransferStatus(L"无法读取剪贴板");
+        return;
+    }
+    std::vector<std::wstring> files;
+    std::wstring tempPngPath;
+
+    if (HANDLE hd = GetClipboardData(CF_HDROP)) {
+        HDROP drop = (HDROP)GlobalLock(hd);
+        if (drop) {
+            UINT cnt = DragQueryFileW(drop, 0xFFFFFFFF, nullptr, 0);
+            for (UINT i = 0; i < cnt; ++i) {
+                UINT len = DragQueryFileW(drop, i, nullptr, 0);
+                if (len > 0 && len < 4096) {
+                    std::wstring path(len + 1, L'\0');
+                    if (DragQueryFileW(drop, i, &path[0], len + 1) > 0) {
+                        path.resize(wcslen(path.c_str()));
+                        files.push_back(path);
+                    }
+                }
+            }
+            GlobalUnlock(hd);
+        }
+    } else {
+        // 检查剪贴板截图（CF_BITMAP / CF_DIB）并无损编码为 PNG 发送
+        std::unique_ptr<Gdiplus::Bitmap> bmp;
+        if (HBITMAP hbm = (HBITMAP)GetClipboardData(CF_BITMAP)) {
+            bmp.reset(Gdiplus::Bitmap::FromHBITMAP(hbm, nullptr));
+        } else if (HANDLE hdib = GetClipboardData(CF_DIB)) {
+            SIZE_T cb = GlobalSize(hdib);
+            if (cb >= sizeof(BITMAPINFOHEADER)) {
+                if (void* ptr = GlobalLock(hdib)) {
+                    const BITMAPINFO* bmi = (const BITMAPINFO*)ptr;
+                    DWORD hdrSize = bmi->bmiHeader.biSize;
+                    if (hdrSize >= sizeof(BITMAPINFOHEADER) && hdrSize <= cb) {
+                        size_t palBytes = 0;
+                        // 仅标准 40 字节 BITMAPINFOHEADER 在结构体外附加 3 个 DWORD 掩码；V4/V5 已内嵌
+                        if (hdrSize == sizeof(BITMAPINFOHEADER) && bmi->bmiHeader.biCompression == BI_BITFIELDS) {
+                            palBytes += 3 * sizeof(DWORD);
+                        }
+                        if (bmi->bmiHeader.biBitCount <= 8) {
+                            DWORD nCol = bmi->bmiHeader.biClrUsed ? bmi->bmiHeader.biClrUsed : (1u << bmi->bmiHeader.biBitCount);
+                            palBytes += (size_t)nCol * sizeof(RGBQUAD);
+                        } else if (bmi->bmiHeader.biClrUsed > 0) {
+                            palBytes += (size_t)bmi->bmiHeader.biClrUsed * sizeof(RGBQUAD);
+                        }
+                        if ((size_t)hdrSize + palBytes <= cb) {
+                            const void* bits = (const uint8_t*)ptr + hdrSize + palBytes;
+                            bmp.reset(Gdiplus::Bitmap::FromBITMAPINFO(bmi, (void*)bits));
+                        }
+                    }
+                    GlobalUnlock(hdib);
+                }
+            }
+        }
+        CLSID pngClsid{};
+        if (bmp && bmp->GetLastStatus() == Gdiplus::Ok && GetPngEncoderClsid(&pngClsid)) {
+            wchar_t tmpDir[MAX_PATH] = {};
+            if (GetTempPathW(MAX_PATH, tmpDir) > 0) {
+                SYSTEMTIME st{};
+                GetLocalTime(&st);
+                wchar_t fname[96];
+                swprintf(fname, 96, L"Screenshot_%04d%02d%02d_%02d%02d%02d_%03d.png",
+                         st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute, st.wSecond, st.wMilliseconds);
+                std::wstring candidate = std::wstring(tmpDir) + fname;
+                if (bmp->Save(candidate.c_str(), &pngClsid, nullptr) == Gdiplus::Ok) {
+                    tempPngPath = candidate;
+                }
+            }
+        }
+    }
+    CloseClipboard();
+
+    if (!files.empty()) {
+        for (const auto& f : files) EnqueueFileTransfer(f, false);
+    } else if (!tempPngPath.empty()) {
+        EnqueueFileTransfer(tempPngPath, true);
+        Log("剪贴板截图已编码入队: %s", ToUtf8(tempPngPath.c_str()).c_str());
+    } else {
+        SetTransferStatus(L"剪贴板中没有文件或截图");
+    }
 }
 
 static void PickAndSendFiles(HWND owner) {
@@ -2782,18 +2900,36 @@ static void UpdateControlPanel() {
     InvalidateRect(g_panel, nullptr, FALSE);
 }
 
-// 绘制圆角白底卡片（GDI 双缓冲使用）
+// GDI+ 抗锯齿圆角矩形路径（同时支持仅上圆角/全圆角）
+static void AddRoundRectPath(Gdiplus::GraphicsPath& path, float x, float y, float w, float h,
+                             float rTL, float rTR, float rBR, float rBL) {
+    path.Reset();
+    auto clampR = [&](float r) { return std::max(0.0f, std::min(r, std::min(w, h) * 0.5f)); };
+    rTL = clampR(rTL); rTR = clampR(rTR); rBR = clampR(rBR); rBL = clampR(rBL);
+    if (rTL > 0) path.AddArc(x, y, rTL * 2, rTL * 2, 180, 90); else path.AddLine(x, y, x, y);
+    if (rTR > 0) path.AddArc(x + w - rTR * 2, y, rTR * 2, rTR * 2, 270, 90); else path.AddLine(x + w, y, x + w, y);
+    if (rBR > 0) path.AddArc(x + w - rBR * 2, y + h - rBR * 2, rBR * 2, rBR * 2, 0, 90); else path.AddLine(x + w, y + h, x + w, y + h);
+    if (rBL > 0) path.AddArc(x, y + h - rBL * 2, rBL * 2, rBL * 2, 90, 90); else path.AddLine(x, y + h, x, y + h);
+    path.CloseFigure();
+}
+
+static Gdiplus::Color ToGpColor(COLORREF c, BYTE a = 255) {
+    return Gdiplus::Color(a, GetRValue(c), GetGValue(c), GetBValue(c));
+}
+
+// 绘制抗锯齿圆角卡片（GDI+ 双缓冲使用）
 static void DrawPanelCard(HDC hdc, int x, int y, int w, int h, int radius,
                           COLORREF fill, COLORREF border) {
-    HPEN pen = CreatePen(PS_SOLID, 1, border);
-    HBRUSH brush = CreateSolidBrush(fill);
-    HGDIOBJ oldPen = SelectObject(hdc, pen);
-    HGDIOBJ oldBrush = SelectObject(hdc, brush);
-    RoundRect(hdc, x, y, x + w, y + h, radius * 2, radius * 2);
-    SelectObject(hdc, oldBrush);
-    SelectObject(hdc, oldPen);
-    DeleteObject(brush);
-    DeleteObject(pen);
+    Gdiplus::Graphics g(hdc);
+    g.SetSmoothingMode(Gdiplus::SmoothingModeAntiAlias);
+    g.SetPixelOffsetMode(Gdiplus::PixelOffsetModeHighQuality);
+    Gdiplus::GraphicsPath path;
+    AddRoundRectPath(path, (float)x, (float)y, (float)w, (float)h,
+                     (float)radius, (float)radius, (float)radius, (float)radius);
+    Gdiplus::SolidBrush br(ToGpColor(fill));
+    g.FillPath(&br, &path);
+    Gdiplus::Pen pen(ToGpColor(border), 1.0f);
+    g.DrawPath(&pen, &path);
 }
 
 static void DrawKVRow(HDC hdc, int x, int y, int w, int rowH,
@@ -2955,7 +3091,7 @@ static void PaintControlPanel(HWND h) {
         SelectObject(hdc, ob); SelectObject(hdc, op);
         DeleteObject(xbr); DeleteObject(xpen);
 
-        RECT rxt{ S(52), S(329), S(550), S(353) };
+        RECT rxt{ S(52), S(329), S(490), S(353) };
         SelectObject(hdc, g_theme.fontSection);
         SetTextColor(hdc, titleCol);
         DrawTextW(hdc, g_panelData.xferConnected
@@ -2963,7 +3099,7 @@ static void PaintControlPanel(HWND h) {
                   : L"雷电文件中转站 · 等待连接 (9923)",
                   -1, &rxt, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
 
-        RECT rxs{ S(36), S(354), S(555), S(380) };
+        RECT rxs{ S(36), S(354), S(495), S(380) };
         SelectObject(hdc, g_theme.fontBody);
         SetTextColor(hdc, mutedCol);
         DrawTextW(hdc, g_panelData.xferStatusText.c_str(), -1, &rxs,
@@ -3028,12 +3164,17 @@ static void DrawPanelButton(const DRAWITEMSTRUCT* dis, int dpi) {
     }
 
     int rad = DpiPx(6, dpi);
-    HPEN pen = CreatePen(PS_SOLID, 1, bd);
-    HBRUSH br = CreateSolidBrush(bg);
-    HGDIOBJ op = SelectObject(hdc, pen), ob = SelectObject(hdc, br);
-    RoundRect(hdc, rc.left, rc.top, rc.right, rc.bottom, rad * 2, rad * 2);
-    SelectObject(hdc, ob); SelectObject(hdc, op);
-    DeleteObject(br); DeleteObject(pen);
+    Gdiplus::Graphics g(hdc);
+    g.SetSmoothingMode(Gdiplus::SmoothingModeAntiAlias);
+    g.SetPixelOffsetMode(Gdiplus::PixelOffsetModeHighQuality);
+    Gdiplus::GraphicsPath path;
+    AddRoundRectPath(path, (float)rc.left + 0.5f, (float)rc.top + 0.5f,
+                     (float)(rc.right - rc.left) - 1.0f, (float)(rc.bottom - rc.top) - 1.0f,
+                     (float)rad, (float)rad, (float)rad, (float)rad);
+    Gdiplus::SolidBrush br(ToGpColor(bg));
+    g.FillPath(&br, &path);
+    Gdiplus::Pen pen(ToGpColor(bd), 1.0f);
+    g.DrawPath(&pen, &path);
 
     wchar_t text[128] = {};
     GetWindowTextW(dis->hwndItem, text, 128);
@@ -3055,10 +3196,11 @@ static void LayoutPanelControls(HWND h) {
         MoveWindow(c, S(x), S(y), S(w), S(ch), TRUE);
     };
 
-    // 中转站右侧按钮（发送文件 / 悬浮盒 / 打开目录）
-    mv(IDC_PANEL_SENDFILE, 566, 336, 128, 34);
-    mv(IDC_PANEL_DROPBOX,  702, 336, 106, 34);
-    mv(IDC_PANEL_OPENXFER, 816, 336, 106, 34);
+    // 中转站右侧按钮（发送文件 / 粘贴截图 / 悬浮盒 / 打开目录）
+    mv(IDC_PANEL_SENDFILE,   504, 336, 108, 34);
+    mv(IDC_PANEL_PASTEXFER,  620, 336, 102, 34);
+    mv(IDC_PANEL_DROPBOX,    730, 336, 94,  34);
+    mv(IDC_PANEL_OPENXFER,   832, 336, 90,  34);
 
     // 两行 4 列按钮：卡片宽 920 (20..940)，内边距 18 -> 38..922 (宽 884)，
     // 4 * 210 + 3 * 14 = 882，左右居中
@@ -3109,9 +3251,10 @@ static LRESULT CALLBACK PanelWndProc(HWND h, UINT msg, WPARAM w, LPARAM l) {
             return c;
         };
 
-        mkBtn(L"发送文件到 Mac", IDC_PANEL_SENDFILE);
-        mkBtn(L"悬浮投递盒", IDC_PANEL_DROPBOX);
-        mkBtn(L"打开中转站", IDC_PANEL_OPENXFER);
+        mkBtn(L"发送文件", IDC_PANEL_SENDFILE);
+        mkBtn(L"粘贴发送", IDC_PANEL_PASTEXFER);
+        mkBtn(L"悬浮盒", IDC_PANEL_DROPBOX);
+        mkBtn(L"打开目录", IDC_PANEL_OPENXFER);
         mkBtn(L"全屏显示", IDC_PANEL_FULL);
         mkBtn(L"窗口置顶", IDC_PANEL_TOP);
         mkBtn(L"强制关键帧", IDC_PANEL_KEY);
@@ -3200,6 +3343,9 @@ static LRESULT CALLBACK PanelWndProc(HWND h, UINT msg, WPARAM w, LPARAM l) {
         case IDC_PANEL_SENDFILE:
             PickAndSendFiles(h);
             return 0;
+        case IDC_PANEL_PASTEXFER:
+            PasteClipboardToTransfer(h);
+            return 0;
         case IDC_PANEL_DROPBOX:
             ShowDropBoxWindow();
             return 0;
@@ -3268,7 +3414,7 @@ static LRESULT CALLBACK PanelWndProc(HWND h, UINT msg, WPARAM w, LPARAM l) {
             if (!on) {
                 // 关掉时立刻把可能还处于放大状态的光标收回来
                 g_shakeActive = false;
-                g_shakeHolding = false;
+                g_shakePhase = SHAKE_IDLE;
                 g_shakeZoom = 1.0;
                 // 定时器是建在主窗口上的（SetTimer(g_hwnd, ...)），
                 // 用面板句柄 KillTimer 杀不掉，必须用 g_hwnd。
@@ -3354,53 +3500,28 @@ static void ShowControlPanel() {
     }
 }
 
-// ---- 悬浮文件投递盒（ArcZip Box 风格，全屏期间也可浮在角落边用边互传）----
-static int g_dbHot = 0;   // 0=无 1=图钉 2=关闭 3=投递区 4=已收文件胶囊
+// ---- 悬浮文件投递盒（ArcZip Box 风格：UpdateLayeredWindow + GDI+ 亚像素抗锯齿真圆角与软投影）----
+static int g_dbHot = 0;   // 0=无 1=图钉 2=关闭 3=投递区 4=已收文件胶囊 5=粘贴截图
 
-static void ApplyDropBoxRoundCorners(HWND h, int dpi) {
-    RECT rc{};
-    GetWindowRect(h, &rc);
-    int w = rc.right - rc.left, ch = rc.bottom - rc.top;
-    // Win11 原生圆角 + 阴影
-    HMODULE dwm = LoadLibraryA("dwmapi.dll");
-    bool dwmOk = false;
-    if (dwm) {
-        typedef HRESULT (WINAPI *DwmSetAttrFn)(HWND, DWORD, LPCVOID, DWORD);
-        auto fn = (DwmSetAttrFn)GetProcAddress(dwm, "DwmSetWindowAttribute");
-        if (fn) {
-            DWORD pref = 2;   // DWMWCP_ROUND
-            if (SUCCEEDED(fn(h, 33, &pref, sizeof(pref)))) dwmOk = true;
-        }
-        FreeLibrary(dwm);
-    }
-    if (!dwmOk && w > 0 && ch > 0) {
-        int rad = DpiPx(16, dpi);
-        HRGN rgn = CreateRoundRectRgn(0, 0, w + 1, ch + 1, rad * 2, rad * 2);
-        if (rgn && SetWindowRgn(h, rgn, TRUE) == 0) {
-            DeleteObject(rgn);
-        }
-    }
-}
-
-static void DropBoxLayoutRects(int dpi, RECT* rcPin, RECT* rcClose, RECT* rcBox, RECT* rcRecv) {
+static void DropBoxLayoutRects(int dpi, RECT* rcPaste, RECT* rcPin, RECT* rcClose, RECT* rcBox, RECT* rcRecv) {
     auto S = [&](int v) { return DpiPx(v, dpi); };
-    if (rcPin)   *rcPin   = RECT{ S(176), S(12),  S(202), S(38)  };
-    if (rcClose) *rcClose = RECT{ S(210), S(12),  S(236), S(38)  };
-    if (rcBox)   *rcBox   = RECT{ S(38),  S(66),  S(210), S(202) };
-    if (rcRecv)  *rcRecv  = RECT{ S(18),  S(214), S(230), S(248) };
+    // 外留 12dp 投影边，主体卡片在 (12, 12) 大小 248x268
+    if (rcPaste) *rcPaste = RECT{ S(150), S(24),  S(176), S(50)  };
+    if (rcPin)   *rcPin   = RECT{ S(184), S(24),  S(210), S(50)  };
+    if (rcClose) *rcClose = RECT{ S(218), S(24),  S(244), S(50)  };
+    if (rcBox)   *rcBox   = RECT{ S(46),  S(78),  S(226), S(218) };
+    if (rcRecv)  *rcRecv  = RECT{ S(28),  S(228), S(244), S(264) };
 }
 
-static void PaintDropBox(HWND h) {
-    PAINTSTRUCT ps{};
-    HDC screenDc = BeginPaint(h, &ps);
-    RECT cli{};
-    GetClientRect(h, &cli);
-    const int cw = cli.right - cli.left, ch = cli.bottom - cli.top;
-    if (cw <= 0 || ch <= 0) { EndPaint(h, &ps); return; }
+static void RenderDropBoxLayered(HWND h) {
+    if (!h) return;
+    RECT wndRc{};
+    GetWindowRect(h, &wndRc);
+    const int cw = wndRc.right - wndRc.left, ch = wndRc.bottom - wndRc.top;
+    if (cw <= 0 || ch <= 0) return;
 
     const int dpi = PanelWindowDpi(h);
-    g_theme.Ensure(dpi);
-    auto S = [&](int v) { return DpiPx(v, dpi); };
+    auto S = [&](int v) -> float { return (float)DpiPx(v, dpi); };
 
     bool conn = g_xferConnected.load();
     bool pinned = g_dropBoxPinned.load();
@@ -3414,228 +3535,316 @@ static void PaintDropBox(HWND h) {
         recvName = g_xferLastRecvName;
     }
 
-    HDC hdc = CreateCompatibleDC(screenDc);
-    HBITMAP bmp = CreateCompatibleBitmap(screenDc, cw, ch);
-    HGDIOBJ oldBmp = SelectObject(hdc, bmp);
-    SetBkMode(hdc, TRANSPARENT);
-
-    // 1. 整体白底 + 顶部淡紫灰标题栏
-    FillRect(hdc, &cli, g_theme.cardBrush);
-    RECT topBar{ 0, 0, cw, S(50) };
-    HBRUSH topBr = CreateSolidBrush(RGB(178, 174, 198));
-    FillRect(hdc, &topBar, topBr);
-    DeleteObject(topBr);
-
-    // 应用图标
-    HICON hIcon = (HICON)LoadImageW(GetModuleHandleW(nullptr), MAKEINTRESOURCEW(1),
-                                    IMAGE_ICON, S(22), S(22), LR_DEFAULTCOLOR);
-    if (hIcon) {
-        DrawIconEx(hdc, S(14), S(14), hIcon, S(22), S(22), 0, nullptr, DI_NORMAL);
-        DestroyIcon(hIcon);
-    } else {
-        DrawPanelCard(hdc, S(14), S(14), S(22), S(22), S(6), RGB(255, 255, 255), RGB(210, 210, 224));
+    BITMAPV5HEADER bi{};
+    bi.bV5Size = sizeof(bi);
+    bi.bV5Width = cw;
+    bi.bV5Height = -ch;
+    bi.bV5Planes = 1;
+    bi.bV5BitCount = 32;
+    bi.bV5Compression = BI_RGB;
+    void* bits = nullptr;
+    HDC screenDc = GetDC(nullptr);
+    HDC memDc = CreateCompatibleDC(screenDc);
+    HBITMAP dib = CreateDIBSection(screenDc, (BITMAPINFO*)&bi, DIB_RGB_COLORS, &bits, nullptr, 0);
+    if (!dib || !bits) {
+        if (dib) DeleteObject(dib);
+        if (memDc) DeleteDC(memDc);
+        if (screenDc) ReleaseDC(nullptr, screenDc);
+        return;
     }
+    memset(bits, 0, (size_t)cw * ch * 4);
+    HGDIOBJ oldBmp = SelectObject(memDc, dib);
 
-    // 标题 + "Box" 胶囊
     {
-        RECT rt{ S(44), S(8), S(168), S(28) };
-        SelectObject(hdc, g_theme.fontSection);
-        SetTextColor(hdc, RGB(32, 30, 42));
-        DrawTextW(hdc, L"SecDisplay", -1, &rt, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
+        Gdiplus::Bitmap canvas(cw, ch, cw * 4, PixelFormat32bppPARGB, (BYTE*)bits);
+        Gdiplus::Graphics g(&canvas);
+        g.SetSmoothingMode(Gdiplus::SmoothingModeHighQuality);
+        g.SetPixelOffsetMode(Gdiplus::PixelOffsetModeHighQuality);
+        g.SetTextRenderingHint(Gdiplus::TextRenderingHintAntiAliasGridFit);
 
-        DrawPanelCard(hdc, S(44), S(28), S(42), S(14), S(7), RGB(236, 234, 245), RGB(220, 216, 234));
-        COLORREF dotC = conn ? RGB(22, 163, 74) : RGB(148, 163, 184);
-        HPEN dp = CreatePen(PS_SOLID, 1, dotC);
-        HBRUSH db = CreateSolidBrush(dotC);
-        HGDIOBJ op = SelectObject(hdc, dp), ob = SelectObject(hdc, db);
-        Ellipse(hdc, S(49), S(32), S(55), S(38));
-        SelectObject(hdc, ob); SelectObject(hdc, op);
-        DeleteObject(db); DeleteObject(dp);
+        const float pad = S(12), cardW = S(248), cardH = S(268), rad = S(18);
 
-        RECT rb{ S(56), S(27), S(84), S(42) };
-        SelectObject(hdc, g_theme.fontSmall);
-        SetTextColor(hdc, RGB(58, 55, 72));
-        DrawTextW(hdc, L"Box", -1, &rb, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
-    }
-
-    // 圆形按钮：图钉 + 关闭
-    RECT rcPin{}, rcClose{}, rcBox{}, rcRecv{};
-    DropBoxLayoutRects(dpi, &rcPin, &rcClose, &rcBox, &rcRecv);
-    auto drawCircleBtn = [&](const RECT& r, COLORREF fill) {
-        HPEN p = CreatePen(PS_SOLID, 1, RGB(228, 226, 238));
-        HBRUSH b = CreateSolidBrush(fill);
-        HGDIOBJ op = SelectObject(hdc, p), ob = SelectObject(hdc, b);
-        Ellipse(hdc, r.left, r.top, r.right, r.bottom);
-        SelectObject(hdc, ob); SelectObject(hdc, op);
-        DeleteObject(b); DeleteObject(p);
-    };
-    drawCircleBtn(rcPin, g_dbHot == 1 ? RGB(228, 236, 254) : RGB(246, 245, 250));
-    {
-        // 斜向矢量图钉图标（pin 顶帽 + 底座 + 针尖），辨识度更高
-        int cx = (rcPin.left + rcPin.right) / 2;
-        int cy = (rcPin.top + rcPin.bottom) / 2;
-        COLORREF pc = pinned ? RGB(37, 99, 235) : RGB(115, 118, 132);
-        HPEN pp = CreatePen(PS_SOLID, std::max(1, S(2)), pc);
-        HBRUSH pb = CreateSolidBrush(pinned ? pc : RGB(246, 245, 250));
-        HGDIOBJ op = SelectObject(hdc, pp), ob = SelectObject(hdc, pb);
-        // 顶帽（小圆角块）+ 底座横线 + 针尖
-        POINT head[4] = {
-            { cx - S(2), cy - S(6) },
-            { cx + S(5), cy - S(6) },
-            { cx + S(3), cy },
-            { cx - S(4), cy }
-        };
-        Polygon(hdc, head, 4);
-        MoveToEx(hdc, cx - S(5), cy + S(1), nullptr);
-        LineTo(hdc, cx + S(4), cy + S(1));
-        MoveToEx(hdc, cx - S(1), cy + S(1), nullptr);
-        LineTo(hdc, cx - S(3), cy + S(6));
-        SelectObject(hdc, ob);
-        SelectObject(hdc, op);
-        DeleteObject(pb);
-        DeleteObject(pp);
-    }
-    drawCircleBtn(rcClose, g_dbHot == 2 ? RGB(254, 226, 226) : RGB(246, 245, 250));
-    {
-        int cx = (rcClose.left + rcClose.right) / 2;
-        int cy = (rcClose.top + rcClose.bottom) / 2;
-        int d = S(4);
-        HPEN cp = CreatePen(PS_SOLID, std::max(1, S(2)), g_dbHot == 2 ? RGB(185, 28, 28) : RGB(45, 45, 55));
-        HGDIOBJ op = SelectObject(hdc, cp);
-        MoveToEx(hdc, cx - d, cy - d, nullptr); LineTo(hdc, cx + d, cy + d);
-        MoveToEx(hdc, cx + d, cy - d, nullptr); LineTo(hdc, cx - d, cy + d);
-        SelectObject(hdc, op);
-        DeleteObject(cp);
-    }
-
-    // 2. 中央发光投递盒
-    const bool boxActive = (g_dbHot == 3 || pct >= 0);
-    // 外层柔和光晕轮廓
-    DrawPanelCard(hdc, rcBox.left - S(4), rcBox.top - S(4),
-                  (rcBox.right - rcBox.left) + S(8), (rcBox.bottom - rcBox.top) + S(8),
-                  S(14), boxActive ? RGB(239, 246, 255) : RGB(246, 247, 250),
-                  boxActive ? RGB(191, 219, 254) : RGB(238, 240, 245));
-    DrawPanelCard(hdc, rcBox.left, rcBox.top,
-                  rcBox.right - rcBox.left, rcBox.bottom - rcBox.top,
-                  S(12), boxActive ? RGB(229, 240, 255) : RGB(224, 226, 230),
-                  boxActive ? RGB(59, 130, 246) : RGB(212, 215, 222));
-
-    if (pct >= 0) {
-        wchar_t pbuf[32];
-        swprintf(pbuf, 32, L"%d%%", pct);
-        RECT rp{ rcBox.left, rcBox.top + S(26), rcBox.right, rcBox.top + S(68) };
-        SelectObject(hdc, g_theme.fontTitle);
-        SetTextColor(hdc, RGB(37, 99, 235));
-        DrawTextW(hdc, pbuf, -1, &rp, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
-
-        int bx1 = rcBox.left + S(22), bx2 = rcBox.right - S(22), by1 = rcBox.top + S(76), bh = S(8);
-        DrawPanelCard(hdc, bx1, by1, bx2 - bx1, bh, bh / 2, RGB(203, 213, 225), RGB(203, 213, 225));
-        int fillW = (int)((bx2 - bx1) * std::min(100, std::max(0, pct)) / 100.0);
-        if (fillW > S(4)) {
-            DrawPanelCard(hdc, bx1, by1, fillW, bh, bh / 2, RGB(37, 99, 235), RGB(37, 99, 235));
+        // 1. 柔和环境软阴影（4 层透明圆角扩散，彻底摆脱锯齿硬边）
+        for (int i = 4; i >= 1; --i) {
+            float exp = (float)i * S(2);
+            BYTE alpha = (BYTE)(24 - i * 4);
+            Gdiplus::GraphicsPath sp;
+            AddRoundRectPath(sp, pad - exp * 0.5f, pad - exp * 0.25f + (float)i * S(1),
+                             cardW + exp, cardH + exp, rad + exp * 0.4f, rad + exp * 0.4f,
+                             rad + exp * 0.4f, rad + exp * 0.4f);
+            Gdiplus::SolidBrush sb(Gdiplus::Color(alpha, 15, 23, 42));
+            g.FillPath(&sb, &sp);
         }
 
-        RECT rs{ rcBox.left + S(8), rcBox.top + S(92), rcBox.right - S(8), rcBox.bottom - S(10) };
-        SelectObject(hdc, g_theme.fontSmall);
-        SetTextColor(hdc, RGB(71, 85, 105));
-        DrawTextW(hdc, speed.c_str(), -1, &rs, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
-    } else {
-        // 居中收件箱 + 向下箭头矢量图标
-        int cx = (rcBox.left + rcBox.right) / 2;
-        int cy = (rcBox.top + rcBox.bottom) / 2 - S(8);
-        COLORREF ic = g_dbHot == 3 ? RGB(37, 99, 235) : RGB(130, 134, 142);
-        HPEN ip = CreatePen(PS_SOLID, std::max(1, S(2)), ic);
-        HGDIOBJ op = SelectObject(hdc, ip);
-        // 向下箭头
-        MoveToEx(hdc, cx, cy - S(22), nullptr); LineTo(hdc, cx, cy + S(2));
-        MoveToEx(hdc, cx - S(8), cy - S(6), nullptr); LineTo(hdc, cx, cy + S(2));
-        LineTo(hdc, cx + S(8), cy - S(6));
-        // 托盘收件箱（梯形+凹口）
-        MoveToEx(hdc, cx - S(14), cy - S(4), nullptr);
-        LineTo(hdc, cx - S(20), cy + S(8));
-        LineTo(hdc, cx - S(20), cy + S(22));
-        LineTo(hdc, cx + S(20), cy + S(22));
-        LineTo(hdc, cx + S(20), cy + S(8));
-        LineTo(hdc, cx + S(14), cy - S(4));
-        MoveToEx(hdc, cx - S(20), cy + S(8), nullptr);
-        LineTo(hdc, cx - S(8), cy + S(8));
-        LineTo(hdc, cx - S(5), cy + S(13));
-        LineTo(hdc, cx + S(5), cy + S(13));
-        LineTo(hdc, cx + S(8), cy + S(8));
-        LineTo(hdc, cx + S(20), cy + S(8));
-        SelectObject(hdc, op);
-        DeleteObject(ip);
+        // 2. 白色卡片主体（抗锯齿 18dp 圆角）
+        Gdiplus::GraphicsPath cardPath;
+        AddRoundRectPath(cardPath, pad, pad, cardW, cardH, rad, rad, rad, rad);
+        Gdiplus::SolidBrush cardBr(Gdiplus::Color(255, 255, 255, 255));
+        g.FillPath(&cardBr, &cardPath);
 
-        RECT rh{ rcBox.left + S(8), rcBox.bottom - S(30), rcBox.right - S(8), rcBox.bottom - S(8) };
-        SelectObject(hdc, g_theme.fontSmall);
-        SetTextColor(hdc, g_dbHot == 3 ? RGB(37, 99, 235) : RGB(115, 120, 130));
-        DrawTextW(hdc, L"拖入或点击发送", -1, &rh, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+        // 3. 顶部柔冷紫灰渐变标题栏（仅上圆角，底平接白区）
+        const float hdrH = S(50);
+        Gdiplus::GraphicsPath hdrPath;
+        AddRoundRectPath(hdrPath, pad, pad, cardW, hdrH, rad, rad, 0.0f, 0.0f);
+        Gdiplus::LinearGradientBrush hdrBr(
+            Gdiplus::PointF(pad, pad), Gdiplus::PointF(pad, pad + hdrH),
+            Gdiplus::Color(255, 186, 182, 206), Gdiplus::Color(255, 173, 169, 194));
+        g.FillPath(&hdrBr, &hdrPath);
+
+        // 应用图标
+        HICON hIcon = (HICON)LoadImageW(GetModuleHandleW(nullptr), MAKEINTRESOURCEW(1),
+                                        IMAGE_ICON, (int)S(24), (int)S(24), LR_DEFAULTCOLOR);
+        if (hIcon) {
+            std::unique_ptr<Gdiplus::Bitmap> ibmp(Gdiplus::Bitmap::FromHICON(hIcon));
+            if (ibmp) {
+                g.DrawImage(ibmp.get(), Gdiplus::RectF(pad + S(14), pad + S(13), S(24), S(24)));
+            }
+            DestroyIcon(hIcon);
+        } else {
+            Gdiplus::GraphicsPath ip;
+            AddRoundRectPath(ip, pad + S(14), pad + S(13), S(24), S(24), S(6), S(6), S(6), S(6));
+            Gdiplus::SolidBrush ibr(Gdiplus::Color(235, 255, 255, 255));
+            g.FillPath(&ibr, &ip);
+        }
+
+        // 标题 SecDisplay + Box 状态胶囊
+        Gdiplus::FontFamily ff(L"Microsoft YaHei UI");
+        Gdiplus::Font fTitle(&ff, S(12), Gdiplus::FontStyleBold, Gdiplus::UnitPixel);
+        Gdiplus::Font fSmall(&ff, S(10), Gdiplus::FontStyleRegular, Gdiplus::UnitPixel);
+        Gdiplus::Font fHint(&ff, S(11), Gdiplus::FontStyleRegular, Gdiplus::UnitPixel);
+        Gdiplus::Font fPct(&ff, S(22), Gdiplus::FontStyleBold, Gdiplus::UnitPixel);
+
+        Gdiplus::SolidBrush titleBr(Gdiplus::Color(255, 32, 30, 44));
+        g.DrawString(L"SecDisplay", -1, &fTitle, Gdiplus::PointF(pad + S(44), pad + S(8)), &titleBr);
+
+        Gdiplus::GraphicsPath pill;
+        AddRoundRectPath(pill, pad + S(44), pad + S(27), S(46), S(16), S(8), S(8), S(8), S(8));
+        Gdiplus::SolidBrush pillBr(Gdiplus::Color(215, 244, 243, 250));
+        g.FillPath(&pillBr, &pill);
+        Gdiplus::SolidBrush dotBr(conn ? Gdiplus::Color(255, 22, 163, 74) : Gdiplus::Color(255, 148, 163, 184));
+        g.FillEllipse(&dotBr, pad + S(50), pad + S(32), S(6), S(6));
+        Gdiplus::SolidBrush boxTxtBr(Gdiplus::Color(255, 58, 55, 74));
+        g.DrawString(L"Box", -1, &fSmall, Gdiplus::PointF(pad + S(59), pad + S(28)), &boxTxtBr);
+
+        // 顶部三个抗锯齿圆形按钮：粘贴 / 图钉 / 关闭
+        RECT rcPaste{}, rcPin{}, rcClose{}, rcBox{}, rcRecv{};
+        DropBoxLayoutRects(dpi, &rcPaste, &rcPin, &rcClose, &rcBox, &rcRecv);
+        auto drawCircle = [&](const RECT& r, Gdiplus::Color fill) {
+            Gdiplus::SolidBrush cb(fill);
+            g.FillEllipse(&cb, (float)r.left, (float)r.top,
+                          (float)(r.right - r.left), (float)(r.bottom - r.top));
+            Gdiplus::Pen cp(Gdiplus::Color(90, 255, 255, 255), 1.0f);
+            g.DrawEllipse(&cp, (float)r.left, (float)r.top,
+                          (float)(r.right - r.left), (float)(r.bottom - r.top));
+        };
+
+        // 粘贴按钮（剪贴板图标）
+        drawCircle(rcPaste, g_dbHot == 5 ? Gdiplus::Color(255, 224, 236, 255) : Gdiplus::Color(235, 248, 247, 252));
+        {
+            float cx = (rcPaste.left + rcPaste.right) * 0.5f;
+            float cy = (rcPaste.top + rcPaste.bottom) * 0.5f;
+            Gdiplus::Pen cp(g_dbHot == 5 ? Gdiplus::Color(255, 37, 99, 235) : Gdiplus::Color(255, 72, 74, 88), S(2) * 0.75f);
+            cp.SetLineJoin(Gdiplus::LineJoinRound);
+            Gdiplus::GraphicsPath board;
+            AddRoundRectPath(board, cx - S(4), cy - S(4), S(9), S(10), S(2), S(2), S(2), S(2));
+            g.DrawPath(&cp, &board);
+            Gdiplus::GraphicsPath clip;
+            AddRoundRectPath(clip, cx - S(2), cy - S(6), S(5), S(3), S(1), S(1), S(1), S(1));
+            Gdiplus::SolidBrush cbr(Gdiplus::Color(255, 248, 247, 252));
+            g.FillPath(&cbr, &clip);
+            g.DrawPath(&cp, &clip);
+        }
+
+        // 图钉按钮
+        drawCircle(rcPin, g_dbHot == 1 ? Gdiplus::Color(255, 224, 236, 255) : Gdiplus::Color(235, 248, 247, 252));
+        {
+            float cx = (rcPin.left + rcPin.right) * 0.5f;
+            float cy = (rcPin.top + rcPin.bottom) * 0.5f;
+            Gdiplus::Color pc = pinned ? Gdiplus::Color(255, 37, 99, 235) : Gdiplus::Color(255, 108, 112, 126);
+            Gdiplus::Pen pp(pc, S(2) * 0.8f);
+            pp.SetStartCap(Gdiplus::LineCapRound);
+            pp.SetEndCap(Gdiplus::LineCapRound);
+            pp.SetLineJoin(Gdiplus::LineJoinRound);
+            Gdiplus::PointF pts[4] = {
+                { cx - S(2), cy - S(5) }, { cx + S(4), cy - S(5) },
+                { cx + S(3), cy },        { cx - S(3), cy }
+            };
+            if (pinned) {
+                Gdiplus::SolidBrush pbr(pc);
+                g.FillPolygon(&pbr, pts, 4);
+            } else {
+                g.DrawPolygon(&pp, pts, 4);
+            }
+            g.DrawLine(&pp, cx - S(5), cy + S(1), cx + S(5), cy + S(1));
+            g.DrawLine(&pp, cx, cy + S(1), cx - S(2), cy + S(6));
+        }
+
+        // 关闭按钮
+        drawCircle(rcClose, g_dbHot == 2 ? Gdiplus::Color(255, 254, 226, 226) : Gdiplus::Color(235, 248, 247, 252));
+        {
+            float cx = (rcClose.left + rcClose.right) * 0.5f;
+            float cy = (rcClose.top + rcClose.bottom) * 0.5f;
+            float d = S(4);
+            Gdiplus::Pen xp(g_dbHot == 2 ? Gdiplus::Color(255, 185, 28, 28) : Gdiplus::Color(255, 48, 48, 58), S(2) * 0.85f);
+            xp.SetStartCap(Gdiplus::LineCapRound);
+            xp.SetEndCap(Gdiplus::LineCapRound);
+            g.DrawLine(&xp, cx - d, cy - d, cx + d, cy + d);
+            g.DrawLine(&xp, cx + d, cy - d, cx - d, cy + d);
+        }
+
+        // 4. 中央发光投递盒（柔和抗锯齿光晕 + 圆角投递框）
+        const bool boxActive = (g_dbHot == 3 || pct >= 0);
+        float bx = (float)rcBox.left, by = (float)rcBox.top;
+        float bw = (float)(rcBox.right - rcBox.left), bh = (float)(rcBox.bottom - rcBox.top);
+        for (int i = 3; i >= 1; --i) {
+            float e = (float)i * S(3);
+            Gdiplus::GraphicsPath gp;
+            AddRoundRectPath(gp, bx - e, by - e, bw + e * 2, bh + e * 2,
+                             S(14) + e * 0.5f, S(14) + e * 0.5f, S(14) + e * 0.5f, S(14) + e * 0.5f);
+            Gdiplus::SolidBrush gb(boxActive
+                ? Gdiplus::Color((BYTE)(28 - i * 6), 59, 130, 246)
+                : Gdiplus::Color((BYTE)(20 - i * 4), 148, 163, 184));
+            g.FillPath(&gb, &gp);
+        }
+
+        Gdiplus::GraphicsPath boxPath;
+        AddRoundRectPath(boxPath, bx, by, bw, bh, S(14), S(14), S(14), S(14));
+        Gdiplus::SolidBrush boxFill(boxActive ? Gdiplus::Color(255, 232, 241, 255) : Gdiplus::Color(255, 229, 231, 235));
+        g.FillPath(&boxFill, &boxPath);
+        Gdiplus::Pen boxBorder(boxActive ? Gdiplus::Color(220, 59, 130, 246) : Gdiplus::Color(160, 210, 214, 222), 1.2f);
+        g.DrawPath(&boxBorder, &boxPath);
+
+        Gdiplus::StringFormat sfCenter;
+        sfCenter.SetAlignment(Gdiplus::StringAlignmentCenter);
+        sfCenter.SetLineAlignment(Gdiplus::StringAlignmentCenter);
+
+        if (pct >= 0) {
+            wchar_t pbuf[32];
+            swprintf(pbuf, 32, L"%d%%", pct);
+            Gdiplus::SolidBrush pbr(Gdiplus::Color(255, 37, 99, 235));
+            g.DrawString(pbuf, -1, &fPct, Gdiplus::RectF(bx, by + S(26), bw, S(44)), &sfCenter, &pbr);
+
+            float px1 = bx + S(24), pw = bw - S(48), py1 = by + S(80), ph = S(8);
+            Gdiplus::GraphicsPath trackP;
+            AddRoundRectPath(trackP, px1, py1, pw, ph, ph * 0.5f, ph * 0.5f, ph * 0.5f, ph * 0.5f);
+            Gdiplus::SolidBrush trackBr(Gdiplus::Color(255, 203, 213, 225));
+            g.FillPath(&trackBr, &trackP);
+            float fw = pw * (float)std::min(100, std::max(0, pct)) / 100.0f;
+            if (fw > S(4)) {
+                Gdiplus::GraphicsPath fillP;
+                AddRoundRectPath(fillP, px1, py1, fw, ph, ph * 0.5f, ph * 0.5f, ph * 0.5f, ph * 0.5f);
+                Gdiplus::SolidBrush fillBr(Gdiplus::Color(255, 37, 99, 235));
+                g.FillPath(&fillBr, &fillP);
+            }
+            Gdiplus::SolidBrush sbr(Gdiplus::Color(255, 71, 85, 105));
+            g.DrawString(speed.c_str(), -1, &fHint, Gdiplus::RectF(bx, by + S(96), bw, S(28)), &sfCenter, &sbr);
+        } else {
+            float icx = bx + bw * 0.5f, icy = by + bh * 0.5f - S(8);
+            Gdiplus::Color ic = g_dbHot == 3 ? Gdiplus::Color(255, 37, 99, 235) : Gdiplus::Color(255, 134, 138, 146);
+            Gdiplus::Pen ip(ic, S(2) * 1.15f);
+            ip.SetStartCap(Gdiplus::LineCapRound);
+            ip.SetEndCap(Gdiplus::LineCapRound);
+            ip.SetLineJoin(Gdiplus::LineJoinRound);
+
+            // 向下箭头
+            g.DrawLine(&ip, icx, icy - S(22), icx, icy + S(2));
+            Gdiplus::PointF arrow[3] = {
+                { icx - S(8), icy - S(6) }, { icx, icy + S(2) }, { icx + S(8), icy - S(6) }
+            };
+            g.DrawLines(&ip, arrow, 3);
+            // 托盘外框 + 凹口横线
+            Gdiplus::PointF tray[6] = {
+                { icx - S(14), icy - S(4) }, { icx - S(20), icy + S(8) },
+                { icx - S(20), icy + S(22) }, { icx + S(20), icy + S(22) },
+                { icx + S(20), icy + S(8) }, { icx + S(14), icy - S(4) }
+            };
+            g.DrawLines(&ip, tray, 6);
+            Gdiplus::PointF notch[6] = {
+                { icx - S(20), icy + S(8) }, { icx - S(8), icy + S(8) },
+                { icx - S(5), icy + S(13) }, { icx + S(5), icy + S(13) },
+                { icx + S(8), icy + S(8) }, { icx + S(20), icy + S(8) }
+            };
+            g.DrawLines(&ip, notch, 6);
+
+            Gdiplus::SolidBrush hbr(g_dbHot == 3 ? Gdiplus::Color(255, 37, 99, 235) : Gdiplus::Color(255, 115, 120, 130));
+            g.DrawString(L"拖入或点击选文件", -1, &fHint,
+                         Gdiplus::RectF(bx, by + bh - S(30), bw, S(24)), &sfCenter, &hbr);
+        }
+
+        // 5. 底部已收文件胶囊或状态提示
+        if (!recvName.empty() && pct < 0) {
+            Gdiplus::GraphicsPath rp;
+            float rx = (float)rcRecv.left, ry = (float)rcRecv.top;
+            float rw = (float)(rcRecv.right - rcRecv.left), rh = (float)(rcRecv.bottom - rcRecv.top);
+            AddRoundRectPath(rp, rx, ry, rw, rh, S(14), S(14), S(14), S(14));
+            Gdiplus::SolidBrush rbr(g_dbHot == 4 ? Gdiplus::Color(255, 220, 252, 231) : Gdiplus::Color(255, 236, 253, 245));
+            g.FillPath(&rbr, &rp);
+            Gdiplus::Pen rpen(Gdiplus::Color(255, 167, 243, 208), 1.0f);
+            g.DrawPath(&rpen, &rp);
+            std::wstring label = L"↓ " + recvName;
+            Gdiplus::SolidBrush tbr(Gdiplus::Color(255, 21, 128, 61));
+            g.DrawString(label.c_str(), -1, &fHint, Gdiplus::RectF(rx + S(10), ry, rw - S(20), rh), &sfCenter, &tbr);
+        } else {
+            Gdiplus::SolidBrush sbr(Gdiplus::Color(255, 100, 116, 139));
+            std::wstring hintTxt = (pct < 0 && conn) ? L"Ctrl+V 可直接粘贴截图发送" : status;
+            Gdiplus::StringFormat sfEllipsis;
+            sfEllipsis.SetAlignment(Gdiplus::StringAlignmentCenter);
+            sfEllipsis.SetLineAlignment(Gdiplus::StringAlignmentCenter);
+            sfEllipsis.SetTrimming(Gdiplus::StringTrimmingEllipsisCharacter);
+            sfEllipsis.SetFormatFlags(Gdiplus::StringFormatFlagsNoWrap);
+            g.DrawString(hintTxt.c_str(), -1, &fHint,
+                         Gdiplus::RectF(pad + S(12), pad + S(214), cardW - S(24), S(38)),
+                         &sfEllipsis, &sbr);
+        }
+
+        // 卡片细微外边框
+        Gdiplus::Pen cardBorder(Gdiplus::Color(48, 30, 41, 59), 1.0f);
+        g.DrawPath(&cardBorder, &cardPath);
     }
 
-    // 3. 底部已收文件胶囊 / 状态文字
-    if (!recvName.empty() && pct < 0) {
-        DrawPanelCard(hdc, rcRecv.left, rcRecv.top,
-                      rcRecv.right - rcRecv.left, rcRecv.bottom - rcRecv.top,
-                      S(14), g_dbHot == 4 ? RGB(220, 252, 231) : RGB(236, 253, 245),
-                      RGB(167, 243, 208));
-        std::wstring label = L"↓ " + recvName;
-        RECT rr{ rcRecv.left + S(10), rcRecv.top, rcRecv.right - S(10), rcRecv.bottom };
-        SelectObject(hdc, g_theme.fontSmall);
-        SetTextColor(hdc, RGB(21, 128, 61));
-        DrawTextW(hdc, label.c_str(), -1, &rr,
-                  DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
-    } else {
-        RECT rr{ S(12), S(214), cw - S(12), ch - S(10) };
-        SelectObject(hdc, g_theme.fontSmall);
-        SetTextColor(hdc, RGB(100, 116, 139));
-        DrawTextW(hdc, status.c_str(), -1, &rr,
-                  DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
-    }
+    POINT srcPt{ 0, 0 };
+    SIZE wndSz{ cw, ch };
+    BLENDFUNCTION bf{ AC_SRC_OVER, 0, 255, AC_SRC_ALPHA };
+    UpdateLayeredWindow(h, screenDc, nullptr, &wndSz, memDc, &srcPt, 0, &bf, ULW_ALPHA);
 
-    // 淡外框描边
-    {
-        HPEN bp = CreatePen(PS_SOLID, 1, RGB(214, 218, 228));
-        HGDIOBJ ob = SelectObject(hdc, GetStockObject(NULL_BRUSH));
-        HGDIOBJ op = SelectObject(hdc, bp);
-        Rectangle(hdc, 0, 0, cw, ch);
-        SelectObject(hdc, op); SelectObject(hdc, ob);
-        DeleteObject(bp);
-    }
-
-    BitBlt(screenDc, 0, 0, cw, ch, hdc, 0, 0, SRCCOPY);
-    SelectObject(hdc, oldBmp);
-    DeleteObject(bmp);
-    DeleteDC(hdc);
-    EndPaint(h, &ps);
+    SelectObject(memDc, oldBmp);
+    DeleteObject(dib);
+    DeleteDC(memDc);
+    ReleaseDC(nullptr, screenDc);
 }
 
 static LRESULT CALLBACK DropBoxWndProc(HWND h, UINT msg, WPARAM w, LPARAM l) {
     switch (msg) {
     case WM_CREATE:
         DragAcceptFiles(h, TRUE);
-        ApplyDropBoxRoundCorners(h, PanelWindowDpi(h));
+        RenderDropBoxLayered(h);
         return 0;
     case WM_ERASEBKGND:
         return 1;
-    case WM_PAINT:
-        PaintDropBox(h);
+    case WM_PAINT: {
+        PAINTSTRUCT ps{};
+        BeginPaint(h, &ps);
+        EndPaint(h, &ps);
+        RenderDropBoxLayered(h);
         return 0;
+    }
     case WM_APP_XFER_UI:
-        InvalidateRect(h, nullptr, FALSE);
+        RenderDropBoxLayered(h);
         return 0;
     case WM_MOUSEMOVE: {
         POINT pt{ GET_X_LPARAM(l), GET_Y_LPARAM(l) };
         const int dpi = PanelWindowDpi(h);
-        RECT rcPin{}, rcClose{}, rcBox{}, rcRecv{};
-        DropBoxLayoutRects(dpi, &rcPin, &rcClose, &rcBox, &rcRecv);
+        RECT rcPaste{}, rcPin{}, rcClose{}, rcBox{}, rcRecv{};
+        DropBoxLayoutRects(dpi, &rcPaste, &rcPin, &rcClose, &rcBox, &rcRecv);
         int hot = 0;
         if (PtInRect(&rcPin, pt)) hot = 1;
         else if (PtInRect(&rcClose, pt)) hot = 2;
         else if (PtInRect(&rcBox, pt)) hot = 3;
         else if (PtInRect(&rcRecv, pt)) hot = 4;
+        else if (PtInRect(&rcPaste, pt)) hot = 5;
         if (hot != g_dbHot) {
             g_dbHot = hot;
-            InvalidateRect(h, nullptr, FALSE);
+            RenderDropBoxLayered(h);
         }
         TRACKMOUSEEVENT tme{ sizeof(tme), TME_LEAVE, h, 0 };
         TrackMouseEvent(&tme);
@@ -3644,20 +3853,24 @@ static LRESULT CALLBACK DropBoxWndProc(HWND h, UINT msg, WPARAM w, LPARAM l) {
     case WM_MOUSELEAVE:
         if (g_dbHot != 0) {
             g_dbHot = 0;
-            InvalidateRect(h, nullptr, FALSE);
+            RenderDropBoxLayered(h);
         }
         return 0;
     case WM_LBUTTONDOWN: {
         POINT pt{ GET_X_LPARAM(l), GET_Y_LPARAM(l) };
         const int dpi = PanelWindowDpi(h);
-        RECT rcPin{}, rcClose{}, rcBox{}, rcRecv{};
-        DropBoxLayoutRects(dpi, &rcPin, &rcClose, &rcBox, &rcRecv);
+        RECT rcPaste{}, rcPin{}, rcClose{}, rcBox{}, rcRecv{};
+        DropBoxLayoutRects(dpi, &rcPaste, &rcPin, &rcClose, &rcBox, &rcRecv);
+        if (PtInRect(&rcPaste, pt)) {
+            PasteClipboardToTransfer(h);
+            return 0;
+        }
         if (PtInRect(&rcPin, pt)) {
             bool next = !g_dropBoxPinned.load();
             g_dropBoxPinned = next;
             SetWindowPos(h, next ? HWND_TOPMOST : HWND_NOTOPMOST, 0, 0, 0, 0,
                          SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
-            InvalidateRect(h, nullptr, FALSE);
+            RenderDropBoxLayered(h);
             Log("悬浮投递盒置顶: %s", next ? "开" : "关");
             return 0;
         }
@@ -3686,7 +3899,7 @@ static LRESULT CALLBACK DropBoxWndProc(HWND h, UINT msg, WPARAM w, LPARAM l) {
             return 0;
         }
         // 顶部紫灰标题栏空白区支持按住拖动整个悬浮盒
-        if (pt.y < DpiPx(50, dpi)) {
+        if (pt.y < DpiPx(62, dpi)) {
             ReleaseCapture();
             SendMessageW(h, WM_NCLBUTTONDOWN, HTCAPTION, 0);
         }
@@ -3716,8 +3929,7 @@ static LRESULT CALLBACK DropBoxWndProc(HWND h, UINT msg, WPARAM w, LPARAM l) {
                          suggested->bottom - suggested->top,
                          SWP_NOZORDER | SWP_NOACTIVATE);
         }
-        ApplyDropBoxRoundCorners(h, PanelWindowDpi(h));
-        InvalidateRect(h, nullptr, FALSE);
+        RenderDropBoxLayered(h);
         return 0;
     }
     case WM_CLOSE:
@@ -3734,7 +3946,7 @@ static void ShowDropBoxWindow() {
         ShowWindow(cur, SW_SHOWNOACTIVATE);
         SetWindowPos(cur, g_dropBoxPinned.load() ? HWND_TOPMOST : HWND_NOTOPMOST,
                      0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
-        InvalidateRect(cur, nullptr, FALSE);
+        RenderDropBoxLayered(cur);
         return;
     }
 
@@ -3752,12 +3964,12 @@ static void ShowDropBoxWindow() {
     }
 
     const int dpi = PanelWindowDpi(nullptr);
-    int w = DpiPx(248, dpi), hgt = DpiPx(266, dpi);
+    int w = DpiPx(272, dpi), hgt = DpiPx(292, dpi);
     RECT wa{};
     SystemParametersInfoW(SPI_GETWORKAREA, 0, &wa, 0);
-    int x = (wa.right > wa.left) ? (wa.right - w - DpiPx(24, dpi)) : (GetSystemMetrics(SM_CXSCREEN) - w - 24);
-    int y = (wa.bottom > wa.top) ? (wa.bottom - hgt - DpiPx(24, dpi)) : (GetSystemMetrics(SM_CYSCREEN) - hgt - 48);
-    DWORD exStyle = WS_EX_TOOLWINDOW | (g_dropBoxPinned.load() ? WS_EX_TOPMOST : 0);
+    int x = (wa.right > wa.left) ? (wa.right - w - DpiPx(16, dpi)) : (GetSystemMetrics(SM_CXSCREEN) - w - 16);
+    int y = (wa.bottom > wa.top) ? (wa.bottom - hgt - DpiPx(16, dpi)) : (GetSystemMetrics(SM_CYSCREEN) - hgt - 40);
+    DWORD exStyle = WS_EX_LAYERED | WS_EX_TOOLWINDOW | (g_dropBoxPinned.load() ? WS_EX_TOPMOST : 0);
     HWND h = CreateWindowExW(exStyle, L"SecDisplayDropBox", L"SecDisplay Box",
                              WS_POPUP | WS_CLIPCHILDREN, x, y, w, hgt,
                              nullptr, nullptr, GetModuleHandleW(nullptr), nullptr);
@@ -3765,12 +3977,12 @@ static void ShowDropBoxWindow() {
         g_dropBox = h;
         const int realDpi = PanelWindowDpi(h);
         if (realDpi != dpi) {
-            int rw = DpiPx(248, realDpi), rh = DpiPx(266, realDpi);
-            int rx = (wa.right > wa.left) ? (wa.right - rw - DpiPx(24, realDpi)) : (GetSystemMetrics(SM_CXSCREEN) - rw - 24);
-            int ry = (wa.bottom > wa.top) ? (wa.bottom - rh - DpiPx(24, realDpi)) : (GetSystemMetrics(SM_CYSCREEN) - rh - 48);
+            int rw = DpiPx(272, realDpi), rh = DpiPx(292, realDpi);
+            int rx = (wa.right > wa.left) ? (wa.right - rw - DpiPx(16, realDpi)) : (GetSystemMetrics(SM_CXSCREEN) - rw - 16);
+            int ry = (wa.bottom > wa.top) ? (wa.bottom - rh - DpiPx(16, realDpi)) : (GetSystemMetrics(SM_CYSCREEN) - rh - 40);
             SetWindowPos(h, nullptr, rx, ry, rw, rh, SWP_NOZORDER | SWP_NOACTIVATE);
-            ApplyDropBoxRoundCorners(h, realDpi);
         }
+        RenderDropBoxLayered(h);
         ShowWindow(h, SW_SHOWNOACTIVATE);
         Log("Windows 悬浮投递盒已打开 hwnd=%p", (void*)h);
     }
@@ -3869,15 +4081,39 @@ static void ApplyCursorImage() {
     if (w2 < 1) w2 = 1;
     if (h2 < 1) h2 = 1;
     if (w2 != w || h2 != h) {
+        // 32bpp premultiplied BGRA 双线性插值（像素中心对齐），消除动画缩放期间的最近邻锯齿跳变
         std::vector<uint8_t> dst((size_t)w2 * h2 * 4);
+        const double scaleX = (double)w / (double)w2;
+        const double scaleY = (double)h / (double)h2;
         for (int yy = 0; yy < h2; ++yy) {
-            int sy0 = (int)((long long)yy * h / h2);
-            if (sy0 >= h) sy0 = h - 1;
+            double fy = ((double)yy + 0.5) * scaleY - 0.5;
+            if (fy < 0.0) fy = 0.0;
+            if (fy > (double)(h - 1)) fy = (double)(h - 1);
+            int y0 = (int)fy;
+            int y1 = (y0 + 1 < h) ? (y0 + 1) : (h - 1);
+            double wy = fy - y0;
+            double wy0 = 1.0 - wy;
+            const uint8_t* row0 = &bgra[(size_t)y0 * w * 4];
+            const uint8_t* row1 = &bgra[(size_t)y1 * w * 4];
+            uint8_t* outRow = &dst[(size_t)yy * w2 * 4];
             for (int xx = 0; xx < w2; ++xx) {
-                int sx0 = (int)((long long)xx * w / w2);
-                if (sx0 >= w) sx0 = w - 1;
-                memcpy(&dst[((size_t)yy * w2 + xx) * 4],
-                       &bgra[((size_t)sy0 * w + sx0) * 4], 4);
+                double fx = ((double)xx + 0.5) * scaleX - 0.5;
+                if (fx < 0.0) fx = 0.0;
+                if (fx > (double)(w - 1)) fx = (double)(w - 1);
+                int x0 = (int)fx;
+                int x1 = (x0 + 1 < w) ? (x0 + 1) : (w - 1);
+                double wx = fx - x0;
+                double wx0 = 1.0 - wx;
+                const double w00 = wx0 * wy0, w10 = wx * wy0, w01 = wx0 * wy, w11 = wx * wy;
+                const uint8_t* p00 = row0 + (size_t)x0 * 4;
+                const uint8_t* p10 = row0 + (size_t)x1 * 4;
+                const uint8_t* p01 = row1 + (size_t)x0 * 4;
+                const uint8_t* p11 = row1 + (size_t)x1 * 4;
+                uint8_t* dp = outRow + (size_t)xx * 4;
+                for (int c = 0; c < 4; ++c) {
+                    int v = (int)(p00[c] * w00 + p10[c] * w10 + p01[c] * w01 + p11[c] * w11 + 0.5);
+                    dp[c] = (uint8_t)(v < 0 ? 0 : (v > 255 ? 255 : v));
+                }
             }
         }
         // 热点跟着位图同比例缩放，否则指针尖和实际点击点会错位
@@ -3924,10 +4160,11 @@ static void ApplyCursorImage() {
     DeleteObject(mask);
     if (!cur) return;   // 不更新指纹，下一包重试
 
-    // 日志把 DPI 与晃动倍数分开打印。合成后的倍率会变成 5.00x，
-// 排查 DPI 问题时容易误以为显示器变了。
-    Log("光标位图 %dx%d hot=(%d,%d) DPI %.2fx 晃动 %.2fx → 实际 %dx%d hot=(%d,%d)",
-        rawW, rawH, rawHotX, rawHotY, WindowDpiScale(g_hwnd), g_shakeZoom, w, h, hotX, hotY);
+    if (g_shakeZoom == 1.0) {
+        // 稳态切换才记日志，动画每 12ms 刷新一帧不刷屏
+        Log("光标位图 %dx%d hot=(%d,%d) DPI %.2fx → 实际 %dx%d hot=(%d,%d)",
+            rawW, rawH, rawHotX, rawHotY, WindowDpiScale(g_hwnd), w, h, hotX, hotY);
+    }
 
     // 先挂上新的再销毁旧的：反过来的话，销毁到 SetCursor 之间系统光标句柄是悬空的
     HCURSOR old = g_customCursor;
@@ -4011,20 +4248,23 @@ static bool DetectShake(int64_t now, int x, int y) {
 
     if (shaking) {
         if (!g_shakeEnabled.load()) return false;
-        g_shakeHolding = false;
-        g_shakeLastShakeMs = now;
-        if (!g_shakeActive) {
+        const double nowQpc = QpcNowMs();
+        g_shakeLastShakeQpcMs = nowQpc;
+        // 平滑接续：处于 IDLE 或正在 SHRINK 时，从当前缩放倍率启动平滑放大曲线（InOutCubic），
+        // 不再瞬间跳变到 2.8x；已在 GROW 或 HOLD 时只延长保持时刻，过渡连续不抖动。
+        if (!g_shakeActive || g_shakePhase == SHAKE_IDLE || g_shakePhase == SHAKE_SHRINK) {
+            if (!g_shakeActive) {
+                Log("检测到快速晃动（反转 x%d y%d，摆幅 x%dp y%dp），平滑放大光标 %.1fx",
+                    reversalsX, reversalsY, spanX, spanY, kShakeCursorZoom);
+            }
             g_shakeActive = true;
-            // 放大是立刻的：直接把目标倍数给上，动画只用于收缩
-            g_shakeZoom = kShakeCursorZoom;
-            Log("检测到快速晃动（反转 x%d y%d，摆幅 x%dp y%dp），放大光标 %.1fx",
-                reversalsX, reversalsY, spanX, spanY, kShakeCursorZoom);
-            // 定时器负责 hold 到期后的收缩动画。光标停住就不会再有位置包，
-            // 这条定时器是唯一的收回路径，所以创建失败必须回滚，
-            // 否则光标会永久停在放大状态。
+            g_shakePhase = SHAKE_GROW;
+            g_shakeAnimStartMs = nowQpc;
+            g_shakeAnimFromZoom = g_shakeZoom;
             if (SetTimer(g_hwnd, kShakeTimer, kShakeTickMs, nullptr) == 0) {
                 Log("警告: 创建晃动定时器失败，放弃本次放大");
                 g_shakeActive = false;
+                g_shakePhase = SHAKE_IDLE;
                 g_shakeZoom = 1.0;
                 return false;
             }
@@ -4045,40 +4285,45 @@ static void ResetShakeSamples() {
     g_shakeHead = 0;
 }
 
-// 收缩动画的一帧。返回 true 表示动画仍在进行，需要继续定时器。
-// 用 ease-out（1-(1-t)^3）让收缩前段快、尾段贴住原尺寸，观感比线性自然。
-static bool TickShakeShrink(int64_t now) {
-    if (!g_shakeActive) return false;
+static double EaseInOutCubic(double t) {
+    if (t <= 0.0) return 0.0;
+    if (t >= 1.0) return 1.0;
+    return (t < 0.5) ? (4.0 * t * t * t) : (1.0 - std::pow(-2.0 * t + 2.0, 3.0) * 0.5);
+}
 
-    // 关键：不能只等 DetectShake 来置 holding。
-    // DetectShake 只在 WM_APP_REMOTE_CURSOR 里被调用，而晃动结束的标准用法
-    // 就是「停手不再移动」——此后再无光标包，holding 永远不会被置上，
-    // 光标就会永久停在放大状态、定时器永久空转。
-    //
-    // 计时锚在「最后一次判定为晃动」而不是「最后一个光标包」：
-    // 晃完继续慢慢移动时位置包不断，锚在包时间上会让放大永久收不回来，
-    // 同时 16ms 定时器还会一直空转重建光标图。
-    //
-    // holdUntil 直接取 lastShake + kShakeHoldMs，不再叠加第二段：
-    // 原来这里是「静默 700 + hold 700」，实际要 1.4 秒才开始收缩。
-    if (!g_shakeHolding) {
-        if (now - g_shakeLastShakeMs < kShakeHoldMs) return true;   // 仍在晃动/刚晃完
-        g_shakeHolding = true;
-        g_shakeHoldUntil = g_shakeLastShakeMs + kShakeHoldMs;
-    }
-    if (now < g_shakeHoldUntil) return true;   // 保持期未到期
+// 晃动缩放动画（Grow -> Hold -> Shrink，双向 InOutCubic 缓动，使用亚毫秒级 QPC 时钟）。
+// 返回 true 表示动画或保持仍在进行，需要继续定时器。
+static bool TickShakeAnim(double nowQpc) {
+    if (!g_shakeActive || g_shakePhase == SHAKE_IDLE) return false;
 
-    const int64_t t0 = g_shakeHoldUntil;
-    const double p = (double)(now - t0) / (double)kShakeShrinkMs;
-    if (p >= 1.0) {
-        g_shakeActive = false;
-        g_shakeHolding = false;
-        g_shakeZoom = 1.0;
-        return false;
+    if (g_shakePhase == SHAKE_GROW) {
+        double p = (nowQpc - g_shakeAnimStartMs) / kShakeGrowMs;
+        if (p >= 1.0) {
+            g_shakeZoom = kShakeCursorZoom;
+            g_shakePhase = SHAKE_HOLD;
+        } else {
+            g_shakeZoom = g_shakeAnimFromZoom + (kShakeCursorZoom - g_shakeAnimFromZoom) * EaseInOutCubic(p);
+            return true;
+        }
     }
-    const double e = 1.0 - (1.0 - p) * (1.0 - p) * (1.0 - p);
-    g_shakeZoom = kShakeCursorZoom - (kShakeCursorZoom - 1.0) * e;
-    return true;
+    if (g_shakePhase == SHAKE_HOLD) {
+        if (nowQpc - g_shakeLastShakeQpcMs < kShakeHoldMs) return true;
+        g_shakePhase = SHAKE_SHRINK;
+        g_shakeAnimStartMs = nowQpc;
+        g_shakeAnimFromZoom = g_shakeZoom;
+    }
+    if (g_shakePhase == SHAKE_SHRINK) {
+        double p = (nowQpc - g_shakeAnimStartMs) / kShakeShrinkMs;
+        if (p >= 1.0) {
+            g_shakeActive = false;
+            g_shakePhase = SHAKE_IDLE;
+            g_shakeZoom = 1.0;
+            return false;
+        }
+        g_shakeZoom = g_shakeAnimFromZoom + (1.0 - g_shakeAnimFromZoom) * EaseInOutCubic(p);
+        return true;
+    }
+    return false;
 }
 
 // 当前应使用的缩放（千分比）。DPI 与晃动倍数合并在这里算，
@@ -4196,11 +4441,7 @@ static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
             return 0;
         }
         if (w == kShakeTimer) {
-            // 晃动停止后光标不再移动，就不会再有 WM_APP_REMOTE_CURSOR。
-            // 这条定时器是唯一的收回路径：hold 到期后逐帧收缩，直到回到 1.0。
-            const bool keep = TickShakeShrink(GetTickCount64());
-            // ApplyCursorImage 内部按 g_cursorAppliedScalePm 判重，这里不必再维护副本，
-            // 直接调即可：缩放没变就是空转一次比较，变了才真的重建。
+            const bool keep = TickShakeAnim(QpcNowMs());
             RefreshCursorScale();
             if (!keep) {
                 Log("晃动结束，光标已恢复原尺寸");
@@ -4286,20 +4527,12 @@ static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
         RecordRemoteTarget(sx, sy, nowMoveMs);
         SetCursorPos(sx, sy);
 
-        // 晃动检测：放大状态变化时重建光标位图。放在 SetCursorPos 之后。
-        // 用屏幕坐标参与判定，代价是窗口移动/DPI 变化会污染轨迹，
-        // 所以那些事件里会清空采样缓冲（见 WM_MOVE / WM_SIZE / WM_DPICHANGED）。
+        // 晃动检测：触发或状态切换时交由 kShakeTimer 按 InOutCubic 曲线平滑推进缩放
         {
             const int64_t nowMs = GetTickCount64();
             const bool wasActive = g_shakeActive;
-            const bool shaking = DetectShake(nowMs, sx, sy);
-            // 只有「本次真的判定为晃动」才把缩放拉回满值并立即重建，
-            // 保证「放大是立刻的」。用 shaking 而不是 !holding 判断：
-            // 否则收缩期间来一个孤立噪声包也会把 2.1x 弹回 2.5x，看起来闪一下。
-            if (shaking && g_shakeZoom < kShakeCursorZoom) {
-                g_shakeZoom = kShakeCursorZoom;
-                RefreshCursorScale();
-            } else if (g_shakeActive != wasActive) {
+            DetectShake(nowMs, sx, sy);
+            if (g_shakeActive != wasActive) {
                 RefreshCursorScale();
             }
         }
@@ -5367,7 +5600,7 @@ static void TransferLoop(RunConfig cfg) {
         std::thread sendThread([&] {
             std::vector<uint8_t> readBuf(262144);
             while (g_alive && xferAlive) {
-                std::wstring path;
+                XferOutItem item;
                 uint32_t tid = 0;
                 {
                     std::unique_lock<std::mutex> lk(g_xferMtx);
@@ -5376,21 +5609,27 @@ static void TransferLoop(RunConfig cfg) {
                     });
                     if (!g_alive || !xferAlive) break;
                     if (g_xferOutQ.empty()) continue;
-                    path = g_xferOutQ.front();
+                    item = g_xferOutQ.front();
                     g_xferOutQ.pop_front();
                     tid = g_xferNextId++;
                     if (g_xferNextId == 0) g_xferNextId = 1;
                 }
+                const std::wstring& path = item.path;
 
                 HANDLE hf = CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ,
                                         nullptr, OPEN_EXISTING, FILE_FLAG_SEQUENTIAL_SCAN, nullptr);
                 if (hf == INVALID_HANDLE_VALUE) {
                     Log("中转站打开文件失败: %s (%lu)", ToUtf8(path.c_str()).c_str(), GetLastError());
                     SetTransferStatus(L"无法读取所选文件");
+                    if (item.deleteAfterSend) DeleteFileW(path.c_str());
                     continue;
                 }
                 LARGE_INTEGER li{};
-                if (!GetFileSizeEx(hf, &li)) { CloseHandle(hf); continue; }
+                if (!GetFileSizeEx(hf, &li)) {
+                    CloseHandle(hf);
+                    if (item.deleteAfterSend) DeleteFileW(path.c_str());
+                    continue;
+                }
                 uint64_t totalSize = (uint64_t)li.QuadPart;
 
                 size_t slash = path.find_last_of(L"\\/");
@@ -5414,7 +5653,7 @@ static void TransferLoop(RunConfig cfg) {
 
                 if (!XferSendAll(sock, xferSendMtx, beginFrame.data(), beginFrame.size())) {
                     CloseHandle(hf);
-                    { std::lock_guard<std::mutex> lk(g_xferMtx); g_xferOutQ.push_front(path); }
+                    { std::lock_guard<std::mutex> lk(g_xferMtx); g_xferOutQ.push_front(item); }
                     xferAlive = false;
                     break;
                 }
@@ -5459,7 +5698,9 @@ static void TransferLoop(RunConfig cfg) {
                     // 连接已断：切勿补发 endFrame 或记发送成功，直接把未传完文件放回队头等重连
                     if (g_alive) {
                         std::lock_guard<std::mutex> lk(g_xferMtx);
-                        g_xferOutQ.push_front(path);
+                        g_xferOutQ.push_front(item);
+                    } else if (item.deleteAfterSend) {
+                        DeleteFileW(path.c_str());
                     }
                     xferAlive = false;
                     break;
@@ -5473,11 +5714,14 @@ static void TransferLoop(RunConfig cfg) {
                 if (!XferSendAll(sock, xferSendMtx, endFrame.data(), endFrame.size())) {
                     if (g_alive) {
                         std::lock_guard<std::mutex> lk(g_xferMtx);
-                        g_xferOutQ.push_front(path);
+                        g_xferOutQ.push_front(item);
+                    } else if (item.deleteAfterSend) {
+                        DeleteFileW(path.c_str());
                     }
                     xferAlive = false;
                     break;
                 }
+                if (item.deleteAfterSend) DeleteFileW(path.c_str());
                 if (complete) {
                     double dt = std::max(0.001, (double)(GetTickCount64() - t0) / 1000.0);
                     double speed = (double)sentTotal / dt / 1048576.0;
@@ -5728,6 +5972,10 @@ int main(int argc, char** argv) {
         Log("MFStartup 失败");
         return 1;
     }
+    {
+        Gdiplus::GdiplusStartupInput gsi;
+        Gdiplus::GdiplusStartup(&g_gdipToken, &gsi, nullptr);
+    }
 
     Graphics gfx;
     if (!gfx.Init(cfg.width, cfg.height)) return 2;
@@ -5967,6 +6215,19 @@ int main(int argc, char** argv) {
 
     MSG msg;
     while (GetMessage(&msg, nullptr, 0, 0)) {
+        // 控制面板或悬浮投递盒处于激活态时，拦截纯 Ctrl+V 一键发送剪贴板截图/文件
+        if (msg.message == WM_KEYDOWN && msg.wParam == 'V' &&
+            (GetKeyState(VK_CONTROL) & 0x8000) &&
+            !(GetKeyState(VK_MENU) & 0x8000) &&
+            !(GetKeyState(VK_SHIFT) & 0x8000)) {
+            HWND act = GetActiveWindow();
+            HWND hp = g_panel.load();
+            HWND db = g_dropBox.load();
+            if (act && (act == hp || act == db || (hp && IsChild(hp, act)))) {
+                PasteClipboardToTransfer(act);
+                continue;
+            }
+        }
         TranslateMessage(&msg);
         DispatchMessage(&msg);
     }
@@ -6007,7 +6268,18 @@ int main(int argc, char** argv) {
     if (panelToDestroy) { DestroyWindow(panelToDestroy); }
     HWND dbToDestroy = g_dropBox.exchange(nullptr);
     if (dbToDestroy) { DestroyWindow(dbToDestroy); }
+    {
+        std::lock_guard<std::mutex> lk(g_xferMtx);
+        for (const auto& it : g_xferOutQ) {
+            if (it.deleteAfterSend) DeleteFileW(it.path.c_str());
+        }
+        g_xferOutQ.clear();
+    }
     g_theme.ReleaseAll();
+    if (g_gdipToken) {
+        Gdiplus::GdiplusShutdown(g_gdipToken);
+        g_gdipToken = 0;
+    }
 
     WSACleanup();
     presenter.Shutdown();
