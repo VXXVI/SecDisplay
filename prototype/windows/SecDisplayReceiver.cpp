@@ -3058,7 +3058,7 @@ static void CopyDiagnostics() {
             L"Mac 副屏: %hs\r\n"
             L"虚拟屏分辨率: %dx%d @ %dHz\r\n"
             L"连接时长: %llu 秒\r\n"
-            L"帧率: %.1f fps  码率: %.1f Mbps (目标 %d Mbps)\r\n"
+            L"帧率: %.1f fps  码率: %.1f Mbps (当前 %d / 目标 %d Mbps)\r\n"
             L"编码耗时: %.2f ms  失败: %llu  围栏超时: %llu  丢弃: %llu\r\n"
             L"光标发送: %llu  收到输入: %llu\r\n"
             L"编码器: %s\r\n"
@@ -3072,7 +3072,7 @@ static void CopyDiagnostics() {
             hostErr.empty() ? "" : ")",
             peerStr.c_str(),
             hs.width.load(), hs.height.load(), hs.fps.load(), hUp,
-            g_uiFps.load(), g_uiMbps.load(), hs.targetBitrateMbps.load(),
+            g_uiFps.load(), g_uiMbps.load(), hs.bitrateMbps.load(), hs.targetBitrateMbps.load(),
             hs.lastEncMs.load(),
             (unsigned long long)hs.encodeFail.load(),
             (unsigned long long)hs.fenceTimeouts.load(),
@@ -3205,7 +3205,7 @@ static void UpdateControlPanel() {
 
         swprintf(buf, 256, L"%.1f fps", fps);
         g_panelData.fpsText = buf;
-        swprintf(buf, 256, L"%.1f Mbps (目标 %dM)", mbps, hs.targetBitrateMbps.load());
+        swprintf(buf, 256, L"%.1f Mbps (%d/%dM)", mbps, hs.bitrateMbps.load(), hs.targetBitrateMbps.load());
         g_panelData.mbpsText = buf;
 
         swprintf(buf, 256, L"%.2f ms", hs.lastEncMs.load());

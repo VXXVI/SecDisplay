@@ -144,7 +144,7 @@ public:
         }
         stats_.width = b.width;
         stats_.height = b.height;
-        stats_.fps = (b.hz >= 24 && b.hz <= 240) ? b.hz : reqFps_;
+        stats_.fps = ClampHz(b.hz, reqFps_);
 
         {
             char msg[128];
@@ -529,7 +529,7 @@ private:
 
             // 先发会话头再置 clientConnected=true，确保 0x06 总是早于首帧 0x01 到达
             WinVddBounds b = vdd_.Bounds();
-            int initHz = (b.hz >= 24 && b.hz <= 240) ? b.hz : reqFps_;
+            int initHz = ClampHz(b.hz, reqFps_);
             SendSessionHeader(b.width, b.height, initHz);
             stats_.clientConnected = true;
 
@@ -1658,6 +1658,8 @@ private:
             int badFormatCount = 0;
             bool sessionHealthy = false;
             bool needBackoff = false;
+            const char* rebuildReason = "采集/编码上下文重建";
+            HRESULT rebuildHr = S_OK;
 
             while (alive_.load()) {
                 enc.UpdateBitrateIfChanged(curMbps_.load());
@@ -1715,6 +1717,9 @@ private:
                                 forceKeyframe_.store(true);
                                 if (++encFailStreak >= 30) {
                                     EmitLog("WinHost: 静止桌面补关键帧连续失败 30 次，重建采集与编码器");
+                                    needBackoff = true;
+                                    rebuildReason = "静止桌面补关键帧连续失败";
+                                    rebuildHr = E_FAIL;
                                     break;
                                 }
                             }
@@ -1738,6 +1743,8 @@ private:
 
                 if (hr == DXGI_ERROR_ACCESS_LOST || FAILED(hr)) {
                     needBackoff = true;
+                    rebuildReason = "DXGI 输出上下文变更";
+                    rebuildHr = hr;
                     break;
                 }
 
@@ -1758,6 +1765,8 @@ private:
                         EmitLog(msg);
                         dup->ReleaseFrame();
                         needBackoff = true;
+                        rebuildReason = "虚拟屏分辨率变更重建";
+                        rebuildHr = S_OK;
                         break;
                     }
                     if (td.Format != DXGI_FORMAT_B8G8R8A8_UNORM) {
@@ -1803,6 +1812,8 @@ private:
                                 EmitLog("WinHost: 编码连续失败 30 次，重建采集与编码器");
                                 dup->ReleaseFrame();
                                 needBackoff = true;
+                                rebuildReason = "编码连续失败";
+                                rebuildHr = E_FAIL;
                                 break;
                             }
                         }
@@ -1812,7 +1823,7 @@ private:
             }
             enc.Shutdown();
             if (needBackoff && alive_.load()) {
-                backoffSleep("采集/编码上下文重建退避", hr);
+                backoffSleep(rebuildReason, rebuildHr);
             }
         }
 
