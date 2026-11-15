@@ -2900,7 +2900,9 @@ final class FileTransferService {
         stateLock.unlock()
         notifyUI()
         netQueue.async { [weak self] in
-            self?.startClientConnection()
+            guard let self else { return }
+            self.clientReconnectScheduled = false
+            self.startClientConnection()
         }
     }
 
@@ -2919,6 +2921,7 @@ final class FileTransferService {
         for u in toDelete { try? FileManager.default.removeItem(at: u) }
         netQueue.async { [weak self] in
             guard let self else { return }
+            self.connEpoch &+= 1
             self.keepAliveTimer?.cancel()
             self.keepAliveTimer = nil
             self.cleanupActiveRecvs()
@@ -3116,7 +3119,7 @@ final class FileTransferService {
         stateLock.lock()
         let isStopped = stopped
         stateLock.unlock()
-        if isStopped { return }
+        guard clientMode, !isStopped else { return }
 
         guard let nwPort = NWEndpoint.Port(rawValue: listenPort) else { return }
         let params = NWParameters.tcp

@@ -198,6 +198,7 @@ final class VideoToolboxDecoder {
     private(set) var videoHeight = 0
 
     var onDecodedFrame: ((CVPixelBuffer, Int, Int) -> Void)?
+    var onDecodeError: (() -> Void)?
     var onNeedKeyframe: (() -> Void)?
 
     func reset() {
@@ -256,7 +257,10 @@ final class VideoToolboxDecoder {
         }
 
         guard let session, let formatDesc, !vclPayload.isEmpty else {
-            if session == nil { onNeedKeyframe?() }
+            if session == nil {
+                onDecodeError?()
+                onNeedKeyframe?()
+            }
             return
         }
 
@@ -325,6 +329,7 @@ final class VideoToolboxDecoder {
         } else {
             pendingDecodedPB = nil
             decodeErrors &+= 1
+            onDecodeError?()
             if st3 == kVTInvalidSessionErr || st3 == kVTVideoDecoderMalfunctionErr {
                 reset()
             }
@@ -437,6 +442,12 @@ final class MacReceiverClient {
     private var _lastDecodeFps: Double = 0
     private var _lastMbps: Double = 0
     private var _droppedFrames: UInt64 = 0
+    private var _decodeInFlight: Int = 0
+    private var _decodedFrames: UInt64 = 0
+    private var _decodeErrors: UInt64 = 0
+    private var _videoWidth: Int = 0
+    private var _videoHeight: Int = 0
+    private var _lastFbDrops: UInt64 = 0
     private var _cursorRecv: UInt64 = 0
     private var _inputSent: UInt64 = 0
     private var _lastFrameRecvAt: CFAbsoluteTime = 0
@@ -457,6 +468,9 @@ final class MacReceiverClient {
             self.stateLock.lock()
             self._streaming = true
             self._framesInWindow &+= 1
+            self._decodedFrames &+= 1
+            self._videoWidth = w
+            self._videoHeight = h
             if self._lastPresentAt > 0 {
                 self._presIntervalsMs.append((now - self._lastPresentAt) * 1000.0)
                 if self._presIntervalsMs.count > 120 { self._presIntervalsMs.removeFirst() }
@@ -464,6 +478,12 @@ final class MacReceiverClient {
             self._lastPresentAt = now
             self.stateLock.unlock()
             self.onVideoFrame?(pb, w, h)
+        }
+        decoder.onDecodeError = { [weak self] in
+            guard let self else { return }
+            self.stateLock.lock()
+            self._decodeErrors &+= 1
+            self.stateLock.unlock()
         }
         decoder.onNeedKeyframe = { [weak self] in
             self?.sendKeyframeRequest(throttled: true)
@@ -518,8 +538,8 @@ final class MacReceiverClient {
                 _windowStartAt = now
             }
         }
-        let w = decoder.videoWidth > 0 ? decoder.videoWidth : _sessW
-        let h = decoder.videoHeight > 0 ? decoder.videoHeight : _sessH
+        let w = _videoWidth > 0 ? _videoWidth : _sessW
+        let h = _videoHeight > 0 ? _videoHeight : _sessH
         let p95Src = Self.percentile95(_srcIntervalsMs)
         let p95Pres = Self.percentile95(_presIntervalsMs)
         return MacReceiverSnapshot(
@@ -533,8 +553,8 @@ final class MacReceiverClient {
             mbps: _lastMbps,
             sourceP95: p95Src,
             presentP95: p95Pres,
-            decodedFrames: decoder.decodedFrames,
-            decodeErrors: decoder.decodeErrors,
+            decodedFrames: _decodedFrames,
+            decodeErrors: _decodeErrors,
             droppedFrames: _droppedFrames,
             cursorRecv: _cursorRecv,
             inputSent: _inputSent,
@@ -607,6 +627,7 @@ final class MacReceiverClient {
 
     private func handleDisconnect(epoch: Int) {
         guard connEpoch == epoch else { return }
+        connEpoch &+= 1
         feedbackTimer?.cancel()
         feedbackTimer = nil
         conn?.cancel()
@@ -616,6 +637,7 @@ final class MacReceiverClient {
         let isStopped = stopped
         _connected = false
         _streaming = false
+        _decodeInFlight = 0
         stateLock.unlock()
         decodeQueue.async { [weak self] in
             self?.decoder.reset()
@@ -691,15 +713,32 @@ final class MacReceiverClient {
         switch type {
         case 0x01:
             let now = CFAbsoluteTimeGetCurrent()
+            let hasIdr = Self.avccContainsIDR(payload)
             stateLock.lock()
             if _lastFrameRecvAt > 0 {
                 _srcIntervalsMs.append((now - _lastFrameRecvAt) * 1000.0)
                 if _srcIntervalsMs.count > 120 { _srcIntervalsMs.removeFirst() }
             }
             _lastFrameRecvAt = now
+            // 解码队列背压：在途帧数 >= 3 时丢弃非关键帧防止延迟堆积
+            if _decodeInFlight >= 3 && !hasIdr {
+                _droppedFrames &+= 1
+                stateLock.unlock()
+                return
+            }
+            _decodeInFlight += 1
             stateLock.unlock()
             decodeQueue.async { [weak self] in
-                self?.decoder.decodeAvccFrame(payload)
+                guard let self else { return }
+                self.stateLock.lock()
+                let alive = !self.stopped && self._connected
+                self.stateLock.unlock()
+                if alive {
+                    self.decoder.decodeAvccFrame(payload)
+                }
+                self.stateLock.lock()
+                self._decodeInFlight = max(0, self._decodeInFlight - 1)
+                self.stateLock.unlock()
             }
         case 0x03:
             guard payload.count >= 9 else { return }
@@ -717,7 +756,9 @@ final class MacReceiverClient {
             let hx = Int(readU16BE(payload, 4))
             let hy = Int(readU16BE(payload, 6))
             let nBytes = Int(readU32BE(payload, 8))
-            guard w > 0, h > 0, w <= 128, h <= 128, nBytes == w * h * 4, payload.count >= 12 + nBytes else { return }
+            guard w > 0, h > 0, w <= 256, h <= 256 else { return }
+            let expected = w * h * 4
+            guard nBytes == expected, payload.count - 12 >= expected else { return }
             let bgra = payload.subdata(in: (payload.startIndex + 12)..<(payload.startIndex + 12 + nBytes))
             if let cg = buildCursorCGImage(bgra: bgra, width: w, height: h) {
                 onCursorImage?(cg, hx, hy)
@@ -827,9 +868,31 @@ final class MacReceiverClient {
         }
     }
 
+    private static func avccContainsIDR(_ avcc: Data) -> Bool {
+        var offset = avcc.startIndex
+        while offset + 4 <= avcc.endIndex {
+            let b0 = UInt32(avcc[offset])
+            let b1 = UInt32(avcc[offset + 1])
+            let b2 = UInt32(avcc[offset + 2])
+            let b3 = UInt32(avcc[offset + 3])
+            let len = Int((b0 << 24) | (b1 << 16) | (b2 << 8) | b3)
+            offset += 4
+            guard len > 0, offset + len <= avcc.endIndex else { break }
+            if (avcc[offset] & 0x1F) == 5 { return true }
+            offset += len
+        }
+        return false
+    }
+
     private func sendFeedbackPacket() {
         let snap = snapshot()
         guard snap.connected else { return }
+        stateLock.lock()
+        let curDrops = _droppedFrames &+ _decodeErrors
+        let dropDelta = curDrops >= _lastFbDrops ? (curDrops - _lastFbDrops) : curDrops
+        _lastFbDrops = curDrops
+        stateLock.unlock()
+
         var pkt = Data(capacity: 13)
         pkt.append(0x07)
         func put16(_ v: UInt16) {
@@ -839,8 +902,8 @@ final class MacReceiverClient {
         put16(UInt16(clamping: Int(snap.presentP95.rounded())))
         put16(UInt16(clamping: Int(snap.sourceP95.rounded())))
         put16(UInt16(clamping: Int((snap.decodeFps * 10.0).rounded())))
-        put16(UInt16(clamping: Int(snap.decodeErrors)))
-        put16(UInt16(clamping: Int(snap.droppedFrames)))
+        put16(UInt16(clamping: dropDelta))
+        put16(0)
         put16(0)
         conn?.send(content: pkt, completion: .contentProcessed { _ in })
     }
@@ -949,9 +1012,19 @@ final class ReceiverCanvasView: NSView {
         CATransaction.begin()
         CATransaction.setDisableActions(true)
         videoLayer.frame = bounds
+        if let scale = window?.backingScaleFactor, scale > 0 {
+            cursorLayer.contentsScale = scale
+        }
         updateCursorLayerFrame()
         CATransaction.commit()
         window?.invalidateCursorRects(for: self)
+    }
+
+    override func viewDidChangeBackingProperties() {
+        super.viewDidChangeBackingProperties()
+        if let scale = window?.backingScaleFactor, scale > 0 {
+            cursorLayer.contentsScale = scale
+        }
     }
 
     func updateWaitingText(_ text: String) {
@@ -1120,7 +1193,7 @@ final class ReceiverCanvasView: NSView {
 
     override func scrollWheel(with event: NSEvent) {
         guard let (vx, vy) = viewPointToVideo(event) else { return }
-        let raw = event.hasPreciseScrollingDeltas ? event.scrollingDeltaY * 3.0 : event.scrollingDeltaY * 40.0
+        let raw = event.hasPreciseScrollingDeltas ? event.scrollingDeltaY * 3.0 : event.scrollingDeltaY * 120.0
         let clamped = max(-32767.0, min(32767.0, raw))
         // Windows 接收正值向上，WinHostSender 内部做了 -(int)wheel 还原，故这里发 -clamped 保持自然一致
         let wheel = Int16((-clamped).rounded())
@@ -1131,9 +1204,12 @@ final class ReceiverCanvasView: NSView {
 
     override func keyDown(with event: NSEvent) {
         let mods = event.modifierFlags.intersection([.command, .control, .option, .shift])
-        // Ctrl+Cmd+F（macOS 标准全屏快捷键）在本地切换全屏，不转发
+        // Ctrl+Cmd+F（macOS 标准全屏快捷键）在本地切换全屏，先释放对端已按下的修饰键避免粘连
         if event.keyCode == 0x03 && mods == [.command, .control] {
-            if !event.isARepeat { window?.toggleFullScreen(nil) }
+            if !event.isARepeat {
+                releaseAllInputs()
+                window?.toggleFullScreen(nil)
+            }
             return
         }
         guard let wk = MacKeyMap.lookup(event.keyCode) else { return }
@@ -1143,7 +1219,7 @@ final class ReceiverCanvasView: NSView {
 
     override func keyUp(with event: NSEvent) {
         guard let wk = MacKeyMap.lookup(event.keyCode) else { return }
-        heldKeys.remove(event.keyCode)
+        guard heldKeys.remove(event.keyCode) != nil else { return }
         client?.sendKeyInput(vk: wk.vk, scan: wk.scan, down: false, flags: wk.extended ? 0x01 : 0)
     }
 
@@ -1156,13 +1232,14 @@ final class ReceiverCanvasView: NSView {
             client?.sendKeyInput(vk: wk.vk, scan: wk.scan, down: false, flags: 0)
             return
         }
-        let isDown = event.modifierFlags.contains(flag)
-        if isDown {
-            heldModifiers.insert(kc)
-        } else {
+        // 以 heldModifiers 集合作为单一事实来源区分同类别左右键（避免同时按左右 Shift 松开一个时仍判为 down）
+        if heldModifiers.contains(kc) {
             heldModifiers.remove(kc)
+            client?.sendKeyInput(vk: wk.vk, scan: wk.scan, down: false, flags: wk.extended ? 0x01 : 0)
+        } else if event.modifierFlags.contains(flag) {
+            heldModifiers.insert(kc)
+            client?.sendKeyInput(vk: wk.vk, scan: wk.scan, down: true, flags: wk.extended ? 0x01 : 0)
         }
-        client?.sendKeyInput(vk: wk.vk, scan: wk.scan, down: isDown, flags: wk.extended ? 0x01 : 0)
     }
 }
 
