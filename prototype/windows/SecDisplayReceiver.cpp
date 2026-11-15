@@ -4804,7 +4804,7 @@ static std::wstring UniqueDestPathW(const std::wstring& dir, const std::wstring&
     return dir + L"\\" + stem + ts + ext;
 }
 
-static void TransferLoop(Config cfg) {
+static void TransferLoop(RunConfig cfg) {
     const uint16_t xferPort = (uint16_t)(cfg.port + 1);
     const std::wstring inbox = GetTransferInboxDir();
     Log("中转站线程启动: 目标 %s:%d，目录 %s",
