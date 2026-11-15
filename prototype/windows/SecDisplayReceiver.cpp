@@ -2301,6 +2301,8 @@ static LRESULT CALLBACK PanelBtnSubclassProc(HWND h, UINT msg, WPARAM w, LPARAM 
             g_hoverBtn = nullptr;
             InvalidateRect(h, nullptr, FALSE);
         }
+    } else if (msg == WM_NCDESTROY) {
+        if (g_hoverBtn == h) g_hoverBtn = nullptr;
     }
     return CallWindowProcW(g_origBtnProc, h, msg, w, l);
 }
@@ -3068,6 +3070,15 @@ static void ShowControlPanel() {
                               style, x, y, w, hgt,
                               nullptr, nullptr, GetModuleHandleW(nullptr), nullptr);
     if (g_panel) {
+        // 创建后校准一次真实所在屏幕 DPI，避免多屏 DPI 不同时窗口外框与内绘比例错配
+        const int realDpi = PanelWindowDpi(g_panel);
+        if (realDpi != dpi) {
+            RECT r2{ 0, 0, DpiPx(960, realDpi), DpiPx(534, realDpi) };
+            AdjustRectDpi(&r2, style, WS_EX_APPWINDOW, realDpi);
+            SetWindowPos(g_panel, nullptr, 0, 0, r2.right - r2.left, r2.bottom - r2.top,
+                         SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE);
+            LayoutPanelControls(g_panel);
+        }
         Log("控制面板已创建 hwnd=%p", (void*)g_panel);
         ShowWindow(g_panel, SW_SHOW);
         SetForegroundWindow(g_panel);
