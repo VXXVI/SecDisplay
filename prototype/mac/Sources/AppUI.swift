@@ -117,7 +117,7 @@ final class AppModel: ObservableObject {
         logLine = Log.currentPath
 
         if appRole == .receiver {
-            if let snap = macReceiverClient?.snapshot() {
+            if let snap = macReceiverClient?.snapshot(sampleRates: true) {
                 recvConnected = snap.connected
                 recvStreaming = snap.streaming
                 recvPeer = snap.peer
@@ -328,20 +328,7 @@ struct StatusView: View {
                 if model.isReceiverMode {
                     SectionHeader(title: "副屏连接（Windows 主控）")
                     VStack(spacing: 6) {
-                        HStack(spacing: 6) {
-                            Text("主控 IP").foregroundStyle(.secondary)
-                            TextField("10.10.10.2", text: $model.winHost)
-                                .textFieldStyle(.roundedBorder)
-                                .font(.system(size: 11, design: .monospaced))
-                            Button("重连") {
-                                let host = model.winHost.trimmingCharacters(in: .whitespacesAndNewlines)
-                                guard !host.isEmpty else { return }
-                                winHostAddress = host
-                                UserDefaults.standard.set(host, forKey: "SecDisplayWinHost")
-                                macReceiverClient?.start(host: host, port: cfg.port)
-                                transferService.connect(host: host, port: cfg.port &+ 1)
-                            }
-                        }
+                        StatRow(label: "监听端口", value: "\(cfg.port) / \(cfg.port &+ 1) (等待 Windows 连入)")
                         StatRow(label: "对端", value: model.recvPeer)
                         StatRow(label: "连接时长", value: fmtUptime(model.recvUptimeSec))
                         StatRow(label: "已解码帧", value: "\(model.recvDecoded) 帧")
