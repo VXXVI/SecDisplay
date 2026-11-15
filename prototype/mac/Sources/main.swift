@@ -1374,10 +1374,6 @@ final class ScreenshotCapture {
         slowStreak += 1
         return slowStreak
     }
-    /// 只清退避计数（唤醒后用），保留重启预算
-    private func resetSlowStreak() {
-        genLock.lock(); slowStreak = 0; genLock.unlock()
-    }
     private func bumpRestartCount() -> Int {
         genLock.lock(); defer { genLock.unlock() }
         restartCount += 1
@@ -1387,10 +1383,28 @@ final class ScreenshotCapture {
     private func resetCaptureCounters() {
         genLock.lock(); slowStreak = 0; restartCount = 0; genLock.unlock()
     }
-    /// 重启硬上限。超过就彻底停手，只留面板告警 ——
-    /// 「退避」只降低重启频率，卡在 await 里的 Task 永不返回，代次对它们无效，
-    /// 每 30 秒仍会净增 4 个线程：一小时 480 个，一天上万。所以必须有出口。
+    /// 连续失败的重启上限。超过就停手，等用户重启进程 ——
+    /// 这一条针对「采集彻底死掉」：退避只降低频率，卡在 await 里的 Task
+    /// 永不返回，每 30 秒仍会净增 4 个线程。
     private let restartHardCap = 20
+    /// 进程生命周期内 spawnWorkers 的总次数，**不随恢复清零**。
+    ///
+    /// 为什么需要它：连续失败上限会在采集恢复正常时归零，而「休眠 → 唤醒」
+    /// 恰好是「先失败一次、随后恢复正常」的模式。屏保每分钟休眠一次时，
+    /// 每次唤醒都会新建 4 个 worker，休眠期间卡住的旧 worker 永不返回，
+    /// 连续失败计数却永远到不了 20。一天下来就是几千个僵尸线程。
+    /// 这里按代次总量设一个绝对上限，与是否恢复无关。
+    private let spawnHardCap = 300
+    private var totalSpawns = 0
+    private func bumpTotalSpawns() -> Int {
+        genLock.lock(); defer { genLock.unlock() }
+        totalSpawns += 1
+        return totalSpawns
+    }
+    private var totalSpawnCount: Int {
+        genLock.lock(); defer { genLock.unlock() }
+        return totalSpawns
+    }
     /// 放弃自动重启后，日志降频到 5 分钟一条
     private var lastGiveUpLogAt: CFAbsoluteTime = 0
     /// 原始采集计数：capture 一返回就自增，不经过 encodeQueue。
@@ -1479,19 +1493,16 @@ final class ScreenshotCapture {
                 // 休眠期间 worker 多半已卡在 await 里，唤醒后不会自己恢复。
                 // 直接重建一次比等 3 秒再判「异常」更干净。
                 //
-                // 但这次重建必须计入同一个重启预算：屏保或显示器每分钟休眠
-                // 一次时，若每次都无条件 +4 个 Task，一天就是上千个永不返回的
-                // 线程 —— 正是这个 PR 要消灭的那种增长。
-                self.resetSlowStreak()
-                let n = self.bumpRestartCount()
-                if n > self.restartHardCap {
-                    Log.info("显示器已唤醒，但已累计重启 \(n) 次，跳过重建（请退出并重开 SecDisplay）")
+                // 唤醒本身不算失败，所以清零连续失败计数；但「线程重建总量」
+                // 是另一条独立的绝对上限（spawnHardCap），屏保每分钟休眠一次
+                // 时也不会无界堆线程。
+                self.resetCaptureCounters()
+                if self.spawnWorkers() {
+                    Log.info("显示器已唤醒，重建采集工作线程")
+                } else {
                     self.lastSupervisorCount = self.capturedRaw
                     self.lastSupervisorAt = now
-                    return
                 }
-                self.spawnWorkers()
-                Log.info("显示器已唤醒，重建采集工作线程（累计第 \(n) 次）")
                 return
             }
 
@@ -1527,6 +1538,9 @@ final class ScreenshotCapture {
                     return
                 }
                 self.lastRestartAt = now
+                // 先确认真的拉起了再计数、再记日志，避免出现「日志说重启了
+                // 第 21 次，实际因为总量上限没拉起来」这种自相矛盾。
+                guard self.spawnWorkers() else { return }
                 let n = self.bumpRestartCount()
                 // 每次真正重启都记一行。退避后重启频率已降到 30 秒一次，
                 // 不会刷屏；而这里恰恰是「画面一直不动」时唯一的线索，
@@ -1538,7 +1552,6 @@ final class ScreenshotCapture {
                     Log.info(String(format: "截图采集持续异常（%.1ffps，已重启 %d 次），已降为 30 秒重试一次。若画面不动请重启发送端",
                                     measuredFps, n))
                 }
-                self.spawnWorkers()
             } else {
                 if self.captureRestartCount > 0 {
                     Log.info("截图采集已恢复正常（\(String(format: "%.0f", measuredFps))fps）")
@@ -1549,23 +1562,38 @@ final class ScreenshotCapture {
         supervisor?.resume()
     }
 
-    private func spawnWorkers() {
+    /// 拉起采集工作线程。返回 false 表示已到总量上限，没有真的拉起。
+    @discardableResult
+    private func spawnWorkers() -> Bool {
         // 防御：stop() 可能在 start() 的 await 之后、这里之前到达。
         // 顶层代码是 @MainActor 隔离的，实际窗口很小，但不该依赖这个隐式前提。
         guard !stopRequested else {
             Log.info("已请求停止，跳过启动采集工作线程")
-            return
+            return false
+        }
+        // 绝对上限：卡在 await 里的 Task 永不返回，代次对它们无效。
+        // 这里按代次总量兜底，与「连续失败」是否已恢复无关。
+        let done = totalSpawnCount
+        if done >= spawnHardCap {
+            let now = CFAbsoluteTimeGetCurrent()
+            if now - lastGiveUpLogAt > 300.0 {
+                lastGiveUpLogAt = now
+                Log.info("采集线程已累计重建 \(done) 次，停止重建。请退出并重开 SecDisplay")
+            }
+            return false
         }
         let workers = 4
+        let total = bumpTotalSpawns()
         let gen = bumpWorkerGen()
         lastSupervisorAt = CFAbsoluteTimeGetCurrent()
         lastSupervisorCount = capturedRaw
-        Log.info("采集通道: SCScreenshotManager 轮询，\(workers) 路并发（代次 \(gen)）")
+        Log.info("采集通道: SCScreenshotManager 轮询，\(workers) 路并发（代次 \(gen)，累计第 \(total) 次）")
         for i in 0..<workers {
             Task.detached(priority: .userInitiated) { [weak self] in
                 await self?.loop(index: i, gen: gen)
             }
         }
+        return true
     }
 
     /// 停止采集。这是同步函数（只置标志 + 自增代次），调用方不需要
