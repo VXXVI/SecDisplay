@@ -138,7 +138,8 @@ echo "已生成 $APP"
 
 if [ "$INSTALL" = "1" ]; then
     rm -rf "/Applications/SecDisplay.app"
-    cp -R "$APP" /Applications/
+    # 用 ditto 而不是 cp -R：它会保留扩展属性与资源分支，签名校验更稳。
+    ditto "$APP" "/Applications/SecDisplay.app"
     echo "已安装到 /Applications/SecDisplay.app"
     if pgrep -f "/Applications/SecDisplay.app/Contents/MacOS/SecDisplay" >/dev/null 2>&1; then
         echo "提示: 检测到旧实例正在运行，先退出旧实例后再重新 open /Applications/SecDisplay.app"
