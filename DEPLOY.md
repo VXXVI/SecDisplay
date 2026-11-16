@@ -262,6 +262,20 @@ Windows 电源计划默认在无本地键鼠输入时关闭显示器（例如平
 
 接收端现已在投屏且未最小化时自动声明 `SetThreadExecutionState(ES_DISPLAY_REQUIRED | ES_SYSTEM_REQUIRED)` 保持屏幕常亮，断连或最小化让位时释放。可在控制面板勾选或取消「保持屏幕常亮 (防熄屏)」。
 
+### Windows 端：主控合盖或插拔雷电线后不亮屏、亮度调节失效
+
+当 Windows 笔记本以主控模式合盖运行时，Windows 会关闭内建 eDP 面板并把 `ParsecVDA` 设为唯一屏幕：
+
+1. **避免电池合盖触发休眠/掉电**：Windows 默认常将「接通电源合盖 = 无操作」而「使用电池合盖 = 睡眠/休眠」。若雷电口供电瞬断或拔掉电源，合盖会直接休眠或异常断电黑屏。请以管理员执行以下命令把接通电源与电池的合盖动作均设为「不采取任何操作」：
+
+```cmd
+powercfg /setacvalueindex SCHEME_CURRENT SUB_BUTTONS LIDACTION 0
+powercfg /setdcvalueindex SCHEME_CURRENT SUB_BUTTONS LIDACTION 0
+powercfg /setactive SCHEME_CURRENT
+```
+
+2. **程序内自动防护与唤醒**：主控端不再把合盖单屏下的 `(0,0)` 虚拟屏排布持久化写入注册表；在收到 `WM_POWERBROADCAST` 休眠通知时先卸载虚拟屏并在唤醒时调用 `SDC_TOPOLOGY_INTERNAL` 唤醒内建显示路径；开盖（`GUID_LIDSWITCH_STATE_CHANGE`）或退出时若内建屏仍处于熄灭状态，会自动切回内建屏并重建扩展桌面。若因系统异常中断导致物理黑屏，可在另一台设备通过快捷键 `Win+Ctrl+Shift+B` 重置显卡驱动或运行一次 `SecDisplayReceiver.exe` 后正常退出触发内建屏恢复。
+
 ### Mac 端：画面卡住不动 / 内存持续上涨
 
 `SCScreenshotManager` 并发轮询有两个已知故障模式：整体卡死（完成回调永不返回），和半卡死（偶尔回一帧但远低于目标帧率）。看护会按实测帧率判断，连续异常时重启工作线程。

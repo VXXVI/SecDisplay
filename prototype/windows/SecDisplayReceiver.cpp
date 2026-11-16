@@ -22,6 +22,9 @@
 //   SecDisplayReceiver.exe <Mac的IP> <端口> <宽> <高>
 // ============================================================================
 
+#ifndef _WIN32_WINNT
+#define _WIN32_WINNT 0x0A00
+#endif
 #define WIN32_LEAN_AND_MEAN
 #define NOMINMAX
 #define _CRT_SECURE_NO_WARNINGS   // fopen/strncpy 等标准函数在 MSVC 下会被警告
@@ -5570,6 +5573,54 @@ static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
         UpdateRefreshHz();
         ResetShakeSamples();
         return 0;
+    case WM_POWERBROADCAST:
+        if (w == PBT_APMSUSPEND) {
+            if (g_hostMode.load()) {
+                Log("电源事件: 系统即将进入睡眠/休眠 (PBT_APMSUSPEND)");
+                g_winHost.PauseForSleep();
+                UpdateControlPanel();
+            }
+            return TRUE;
+        }
+        if (w == PBT_APMRESUMEAUTOMATIC) {
+            if (g_hostMode.load()) {
+                Log("电源事件: 系统自动唤醒 (PBT_APMRESUMEAUTOMATIC)");
+                SetThreadExecutionState(ES_CONTINUOUS | ES_SYSTEM_REQUIRED | ES_DISPLAY_REQUIRED);
+                g_winHost.ResumeFromSleep();
+                UpdateControlPanel();
+            }
+            return TRUE;
+        }
+        if (w == PBT_APMRESUMESUSPEND) {
+            if (g_hostMode.load()) {
+                Log("电源事件: 系统用户态唤醒 (PBT_APMRESUMESUSPEND)");
+                SetThreadExecutionState(ES_CONTINUOUS | ES_SYSTEM_REQUIRED | ES_DISPLAY_REQUIRED);
+                if (!g_winHost.ResumeFromSleep()) {
+                    g_winHost.OnDisplayChange(true);
+                }
+                UpdateControlPanel();
+            }
+            return TRUE;
+        }
+        if (w == PBT_POWERSETTINGCHANGE && l) {
+            const auto* pbs = reinterpret_cast<const POWERBROADCAST_SETTING*>(l);
+            static const GUID kGuidLidSwitch = {
+                0xBA3E0F4D, 0xB817, 0x4094, { 0xA2, 0xD1, 0xD5, 0x63, 0x79, 0xE6, 0xA0, 0xF3 }
+            };
+            if (IsEqualGUID(pbs->PowerSetting, kGuidLidSwitch) && pbs->DataLength >= sizeof(DWORD)) {
+                DWORD lidOpen = *reinterpret_cast<const DWORD*>(pbs->Data);
+                Log("电源事件: 笔记本合盖开关状态变化 -> %s", lidOpen ? "已开盖" : "已合盖");
+                if (lidOpen && g_hostMode.load()) {
+                    if (g_winHost.IsRunning() && g_winHost.VddActive()) {
+                        g_winHost.OnDisplayChange(true);
+                    } else {
+                        secdisplay::WinVirtualDisplay::EnsureInternalPanelAwake([](const char* s) { Log("%s", s); });
+                    }
+                }
+            }
+            return TRUE;
+        }
+        break;
     case WM_EXITSIZEMOVE:
         // 显示模式变化或窗口跨屏移动后，刷新率可能变了，--pace 的节拍要跟着更新
         UpdateRefreshHz();
@@ -7191,6 +7242,53 @@ static void TransferLoop(RunConfig cfg) {
 // 主流程
 // ---------------------------------------------------------------------------
 
+static const char* LidActionName(DWORD v) {
+    switch (v) {
+    case 0: return "无操作";
+    case 1: return "睡眠";
+    case 2: return "休眠";
+    case 3: return "关机";
+    default: return "未知";
+    }
+}
+
+// 启动时检查当前电源方案合盖动作：若 AC/DC 仍设为睡眠/休眠，合盖用雷电扩展屏可能触发断显或掉电黑屏
+static void CheckWindowsLidPowerPolicy() {
+    HMODULE hPowr = LoadLibraryA("powrprof.dll");
+    if (!hPowr) return;
+    typedef DWORD (WINAPI *GetActiveFn)(HKEY, GUID**);
+    typedef DWORD (WINAPI *ReadValFn)(HKEY, const GUID*, const GUID*, const GUID*, LPDWORD);
+    auto pGetActive = reinterpret_cast<GetActiveFn>(GetProcAddress(hPowr, "PowerGetActiveScheme"));
+    auto pReadAC    = reinterpret_cast<ReadValFn>(GetProcAddress(hPowr, "PowerReadACValueIndex"));
+    auto pReadDC    = reinterpret_cast<ReadValFn>(GetProcAddress(hPowr, "PowerReadDCValueIndex"));
+    if (pGetActive && pReadAC && pReadDC) {
+        GUID* activeScheme = nullptr;
+        if (pGetActive(nullptr, &activeScheme) == ERROR_SUCCESS && activeScheme) {
+            static const GUID kSubButtons = {
+                0x4f971e89, 0xeebd, 0x4455, { 0xa8, 0xde, 0x9e, 0x59, 0x04, 0x0e, 0x73, 0x47 }
+            };
+            static const GUID kLidAction = {
+                0x5ca83367, 0x6e45, 0x459f, { 0xa2, 0x7b, 0x47, 0x6b, 0x1d, 0x01, 0xc9, 0x36 }
+            };
+            DWORD acVal = 0, dcVal = 0;
+            bool hasAc = (pReadAC(nullptr, activeScheme, &kSubButtons, &kLidAction, &acVal) == ERROR_SUCCESS);
+            bool hasDc = (pReadDC(nullptr, activeScheme, &kSubButtons, &kLidAction, &dcVal) == ERROR_SUCCESS);
+            if (hasAc || hasDc) {
+                Log("电源合盖策略: 接通电源=%s(%lu)  电池=%s(%lu)",
+                    hasAc ? LidActionName(acVal) : "未知", (unsigned long)acVal,
+                    hasDc ? LidActionName(dcVal) : "未知", (unsigned long)dcVal);
+                if ((hasAc && acVal != 0) || (hasDc && dcVal != 0)) {
+                    Log("警告: 合盖动作非「无操作」，合盖连接雷电屏可能导致休眠黑屏；"
+                        "建议以管理员执行: powercfg /setacvalueindex SCHEME_CURRENT SUB_BUTTONS LIDACTION 0 "
+                        "与 /setdcvalueindex ... LIDACTION 0 后 powercfg /setactive SCHEME_CURRENT");
+                }
+            }
+            LocalFree(activeScheme);
+        }
+    }
+    FreeLibrary(hPowr);
+}
+
 // 未处理异常/terminate 时尽量留一行日志，便于区分崩溃与外部终止。
 static LONG WINAPI CrashFilter(EXCEPTION_POINTERS* ep) {
     if (ep && ep->ExceptionRecord) {
@@ -7352,7 +7450,12 @@ int main(int argc, char** argv) {
         RegisterHotKey(hwnd, HOTKEY_QUIT_ID, MOD_CONTROL | MOD_ALT, 'Q');
         RegisterHotKey(hwnd, HOTKEY_DROPBOX_ID, MOD_CONTROL | MOD_ALT, 'B');
         RegisterHotKey(hwnd, HOTKEY_KVM_ID, MOD_CONTROL | MOD_ALT, 'K');
+        static const GUID kGuidLidSwitchHost = {
+            0xBA3E0F4D, 0xB817, 0x4094, { 0xA2, 0xD1, 0xD5, 0x63, 0x79, 0xE6, 0xA0, 0xF3 }
+        };
+        HPOWERNOTIFY hPowerLid = RegisterPowerSettingNotification(hwnd, &kGuidLidSwitchHost, DEVICE_NOTIFY_WINDOW_HANDLE);
         SetThreadExecutionState(ES_CONTINUOUS | ES_SYSTEM_REQUIRED | ES_DISPLAY_REQUIRED);
+        CheckWindowsLidPowerPolicy();
 
         g_hostReqW = cfg.hostWidth;
         g_hostReqH = cfg.hostHeight;
@@ -7386,6 +7489,7 @@ int main(int argc, char** argv) {
         }
 
         SetThreadExecutionState(ES_CONTINUOUS);
+        if (hPowerLid) UnregisterPowerSettingNotification(hPowerLid);
         TrayRemove();
         UnregisterHotKey(hwnd, HOTKEY_QUIT_ID);
         UnregisterHotKey(hwnd, HOTKEY_DROPBOX_ID);

@@ -160,6 +160,7 @@ ping -c 5 10.10.10.2
 - **Mac 端异常退出残留虚拟屏**：正常退出会自动等待采集停稳后销毁虚拟屏；若被强杀导致残留，可执行 `/Applications/SecDisplay.app/Contents/MacOS/SecDisplay --cleanup-orphan`（或 `SECDISPLAY_CLEANUP_ORPHAN=1 ./run.sh start`），必要时注销重登即可回收。
 - **Mac 副屏安全防抢占**：副屏接收模式下 `9922` 默认仅放行私有/链路本地/Tailscale 网段，且在已有主控连接时拒绝不同来源 IP 抢占当前会话；也可在面板填写允许接入的 Windows IP 白名单。
 - **Windows 主控端 2880x1800 自定义模式**：若驱动尚未注册 `2880x1800`，以管理员权限启动一次即可自动写入 `HKLM\SOFTWARE\Parsec\vdd\0`；若虚拟屏开启了 HDR 导致格式非 `BGRA8`，请在系统显示设置中关闭该屏 HDR。
+- **Windows 合盖主控黑屏防护**：如需合盖运行 Windows 主控端，建议通过 `powercfg` 将电源方案的接通电源与电池合盖动作（`SUB_BUTTONS LIDACTION`）均设为 `0`（不采取任何操作），详情见 `DEPLOY.md`；主控端已内置休眠保护、开盖唤醒内建屏与退出拓扑恢复。
 
 ---
 

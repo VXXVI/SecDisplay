@@ -104,11 +104,13 @@ public:
 
     bool Start(const std::string& targetHost, int width, int height, int fps, int bitrateMbps, uint16_t port, LogFn logFn, int dpiPercent = 0) {
         Stop();
+        pausedForSleep_.store(false);
         logFn_ = std::move(logFn);
         targetHost_ = targetHost.empty() ? "10.10.10.1" : targetHost;
         reqW_ = width > 0 ? width : 2880;
         reqH_ = height > 0 ? height : 1800;
         reqFps_ = (fps >= 24 && fps <= 144) ? fps : 60;
+        reqDpi_ = dpiPercent;
         if (bitrateMbps < 10) bitrateMbps = 10;
         if (bitrateMbps > 200) bitrateMbps = 200;
         targetMbps_.store(bitrateMbps);
@@ -298,8 +300,29 @@ public:
         forceKeyframe_.store(true);
     }
 
-    void OnDisplayChange() {
+    void OnDisplayChange(bool forceWakeInternal = false) {
+        if (forceWakeInternal) displayWakeInternal_.store(true);
         displayReconcilePending_.store(true);
+    }
+
+    bool PauseForSleep() {
+        if (!alive_.load() && !vdd_.IsActive()) {
+            pausedForSleep_.store(false);
+            return false;
+        }
+        pausedForSleep_.store(true);
+        EmitLog("WinHost: 系统即将进入休眠，暂停推流并卸载虚拟屏以保护内建屏");
+        Stop();
+        return true;
+    }
+
+    bool ResumeFromSleep() {
+        if (!pausedForSleep_.exchange(false)) return false;
+        EmitLog("WinHost: 系统从休眠恢复，先唤醒内建显示路径再重建虚拟屏");
+        WinVirtualDisplay::EnsureInternalPanelAwake(logFn_);
+        std::string hostCopy = targetHost_;
+        LogFn logCopy = logFn_;
+        return Start(hostCopy, reqW_, reqH_, reqFps_, targetMbps_.load(), port_, std::move(logCopy), reqDpi_);
     }
 
     bool IsRunning() const { return alive_.load(); }
@@ -329,6 +352,7 @@ private:
     int reqW_ = 2560;
     int reqH_ = 1600;
     int reqFps_ = 60;
+    int reqDpi_ = 0;
     std::atomic<int> targetMbps_{80};
     std::atomic<int> curMbps_{80};
     uint16_t port_ = 9922;
@@ -336,6 +360,8 @@ private:
     std::atomic<bool> alive_{false};
     std::atomic<bool> forceKeyframe_{true};
     std::atomic<bool> displayReconcilePending_{false};
+    std::atomic<bool> displayWakeInternal_{false};
+    std::atomic<bool> pausedForSleep_{false};
     std::atomic<uint64_t> lastPayloadUs_{0};
 
     std::mutex sockMtx_;
@@ -1905,10 +1931,12 @@ private:
 
         while (alive_.load()) {
             if (displayReconcilePending_.exchange(false)) {
+                bool wake = displayWakeInternal_.exchange(false);
                 bool cd = false;
-                if (vdd_.ReconcileExtendedTopology(&cd)) {
+                if (vdd_.ReconcileExtendedTopology(&cd, wake)) {
                     forceKeyframe_.store(true);
                 } else if (cd) {
+                    if (wake) displayWakeInternal_.store(true);
                     displayReconcilePending_.store(true);
                 }
             }
@@ -1993,11 +2021,13 @@ private:
 
             while (alive_.load()) {
                 if (displayReconcilePending_.exchange(false)) {
+                    bool wake = displayWakeInternal_.exchange(false);
                     bool cd = false;
-                    if (vdd_.ReconcileExtendedTopology(&cd)) {
+                    if (vdd_.ReconcileExtendedTopology(&cd, wake)) {
                         forceKeyframe_.store(true);
                         break;
                     } else if (cd) {
+                        if (wake) displayWakeInternal_.store(true);
                         displayReconcilePending_.store(true);
                     }
                 }
@@ -2016,10 +2046,10 @@ private:
                         if (stats_.clientConnected.load()) {
                             ULONGLONG lastTx = stats_.lastSentTick.load();
                             unsigned long long ageMs = lastTx ? (unsigned long long)(nowStat - lastTx) : 0ULL;
-                            char msg[240];
+                            char msg[256];
                             snprintf(msg, sizeof(msg),
-                                     "WinHost: %dx%d  %.1f fps  %.1f Mbps (目标 %dM)  编码 %.2f ms  距上帧 %llu ms  失败 %llu  围栏超时 %llu  光标 %llu  输入 %llu",
-                                     capW, capH, fpsNow, mbpsNow, curMbps_.load(), stats_.lastEncMs.load(),
+                                     "WinHost: %dx%d  %.1f fps  %.1f Mbps (动态 %dM / 目标 %dM)  编码 %.2f ms  距上帧 %llu ms  失败 %llu  围栏超时 %llu  光标 %llu  输入 %llu",
+                                     capW, capH, fpsNow, mbpsNow, curMbps_.load(), targetMbps_.load(), stats_.lastEncMs.load(),
                                      ageMs,
                                      (unsigned long long)stats_.encodeFail.load(),
                                      (unsigned long long)stats_.fenceTimeouts.load(),
