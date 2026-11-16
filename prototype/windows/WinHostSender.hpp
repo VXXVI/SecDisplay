@@ -1185,12 +1185,21 @@ private:
                 clearConflictErr();
                 AdjustAdaptiveBitrate(presentP95, sourceP95, presDrop, pacedDrop);
                 pos += 13;
+            } else if (t == 0x00) {
+                if (acc.size() - pos < 5) break;
+                const uint8_t* p = acc.data() + pos;
+                if (p[1] == 0x00 && p[2] == 0x00 && p[4] == kTypeRoleConflict) {
+                    return failConflict("角色冲突: Mac 端当前也是主控发送模式（0x7F），已拒绝注入并断开", kTypeRoleConflict);
+                }
+                if (p[1] == 0x00 && p[2] == 0x00 && p[4] == kTypeSession) {
+                    return failConflict("角色冲突: Mac 端当前也是主控发送模式（0x06），已拒绝注入并断开", kTypeSession);
+                }
+                return failConflict("控制通道协议异常（非法帧头），已拒绝输入并断开保护", t);
+            } else if (t == kTypeRoleConflict) {
+                return failConflict("角色冲突: Mac 端当前也是主控发送模式（0x7F），已拒绝注入并断开", t);
             } else {
                 // 严禁逐字节跳过未知字节（否则同为发送端的 H.264 视频流会被当作随机键鼠事件注入）
-                const char* msg = (t == 0x00)
-                    ? "角色冲突: Mac 端当前也是主控发送模式（非副屏），已拒绝注入并断开"
-                    : "控制通道协议异常，已拒绝输入并断开保护";
-                return failConflict(msg, t);
+                return failConflict("控制通道协议异常，已拒绝输入并断开保护", t);
             }
         }
         if (pos > 0) acc.erase(acc.begin(), acc.begin() + pos);

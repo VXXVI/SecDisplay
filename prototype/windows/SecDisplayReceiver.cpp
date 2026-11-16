@@ -543,6 +543,19 @@ static std::atomic<uint16_t> g_fbDecodeFps10{ 0 };
 static std::atomic<uint16_t> g_fbPresentDrop{ 0 };
 static std::atomic<uint16_t> g_fbPacedDrop{ 0 };
 
+static bool SendCtrlAllUnderLock(SOCKET s, const uint8_t* p, int len) {
+    int sent = 0;
+    while (sent < len) {
+        int r = send(s, (const char*)(p + sent), len - sent, 0);
+        if (r > 0) {
+            sent += r;
+        } else {
+            return false;
+        }
+    }
+    return true;
+}
+
 static void SendFeedbackPacket() {
     SOCKET s = g_sock.load();
     if (s == INVALID_SOCKET) return;
@@ -558,7 +571,7 @@ static void SendFeedbackPacket() {
     wr16(pkt + 9,  g_fbPacedDrop.load());
     wr16(pkt + 11, 0);
     std::lock_guard<std::mutex> lk(g_sendMtx);
-    send(s, (const char*)pkt, sizeof(pkt), 0);
+    SendCtrlAllUnderLock(s, pkt, sizeof(pkt));
 }
 
 static void SendInputPacket(float vx, float vy, uint8_t buttons, int16_t wheel) {
@@ -579,7 +592,7 @@ static void SendInputPacket(float vx, float vy, uint8_t buttons, int16_t wheel) 
     pkt[11] = (uint8_t)((uint16_t)wheel & 0xFF);
     {
         std::lock_guard<std::mutex> lk(g_sendMtx);
-        send(s, (const char*)pkt, 12, 0);
+        SendCtrlAllUnderLock(s, pkt, 12);
     }
     g_stats.inputSent++;
 }
@@ -597,7 +610,7 @@ static void SendKeyPacket(uint16_t vk, uint16_t scan, uint8_t down, uint8_t flag
     pkt[6] = flags;
     {
         std::lock_guard<std::mutex> lk(g_sendMtx);
-        send(s, (const char*)pkt, 7, 0);
+        SendCtrlAllUnderLock(s, pkt, 7);
     }
     g_stats.inputSent++;
 }
@@ -3344,7 +3357,7 @@ static void UpdateControlPanel() {
             errCopy = hs.lastError;
         }
         if (vddOk && !connected && !errCopy.empty()) {
-            g_panelData.state = 3;
+            g_panelData.state = 4;
             g_panelData.statusText = ToWide(errCopy.c_str(), (int)errCopy.size());
         }
         swprintf(buf, 256, L"%d × %d @ %dHz", hs.width.load(), hs.height.load(), hs.fps.load());
@@ -3687,7 +3700,7 @@ static void PaintControlPanel(HWND h) {
     DrawPanelCard(hdc, S(20), S(12), S(920), S(44), S(8), cardFill, cardBorder);
     COLORREF dotCol = g_panelData.state == 2 ? okCol
                     : (g_panelData.state == 1 ? warnCol
-                    : (g_panelData.state == 3 ? errCol : RGB(148, 163, 184)));
+                    : ((g_panelData.state == 3 || g_panelData.state == 4) ? errCol : RGB(148, 163, 184)));
     {
         int d = S(10), dx = S(38), dy = S(12) + (S(44) - d) / 2;
         HPEN dp = CreatePen(PS_SOLID, 1, dotCol);
@@ -3738,8 +3751,9 @@ static void PaintControlPanel(HWND h) {
         const bool hm = g_hostMode.load();
         const wchar_t* shortSt = g_panelData.state == 2 ? (hm ? L"主控推送中" : L"正在接收")
                                : (g_panelData.state == 1 ? (hm ? L"准备推流" : L"等待首帧")
+                               : (g_panelData.state == 4 ? L"角色冲突"
                                : (g_panelData.state == 3 ? L"虚拟屏异常"
-                                                         : (hm ? L"主控待命" : L"等待重连")));
+                                                         : (hm ? L"主控待命" : L"等待重连"))));
         DrawKVRow(hdc, px, rowY, pw, rh, L"连接状态", shortSt, dotCol);
         DrawKVRow(hdc, px, rowY + step * 1, pw, rh, L"对端地址", g_panelData.peerText.c_str(), valCol);
         DrawKVRow(hdc, px, rowY + step * 2, pw, rh, L"分辨率",   g_panelData.sizeText.c_str(), valCol);
@@ -6351,15 +6365,13 @@ static void NetworkLoop(RunConfig cfg, Graphics* gfx, Presenter* presenter) {
 
         // 先发 8 字节接收端握手标识（Mac Sender/Receiver 据此秒级识别角色是否匹配），再请求关键帧
         {
-            const uint8_t hello[8] = { TYPE_ROLE_HELLO, 'S', 'D', 'R', 'X', 1, 2, 0 };
-            uint8_t req = TYPE_KEYFRAME_REQUEST;
-            int sentHello = 0, sentReq = 0;
+            const uint8_t pktInit[9] = { TYPE_ROLE_HELLO, 'S', 'D', 'R', 'X', 1, 2, 0, TYPE_KEYFRAME_REQUEST };
+            bool ok = false;
             {
                 std::lock_guard<std::mutex> lk(g_sendMtx);
-                sentHello = send(sock, (const char*)hello, sizeof(hello), 0);
-                sentReq = send(sock, (const char*)&req, 1, 0);
+                ok = SendCtrlAllUnderLock(sock, pktInit, sizeof(pktInit));
             }
-            if (sentHello == sizeof(hello) && sentReq == 1) Log("已发送接收端握手并请求关键帧（0x7E/0x02）");
+            if (ok) Log("已发送接收端握手并请求关键帧（0x7E/0x02）");
         }
 
         Decoder decoder;
@@ -6396,6 +6408,12 @@ static void NetworkLoop(RunConfig cfg, Graphics* gfx, Presenter* presenter) {
                 uint32_t len = 0;
                 if (!RecvAll(sock, &len, 4)) {
                     Log("收流结束：读包头失败 err=%d", WSAGetLastError());
+                    break;
+                }
+                const uint8_t* hdr4 = reinterpret_cast<const uint8_t*>(&len);
+                if (hdr4[0] == TYPE_ROLE_HELLO && hdr4[1] == 'S' && hdr4[2] == 'D' && hdr4[3] == 'R') {
+                    Log("角色冲突: Mac 端当前也是副屏接收模式，已拒绝连接");
+                    roleConflictDetected = true;
                     break;
                 }
                 len = ntohl(len);
@@ -6435,10 +6453,14 @@ static void NetworkLoop(RunConfig cfg, Graphics* gfx, Presenter* presenter) {
                     continue;
                 }
                 if (packet[0] == TYPE_ROLE_CONFLICT) {
-                    uint8_t peerRole = (len > HEADER_BYTES) ? packet[HEADER_BYTES] : 0;
-                    Log("角色冲突: Mac 端当前为 %s，无法与本机副屏模式配对",
-                        peerRole == 2 ? "副屏模式" : "不兼容角色");
-                    roleConflictDetected = true;
+                    uint8_t reason = (len > HEADER_BYTES) ? packet[HEADER_BYTES] : 0;
+                    if (reason == 3) {
+                        Log("协议异常: Mac 端检测到控制流越界并主动断开 (0x7F reason=3)");
+                    } else {
+                        Log("角色冲突: Mac 端当前为 %s，无法与本机副屏模式配对",
+                            reason == 2 ? "副屏模式" : "不兼容角色");
+                        roleConflictDetected = true;
+                    }
                     break;
                 }
                 // 其它未知类型：忽略即可，TCP 已有数据流动
