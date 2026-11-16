@@ -277,15 +277,19 @@ public:
         if (!EnsureCustomResolution(width, height, hz)) {
             EmitLog("WinVDD: 写入 HKLM\\SOFTWARE\\Parsec\\vdd\\0 失败（需管理员权限），动态切分可能回落");
         }
-        ApplyDisplayMode(devName, width, height, hz);
-        ApplyDisplayDpiScale(devName, dpiPct);
         WinVddBounds b{};
-        b.deviceName = devName;
-        if (!ReadCurrentBounds(devName, &b)) {
-            EmitLog("WinVDD: 动态切换分辨率后读回显示模式失败");
-            return false;
+        bool hasOther = false;
+        {
+            std::lock_guard<std::mutex> topoLk(TopologyMtx());
+            ApplyDisplayMode(devName, width, height, hz);
+            ApplyDisplayDpiScale(devName, dpiPct);
+            b.deviceName = devName;
+            if (!ReadCurrentBounds(devName, &b)) {
+                EmitLog("WinVDD: 动态切换分辨率后读回显示模式失败");
+                return false;
+            }
+            hasOther = HasOtherAttachedDisplay(devName);
         }
-        bool hasOther = HasOtherAttachedDisplay(devName);
         {
             std::lock_guard<std::mutex> lk(mtx_);
             if (active_ && bounds_.deviceName == devName) {
@@ -330,6 +334,15 @@ public:
         }
         lastReconcileTick_ = nowTick;
 
+        auto failRetry = [&]() -> bool {
+            if (++reconcileFailStreak_ <= 6) {
+                if (outCooldown) *outCooldown = true;
+            } else if (reconcileFailStreak_ == 7) {
+                EmitLog("WinVDD: 连续多次拓扑恢复失败，暂停自动重试（可检查虚拟屏或点重挂虚拟屏）");
+            }
+            return false;
+        };
+
         std::wstring devName;
         bool cloned = false;
         bool found = FindParsecSourceDevice(&devName, &cloned);
@@ -343,8 +356,7 @@ public:
                 }
             }
             if (devName.empty()) {
-                if (outCooldown) *outCooldown = true;
-                return false;
+                return failRetry();
             }
             cloned = true; // 刚从隐藏恢复，按需重新布置分辨率与右侧位置
         }
@@ -365,7 +377,8 @@ public:
             SendInput(1, &wake, sizeof(INPUT));
             wakeR1 = SetDisplayConfig(0, nullptr, 0, nullptr, SDC_TOPOLOGY_EXTEND | SDC_APPLY);
             Sleep(350);
-            hasOtherNow = HasOtherAttachedDisplay(devName);
+            FindParsecSourceDevice(&devName, &cloned);
+            hasOtherNow = !devName.empty() && HasOtherAttachedDisplay(devName);
             if (!hasOtherNow) {
                 wakeR2 = SetDisplayConfig(0, nullptr, 0, nullptr, SDC_TOPOLOGY_INTERNAL | SDC_APPLY);
                 Sleep(450);
@@ -380,6 +393,7 @@ public:
         bool lidReopened = (!wasOther && hasOtherNow && hasBounds && curB.left == 0 && curB.top == 0);
 
         if (!cloned && !lidReopened && !wokeInternal) {
+            reconcileFailStreak_ = 0;
             std::lock_guard<std::mutex> lk(mtx_);
             hadOtherDisplay_ = hasOtherNow;
             return false;
@@ -391,7 +405,8 @@ public:
                      "WinVDD: 强制唤醒内建屏执行结果 r1=%ld r2=%ld r3=%ld internal=%d",
                      wakeR1, wakeR2, wakeR3, hasOtherNow ? 1 : 0);
             EmitLog(msg);
-        } else if (cloned) {
+        }
+        if (cloned) {
             LONG er = SetDisplayConfig(0, nullptr, 0, nullptr, SDC_TOPOLOGY_EXTEND | SDC_APPLY);
             char msg[128];
             snprintf(msg, sizeof(msg), "WinVDD: 检测到镜像/拓扑异常，自动恢复扩展桌面 topology r=%ld", er);
@@ -401,13 +416,12 @@ public:
                 bool stillCloned = false;
                 if (FindParsecSourceDevice(&devName, &stillCloned) && !stillCloned) break;
             }
-        } else {
+        } else if (!wokeInternal) {
             EmitLog("WinVDD: 检测到物理主屏重新接入，自动将虚拟屏归位至主屏右侧");
         }
 
         if (devName.empty()) {
-            if (outCooldown) *outCooldown = true;
-            return false;
+            return failRetry();
         }
 
         ApplyDisplayMode(devName, rw, rh, rhz);
@@ -416,9 +430,9 @@ public:
         WinVddBounds nb{};
         nb.deviceName = devName;
         if (!ReadCurrentBounds(devName, &nb)) {
-            if (outCooldown) *outCooldown = true;
-            return false;
+            return failRetry();
         }
+        reconcileFailStreak_ = 0;
         bool hasOtherAfter = HasOtherAttachedDisplay(devName);
         {
             std::lock_guard<std::mutex> lk(mtx_);
@@ -493,6 +507,10 @@ public:
             std::lock_guard<std::mutex> topoLk(TopologyMtx());
             Sleep(120);
             LONG r = SetDisplayConfig(0, nullptr, 0, nullptr, SDC_TOPOLOGY_INTERNAL | SDC_APPLY);
+            if (r != ERROR_SUCCESS) {
+                Sleep(200);
+                r = SetDisplayConfig(0, nullptr, 0, nullptr, SDC_TOPOLOGY_INTERNAL | SDC_APPLY);
+            }
             INPUT wake{};
             wake.type = INPUT_MOUSE;
             wake.mi.dwFlags = MOUSEEVENTF_MOVE;
@@ -502,6 +520,7 @@ public:
             EmitLog(msg);
         }
 
+        reconcileFailStreak_ = 0;
         std::lock_guard<std::mutex> lk(mtx_);
         active_ = false;
         hadOtherDisplay_ = false;
@@ -596,6 +615,7 @@ private:
     int reqHz_ = 60;
     int lastDpiPercent_ = 0;
     ULONGLONG lastReconcileTick_ = 0;
+    int reconcileFailStreak_ = 0;
     LogFn logFn_;
 
     static std::mutex& TopologyMtx() {

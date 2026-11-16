@@ -312,8 +312,7 @@ public:
 
     bool PauseForSleep() {
         if (!alive_.load() && !vdd_.IsActive()) {
-            pausedForSleep_.store(false);
-            return false;
+            return pausedForSleep_.load();
         }
         pausedForSleep_.store(true);
         EmitLog("WinHost: 系统即将进入休眠，暂停推流并卸载虚拟屏以保护内建屏");
