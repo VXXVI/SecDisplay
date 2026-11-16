@@ -600,6 +600,7 @@ final class MacReceiverClient {
     private var _lastMbps: Double = 0
     private var _droppedFrames: UInt64 = 0
     private var _decodeInFlight: Int = 0
+    private var _needRecoveryKeyframe: Bool = false
     private var _decodedFrames: UInt64 = 0
     private var _decodeErrors: UInt64 = 0
     private var _videoWidth: Int = 0
@@ -647,7 +648,9 @@ final class MacReceiverClient {
             guard let self else { return }
             self.stateLock.lock()
             self._decodeErrors &+= 1
+            self._needRecoveryKeyframe = true
             self.stateLock.unlock()
+            self.sendKeyframeRequest(throttled: true)
         }
         decoder.onFrameDropped = { [weak self] in
             guard let self else { return }
@@ -702,6 +705,8 @@ final class MacReceiverClient {
         _listenerError = nil
         _activePeerHost = ""
         _latestEpoch &+= 1
+        _decodeInFlight = 0
+        _needRecoveryKeyframe = false
         peerDesc = "-"
         stateLock.unlock()
         kvmQueue.async { [weak self] in
@@ -1003,6 +1008,8 @@ final class MacReceiverClient {
                 self._sessW = 0
                 self._sessH = 0
                 self._sessFps = 0
+                self._decodeInFlight = 0
+                self._needRecoveryKeyframe = false
                 self.peerDesc = ep
                 self._connStartAt = CFAbsoluteTimeGetCurrent()
                 self._windowStartAt = CFAbsoluteTimeGetCurrent()
@@ -1045,6 +1052,7 @@ final class MacReceiverClient {
         _kvmActive = false
         _activePeerHost = ""
         _decodeInFlight = 0
+        _needRecoveryKeyframe = false
         _lastDecodeFps = 0
         _lastMbps = 0
         _srcIntervalsMs.removeAll()
@@ -1136,10 +1144,16 @@ final class MacReceiverClient {
                 }
             }
             _lastFrameRecvAt = now
-            // 解码队列背压：在途帧数 >= 3 时丢弃非关键帧防止延迟堆积
-            if _decodeInFlight >= 3 && !hasIdr {
-                _droppedFrames &+= 1
+            // 解码队列背压：在途帧数 >= 3 时丢弃非关键帧并立即补求关键帧；
+            // 仅在断链起始帧计入一次 _droppedFrames 避免等待 IDR 期间重复计数放大 0x07 误降码率
+            if hasIdr {
+                _needRecoveryKeyframe = false
+            } else if _needRecoveryKeyframe || _decodeInFlight >= 3 {
+                let firstDrop = !_needRecoveryKeyframe
+                _needRecoveryKeyframe = true
+                if firstDrop { _droppedFrames &+= 1 }
                 stateLock.unlock()
+                sendKeyframeRequest(throttled: true)
                 return
             }
             _decodeInFlight += 1
@@ -1190,6 +1204,7 @@ final class MacReceiverClient {
             _sessW = w
             _sessH = h
             _sessFps = fps
+            if changed { _needRecoveryKeyframe = false }
             stateLock.unlock()
             if changed {
                 Log.info("MacReceiver: 收到会话头 \(w)x\(h) @ \(fps)fps")
