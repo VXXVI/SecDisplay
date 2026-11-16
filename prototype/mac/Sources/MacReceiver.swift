@@ -648,6 +648,7 @@ final class MacReceiverClient {
             guard let self else { return }
             self.stateLock.lock()
             self._decodeErrors &+= 1
+            self._needRecoveryKeyframe = true
             self.stateLock.unlock()
         }
         decoder.onFrameDropped = { [weak self] in
@@ -1006,6 +1007,8 @@ final class MacReceiverClient {
                 self._sessW = 0
                 self._sessH = 0
                 self._sessFps = 0
+                self._decodeInFlight = 0
+                self._needRecoveryKeyframe = false
                 self.peerDesc = ep
                 self._connStartAt = CFAbsoluteTimeGetCurrent()
                 self._windowStartAt = CFAbsoluteTimeGetCurrent()
@@ -1140,18 +1143,16 @@ final class MacReceiverClient {
                 }
             }
             _lastFrameRecvAt = now
-            // 解码队列背压：在途帧数 >= 3 时丢弃非关键帧防止延迟堆积，并立即补求关键帧；
-            // 丢弃 P 帧后跳过后续非 IDR 帧，避免 VideoToolbox 因缺参考帧连续报错与花屏卡顿
+            // 解码队列背压：在途帧数 >= 3 时丢弃非关键帧并立即补求关键帧；
+            // 仅在断链起始帧计入一次 _droppedFrames 避免等待 IDR 期间重复计数放大 0x07 误降码率
             if hasIdr {
                 _needRecoveryKeyframe = false
             } else if _needRecoveryKeyframe || _decodeInFlight >= 3 {
                 let firstDrop = !_needRecoveryKeyframe
                 _needRecoveryKeyframe = true
-                _droppedFrames &+= 1
+                if firstDrop { _droppedFrames &+= 1 }
                 stateLock.unlock()
-                if firstDrop || _decodeInFlight >= 3 {
-                    sendKeyframeRequest(throttled: true)
-                }
+                sendKeyframeRequest(throttled: true)
                 return
             }
             _decodeInFlight += 1

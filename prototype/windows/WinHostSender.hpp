@@ -169,6 +169,7 @@ public:
         }
         ClearVideoQueue();
         activeVideoEpoch_.store(0);
+        stats_.clientConnected = false;
         alive_.store(true);
         acceptThread_ = std::thread(&WinHostSender::ConnectLoop, this);
         captureThread_ = std::thread(&WinHostSender::CaptureEncodeLoop, this);
@@ -418,6 +419,7 @@ private:
     ULONGLONG lastLocalCongestionTick_ = 0;
     ULONGLONG lastRemoteCongestionTick_ = 0;
     ULONGLONG lastCongestionLogTick_ = 0;
+    std::atomic<ULONGLONG> lastQueueIdrTick_{0};
 
     static inline std::atomic<WinHostSender*> s_kvmOwner_{nullptr};
     std::atomic<bool> kvmActive_{false};
@@ -479,15 +481,9 @@ private:
         return f;
     }
 
-    bool SendRawPacket(const uint8_t* data, size_t len) {
-        std::lock_guard<std::mutex> slk(sendMtx_);
-        SOCKET s = INVALID_SOCKET;
-        {
-            std::lock_guard<std::mutex> lk(sockMtx_);
-            s = clientSock_;
-        }
+    // 调用方已持有 sendMtx_
+    bool SendRawPacketUnderSendLock(SOCKET s, const uint8_t* data, size_t len) {
         if (s == INVALID_SOCKET) return false;
-
         size_t sent = 0;
         while (sent < len && alive_.load()) {
             int n = send(s, (const char*)(data + sent), (int)std::min<size_t>(len - sent, 1 << 20), 0);
@@ -505,6 +501,29 @@ private:
             return true;
         }
         return false;
+    }
+
+    bool SendRawPacket(const uint8_t* data, size_t len) {
+        std::lock_guard<std::mutex> slk(sendMtx_);
+        SOCKET s = INVALID_SOCKET;
+        {
+            std::lock_guard<std::mutex> lk(sockMtx_);
+            s = clientSock_;
+        }
+        return SendRawPacketUnderSendLock(s, data, len);
+    }
+
+    bool SendVideoPacket(const VideoQueueItem& item) {
+        std::lock_guard<std::mutex> slk(sendMtx_);
+        SOCKET s = INVALID_SOCKET;
+        uint64_t curEp = 0;
+        {
+            std::lock_guard<std::mutex> lk(sockMtx_);
+            s = clientSock_;
+            curEp = activeVideoEpoch_.load();
+        }
+        if (s == INVALID_SOCKET || item.epoch == 0 || item.epoch != curEp) return false;
+        return SendRawPacketUnderSendLock(s, item.pkt.data(), item.pkt.size());
     }
 
     // 调用方已持有 sendMtx_
@@ -538,9 +557,7 @@ private:
         videoQueue_.clear();
     }
 
-    void SendSessionHeader(int w, int h, int fps) {
-        if (w <= 0 || h <= 0) return;
-        uint8_t pkt[20];
+    static void BuildSessionHeaderPkt(uint8_t (&pkt)[20], int w, int h, int fps) {
         PutU32BE(pkt, 16);                 // 1 type + 8 ts + 7 payload
         pkt[4] = kTypeSession;
         PutU64BE(pkt + 5, NowMicros());
@@ -549,7 +566,13 @@ private:
         PutU16BE(pkt + 16, (uint16_t)h);
         pkt[18] = (uint8_t)std::clamp(fps, 1, 240);
         pkt[19] = 0;
-        SendRawPacket(pkt, sizeof(pkt));
+    }
+
+    bool SendSessionHeader(int w, int h, int fps) {
+        if (w <= 0 || h <= 0) return false;
+        uint8_t pkt[20];
+        BuildSessionHeaderPkt(pkt, w, h, fps);
+        return SendRawPacket(pkt, sizeof(pkt));
     }
 
     void SendHeartbeat() {
@@ -573,6 +596,7 @@ private:
 
         bool dropped = false;
         bool skipThisFrame = false;
+        bool needKey = false;
         {
             std::lock_guard<std::mutex> vlk(videoMtx_);
             if (isIdr) {
@@ -583,22 +607,33 @@ private:
                     dropped = true;
                 }
             } else if (videoQueue_.size() >= 3) {
-                // 队列积压 >= 3 帧：从队尾清掉待发的非 IDR 帧，跳过本 P 帧并立刻补请求关键帧避免参考链断链
+                // 队列积压 >= 3 帧：从队尾清掉待发的非 IDR 帧，跳过当前帧并节流补请求关键帧
                 while (!videoQueue_.empty() && !videoQueue_.back().isIdr) {
                     videoQueue_.pop_back();
                     stats_.framesDropped++;
                     dropped = true;
                 }
-                if (!dropped || videoQueue_.size() >= 3) {
-                    stats_.framesDropped++;
-                    dropped = true;
-                }
+                stats_.framesDropped++; // 当前被跳过的 P 帧无条件计入丢帧
+                dropped = true;
                 skipThisFrame = true;
-                forceKeyframe_.store(true);
+                bool hasIdrInQueue = false;
+                for (const auto& q : videoQueue_) {
+                    if (q.isIdr) { hasIdrInQueue = true; break; }
+                }
+                if (!hasIdrInQueue) {
+                    ULONGLONG nowTick = GetTickCount64();
+                    ULONGLONG prev = lastQueueIdrTick_.load();
+                    if (nowTick - prev >= 250ULL && lastQueueIdrTick_.compare_exchange_strong(prev, nowTick)) {
+                        needKey = true;
+                    }
+                }
             }
             if (!skipThisFrame) {
                 videoQueue_.push_back(VideoQueueItem{ std::move(pkt), epoch, isIdr });
             }
+        }
+        if (needKey) {
+            forceKeyframe_.store(true);
         }
         if (!skipThisFrame) {
             videoCv_.notify_one();
@@ -622,15 +657,16 @@ private:
                 continue;
             }
             ULONGLONG t0 = GetTickCount64();
-            if (SendRawPacket(item.pkt.data(), item.pkt.size())) {
+            if (SendVideoPacket(item)) {
                 double sendMs = (double)(GetTickCount64() - t0);
                 stats_.framesSent++;
                 stats_.lastSentTick = GetTickCount64();
                 lastPayloadUs_.store(NowMicros());
-                if (sendMs > 28.0) {
+                double slowSendThresh = std::max(26.0, (1000.0 / (double)std::max(24, stats_.fps.load())) * 1.6);
+                if (sendMs > slowSendThresh) {
                     NoteLocalCongestion(sendMs, false);
                 }
-            } else {
+            } else if (item.epoch == activeVideoEpoch_.load()) {
                 stats_.framesDropped++;
             }
         }
@@ -750,18 +786,45 @@ private:
 
             std::string peer = targetHost_ + ":" + std::to_string(port_);
 
+            WinVddBounds b = vdd_.Bounds();
+            int initHz = ClampHz(b.hz, reqFps_);
             uint64_t epoch = 0;
+            bool hdrOk = false;
             {
                 std::lock_guard<std::mutex> slk(sendMtx_);
-                std::lock_guard<std::mutex> lk(sockMtx_);
-                SOCKET oldSock = clientSock_;
-                clientSock_ = cs;
-                epoch = ++connEpoch_;
-                if (oldSock != INVALID_SOCKET) {
-                    shutdown(oldSock, SD_BOTH);
-                    closesocket(oldSock);
+                {
+                    std::lock_guard<std::mutex> lk(sockMtx_);
+                    activeVideoEpoch_.store(0);
+                    stats_.clientConnected = false;
+                    SOCKET oldSock = clientSock_;
+                    clientSock_ = cs;
+                    epoch = ++connEpoch_;
+                    if (oldSock != INVALID_SOCKET) {
+                        shutdown(oldSock, SD_BOTH);
+                        closesocket(oldSock);
+                    }
+                }
+                uint8_t hdrPkt[20];
+                BuildSessionHeaderPkt(hdrPkt, b.width, b.height, initHz);
+                if (b.width > 0 && b.height > 0) {
+                    hdrOk = SendRawPacketUnderSendLock(cs, hdrPkt, sizeof(hdrPkt));
+                }
+                if (hdrOk) {
+                    std::lock_guard<std::mutex> lk(sockMtx_);
+                    if (clientSock_ == cs && connEpoch_ == epoch) {
+                        activeVideoEpoch_.store(epoch);
+                        stats_.clientConnected = true;
+                    } else {
+                        hdrOk = false;
+                    }
                 }
             }
+            if (!hdrOk) {
+                ClearVideoQueue();
+                for (int i = 0; i < 10 && alive_.load(); ++i) Sleep(100);
+                continue;
+            }
+            ClearVideoQueue();
             {
                 std::lock_guard<std::mutex> ilk(stats_.infoMtx);
                 stats_.peerAddr = peer;
@@ -769,14 +832,6 @@ private:
             stats_.connStartTick = GetTickCount64();
             lastPayloadUs_.store(0);
             forceKeyframe_.store(true);
-
-            // 先清视频发送队列、发会话头再开放 activeVideoEpoch_ 与 clientConnected=true，确保 0x06 总是早于首帧 0x01 到达
-            ClearVideoQueue();
-            WinVddBounds b = vdd_.Bounds();
-            int initHz = ClampHz(b.hz, reqFps_);
-            SendSessionHeader(b.width, b.height, initHz);
-            activeVideoEpoch_.store(epoch);
-            stats_.clientConnected = true;
 
             {
                 char msg[128];
@@ -1095,7 +1150,7 @@ private:
     }
 
     void NoteLocalCongestion(double latencyMs, bool queueDropped) {
-        const double frameBudgetMs = 1000.0 / (double)std::max(24, reqFps_);
+        const double frameBudgetMs = 1000.0 / (double)std::max(24, stats_.fps.load());
         const double slowThresh = std::max(26.0, frameBudgetMs * 1.6);
         ULONGLONG nowTick = GetTickCount64();
 
@@ -1769,8 +1824,9 @@ private:
                     }
                     v.ulVal = (ULONG)mbps * 1000000UL;
                     api->SetValue(&CODECAPI_AVEncCommonMeanBitRate, &v);
-                    // 收紧峰值倍率到 1.25x，防止突发画面单帧码流尖峰塞满雷电/解码缓冲
-                    int peakMbps = std::min(160, std::max(mbps + 10, (mbps * 5) / 4));
+                    // 收紧峰值倍率到 1.25x，防止突发画面单帧码流尖峰塞满雷电/解码缓冲，同时保证 MaxBitRate >= MeanBitRate
+                    int capMbps = (mbps <= 128) ? 160 : 220;
+                    int peakMbps = std::min(capMbps, std::max(mbps + 10, (mbps * 5) / 4));
                     v.ulVal = (ULONG)peakMbps * 1000000UL;
                     api->SetValue(&CODECAPI_AVEncCommonMaxBitRate, &v);
                     // 1 秒 GOP，丢包/背压触发补关键帧时最快恢复连贯画面
@@ -1826,7 +1882,8 @@ private:
             if (SUCCEEDED(codecApi->SetValue(&CODECAPI_AVEncCommonMeanBitRate, &v))) {
                 VARIANT vmax{};
                 vmax.vt = VT_UI4;
-                int peakMbps = std::min(160, std::max(newMbps + 10, (newMbps * 5) / 4));
+                int capMbps = (newMbps <= 128) ? 160 : 220;
+                int peakMbps = std::min(capMbps, std::max(newMbps + 10, (newMbps * 5) / 4));
                 vmax.ulVal = (ULONG)peakMbps * 1000000UL;
                 codecApi->SetValue(&CODECAPI_AVEncCommonMaxBitRate, &vmax);
                 lastAppliedMbps = newMbps;
@@ -2199,6 +2256,7 @@ private:
                 stats_.encoderName = enc.friendlyName;
             }
             if (stats_.clientConnected.load()) {
+                ClearVideoQueue();
                 SendSessionHeader(capW, capH, encFps);
             }
 
