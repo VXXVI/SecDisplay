@@ -277,15 +277,19 @@ public:
         if (!EnsureCustomResolution(width, height, hz)) {
             EmitLog("WinVDD: 写入 HKLM\\SOFTWARE\\Parsec\\vdd\\0 失败（需管理员权限），动态切分可能回落");
         }
-        ApplyDisplayMode(devName, width, height, hz);
-        ApplyDisplayDpiScale(devName, dpiPct);
         WinVddBounds b{};
-        b.deviceName = devName;
-        if (!ReadCurrentBounds(devName, &b)) {
-            EmitLog("WinVDD: 动态切换分辨率后读回显示模式失败");
-            return false;
+        bool hasOther = false;
+        {
+            std::lock_guard<std::mutex> topoLk(TopologyMtx());
+            ApplyDisplayMode(devName, width, height, hz);
+            ApplyDisplayDpiScale(devName, dpiPct);
+            b.deviceName = devName;
+            if (!ReadCurrentBounds(devName, &b)) {
+                EmitLog("WinVDD: 动态切换分辨率后读回显示模式失败");
+                return false;
+            }
+            hasOther = HasOtherAttachedDisplay(devName);
         }
-        bool hasOther = HasOtherAttachedDisplay(devName);
         {
             std::lock_guard<std::mutex> lk(mtx_);
             if (active_ && bounds_.deviceName == devName) {
@@ -308,7 +312,7 @@ public:
     }
 
     // 检测到笔记本开盖/息屏恢复或系统切回镜像模式时，自动恢复扩展桌面并把虚拟屏摆到物理屏右侧
-    bool ReconcileExtendedTopology(bool* outCooldown = nullptr) {
+    bool ReconcileExtendedTopology(bool* outCooldown = nullptr, bool forceWakeInternal = false) {
         if (outCooldown) *outCooldown = false;
         bool wasOther = false;
         int rw = 2880, rh = 1800, rhz = 60, dpiPct = 0;
@@ -321,12 +325,23 @@ public:
             rhz = reqHz_;
             dpiPct = lastDpiPercent_;
         }
+        std::lock_guard<std::mutex> topoLk(TopologyMtx());
         ULONGLONG nowTick = GetTickCount64();
-        if (nowTick - lastReconcileTick_ < 2500ULL) {
+        ULONGLONG minGap = forceWakeInternal ? 1000ULL : 2500ULL;
+        if (nowTick - lastReconcileTick_ < minGap) {
             if (outCooldown) *outCooldown = true;
             return false;
         }
         lastReconcileTick_ = nowTick;
+
+        auto failRetry = [&]() -> bool {
+            if (++reconcileFailStreak_ <= 6) {
+                if (outCooldown) *outCooldown = true;
+            } else if (reconcileFailStreak_ == 7) {
+                EmitLog("WinVDD: 连续多次拓扑恢复失败，暂停自动重试（可检查虚拟屏或点重挂虚拟屏）");
+            }
+            return false;
+        };
 
         std::wstring devName;
         bool cloned = false;
@@ -340,7 +355,9 @@ public:
                     if (FindParsecSourceDevice(&devName, &cloned) && !cloned) break;
                 }
             }
-            if (devName.empty()) return false;
+            if (devName.empty()) {
+                return failRetry();
+            }
             cloned = true; // 刚从隐藏恢复，按需重新布置分辨率与右侧位置
         }
 
@@ -348,14 +365,47 @@ public:
         curB.deviceName = devName;
         bool hasBounds = ReadCurrentBounds(devName, &curB);
         bool hasOtherNow = HasOtherAttachedDisplay(devName);
+
+        // 开盖/唤醒时如果物理内建屏仍未点亮（Windows 停留在「仅第二屏幕」导致笔记本黑屏且亮度无效），强行切回内建+扩展
+        bool wokeInternal = false;
+        LONG wakeR1 = -1, wakeR2 = -1, wakeR3 = -1;
+        if (forceWakeInternal && !hasOtherNow) {
+            EmitLog("WinVDD: 开盖/唤醒后检测到物理内建屏未点亮，正在强制恢复内建屏与扩展模式");
+            INPUT wake{};
+            wake.type = INPUT_MOUSE;
+            wake.mi.dwFlags = MOUSEEVENTF_MOVE;
+            SendInput(1, &wake, sizeof(INPUT));
+            wakeR1 = SetDisplayConfig(0, nullptr, 0, nullptr, SDC_TOPOLOGY_EXTEND | SDC_APPLY);
+            Sleep(350);
+            FindParsecSourceDevice(&devName, &cloned);
+            hasOtherNow = !devName.empty() && HasOtherAttachedDisplay(devName);
+            if (!hasOtherNow) {
+                wakeR2 = SetDisplayConfig(0, nullptr, 0, nullptr, SDC_TOPOLOGY_INTERNAL | SDC_APPLY);
+                Sleep(450);
+                wakeR3 = SetDisplayConfig(0, nullptr, 0, nullptr, SDC_TOPOLOGY_EXTEND | SDC_APPLY);
+                Sleep(350);
+                FindParsecSourceDevice(&devName, &cloned);
+                hasOtherNow = !devName.empty() && HasOtherAttachedDisplay(devName);
+            }
+            wokeInternal = true;
+        }
+
         bool lidReopened = (!wasOther && hasOtherNow && hasBounds && curB.left == 0 && curB.top == 0);
 
-        if (!cloned && !lidReopened) {
+        if (!cloned && !lidReopened && !wokeInternal) {
+            reconcileFailStreak_ = 0;
             std::lock_guard<std::mutex> lk(mtx_);
             hadOtherDisplay_ = hasOtherNow;
             return false;
         }
 
+        if (wokeInternal) {
+            char msg[160];
+            snprintf(msg, sizeof(msg),
+                     "WinVDD: 强制唤醒内建屏执行结果 r1=%ld r2=%ld r3=%ld internal=%d",
+                     wakeR1, wakeR2, wakeR3, hasOtherNow ? 1 : 0);
+            EmitLog(msg);
+        }
         if (cloned) {
             LONG er = SetDisplayConfig(0, nullptr, 0, nullptr, SDC_TOPOLOGY_EXTEND | SDC_APPLY);
             char msg[128];
@@ -366,8 +416,12 @@ public:
                 bool stillCloned = false;
                 if (FindParsecSourceDevice(&devName, &stillCloned) && !stillCloned) break;
             }
-        } else {
+        } else if (!wokeInternal) {
             EmitLog("WinVDD: 检测到物理主屏重新接入，自动将虚拟屏归位至主屏右侧");
+        }
+
+        if (devName.empty()) {
+            return failRetry();
         }
 
         ApplyDisplayMode(devName, rw, rh, rhz);
@@ -375,7 +429,10 @@ public:
 
         WinVddBounds nb{};
         nb.deviceName = devName;
-        if (!ReadCurrentBounds(devName, &nb)) return false;
+        if (!ReadCurrentBounds(devName, &nb)) {
+            return failRetry();
+        }
+        reconcileFailStreak_ = 0;
         bool hasOtherAfter = HasOtherAttachedDisplay(devName);
         {
             std::lock_guard<std::mutex> lk(mtx_);
@@ -392,9 +449,41 @@ public:
         return true;
     }
 
+    static void EnsureInternalPanelAwake(const LogFn& logFn = nullptr) {
+        std::lock_guard<std::mutex> topoLk(TopologyMtx());
+        std::wstring parsecDev;
+        bool hasParsec = FindParsecSourceDevice(&parsecDev, nullptr);
+        if (!HasOtherAttachedDisplay(hasParsec ? parsecDev : std::wstring())) {
+            LONG r = SetDisplayConfig(0, nullptr, 0, nullptr, SDC_TOPOLOGY_INTERNAL | SDC_APPLY);
+            INPUT wake{};
+            wake.type = INPUT_MOUSE;
+            wake.mi.dwFlags = MOUSEEVENTF_MOVE;
+            SendInput(1, &wake, sizeof(INPUT));
+            Sleep(350);
+            if (!HasOtherAttachedDisplay(hasParsec ? parsecDev : std::wstring())) {
+                Sleep(200);
+                r = SetDisplayConfig(0, nullptr, 0, nullptr, SDC_TOPOLOGY_INTERNAL | SDC_APPLY);
+                SendInput(1, &wake, sizeof(INPUT));
+                Sleep(300);
+            }
+            if (logFn) {
+                char msg[128];
+                snprintf(msg, sizeof(msg), "WinVDD: 已唤醒内建显示路径 topology_internal r=%ld", r);
+                logFn(msg);
+            }
+        }
+    }
+
     void Stop() {
         keepAliveRun_.store(false);
         if (keepAliveThread_.joinable()) keepAliveThread_.join();
+
+        std::wstring devBeforeStop;
+        {
+            std::lock_guard<std::mutex> lk(mtx_);
+            devBeforeStop = bounds_.deviceName;
+        }
+        bool hadOther = !devBeforeStop.empty() && HasOtherAttachedDisplay(devBeforeStop);
 
         if (handle_ != INVALID_HANDLE_VALUE) {
             if (vddIndex_ >= 0 && vddIndex_ <= 65535) {
@@ -413,8 +502,28 @@ public:
             handle_ = INVALID_HANDLE_VALUE;
         }
 
+        if (!devBeforeStop.empty() && !hadOther) {
+            // 虚拟屏曾作为唯一屏幕运行（例如合盖后卸载），拔除后强制切回内建屏，避免 Windows 失去全部激活显示器黑屏
+            std::lock_guard<std::mutex> topoLk(TopologyMtx());
+            Sleep(120);
+            LONG r = SetDisplayConfig(0, nullptr, 0, nullptr, SDC_TOPOLOGY_INTERNAL | SDC_APPLY);
+            if (r != ERROR_SUCCESS) {
+                Sleep(200);
+                r = SetDisplayConfig(0, nullptr, 0, nullptr, SDC_TOPOLOGY_INTERNAL | SDC_APPLY);
+            }
+            INPUT wake{};
+            wake.type = INPUT_MOUSE;
+            wake.mi.dwFlags = MOUSEEVENTF_MOVE;
+            SendInput(1, &wake, sizeof(INPUT));
+            char msg[128];
+            snprintf(msg, sizeof(msg), "WinVDD: 卸载前无其它在线屏，已恢复内建主屏显示 r=%ld", r);
+            EmitLog(msg);
+        }
+
+        reconcileFailStreak_ = 0;
         std::lock_guard<std::mutex> lk(mtx_);
         active_ = false;
+        hadOtherDisplay_ = false;
         bounds_ = WinVddBounds{};
     }
 
@@ -506,7 +615,13 @@ private:
     int reqHz_ = 60;
     int lastDpiPercent_ = 0;
     ULONGLONG lastReconcileTick_ = 0;
+    int reconcileFailStreak_ = 0;
     LogFn logFn_;
+
+    static std::mutex& TopologyMtx() {
+        static std::mutex m;
+        return m;
+    }
 
     static bool HasOtherAttachedDisplay(const std::wstring& devName) {
         for (DWORD i = 0; ; ++i) {
@@ -714,8 +829,11 @@ private:
                          chk.left, chk.top, rightEdge);
                 EmitLog(msg);
             }
-            // 仅对已验证生效的分辨率持久化写入注册表
-            ChangeDisplaySettingsExW(devName.c_str(), &dm, nullptr, CDS_UPDATEREGISTRY, nullptr);
+            // 仅在存在物理主屏（正常扩展桌面）时将位置与分辨率持久化写入注册表；
+            // 若处于合盖单屏状态，绝不把虚拟屏(0,0)主屏排布写死到注册表导致开盖后内建屏仍被禁用
+            if (foundOther) {
+                ChangeDisplaySettingsExW(devName.c_str(), &dm, nullptr, CDS_UPDATEREGISTRY, nullptr);
+            }
             return true;
         };
 
