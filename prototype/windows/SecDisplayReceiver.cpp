@@ -311,6 +311,9 @@ static const size_t SESSION_PAYLOAD_BYTES = 7;
 //   down  : 1=按下 0=抬起
 //   flags : bit0 扩展键；bit1 系统键（Alt 组合）
 static const uint8_t TYPE_KEY = 0x09;
+static const uint8_t TYPE_KVM_MOUSE = 0x0A;
+static const uint8_t TYPE_KVM_KEY   = 0x0B;
+static const uint8_t TYPE_KVM_STATE = 0x0C;
 static const size_t KEY_PAYLOAD_BYTES = 6;
 static const size_t HEADER_BYTES = 9;   // 类型 1 + 时间戳 8
 static const size_t MAX_PACKET = 64u * 1024u * 1024u;
@@ -594,6 +597,124 @@ static void SendKeyPacket(uint16_t vk, uint16_t scan, uint8_t down, uint8_t flag
     g_stats.inputSent++;
 }
 
+static std::atomic<bool> g_rxKvmActive{false};
+static std::mutex g_rxKvmMtx;
+static uint8_t g_rxKvmButtons = 0;
+struct RxKvmHeldKey { uint16_t vk; uint16_t scan; uint8_t flags; };
+static std::unordered_map<uint64_t, RxKvmHeldKey> g_rxKvmHeldKeys;
+
+static void ReleaseRxKvmInputs() {
+    std::vector<INPUT> inputs;
+    {
+        std::lock_guard<std::mutex> lk(g_rxKvmMtx);
+        if (g_rxKvmButtons & 0x01) { INPUT bi{}; bi.type = INPUT_MOUSE; bi.mi.dwFlags = MOUSEEVENTF_LEFTUP; inputs.push_back(bi); }
+        if (g_rxKvmButtons & 0x02) { INPUT bi{}; bi.type = INPUT_MOUSE; bi.mi.dwFlags = MOUSEEVENTF_RIGHTUP; inputs.push_back(bi); }
+        if (g_rxKvmButtons & 0x04) { INPUT bi{}; bi.type = INPUT_MOUSE; bi.mi.dwFlags = MOUSEEVENTF_MIDDLEUP; inputs.push_back(bi); }
+        g_rxKvmButtons = 0;
+        for (const auto& kv : g_rxKvmHeldKeys) {
+            const RxKvmHeldKey& e = kv.second;
+            INPUT in{};
+            in.type = INPUT_KEYBOARD;
+            DWORD dw = KEYEVENTF_KEYUP;
+            if (e.vk == 0) {
+                in.ki.wScan = e.scan;
+                dw |= KEYEVENTF_SCANCODE;
+            } else {
+                in.ki.wVk = e.vk;
+                in.ki.wScan = e.scan ? e.scan : (uint16_t)MapVirtualKeyW(e.vk, MAPVK_VK_TO_VSC);
+            }
+            if (e.flags & 0x01) dw |= KEYEVENTF_EXTENDEDKEY;
+            in.ki.dwFlags = dw;
+            inputs.push_back(in);
+        }
+        g_rxKvmHeldKeys.clear();
+    }
+    if (!inputs.empty()) SendInput((UINT)inputs.size(), inputs.data(), sizeof(INPUT));
+}
+
+static void OnKvmMousePacket(const uint8_t* p, size_t len) {
+    if (!p || len < 7) return;
+    int16_t dx = (int16_t)(((uint16_t)p[0] << 8) | p[1]);
+    int16_t dy = (int16_t)(((uint16_t)p[2] << 8) | p[3]);
+    uint8_t btns = p[4];
+    int16_t wheel = (int16_t)(((uint16_t)p[5] << 8) | p[6]);
+
+    std::vector<INPUT> inputs;
+    if (dx != 0 || dy != 0) {
+        INPUT mv{};
+        mv.type = INPUT_MOUSE;
+        mv.mi.dx = (LONG)dx;
+        mv.mi.dy = (LONG)dy;
+        mv.mi.dwFlags = MOUSEEVENTF_MOVE;
+        inputs.push_back(mv);
+    }
+    {
+        std::lock_guard<std::mutex> lk(g_rxKvmMtx);
+        auto addBtn = [&](uint8_t mask, DWORD downFlag, DWORD upFlag) {
+            bool was = (g_rxKvmButtons & mask) != 0;
+            bool now = (btns & mask) != 0;
+            if (was == now) return;
+            INPUT bi{};
+            bi.type = INPUT_MOUSE;
+            bi.mi.dwFlags = now ? downFlag : upFlag;
+            inputs.push_back(bi);
+        };
+        addBtn(0x01, MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP);
+        addBtn(0x02, MOUSEEVENTF_RIGHTDOWN, MOUSEEVENTF_RIGHTUP);
+        addBtn(0x04, MOUSEEVENTF_MIDDLEDOWN, MOUSEEVENTF_MIDDLEUP);
+        g_rxKvmButtons = btns;
+    }
+    if (wheel != 0) {
+        INPUT wi{};
+        wi.type = INPUT_MOUSE;
+        wi.mi.dwFlags = MOUSEEVENTF_WHEEL;
+        wi.mi.mouseData = (DWORD)(int)wheel;
+        inputs.push_back(wi);
+    }
+    if (!inputs.empty()) SendInput((UINT)inputs.size(), inputs.data(), sizeof(INPUT));
+}
+
+static void OnKvmKeyPacket(const uint8_t* p, size_t len) {
+    if (!p || len < 6) return;
+    uint16_t vk = (uint16_t)(((uint16_t)p[0] << 8) | p[1]);
+    uint16_t scan = (uint16_t)(((uint16_t)p[2] << 8) | p[3]);
+    bool down = p[4] != 0;
+    uint8_t flags = p[5];
+    if (vk == 0 && scan == 0) return;
+
+    INPUT in{};
+    in.type = INPUT_KEYBOARD;
+    DWORD dw = 0;
+    if (vk == 0) {
+        in.ki.wScan = scan;
+        dw |= KEYEVENTF_SCANCODE;
+    } else {
+        in.ki.wVk = vk;
+        in.ki.wScan = scan ? scan : (uint16_t)MapVirtualKeyW(vk, MAPVK_VK_TO_VSC);
+    }
+    if (flags & 0x01) dw |= KEYEVENTF_EXTENDEDKEY;
+    if (!down) dw |= KEYEVENTF_KEYUP;
+    in.ki.dwFlags = dw;
+
+    {
+        std::lock_guard<std::mutex> lk(g_rxKvmMtx);
+        uint64_t k = (vk != 0)
+            ? (uint64_t)vk
+            : (0x8000000000000000ULL | ((uint64_t)(flags & 0x01) << 32) | (uint64_t)scan);
+        if (down) g_rxKvmHeldKeys[k] = RxKvmHeldKey{ vk, scan, flags };
+        else g_rxKvmHeldKeys.erase(k);
+    }
+    SendInput(1, &in, sizeof(INPUT));
+}
+
+static void OnKvmStatePacket(const uint8_t* p, size_t len) {
+    if (!p || len < 1) return;
+    bool active = (p[0] != 0);
+    g_rxKvmActive = active;
+    if (!active) ReleaseRxKvmInputs();
+    Log(active ? "KVM: Mac 主控端已开启键鼠穿透 (正在远程操作本机)" : "KVM: Mac 主控端已退出键鼠穿透");
+}
+
 static HWND g_hwnd = nullptr;   // 主窗口句柄，ClientToVideo 与全屏切换共用
 
 // 全局存活标志。放在靠前位置，因为 RecvAll 等底层函数也要读它来判断退出。
@@ -624,9 +745,11 @@ static const UINT ID_TRAY_MINIMIZE = 1004;
 static const UINT ID_TRAY_PANEL = 1005;
 static const UINT ID_TRAY_DROPBOX = 1006;
 static const UINT ID_TRAY_MODE = 1007;
+static const UINT ID_TRAY_KVM  = 1008;
 static const int  HOTKEY_QUIT_ID = 1;
 static const int  HOTKEY_HIDE_ID = 2;   // Ctrl+Alt+H：最小化让位/还原，不退出
 static const int  HOTKEY_DROPBOX_ID = 3; // Ctrl+Alt+B：一键呼出/隐藏文件投递盒
+static const int  HOTKEY_KVM_ID = 4;     // Ctrl+Alt+K：主机模式切换 KVM 键鼠穿透到 Mac
 // 用 W 版托盘结构与宽字符提示：A 版在 CP936 下会把 UTF-8 中文按 GBK 解码，
 // 托盘悬浮提示会变乱码。窗口类本身仍是 A 版注册（类名纯 ASCII），不受影响。
 static NOTIFYICONDATAW g_nid{};
@@ -700,7 +823,10 @@ static void TrayShowMenu(HWND hwnd) {
     AppendMenuW(menu, MF_STRING, ID_TRAY_DROPBOX, L"文件投递盒（悬浮窗）  (Ctrl+Alt+B)");
     AppendMenuW(menu, MF_STRING, ID_TRAY_MODE,
                 g_hostMode.load() ? L"切到副屏模式 (接收 Mac 画面)" : L"切到主控模式 (Mac 当 Windows 副屏)");
-    if (!g_hostMode.load()) {
+    if (g_hostMode.load()) {
+        AppendMenuW(menu, MF_STRING, ID_TRAY_KVM,
+                    g_winHost.IsKvmActive() ? L"退出键鼠穿透 Mac  (Ctrl+Alt+K)" : L"键鼠穿透控制 Mac  (Ctrl+Alt+K)");
+    } else {
         AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
         AppendMenuW(menu, MF_STRING, ID_TRAY_TOGGLE, L"切换全屏 / 窗口  (F11)");
         AppendMenuW(menu, MF_STRING, ID_TRAY_MINIMIZE, L"最小化让位 / 还原  (Ctrl+Alt+H)");
@@ -2340,6 +2466,7 @@ static const int IDC_PANEL_MBPS_30   = 2038;
 static const int IDC_PANEL_MBPS_50   = 2039;
 static const int IDC_PANEL_MBPS_80   = 2040;
 static const int IDC_PANEL_VDD_RETRY = 2041;
+static const int IDC_PANEL_KVM       = 2042;
 
 static std::atomic<int> g_hostReqW{2880};
 static std::atomic<int> g_hostReqH{1800};
@@ -3167,12 +3294,16 @@ static void UpdateControlPanel() {
 
         bool connected = hs.clientConnected.load();
         bool vddOk = g_winHost.VddActive();
+        bool kvmOn = hs.kvmActive.load();
         ULONGLONG lastTx = hs.lastSentTick.load();
         bool staticIdle = connected && sentF > 0 && lastTx > 0 && (GetTickCount64() - lastTx > 1500ULL);
         bool streaming = connected && sentF > 0;
         if (!vddOk) {
             g_panelData.state = 3;
             g_panelData.statusText = L"虚拟屏异常 · 请检查 Parsec VDD 或点击重挂";
+        } else if (kvmOn) {
+            g_panelData.state = 2;
+            g_panelData.statusText = L"KVM 穿透中 · 键鼠正控制 Mac (Ctrl+Alt+K 退出)";
         } else if (streaming) {
             g_panelData.state = 2;
             g_panelData.statusText = staticIdle ? L"主控在线 · 桌面静止省流中" : L"主控发送中 · Mac 副屏在线";
@@ -3266,6 +3397,8 @@ static void UpdateControlPanel() {
         SetWindowTextW(GetDlgItem(g_panel, IDC_PANEL_MODE), L"切回副屏模式");
         SetWindowTextW(GetDlgItem(g_panel, IDC_PANEL_FULL), L"显示设置");
         SetWindowTextW(GetDlgItem(g_panel, IDC_PANEL_RECONN), L"断开重连");
+        SetWindowTextW(GetDlgItem(g_panel, IDC_PANEL_KVM),
+                       hs.kvmActive.load() ? L"退出穿透 (Ctrl+Alt+K)" : L"键鼠控 Mac (Ctrl+Alt+K)");
         InvalidateRect(g_panel, nullptr, FALSE);
         return;
     }
@@ -3833,13 +3966,14 @@ static void LayoutPanelControls(HWND h) {
     mvChk(IDC_PANEL_SHAKE,    477, 494, 165, 28);
     mvChk(IDC_PANEL_KEEPON,   658, 494, 250, 28);
 
-    mvHost(IDC_PANEL_RES_2880,  39,  491, 116, 32);
-    mvHost(IDC_PANEL_RES_2560,  163, 491, 116, 32);
-    mvHost(IDC_PANEL_RES_1920,  287, 491, 116, 32);
-    mvHost(IDC_PANEL_MBPS_30,   423, 491, 100, 32);
-    mvHost(IDC_PANEL_MBPS_50,   531, 491, 100, 32);
-    mvHost(IDC_PANEL_MBPS_80,   639, 491, 100, 32);
-    mvHost(IDC_PANEL_VDD_RETRY, 759, 491, 162, 32);
+    mvHost(IDC_PANEL_RES_2880,  39,  491, 96,  32);
+    mvHost(IDC_PANEL_RES_2560,  143, 491, 96,  32);
+    mvHost(IDC_PANEL_RES_1920,  247, 491, 96,  32);
+    mvHost(IDC_PANEL_MBPS_30,   355, 491, 68,  32);
+    mvHost(IDC_PANEL_MBPS_50,   431, 491, 68,  32);
+    mvHost(IDC_PANEL_MBPS_80,   507, 491, 68,  32);
+    mvHost(IDC_PANEL_VDD_RETRY, 587, 491, 134, 32);
+    mvHost(IDC_PANEL_KVM,       731, 491, 190, 32);
 }
 
 static LRESULT CALLBACK PanelWndProc(HWND h, UINT msg, WPARAM w, LPARAM l) {
@@ -3897,6 +4031,7 @@ static LRESULT CALLBACK PanelWndProc(HWND h, UINT msg, WPARAM w, LPARAM l) {
         mkBtn(L"码率 50M",  IDC_PANEL_MBPS_50);
         mkBtn(L"码率 80M",  IDC_PANEL_MBPS_80);
         mkBtn(L"重挂虚拟屏", IDC_PANEL_VDD_RETRY);
+        mkBtn(L"键鼠控 Mac (Ctrl+Alt+K)", IDC_PANEL_KVM);
 
         DragAcceptFiles(h, TRUE);
         LayoutPanelControls(h);
@@ -4055,6 +4190,12 @@ static LRESULT CALLBACK PanelWndProc(HWND h, UINT msg, WPARAM w, LPARAM l) {
                                      g_hostReqDpi.load())) {
                     Log("警告: 重挂 Parsec 虚拟屏仍失败，请检查驱动是否安装");
                 }
+            }
+            return 0;
+        case IDC_PANEL_KVM:
+            if (g_hostMode.load()) {
+                g_winHost.ToggleKvm();
+                UpdateControlPanel();
             }
             return 0;
         case IDC_PANEL_LOG:
@@ -5504,6 +5645,12 @@ static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
         case ID_TRAY_PANEL:   ShowControlPanel(); return 0;
         case ID_TRAY_DROPBOX: ShowDropBoxWindow(); return 0;
         case ID_TRAY_MODE:    SwitchAppMode(!g_hostMode.load()); return 0;
+        case ID_TRAY_KVM:
+            if (g_hostMode.load()) {
+                g_winHost.ToggleKvm();
+                UpdateControlPanel();
+            }
+            return 0;
         case ID_TRAY_EXIT:   RequestQuit(); return 0;
         case ID_TRAY_TOGGLE:
             if (g_isFullscreen) ExitFullscreen(); else EnterFullscreen();
@@ -5525,6 +5672,10 @@ static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
         if (w == HOTKEY_QUIT_ID) RequestQuit();
         else if (w == HOTKEY_HIDE_ID) ToggleMinimize();
         else if (w == HOTKEY_DROPBOX_ID) ToggleDropBoxWindow();
+        else if (w == HOTKEY_KVM_ID && g_hostMode.load()) {
+            g_winHost.ToggleKvm();
+            UpdateControlPanel();
+        }
         return 0;
     case WM_KEYDOWN:
     case WM_KEYUP:
@@ -6164,6 +6315,18 @@ static void NetworkLoop(RunConfig cfg, Graphics* gfx, Presenter* presenter) {
                     OnSessionPacket(packet.data() + HEADER_BYTES, len - HEADER_BYTES);
                     continue;
                 }
+                if (packet[0] == TYPE_KVM_MOUSE) {
+                    OnKvmMousePacket(packet.data() + HEADER_BYTES, len - HEADER_BYTES);
+                    continue;
+                }
+                if (packet[0] == TYPE_KVM_KEY) {
+                    OnKvmKeyPacket(packet.data() + HEADER_BYTES, len - HEADER_BYTES);
+                    continue;
+                }
+                if (packet[0] == TYPE_KVM_STATE) {
+                    OnKvmStatePacket(packet.data() + HEADER_BYTES, len - HEADER_BYTES);
+                    continue;
+                }
                 // 其它未知类型：忽略即可，TCP 已有数据流动
                 if (packet[0] != TYPE_VIDEO) continue;
 
@@ -6486,6 +6649,8 @@ static void NetworkLoop(RunConfig cfg, Graphics* gfx, Presenter* presenter) {
 
         recv.join();
         connAlive = false;
+        g_rxKvmActive = false;
+        ReleaseRxKvmInputs();
         latestCv.notify_all();
         present.join();
         watch.join();
@@ -7186,6 +7351,7 @@ int main(int argc, char** argv) {
         TrayCreate(hwnd);
         RegisterHotKey(hwnd, HOTKEY_QUIT_ID, MOD_CONTROL | MOD_ALT, 'Q');
         RegisterHotKey(hwnd, HOTKEY_DROPBOX_ID, MOD_CONTROL | MOD_ALT, 'B');
+        RegisterHotKey(hwnd, HOTKEY_KVM_ID, MOD_CONTROL | MOD_ALT, 'K');
         SetThreadExecutionState(ES_CONTINUOUS | ES_SYSTEM_REQUIRED | ES_DISPLAY_REQUIRED);
 
         g_hostReqW = cfg.hostWidth;
@@ -7223,6 +7389,7 @@ int main(int argc, char** argv) {
         TrayRemove();
         UnregisterHotKey(hwnd, HOTKEY_QUIT_ID);
         UnregisterHotKey(hwnd, HOTKEY_DROPBOX_ID);
+        UnregisterHotKey(hwnd, HOTKEY_KVM_ID);
         g_alive = false;
         g_winHost.Stop();
         g_xferCv.notify_all();

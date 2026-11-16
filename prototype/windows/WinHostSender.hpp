@@ -36,6 +36,7 @@
 #include <functional>
 #include <map>
 #include <mutex>
+#include <set>
 #include <string>
 #include <thread>
 #include <vector>
@@ -65,6 +66,7 @@ namespace secdisplay {
 
 struct WinHostStats {
     std::atomic<bool>     clientConnected{false};
+    std::atomic<bool>     kvmActive{false};
     std::atomic<int>      width{0};
     std::atomic<int>      height{0};
     std::atomic<int>      fps{60};
@@ -157,6 +159,7 @@ public:
         acceptThread_ = std::thread(&WinHostSender::ConnectLoop, this);
         captureThread_ = std::thread(&WinHostSender::CaptureEncodeLoop, this);
         cursorThread_ = std::thread(&WinHostSender::CursorLoop, this);
+        kvmSendThread_ = std::thread(&WinHostSender::KvmSendLoop, this);
         return true;
     }
 
@@ -198,7 +201,9 @@ public:
     bool VddActive() const { return vdd_.IsActive(); }
 
     void Stop() {
+        SetKvmActive(false);
         alive_.store(false);
+        kvmCv_.notify_all();
         // 按 sendMtx_ -> sockMtx_ 顺序校验身份并一起 shutdown+closesocket，彻底消除锁外句柄复用竞态
         {
             std::lock_guard<std::mutex> slk(sendMtx_);
@@ -214,10 +219,77 @@ public:
         if (acceptThread_.joinable()) acceptThread_.join();
         if (captureThread_.joinable()) captureThread_.join();
         if (cursorThread_.joinable()) cursorThread_.join();
+        if (kvmHookThread_.joinable()) kvmHookThread_.join();
+        if (kvmSendThread_.joinable()) kvmSendThread_.join();
 
         ReleaseAllInputs();
         vdd_.Stop();
         EmitLog("WinHost: 发送端已停止");
+    }
+
+    bool IsKvmActive() const { return kvmActive_.load(); }
+    bool ToggleKvm() { return SetKvmActive(!kvmActive_.load()); }
+
+    bool SetKvmActive(bool on) {
+        if (on) {
+            if (!alive_.load() || !stats_.clientConnected.load()) {
+                EmitLog("WinHost: Mac 副屏未连接，无法开启 KVM 键鼠穿透");
+                return false;
+            }
+            if (kvmActive_.load()) return true;
+            if (kvmHookThread_.joinable()) kvmHookThread_.join();
+
+            POINT anchor{};
+            if (!GetCursorPos(&anchor)) {
+                anchor.x = GetSystemMetrics(SM_CXSCREEN) / 2;
+                anchor.y = GetSystemMetrics(SM_CYSCREEN) / 2;
+            }
+            {
+                std::lock_guard<std::mutex> klk(kvmMtx_);
+                kvmAnchorX_ = anchor.x;
+                kvmAnchorY_ = anchor.y;
+                kvmButtons_ = 0;
+                kvmDxAccum_ = 0;
+                kvmDyAccum_ = 0;
+                kvmQueue_.clear();
+            }
+            kvmHookReady_ = false;
+            kvmHookOk_ = false;
+            kvmHookTid_ = 0;
+            kvmActive_.store(true);
+            stats_.kvmActive.store(true);
+
+            kvmHookThread_ = std::thread(&WinHostSender::KvmHookLoop, this);
+            {
+                std::unique_lock<std::mutex> klk(kvmMtx_);
+                kvmReadyCv_.wait_for(klk, std::chrono::milliseconds(1500), [this]() { return kvmHookReady_; });
+            }
+            if (!kvmHookOk_) {
+                kvmActive_.store(false);
+                stats_.kvmActive.store(false);
+                if (kvmHookThread_.joinable()) kvmHookThread_.join();
+                EmitLog("WinHost: 安装 KVM 低级键鼠钩子失败");
+                return false;
+            }
+            EnqueueKvmState(true);
+            EmitLog("WinHost: 已开启 KVM 键鼠穿透（操作 Mac 桌面），再按 Ctrl+Alt+K 退出");
+            return true;
+        } else {
+            bool was = kvmActive_.exchange(false);
+            stats_.kvmActive.store(false);
+            DWORD tid = kvmHookTid_.load();
+            if (tid != 0) {
+                PostThreadMessageW(tid, WM_QUIT, 0, 0);
+            }
+            if (was) {
+                EnqueueKvmState(false);
+                EmitLog("WinHost: 已退出 KVM 键鼠穿透，恢复操作 Windows");
+            }
+            if (kvmHookThread_.joinable() && GetCurrentThreadId() != tid) {
+                kvmHookThread_.join();
+            }
+            return true;
+        }
     }
 
     void RequestKeyframe() {
@@ -239,6 +311,9 @@ private:
     static constexpr uint8_t kTypeSession     = 0x06;
     static constexpr uint8_t kTypeFeedback    = 0x07;
     static constexpr uint8_t kTypeKeyInput    = 0x09;
+    static constexpr uint8_t kTypeKvmMouse    = 0x0A;
+    static constexpr uint8_t kTypeKvmKey      = 0x0B;
+    static constexpr uint8_t kTypeKvmState    = 0x0C;
 
     WinVirtualDisplay vdd_;
     WinHostStats stats_;
@@ -269,6 +344,24 @@ private:
     std::thread acceptThread_;
     std::thread captureThread_;
     std::thread cursorThread_;
+    std::thread kvmHookThread_;
+    std::thread kvmSendThread_;
+
+    static inline std::atomic<WinHostSender*> s_kvmOwner_{nullptr};
+    std::atomic<bool> kvmActive_{false};
+    std::atomic<DWORD> kvmHookTid_{0};
+    std::mutex kvmMtx_;
+    std::condition_variable kvmCv_;
+    std::condition_variable kvmReadyCv_;
+    bool kvmHookReady_ = false;
+    bool kvmHookOk_ = false;
+    LONG kvmAnchorX_ = 0;
+    LONG kvmAnchorY_ = 0;
+    uint8_t kvmButtons_ = 0;
+    int kvmDxAccum_ = 0;
+    int kvmDyAccum_ = 0;
+    std::deque<std::vector<uint8_t>> kvmQueue_;
+    std::set<uint16_t> kvmForwardedVks_; // 仅在 kvmHookThread_ 内访问
 
     void EmitLog(const char* s) {
         if (logFn_ && s) logFn_(s);
@@ -582,8 +675,220 @@ private:
             }
         }
         DisconnectClient(cs);
+        SetKvmActive(false);
         ReleaseAllInputs();
         EmitLog("WinHost: Mac 副屏连接断开");
+    }
+
+    // ---- 双向 KVM 键鼠穿透（Windows 主控键鼠直接操作 Mac 原生系统）----
+    static std::vector<uint8_t> BuildKvmMousePkt(int16_t dx, int16_t dy, uint8_t buttons, int16_t wheel) {
+        std::vector<uint8_t> pkt(20);
+        PutU32BE(pkt.data(), 16); // 1 + 8 + 7
+        pkt[4] = kTypeKvmMouse;
+        PutU64BE(pkt.data() + 5, NowMicros());
+        PutU16BE(pkt.data() + 13, (uint16_t)dx);
+        PutU16BE(pkt.data() + 15, (uint16_t)dy);
+        pkt[17] = buttons;
+        PutU16BE(pkt.data() + 18, (uint16_t)wheel);
+        return pkt;
+    }
+
+    static std::vector<uint8_t> BuildKvmKeyPkt(uint16_t vk, uint16_t scan, bool down, uint8_t flags) {
+        std::vector<uint8_t> pkt(19);
+        PutU32BE(pkt.data(), 15); // 1 + 8 + 6
+        pkt[4] = kTypeKvmKey;
+        PutU64BE(pkt.data() + 5, NowMicros());
+        PutU16BE(pkt.data() + 13, vk);
+        PutU16BE(pkt.data() + 15, scan);
+        pkt[17] = down ? 1 : 0;
+        pkt[18] = flags;
+        return pkt;
+    }
+
+    void EnqueueKvmState(bool active) {
+        std::vector<uint8_t> pkt(14);
+        PutU32BE(pkt.data(), 10); // 1 + 8 + 1
+        pkt[4] = kTypeKvmState;
+        PutU64BE(pkt.data() + 5, NowMicros());
+        pkt[13] = active ? 1 : 0;
+        {
+            std::lock_guard<std::mutex> klk(kvmMtx_);
+            if (!active) {
+                kvmDxAccum_ = 0;
+                kvmDyAccum_ = 0;
+            }
+            kvmQueue_.push_back(std::move(pkt));
+        }
+        kvmCv_.notify_one();
+    }
+
+    void EnqueueKvmKey(uint16_t vk, uint16_t scan, bool down, uint8_t flags) {
+        auto pkt = BuildKvmKeyPkt(vk, scan, down, flags);
+        {
+            std::lock_guard<std::mutex> klk(kvmMtx_);
+            if (kvmQueue_.size() > 512) kvmQueue_.pop_front();
+            kvmQueue_.push_back(std::move(pkt));
+        }
+        kvmCv_.notify_one();
+    }
+
+    void EnqueueKvmMouseEvent(int dx, int dy, uint8_t buttons, int16_t wheel, bool immediate) {
+        std::lock_guard<std::mutex> klk(kvmMtx_);
+        kvmDxAccum_ += dx;
+        kvmDyAccum_ += dy;
+        kvmButtons_ = buttons;
+        if (immediate) {
+            int16_t sdx = (int16_t)std::clamp(kvmDxAccum_, -32000, 32000);
+            int16_t sdy = (int16_t)std::clamp(kvmDyAccum_, -32000, 32000);
+            kvmDxAccum_ = 0;
+            kvmDyAccum_ = 0;
+            if (kvmQueue_.size() > 512) kvmQueue_.pop_front();
+            kvmQueue_.push_back(BuildKvmMousePkt(sdx, sdy, buttons, wheel));
+        }
+        kvmCv_.notify_one();
+    }
+
+    void RequestKvmExitFromHook() {
+        bool was = kvmActive_.exchange(false);
+        stats_.kvmActive.store(false);
+        DWORD tid = kvmHookTid_.load();
+        if (tid != 0) PostThreadMessageW(tid, WM_QUIT, 0, 0);
+        if (was) {
+            EnqueueKvmState(false);
+            EmitLog("WinHost: 热键退出 KVM 键鼠穿透，恢复操作 Windows");
+        }
+    }
+
+    void KvmSendLoop() {
+        while (alive_.load()) {
+            std::vector<uint8_t> pkt;
+            {
+                std::unique_lock<std::mutex> klk(kvmMtx_);
+                if (kvmQueue_.empty() && kvmDxAccum_ == 0 && kvmDyAccum_ == 0) {
+                    kvmCv_.wait(klk, [this]() {
+                        return !alive_.load() || !kvmQueue_.empty() || kvmDxAccum_ != 0 || kvmDyAccum_ != 0;
+                    });
+                } else if (kvmQueue_.empty()) {
+                    kvmCv_.wait_for(klk, std::chrono::milliseconds(8), [this]() {
+                        return !alive_.load() || !kvmQueue_.empty();
+                    });
+                }
+                if (!alive_.load()) break;
+                if (!kvmQueue_.empty()) {
+                    pkt = std::move(kvmQueue_.front());
+                    kvmQueue_.pop_front();
+                } else if (kvmDxAccum_ != 0 || kvmDyAccum_ != 0) {
+                    int16_t sdx = (int16_t)std::clamp(kvmDxAccum_, -32000, 32000);
+                    int16_t sdy = (int16_t)std::clamp(kvmDyAccum_, -32000, 32000);
+                    kvmDxAccum_ = 0;
+                    kvmDyAccum_ = 0;
+                    pkt = BuildKvmMousePkt(sdx, sdy, kvmButtons_, 0);
+                }
+            }
+            if (!pkt.empty()) {
+                SendRawPacket(pkt.data(), pkt.size());
+            }
+        }
+    }
+
+    static LRESULT CALLBACK KvmKeyboardProc(int code, WPARAM wParam, LPARAM lParam) {
+        WinHostSender* inst = s_kvmOwner_.load();
+        if (code == HC_ACTION && inst && inst->kvmActive_.load() && lParam) {
+            const auto* kb = (const KBDLLHOOKSTRUCT*)lParam;
+            if (!(kb->flags & LLKHF_INJECTED)) {
+                uint16_t vk = (uint16_t)kb->vkCode;
+                uint16_t scan = (uint16_t)kb->scanCode;
+                bool down = (wParam == WM_KEYDOWN || wParam == WM_SYSKEYDOWN);
+                uint8_t flags = (kb->flags & LLKHF_EXTENDED) ? 0x01 : 0;
+
+                if (down && (vk == 'K' || vk == VK_ESCAPE) &&
+                    (GetAsyncKeyState(VK_CONTROL) & 0x8000) &&
+                    (GetAsyncKeyState(VK_MENU) & 0x8000)) {
+                    inst->RequestKvmExitFromHook();
+                    return 1;
+                }
+                if (down) {
+                    inst->kvmForwardedVks_.insert(vk);
+                    inst->EnqueueKvmKey(vk, scan, true, flags);
+                    return 1;
+                } else {
+                    if (inst->kvmForwardedVks_.erase(vk) == 0) {
+                        // 放行进入热键残余的 Ctrl/Alt 抬起事件，避免 Windows 本机卡键
+                        return CallNextHookEx(nullptr, code, wParam, lParam);
+                    }
+                    inst->EnqueueKvmKey(vk, scan, false, flags);
+                    return 1;
+                }
+            }
+        }
+        return CallNextHookEx(nullptr, code, wParam, lParam);
+    }
+
+    static LRESULT CALLBACK KvmMouseProc(int code, WPARAM wParam, LPARAM lParam) {
+        WinHostSender* inst = s_kvmOwner_.load();
+        if (code == HC_ACTION && inst && inst->kvmActive_.load() && lParam) {
+            const auto* ms = (const MSLLHOOKSTRUCT*)lParam;
+            if (!(ms->flags & LLMHF_INJECTED)) {
+                if (wParam == WM_MOUSEMOVE) {
+                    int dx = (int)(ms->pt.x - inst->kvmAnchorX_);
+                    int dy = (int)(ms->pt.y - inst->kvmAnchorY_);
+                    if (dx != 0 || dy != 0) {
+                        inst->EnqueueKvmMouseEvent(dx, dy, inst->kvmButtons_, 0, false);
+                    }
+                    return 1;
+                }
+                uint8_t btns = inst->kvmButtons_;
+                int16_t wheel = 0;
+                bool handled = true;
+                switch (wParam) {
+                case WM_LBUTTONDOWN: btns |= 0x01; break;
+                case WM_LBUTTONUP:   btns &= ~0x01; break;
+                case WM_RBUTTONDOWN: btns |= 0x02; break;
+                case WM_RBUTTONUP:   btns &= ~0x02; break;
+                case WM_MBUTTONDOWN: btns |= 0x04; break;
+                case WM_MBUTTONUP:   btns &= ~0x04; break;
+                case WM_MOUSEWHEEL:  wheel = (int16_t)HIWORD(ms->mouseData); break;
+                default: handled = false; break;
+                }
+                if (handled) {
+                    inst->EnqueueKvmMouseEvent(0, 0, btns, wheel, true);
+                    return 1;
+                }
+            }
+        }
+        return CallNextHookEx(nullptr, code, wParam, lParam);
+    }
+
+    void KvmHookLoop() {
+        MSG dummy{};
+        PeekMessageW(&dummy, nullptr, WM_USER, WM_USER, PM_NOREMOVE);
+        kvmHookTid_.store(GetCurrentThreadId());
+        kvmForwardedVks_.clear();
+        s_kvmOwner_.store(this);
+
+        HHOOK hKb = SetWindowsHookExW(WH_KEYBOARD_LL, KvmKeyboardProc, GetModuleHandleW(nullptr), 0);
+        HHOOK hMs = SetWindowsHookExW(WH_MOUSE_LL, KvmMouseProc, GetModuleHandleW(nullptr), 0);
+        bool ok = (hKb != nullptr && hMs != nullptr);
+        {
+            std::lock_guard<std::mutex> klk(kvmMtx_);
+            kvmHookOk_ = ok;
+            kvmHookReady_ = true;
+        }
+        kvmReadyCv_.notify_all();
+
+        if (ok) {
+            MSG msg{};
+            while (kvmActive_.load() && alive_.load() && GetMessageW(&msg, nullptr, 0, 0) > 0) {
+                TranslateMessage(&msg);
+                DispatchMessageW(&msg);
+            }
+        }
+        if (hKb) UnhookWindowsHookEx(hKb);
+        if (hMs) UnhookWindowsHookEx(hMs);
+        kvmForwardedVks_.clear();
+        WinHostSender* expected = this;
+        s_kvmOwner_.compare_exchange_strong(expected, nullptr);
+        kvmHookTid_.store(0);
     }
 
     void ProcessControlBytes(std::vector<uint8_t>& acc) {
