@@ -239,15 +239,17 @@ public:
             if (kvmActive_.load()) return true;
             if (kvmHookThread_.joinable()) kvmHookThread_.join();
 
-            POINT anchor{};
-            if (!GetCursorPos(&anchor)) {
-                anchor.x = GetSystemMetrics(SM_CXSCREEN) / 2;
-                anchor.y = GetSystemMetrics(SM_CYSCREEN) / 2;
+            int ax = GetSystemMetrics(SM_XVIRTUALSCREEN) + GetSystemMetrics(SM_CXVIRTUALSCREEN) / 2;
+            int ay = GetSystemMetrics(SM_YVIRTUALSCREEN) + GetSystemMetrics(SM_CYVIRTUALSCREEN) / 2;
+            if (ax == 0 && ay == 0) {
+                ax = 640; ay = 400;
             }
+            SetCursorPos(ax, ay);
+            kvmAnchorX_.store(ax);
+            kvmAnchorY_.store(ay);
+            kvmHookButtons_ = 0;
             {
                 std::lock_guard<std::mutex> klk(kvmMtx_);
-                kvmAnchorX_ = anchor.x;
-                kvmAnchorY_ = anchor.y;
                 kvmButtons_ = 0;
                 kvmDxAccum_ = 0;
                 kvmDyAccum_ = 0;
@@ -355,9 +357,10 @@ private:
     std::condition_variable kvmReadyCv_;
     bool kvmHookReady_ = false;
     bool kvmHookOk_ = false;
-    LONG kvmAnchorX_ = 0;
-    LONG kvmAnchorY_ = 0;
-    uint8_t kvmButtons_ = 0;
+    std::atomic<LONG> kvmAnchorX_{0};
+    std::atomic<LONG> kvmAnchorY_{0};
+    uint8_t kvmHookButtons_ = 0; // 仅在 kvmHookThread_ 内读写
+    uint8_t kvmButtons_ = 0;     // 由 kvmMtx_ 保护供 KvmSendLoop 使用
     int kvmDxAccum_ = 0;
     int kvmDyAccum_ = 0;
     std::deque<std::vector<uint8_t>> kvmQueue_;
@@ -830,14 +833,18 @@ private:
             const auto* ms = (const MSLLHOOKSTRUCT*)lParam;
             if (!(ms->flags & LLMHF_INJECTED)) {
                 if (wParam == WM_MOUSEMOVE) {
-                    int dx = (int)(ms->pt.x - inst->kvmAnchorX_);
-                    int dy = (int)(ms->pt.y - inst->kvmAnchorY_);
+                    LONG ax = inst->kvmAnchorX_.load();
+                    LONG ay = inst->kvmAnchorY_.load();
+                    int dx = (int)(ms->pt.x - ax);
+                    int dy = (int)(ms->pt.y - ay);
                     if (dx != 0 || dy != 0) {
-                        inst->EnqueueKvmMouseEvent(dx, dy, inst->kvmButtons_, 0, false);
+                        inst->EnqueueKvmMouseEvent(dx, dy, inst->kvmHookButtons_, 0, false);
+                        DWORD tid = inst->kvmHookTid_.load();
+                        if (tid != 0) PostThreadMessageW(tid, WM_APP + 1, 0, 0);
                     }
                     return 1;
                 }
-                uint8_t btns = inst->kvmButtons_;
+                uint8_t btns = inst->kvmHookButtons_;
                 int16_t wheel = 0;
                 bool handled = true;
                 switch (wParam) {
@@ -851,6 +858,7 @@ private:
                 default: handled = false; break;
                 }
                 if (handled) {
+                    inst->kvmHookButtons_ = btns;
                     inst->EnqueueKvmMouseEvent(0, 0, btns, wheel, true);
                     return 1;
                 }
@@ -879,6 +887,10 @@ private:
         if (ok) {
             MSG msg{};
             while (kvmActive_.load() && alive_.load() && GetMessageW(&msg, nullptr, 0, 0) > 0) {
+                if (msg.message == WM_APP + 1 && kvmActive_.load()) {
+                    SetCursorPos(kvmAnchorX_.load(), kvmAnchorY_.load());
+                    continue;
+                }
                 TranslateMessage(&msg);
                 DispatchMessageW(&msg);
             }
