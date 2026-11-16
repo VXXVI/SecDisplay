@@ -1605,12 +1605,21 @@ final class Sender {
     /// String 是引用计数的多字节值类型，跨线程裸读写是 UB，必须走锁。
     private let peerLock = NSLock()
     private var _peerDescription = "-"
+    private var _roleConflictMessage: String? = nil
+    private var peerVerifiedReceiver = false
     var peerDescription: String {
         peerLock.lock(); defer { peerLock.unlock() }
         return _peerDescription
     }
     func setPeerDescription(_ s: String) {
         peerLock.lock(); _peerDescription = s; peerLock.unlock()
+    }
+    var roleConflictMessage: String? {
+        peerLock.lock(); defer { peerLock.unlock() }
+        return _roleConflictMessage
+    }
+    func setRoleConflictMessage(_ s: String?) {
+        peerLock.lock(); _roleConflictMessage = s; peerLock.unlock()
     }
 
     /// 会话头里通告的虚拟屏参数，由 main 在启动时写入。
@@ -1669,6 +1678,8 @@ final class Sender {
             let old = self.conn
             self.conn = c
             self.connected = true
+            self.peerVerifiedReceiver = false
+            self.setRoleConflictMessage(nil)
             self.resetInFlight()          // 上一轮可能残留未完成的发送，必须清零
             // 旧连接可能留下半个控制包，新连接数据接在残包后会把 0x07 误解析成 0x04。
             self.ctrlBuf.removeAll()
@@ -1774,7 +1785,9 @@ final class Sender {
             guard let self, self.connEpoch == epoch else { return }
             if let data, !data.isEmpty {
                 self.ctrlBuf.append(data)
-                self.drainControl()
+                if !self.drainControl(epoch: epoch) {
+                    return
+                }
             }
             if done || err != nil {
                 // 注意：这里不能把 connected 置 false。
@@ -1789,16 +1802,56 @@ final class Sender {
         }
     }
 
-    private func drainControl() {
+    private func abortRoleConflict(epoch: Int, message: String, firstByte: UInt8) {
+        guard connEpoch == epoch else { return }
+        let c = conn
+        connEpoch &+= 1
+        conn = nil
+        connected = false
+        peerVerifiedReceiver = false
+        ctrlBuf.removeAll()
+        setRoleConflictMessage(message)
+        resetInjectionState()
+        gEncoder?.releaseLastFrame()
+        Log.info("角色冲突/协议异常 (首字节=0x\(String(format: "%02X", firstByte))): \(message)")
+        guard let c else { return }
+        // 发一帧 0x7F 角色冲突通知后再取消连接，让对端也能明确提示
+        var pkt = Data(capacity: 14)
+        var len = UInt32(10).bigEndian
+        withUnsafeBytes(of: &len) { pkt.append(contentsOf: $0) }
+        pkt.append(0x7F)
+        var ts = UInt64(CFAbsoluteTimeGetCurrent() * 1_000_000).bigEndian
+        withUnsafeBytes(of: &ts) { pkt.append(contentsOf: $0) }
+        pkt.append(0x01) // 0x01: Mac 当前为主控发送模式
+        c.send(content: pkt, completion: .contentProcessed { _ in
+            c.cancel()
+        })
+    }
+
+    private func drainControl(epoch: Int) -> Bool {
         while !ctrlBuf.isEmpty {
             let t = ctrlBuf[ctrlBuf.startIndex]
-            if t == 0x02 {
+            if t == 0x7E {
+                // 接收端握手问候: [0x7E]['S']['D']['R']['X'][ver=1][role][0] = 8 字节
+                guard ctrlBuf.count >= 8 else { return true }
+                let b = ctrlBuf
+                let o = b.startIndex
+                let magicOk = b[o + 1] == 0x53 && b[o + 2] == 0x44 && b[o + 3] == 0x52 && b[o + 4] == 0x58
+                let role = b[o + 6]
+                if !magicOk || role != 0x02 {
+                    abortRoleConflict(epoch: epoch, message: "角色冲突：对端非 Windows 副屏接收端，已断开保护", firstByte: t)
+                    return false
+                }
+                peerVerifiedReceiver = true
+                setRoleConflictMessage(nil)
+                ctrlBuf.removeFirst(8)
+            } else if t == 0x02 {
                 Log.info("收到关键帧请求，下一帧强制 IDR")
                 onKeyframeRequest?()
                 ctrlBuf.removeFirst(1)
             } else if t == 0x04 {
                 // [0x04][float32 x][float32 y][uint8 buttons][int16 wheel] = 12 字节
-                guard ctrlBuf.count >= 12 else { return }
+                guard ctrlBuf.count >= 12 else { return true }
                 let b = ctrlBuf
                 let o = b.startIndex
                 func rdF(_ off: Int) -> Float {
@@ -1810,32 +1863,47 @@ final class Sender {
                 let y = rdF(5)
                 let buttons = b[o + 9]
                 let wheel = Int16(bitPattern: (UInt16(b[o + 10]) << 8) | UInt16(b[o + 11]))
+                if !x.isFinite || !y.isFinite || x < -64 || x > 16384 || y < -64 || y > 16384 || (buttons & ~0x07) != 0 {
+                    abortRoleConflict(epoch: epoch, message: "角色冲突或控制流损坏（0x04 越界），已断开保护", firstByte: t)
+                    return false
+                }
                 onInput?(x, y, buttons, wheel)
                 ctrlBuf.removeFirst(12)
             } else if t == 0x09 {
                 // [0x09][vk u16][scan u16][down u8][flags u8] = 7 字节，全大端
-                guard ctrlBuf.count >= 7 else { return }
+                guard ctrlBuf.count >= 7 else { return true }
                 let b = ctrlBuf
                 let o = b.startIndex
                 let vk = (UInt16(b[o + 1]) << 8) | UInt16(b[o + 2])
                 let scan = (UInt16(b[o + 3]) << 8) | UInt16(b[o + 4])
-                let down = b[o + 5] != 0
+                let downByte = b[o + 5]
                 let flags = b[o + 6]
-                onKey?(vk, scan, down, flags)
+                if downByte > 1 || (flags & ~0x03) != 0 {
+                    abortRoleConflict(epoch: epoch, message: "角色冲突或控制流损坏（0x09 越界），已断开保护", firstByte: t)
+                    return false
+                }
+                onKey?(vk, scan, downByte != 0, flags)
                 ctrlBuf.removeFirst(7)
             } else if t == 0x07 {
                 // [0x07][presentP95 u16][sourceP95 u16][decodeFps*10 u16]
                 // [presentDrop u16][pacedDrop u16][reserved u16] = 13 字节，全大端
-                guard ctrlBuf.count >= 13 else { return }
+                guard ctrlBuf.count >= 13 else { return true }
                 let b = ctrlBuf
                 let o = b.startIndex
                 func rd16(_ off: Int) -> UInt16 {
                     (UInt16(b[o + off]) << 8) | UInt16(b[o + off + 1])
                 }
+                let p95p = rd16(1)
+                let p95s = rd16(3)
+                let dec10 = rd16(5)
+                if p95p > 10000 || p95s > 10000 || dec10 > 3000 {
+                    abortRoleConflict(epoch: epoch, message: "角色冲突或控制流损坏（0x07 越界），已断开保护", firstByte: t)
+                    return false
+                }
                 let fb = FeedbackSignals(
-                    presentP95: Double(rd16(1)),
-                    sourceP95: Double(rd16(3)),
-                    decodeFps: Double(rd16(5)) / 10.0,
+                    presentP95: Double(p95p),
+                    sourceP95: Double(p95s),
+                    decodeFps: Double(dec10) / 10.0,
                     presentDrop: Int(rd16(7)),
                     pacedDrop: Int(rd16(9))
                 )
@@ -1847,11 +1915,16 @@ final class Sender {
                                 fb.presentP95, fb.sourceP95, fb.decodeFps, fb.presentDrop, fb.pacedDrop))
                 ctrlBuf.removeFirst(13)
             } else {
-                // 未知字节，丢掉，避免卡死
-                ctrlBuf.removeFirst(1)
+                // 严禁逐字节跳过未知字节（否则同为发送端的 H.264 视频帧会被误判成 0x04/0x09 乱点键盘鼠标）
+                let msg = (t == 0x00)
+                    ? "角色冲突：Windows 端当前也是主控发送模式，请将 Windows 切为「副屏模式」"
+                    : "控制通道协议异常，已拒绝输入并断开保护"
+                abortRoleConflict(epoch: epoch, message: msg, firstByte: t)
+                return false
             }
             if ctrlBuf.count > 65536 { ctrlBuf.removeAll() }
         }
+        return true
     }
 
     /// 收到对端 0x02 时回调，由外部接到编码器

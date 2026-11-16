@@ -317,6 +317,8 @@ static const uint8_t TYPE_KEY = 0x09;
 static const uint8_t TYPE_KVM_MOUSE = 0x0A;
 static const uint8_t TYPE_KVM_KEY   = 0x0B;
 static const uint8_t TYPE_KVM_STATE = 0x0C;
+static const uint8_t TYPE_ROLE_HELLO    = 0x7E;
+static const uint8_t TYPE_ROLE_CONFLICT = 0x7F;
 static const size_t KEY_PAYLOAD_BYTES = 6;
 static const size_t HEADER_BYTES = 9;   // 类型 1 + 时间戳 8
 static const size_t MAX_PACKET = 64u * 1024u * 1024u;
@@ -3332,12 +3334,18 @@ static void UpdateControlPanel() {
 
         wchar_t buf[256];
         std::wstring encNameCopy;
+        std::string errCopy;
         {
             std::lock_guard<std::mutex> lk(hs.infoMtx);
             std::wstring wp = ToWide(hs.peerAddr.c_str(), (int)hs.peerAddr.size());
             g_panelData.peerText = wp.empty() ? L"--" : wp;
             encNameCopy = hs.encoderName;
             g_panelData.decoderText = encNameCopy.empty() ? L"--" : encNameCopy;
+            errCopy = hs.lastError;
+        }
+        if (vddOk && !connected && !errCopy.empty()) {
+            g_panelData.state = 3;
+            g_panelData.statusText = ToWide(errCopy.c_str(), (int)errCopy.size());
         }
         swprintf(buf, 256, L"%d × %d @ %dHz", hs.width.load(), hs.height.load(), hs.fps.load());
         g_panelData.sizeText = buf;
@@ -6341,15 +6349,17 @@ static void NetworkLoop(RunConfig cfg, Graphics* gfx, Presenter* presenter) {
         g_connStartTick.store(GetTickCount64());
         ResetTimestampBase();
 
-        // 立刻请求关键帧，否则解码器拿不到 SPS/PPS，黑屏
+        // 先发 8 字节接收端握手标识（Mac Sender/Receiver 据此秒级识别角色是否匹配），再请求关键帧
         {
+            const uint8_t hello[8] = { TYPE_ROLE_HELLO, 'S', 'D', 'R', 'X', 1, 2, 0 };
             uint8_t req = TYPE_KEYFRAME_REQUEST;
-            int sent = 0;
+            int sentHello = 0, sentReq = 0;
             {
                 std::lock_guard<std::mutex> lk(g_sendMtx);
-                sent = send(sock, (const char*)&req, 1, 0);
+                sentHello = send(sock, (const char*)hello, sizeof(hello), 0);
+                sentReq = send(sock, (const char*)&req, 1, 0);
             }
-            if (sent == 1) Log("已请求关键帧（0x02）");
+            if (sentHello == sizeof(hello) && sentReq == 1) Log("已发送接收端握手并请求关键帧（0x7E/0x02）");
         }
 
         Decoder decoder;
@@ -6364,6 +6374,7 @@ static void NetworkLoop(RunConfig cfg, Graphics* gfx, Presenter* presenter) {
         }
 
         std::atomic<bool> connAlive{ true };
+        std::atomic<bool> roleConflictDetected{ false };
         std::vector<uint8_t> packet;
 
         // 解码只保留最新一帧：收流线程持续解码以维持 H.264 参考链（直接丢编码包会花屏），
@@ -6422,6 +6433,13 @@ static void NetworkLoop(RunConfig cfg, Graphics* gfx, Presenter* presenter) {
                 if (packet[0] == TYPE_KVM_STATE) {
                     OnKvmStatePacket(packet.data() + HEADER_BYTES, len - HEADER_BYTES);
                     continue;
+                }
+                if (packet[0] == TYPE_ROLE_CONFLICT) {
+                    uint8_t peerRole = (len > HEADER_BYTES) ? packet[HEADER_BYTES] : 0;
+                    Log("角色冲突: Mac 端当前为 %s，无法与本机副屏模式配对",
+                        peerRole == 2 ? "副屏模式" : "不兼容角色");
+                    roleConflictDetected = true;
+                    break;
                 }
                 // 其它未知类型：忽略即可，TCP 已有数据流动
                 if (packet[0] != TYPE_VIDEO) continue;
@@ -6754,7 +6772,11 @@ static void NetworkLoop(RunConfig cfg, Graphics* gfx, Presenter* presenter) {
         // 断线必须把画面清掉并给出提示。否则 FLIP 交换链会一直显示最后一帧，
         // 用户看到的是几分钟前的旧画面，容易误判成「显示的是别的屏」。
         presenter->ClearToIdle();
-        if (g_alive) ShowStatusHint(L"连接已断开，2 秒后重连…");
+        if (g_alive) {
+            ShowStatusHint(roleConflictDetected.load()
+                ? L"角色冲突: Mac 端也是副屏模式，请将一端切为主控"
+                : L"连接已断开，2 秒后重连…");
+        }
 
         decoder.Shutdown();
         if (g_sock.load() == sock) g_sock = INVALID_SOCKET;

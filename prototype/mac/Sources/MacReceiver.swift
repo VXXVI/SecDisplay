@@ -1022,6 +1022,8 @@ final class MacReceiverClient {
                 self._lastFbDrops = self._droppedFrames &+ self._decodeErrors
                 self.stateLock.unlock()
                 self.startFeedbackTimer(epoch: epoch)
+                // 发送 8 字节接收端握手标识 [0x7E]['S']['D']['R']['X'][ver=1][role=1(Mac副屏)][0]
+                self.sendBytes(Data([0x7E, 0x53, 0x44, 0x52, 0x58, 0x01, 0x01, 0x00]))
                 self.sendKeyframeRequest(throttled: false)
                 self.receiveLoop(epoch: epoch)
             case .failed(let e):
@@ -1109,6 +1111,26 @@ final class MacReceiverClient {
             let b1 = UInt32(recvBuf[s + 1])
             let b2 = UInt32(recvBuf[s + 2])
             let b3 = UInt32(recvBuf[s + 3])
+            if b0 == 0x7E && b1 == 0x53 && b2 == 0x44 && b3 == 0x52 {
+                Log.info("MacReceiver: 角色冲突 — 对端 Windows 当前也是副屏接收模式，已拒绝连接")
+                stateLock.lock()
+                _rejectedPeer = "角色冲突：Windows 也是副屏模式"
+                stateLock.unlock()
+                if let c = conn {
+                    conn = nil
+                    var pkt = Data(capacity: 14)
+                    var lenBE = UInt32(10).bigEndian
+                    withUnsafeBytes(of: &lenBE) { pkt.append(contentsOf: $0) }
+                    pkt.append(0x7F)
+                    var ts = UInt64(CFAbsoluteTimeGetCurrent() * 1_000_000).bigEndian
+                    withUnsafeBytes(of: &ts) { pkt.append(contentsOf: $0) }
+                    pkt.append(0x02) // 0x02: Mac 当前为副屏接收模式
+                    c.send(content: pkt, completion: .contentProcessed { _ in
+                        c.cancel()
+                    })
+                }
+                return false
+            }
             let len = Int((b0 << 24) | (b1 << 16) | (b2 << 8) | b3)
             if len <= 0 || len > 16 * 1024 * 1024 {
                 Log.info("MacReceiver: 收到异常帧长 \(len)，重置连接")
