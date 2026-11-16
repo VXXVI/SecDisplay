@@ -497,13 +497,7 @@ final class MacKvmInjector {
             ev.post(tap: .cghidEventTap)
         }
 
-        if moved {
-            if (buttons & 0x01) != 0 { postMouse(.leftMouseDragged, .left) }
-            else if (buttons & 0x02) != 0 { postMouse(.rightMouseDragged, .right) }
-            else if (buttons & 0x04) != 0 { postMouse(.otherMouseDragged, .center) }
-            else { postMouse(.mouseMoved, .left) }
-        }
-
+        // 先处理按下/抬起再派发移动/拖拽，确保目标 App 先收到 mouseDown 再收到 mouseDragged
         let changed = prevBtns ^ buttons
         if (changed & 0x01) != 0 {
             postMouse((buttons & 0x01) != 0 ? .leftMouseDown : .leftMouseUp, .left)
@@ -513,6 +507,13 @@ final class MacKvmInjector {
         }
         if (changed & 0x04) != 0 {
             postMouse((buttons & 0x04) != 0 ? .otherMouseDown : .otherMouseUp, .center)
+        }
+
+        if moved {
+            if (buttons & 0x01) != 0 { postMouse(.leftMouseDragged, .left) }
+            else if (buttons & 0x02) != 0 { postMouse(.rightMouseDragged, .right) }
+            else if (buttons & 0x04) != 0 { postMouse(.otherMouseDragged, .center) }
+            else { postMouse(.mouseMoved, .left) }
         }
 
         if wheel != 0 {

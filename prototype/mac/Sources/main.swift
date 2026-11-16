@@ -4980,6 +4980,9 @@ final class KvmPassthroughController {
         } else {
             lock.lock()
             let was = _active
+            let prevBtns = buttonsMask
+            let prevKeys = forwardedKeys
+            let prevMods = heldModifiers
             _active = false
             accumDx = 0
             accumDy = 0
@@ -4993,7 +4996,20 @@ final class KvmPassthroughController {
             if let t = tap { CGEvent.tapEnable(tap: t, enable: false) }
             CGAssociateMouseAndMouseCursorPosition(boolean_t(1))
             if was {
-                if notifyPeer { sender?.sendKvmState(active: false) }
+                if notifyPeer {
+                    if prevBtns != 0 { sender?.sendKvmMouse(dx: 0, dy: 0, buttons: 0, wheel: 0) }
+                    for kc in prevKeys {
+                        if let wk = MacKeyMap.lookup(kc) {
+                            sender?.sendKvmKey(vk: wk.vk, scan: wk.scan, down: false, flags: wk.extended ? 0x01 : 0)
+                        }
+                    }
+                    for kc in prevMods {
+                        if let wk = MacKeyMap.lookup(kc) {
+                            sender?.sendKvmKey(vk: wk.vk, scan: wk.scan, down: false, flags: wk.extended ? 0x01 : 0)
+                        }
+                    }
+                    sender?.sendKvmState(active: false)
+                }
                 Log.info("KVM: 已退出键鼠穿透，恢复操作 Mac")
             }
         }
