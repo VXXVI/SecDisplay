@@ -650,6 +650,7 @@ final class MacReceiverClient {
             self._decodeErrors &+= 1
             self._needRecoveryKeyframe = true
             self.stateLock.unlock()
+            self.sendKeyframeRequest(throttled: true)
         }
         decoder.onFrameDropped = { [weak self] in
             guard let self else { return }

@@ -616,16 +616,10 @@ private:
                 stats_.framesDropped++; // 当前被跳过的 P 帧无条件计入丢帧
                 dropped = true;
                 skipThisFrame = true;
-                bool hasIdrInQueue = false;
-                for (const auto& q : videoQueue_) {
-                    if (q.isIdr) { hasIdrInQueue = true; break; }
-                }
-                if (!hasIdrInQueue) {
-                    ULONGLONG nowTick = GetTickCount64();
-                    ULONGLONG prev = lastQueueIdrTick_.load();
-                    if (nowTick - prev >= 250ULL && lastQueueIdrTick_.compare_exchange_strong(prev, nowTick)) {
-                        needKey = true;
-                    }
+                ULONGLONG nowTick = GetTickCount64();
+                ULONGLONG prev = lastQueueIdrTick_.load();
+                if (nowTick - prev >= 250ULL && lastQueueIdrTick_.compare_exchange_strong(prev, nowTick)) {
+                    needKey = true;
                 }
             }
             if (!skipThisFrame) {
@@ -820,6 +814,7 @@ private:
                 }
             }
             if (!hdrOk) {
+                DisconnectClient(cs);
                 ClearVideoQueue();
                 for (int i = 0; i < 10 && alive_.load(); ++i) Sleep(100);
                 continue;
