@@ -28,6 +28,7 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <cmath>
 #include <condition_variable>
 #include <cstdint>
 #include <cstdio>
@@ -366,6 +367,8 @@ private:
     static constexpr uint8_t kTypeKvmMouse    = 0x0A;
     static constexpr uint8_t kTypeKvmKey      = 0x0B;
     static constexpr uint8_t kTypeKvmState    = 0x0C;
+    static constexpr uint8_t kTypeRoleHello   = 0x7E;
+    static constexpr uint8_t kTypeRoleConflict = 0x7F;
 
     WinVirtualDisplay vdd_;
     WinHostStats stats_;
@@ -834,14 +837,16 @@ private:
                 EmitLog(msg);
             }
 
-            ClientRecvLoop(cs, epoch);
+            std::atomic<bool> roleConflict{false};
+            ClientRecvLoop(cs, epoch, &roleConflict);
 
             if (!alive_.load()) break;
-            for (int i = 0; i < 15 && alive_.load(); ++i) Sleep(100);
+            int waitSteps = roleConflict.load() ? 40 : 15;
+            for (int i = 0; i < waitSteps && alive_.load(); ++i) Sleep(100);
         }
     }
 
-    void ClientRecvLoop(SOCKET cs, uint64_t epoch) {
+    void ClientRecvLoop(SOCKET cs, uint64_t epoch, std::atomic<bool>* outRoleConflict = nullptr) {
         uint8_t buf[4096];
         std::vector<uint8_t> acc;
         acc.reserve(4096);
@@ -855,7 +860,10 @@ private:
             if (n > 0) {
                 lastRxTick = GetTickCount64();
                 acc.insert(acc.end(), buf, buf + n);
-                ProcessControlBytes(acc);
+                if (!ProcessControlBytes(acc)) {
+                    if (outRoleConflict) outRoleConflict->store(true);
+                    break;
+                }
             } else if (n == 0) {
                 break;
             } else {
@@ -1097,16 +1105,43 @@ private:
         kvmHookTid_.store(0);
     }
 
-    void ProcessControlBytes(std::vector<uint8_t>& acc) {
+    bool ProcessControlBytes(std::vector<uint8_t>& acc) {
         // 接收端回传格式：与 SecDisplayReceiver.cpp 完全对称（无 4B 长度前缀）
         //   0x02: 1B 关键帧请求
         //   0x04: 12B [0x04][x f32 BE][y f32 BE][buttons u8][wheel i16 BE]
         //   0x07: 13B [0x07][presentP95 u16][sourceP95 u16][decFps10 u16][presDrop u16][pacedDrop u16][res u16]
         //   0x09: 7B  [0x09][vk u16][scan u16][down u8][flags u8]
+        //   0x7E: 8B  [0x7E]['S']['D']['R']['X'][ver=1][role][0] 接收端握手校验
         size_t pos = 0;
+        auto clearConflictErr = [&]() {
+            std::lock_guard<std::mutex> ilk(stats_.infoMtx);
+            if (!stats_.lastError.empty() && stats_.lastError.find("角色冲突") != std::string::npos) {
+                stats_.lastError.clear();
+            }
+        };
+        auto failConflict = [&](const char* reason, uint8_t firstByte) -> bool {
+            {
+                std::lock_guard<std::mutex> ilk(stats_.infoMtx);
+                stats_.lastError = reason;
+            }
+            char msg[224];
+            snprintf(msg, sizeof(msg), "WinHost: %s (首字节=0x%02X)", reason, (unsigned)firstByte);
+            EmitLog(msg);
+            acc.clear();
+            return false;
+        };
         while (pos < acc.size()) {
             uint8_t t = acc[pos];
-            if (t == kTypeKeyframeReq) {
+            if (t == kTypeRoleHello) {
+                if (acc.size() - pos < 8) break;
+                const uint8_t* p = acc.data() + pos;
+                if (p[1] != 'S' || p[2] != 'D' || p[3] != 'R' || p[4] != 'X' || p[6] != 1) {
+                    return failConflict("角色冲突: 对端非 Mac 副屏接收端，已断开保护", t);
+                }
+                clearConflictErr();
+                pos += 8;
+            } else if (t == kTypeKeyframeReq) {
+                clearConflictErr();
                 forceKeyframe_.store(true);
                 pos += 1;
             } else if (t == kTypeMouseInput) {
@@ -1115,6 +1150,12 @@ private:
                 float y = RdF32BE(acc.data() + pos + 5);
                 uint8_t buttons = acc[pos + 9];
                 int16_t wheel = (int16_t)RdU16BE(acc.data() + pos + 10);
+                if (!std::isfinite(x) || !std::isfinite(y) ||
+                    x < -64.0f || x > 16384.0f || y < -64.0f || y > 16384.0f ||
+                    (buttons & ~0x07) != 0) {
+                    return failConflict("角色冲突或控制流损坏（0x04 越界），已拒绝注入并断开", t);
+                }
+                clearConflictErr();
                 InjectMouse(x, y, buttons, wheel);
                 stats_.inputRecv++;
                 pos += 12;
@@ -1122,26 +1163,48 @@ private:
                 if (acc.size() - pos < 7) break;
                 uint16_t vk = RdU16BE(acc.data() + pos + 1);
                 uint16_t scan = RdU16BE(acc.data() + pos + 3);
-                bool down = acc[pos + 5] != 0;
+                uint8_t downByte = acc[pos + 5];
                 uint8_t flags = acc[pos + 6];
-                InjectKeyboard(vk, scan, down, flags);
+                if (downByte > 1 || (flags & ~0x03) != 0) {
+                    return failConflict("角色冲突或控制流损坏（0x09 越界），已拒绝注入并断开", t);
+                }
+                clearConflictErr();
+                InjectKeyboard(vk, scan, downByte != 0, flags);
                 stats_.inputRecv++;
                 pos += 7;
             } else if (t == kTypeFeedback) {
                 if (acc.size() - pos < 13) break;
                 uint16_t presentP95 = RdU16BE(acc.data() + pos + 1);
                 uint16_t sourceP95  = RdU16BE(acc.data() + pos + 3);
+                uint16_t decFps10   = RdU16BE(acc.data() + pos + 5);
                 uint16_t presDrop   = RdU16BE(acc.data() + pos + 7);
                 uint16_t pacedDrop  = RdU16BE(acc.data() + pos + 9);
+                if (presentP95 > 10000 || sourceP95 > 10000 || decFps10 > 3000) {
+                    return failConflict("控制流损坏（0x07 越界），已断开保护", t);
+                }
+                clearConflictErr();
                 AdjustAdaptiveBitrate(presentP95, sourceP95, presDrop, pacedDrop);
                 pos += 13;
+            } else if (t == 0x00) {
+                if (acc.size() - pos < 5) break;
+                const uint8_t* p = acc.data() + pos;
+                if (p[1] == 0x00 && p[2] == 0x00 && p[4] == kTypeRoleConflict) {
+                    return failConflict("角色冲突: Mac 端当前也是主控发送模式（0x7F），已拒绝注入并断开", kTypeRoleConflict);
+                }
+                if (p[1] == 0x00 && p[2] == 0x00 && p[4] == kTypeSession) {
+                    return failConflict("角色冲突: Mac 端当前也是主控发送模式（0x06），已拒绝注入并断开", kTypeSession);
+                }
+                return failConflict("控制通道协议异常（非法帧头），已拒绝输入并断开保护", t);
+            } else if (t == kTypeRoleConflict) {
+                return failConflict("角色冲突: Mac 端当前也是主控发送模式（0x7F），已拒绝注入并断开", t);
             } else {
-                // 未知控制字节跳过 1 字节同步恢复
-                pos += 1;
+                // 严禁逐字节跳过未知字节（否则同为发送端的 H.264 视频流会被当作随机键鼠事件注入）
+                return failConflict("控制通道协议异常，已拒绝输入并断开保护", t);
             }
         }
         if (pos > 0) acc.erase(acc.begin(), acc.begin() + pos);
         if (acc.size() > 65536) acc.clear();
+        return true;
     }
 
     void NoteLocalCongestion(double latencyMs, bool queueDropped) {

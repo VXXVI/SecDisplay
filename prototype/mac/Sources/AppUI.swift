@@ -50,6 +50,7 @@ final class AppModel: ObservableObject {
     @Published var uptimeSec: Double = 0
     /// 对端地址
     @Published var peer = "-"
+    @Published var senderRoleConflict: String? = nil
     /// 光标的发送计数（位置 / 图像）
     @Published var cursorPosSent = 0
     @Published var cursorImgSent = 0
@@ -209,6 +210,7 @@ final class AppModel: ObservableObject {
         totalSent = UInt64(max(0, sender?.totalSent ?? 0))
         uptimeSec = CFAbsoluteTimeGetCurrent() - appStartTime
         peer = sender?.peerDescription ?? "-"
+        senderRoleConflict = sender?.roleConflictMessage
         cursorPosSent = cursor?.sentCount ?? 0
         cursorImgSent = cursorImage?.sentCount ?? 0
         refreshTransferOnly()
@@ -410,6 +412,11 @@ struct StatusView: View {
                         Button("请求关键帧") { macReceiverClient?.sendKeyframeRequest(throttled: false) }
                     }
                 } else {
+                    if let conflict = model.senderRoleConflict {
+                        Text(conflict)
+                            .font(.caption)
+                            .foregroundStyle(.red)
+                    }
                     // 连接
                     SectionHeader(title: "连接")
                     VStack(spacing: 6) {

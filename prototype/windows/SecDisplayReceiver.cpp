@@ -317,6 +317,8 @@ static const uint8_t TYPE_KEY = 0x09;
 static const uint8_t TYPE_KVM_MOUSE = 0x0A;
 static const uint8_t TYPE_KVM_KEY   = 0x0B;
 static const uint8_t TYPE_KVM_STATE = 0x0C;
+static const uint8_t TYPE_ROLE_HELLO    = 0x7E;
+static const uint8_t TYPE_ROLE_CONFLICT = 0x7F;
 static const size_t KEY_PAYLOAD_BYTES = 6;
 static const size_t HEADER_BYTES = 9;   // 类型 1 + 时间戳 8
 static const size_t MAX_PACKET = 64u * 1024u * 1024u;
@@ -541,6 +543,21 @@ static std::atomic<uint16_t> g_fbDecodeFps10{ 0 };
 static std::atomic<uint16_t> g_fbPresentDrop{ 0 };
 static std::atomic<uint16_t> g_fbPacedDrop{ 0 };
 
+static bool SendCtrlAllUnderLock(SOCKET s, const uint8_t* p, int len) {
+    int sent = 0;
+    while (sent < len) {
+        int r = send(s, (const char*)(p + sent), len - sent, 0);
+        if (r > 0) {
+            sent += r;
+        } else {
+            // 部分写入失败会破坏无前缀控制流边界，立即断开重连防止对端误判
+            shutdown(s, SD_BOTH);
+            return false;
+        }
+    }
+    return true;
+}
+
 static void SendFeedbackPacket() {
     SOCKET s = g_sock.load();
     if (s == INVALID_SOCKET) return;
@@ -556,7 +573,7 @@ static void SendFeedbackPacket() {
     wr16(pkt + 9,  g_fbPacedDrop.load());
     wr16(pkt + 11, 0);
     std::lock_guard<std::mutex> lk(g_sendMtx);
-    send(s, (const char*)pkt, sizeof(pkt), 0);
+    SendCtrlAllUnderLock(s, pkt, sizeof(pkt));
 }
 
 static void SendInputPacket(float vx, float vy, uint8_t buttons, int16_t wheel) {
@@ -577,7 +594,7 @@ static void SendInputPacket(float vx, float vy, uint8_t buttons, int16_t wheel) 
     pkt[11] = (uint8_t)((uint16_t)wheel & 0xFF);
     {
         std::lock_guard<std::mutex> lk(g_sendMtx);
-        send(s, (const char*)pkt, 12, 0);
+        SendCtrlAllUnderLock(s, pkt, 12);
     }
     g_stats.inputSent++;
 }
@@ -595,7 +612,7 @@ static void SendKeyPacket(uint16_t vk, uint16_t scan, uint8_t down, uint8_t flag
     pkt[6] = flags;
     {
         std::lock_guard<std::mutex> lk(g_sendMtx);
-        send(s, (const char*)pkt, 7, 0);
+        SendCtrlAllUnderLock(s, pkt, 7);
     }
     g_stats.inputSent++;
 }
@@ -3332,12 +3349,18 @@ static void UpdateControlPanel() {
 
         wchar_t buf[256];
         std::wstring encNameCopy;
+        std::string errCopy;
         {
             std::lock_guard<std::mutex> lk(hs.infoMtx);
             std::wstring wp = ToWide(hs.peerAddr.c_str(), (int)hs.peerAddr.size());
             g_panelData.peerText = wp.empty() ? L"--" : wp;
             encNameCopy = hs.encoderName;
             g_panelData.decoderText = encNameCopy.empty() ? L"--" : encNameCopy;
+            errCopy = hs.lastError;
+        }
+        if (vddOk && !connected && !errCopy.empty()) {
+            g_panelData.state = 4;
+            g_panelData.statusText = ToWide(errCopy.c_str(), (int)errCopy.size());
         }
         swprintf(buf, 256, L"%d × %d @ %dHz", hs.width.load(), hs.height.load(), hs.fps.load());
         g_panelData.sizeText = buf;
@@ -3679,7 +3702,7 @@ static void PaintControlPanel(HWND h) {
     DrawPanelCard(hdc, S(20), S(12), S(920), S(44), S(8), cardFill, cardBorder);
     COLORREF dotCol = g_panelData.state == 2 ? okCol
                     : (g_panelData.state == 1 ? warnCol
-                    : (g_panelData.state == 3 ? errCol : RGB(148, 163, 184)));
+                    : ((g_panelData.state == 3 || g_panelData.state == 4) ? errCol : RGB(148, 163, 184)));
     {
         int d = S(10), dx = S(38), dy = S(12) + (S(44) - d) / 2;
         HPEN dp = CreatePen(PS_SOLID, 1, dotCol);
@@ -3730,8 +3753,9 @@ static void PaintControlPanel(HWND h) {
         const bool hm = g_hostMode.load();
         const wchar_t* shortSt = g_panelData.state == 2 ? (hm ? L"主控推送中" : L"正在接收")
                                : (g_panelData.state == 1 ? (hm ? L"准备推流" : L"等待首帧")
+                               : (g_panelData.state == 4 ? L"角色/协议冲突"
                                : (g_panelData.state == 3 ? L"虚拟屏异常"
-                                                         : (hm ? L"主控待命" : L"等待重连")));
+                                                         : (hm ? L"主控待命" : L"等待重连"))));
         DrawKVRow(hdc, px, rowY, pw, rh, L"连接状态", shortSt, dotCol);
         DrawKVRow(hdc, px, rowY + step * 1, pw, rh, L"对端地址", g_panelData.peerText.c_str(), valCol);
         DrawKVRow(hdc, px, rowY + step * 2, pw, rh, L"分辨率",   g_panelData.sizeText.c_str(), valCol);
@@ -6341,15 +6365,15 @@ static void NetworkLoop(RunConfig cfg, Graphics* gfx, Presenter* presenter) {
         g_connStartTick.store(GetTickCount64());
         ResetTimestampBase();
 
-        // 立刻请求关键帧，否则解码器拿不到 SPS/PPS，黑屏
+        // 先发 8 字节接收端握手标识（Mac Sender/Receiver 据此秒级识别角色是否匹配），再请求关键帧
         {
-            uint8_t req = TYPE_KEYFRAME_REQUEST;
-            int sent = 0;
+            const uint8_t pktInit[9] = { TYPE_ROLE_HELLO, 'S', 'D', 'R', 'X', 1, 2, 0, TYPE_KEYFRAME_REQUEST };
+            bool ok = false;
             {
                 std::lock_guard<std::mutex> lk(g_sendMtx);
-                sent = send(sock, (const char*)&req, 1, 0);
+                ok = SendCtrlAllUnderLock(sock, pktInit, sizeof(pktInit));
             }
-            if (sent == 1) Log("已请求关键帧（0x02）");
+            if (ok) Log("已发送接收端握手并请求关键帧（0x7E/0x02）");
         }
 
         Decoder decoder;
@@ -6364,6 +6388,7 @@ static void NetworkLoop(RunConfig cfg, Graphics* gfx, Presenter* presenter) {
         }
 
         std::atomic<bool> connAlive{ true };
+        std::atomic<bool> roleConflictDetected{ false };
         std::vector<uint8_t> packet;
 
         // 解码只保留最新一帧：收流线程持续解码以维持 H.264 参考链（直接丢编码包会花屏），
@@ -6385,6 +6410,12 @@ static void NetworkLoop(RunConfig cfg, Graphics* gfx, Presenter* presenter) {
                 uint32_t len = 0;
                 if (!RecvAll(sock, &len, 4)) {
                     Log("收流结束：读包头失败 err=%d", WSAGetLastError());
+                    break;
+                }
+                const uint8_t* hdr4 = reinterpret_cast<const uint8_t*>(&len);
+                if (hdr4[0] == TYPE_ROLE_HELLO && hdr4[1] == 'S' && hdr4[2] == 'D' && hdr4[3] == 'R') {
+                    Log("角色冲突: Mac 端当前也是副屏接收模式，已拒绝连接");
+                    roleConflictDetected = true;
                     break;
                 }
                 len = ntohl(len);
@@ -6422,6 +6453,17 @@ static void NetworkLoop(RunConfig cfg, Graphics* gfx, Presenter* presenter) {
                 if (packet[0] == TYPE_KVM_STATE) {
                     OnKvmStatePacket(packet.data() + HEADER_BYTES, len - HEADER_BYTES);
                     continue;
+                }
+                if (packet[0] == TYPE_ROLE_CONFLICT) {
+                    uint8_t reason = (len > HEADER_BYTES) ? packet[HEADER_BYTES] : 0;
+                    if (reason == 3) {
+                        Log("协议异常: Mac 端检测到控制流越界并主动断开 (0x7F reason=3)");
+                    } else {
+                        Log("角色冲突: Mac 端当前为 %s，无法与本机副屏模式配对",
+                            reason == 2 ? "副屏模式" : "不兼容角色");
+                        roleConflictDetected = true;
+                    }
+                    break;
                 }
                 // 其它未知类型：忽略即可，TCP 已有数据流动
                 if (packet[0] != TYPE_VIDEO) continue;
@@ -6754,7 +6796,11 @@ static void NetworkLoop(RunConfig cfg, Graphics* gfx, Presenter* presenter) {
         // 断线必须把画面清掉并给出提示。否则 FLIP 交换链会一直显示最后一帧，
         // 用户看到的是几分钟前的旧画面，容易误判成「显示的是别的屏」。
         presenter->ClearToIdle();
-        if (g_alive) ShowStatusHint(L"连接已断开，2 秒后重连…");
+        if (g_alive) {
+            ShowStatusHint(roleConflictDetected.load()
+                ? L"角色冲突: Mac 端也是副屏模式，请将一端切为主控"
+                : L"连接已断开，2 秒后重连…");
+        }
 
         decoder.Shutdown();
         if (g_sock.load() == sock) g_sock = INVALID_SOCKET;
