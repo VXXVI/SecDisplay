@@ -159,10 +159,21 @@ public:
             EmitLog(msg);
         }
 
+        {
+            std::lock_guard<std::mutex> blk(bitrateMtx_);
+            localSlowStreak_ = 0;
+            lastDownscaleTick_ = 0;
+            lastLocalCongestionTick_ = 0;
+            lastRemoteCongestionTick_ = 0;
+            lastCongestionLogTick_ = 0;
+        }
+        ClearVideoQueue();
+        activeVideoEpoch_.store(0);
         alive_.store(true);
         acceptThread_ = std::thread(&WinHostSender::ConnectLoop, this);
         captureThread_ = std::thread(&WinHostSender::CaptureEncodeLoop, this);
         cursorThread_ = std::thread(&WinHostSender::CursorLoop, this);
+        videoSendThread_ = std::thread(&WinHostSender::VideoSendLoop, this);
         kvmSendThread_ = std::thread(&WinHostSender::KvmSendLoop, this);
         return true;
     }
@@ -196,8 +207,10 @@ public:
 
     void SetTargetMbps(int mbps) {
         int clamped = std::clamp(mbps, 10, 200);
+        std::lock_guard<std::mutex> blk(bitrateMtx_);
         targetMbps_.store(clamped);
         curMbps_.store(clamped);
+        localSlowStreak_ = 0;
         stats_.targetBitrateMbps = clamped;
         stats_.bitrateMbps = clamped;
     }
@@ -207,6 +220,7 @@ public:
     void Stop() {
         SetKvmActive(false);
         alive_.store(false);
+        videoCv_.notify_all();
         kvmCv_.notify_all();
         // 按 sendMtx_ -> sockMtx_ 顺序校验身份并一起 shutdown+closesocket，彻底消除锁外句柄复用竞态
         {
@@ -218,13 +232,16 @@ public:
                 clientSock_ = INVALID_SOCKET;
             }
         }
+        activeVideoEpoch_.store(0);
         stats_.clientConnected = false;
 
         if (acceptThread_.joinable()) acceptThread_.join();
         if (captureThread_.joinable()) captureThread_.join();
         if (cursorThread_.joinable()) cursorThread_.join();
+        if (videoSendThread_.joinable()) videoSendThread_.join();
         if (kvmHookThread_.joinable()) kvmHookThread_.join();
         if (kvmSendThread_.joinable()) kvmSendThread_.join();
+        ClearVideoQueue();
 
         ReleaseAllInputs();
         vdd_.Stop();
@@ -381,8 +398,26 @@ private:
     std::thread acceptThread_;
     std::thread captureThread_;
     std::thread cursorThread_;
+    std::thread videoSendThread_;
     std::thread kvmHookThread_;
     std::thread kvmSendThread_;
+
+    struct VideoQueueItem {
+        std::vector<uint8_t> pkt;
+        uint64_t epoch = 0;
+        bool isIdr = false;
+    };
+    std::mutex videoMtx_;
+    std::condition_variable videoCv_;
+    std::deque<VideoQueueItem> videoQueue_;
+    std::atomic<uint64_t> activeVideoEpoch_{0};
+
+    std::mutex bitrateMtx_;
+    int localSlowStreak_ = 0;
+    ULONGLONG lastDownscaleTick_ = 0;
+    ULONGLONG lastLocalCongestionTick_ = 0;
+    ULONGLONG lastRemoteCongestionTick_ = 0;
+    ULONGLONG lastCongestionLogTick_ = 0;
 
     static inline std::atomic<WinHostSender*> s_kvmOwner_{nullptr};
     std::atomic<bool> kvmActive_{false};
@@ -479,6 +514,7 @@ private:
             shutdown(clientSock_, SD_BOTH);
             closesocket(clientSock_);
             clientSock_ = INVALID_SOCKET;
+            activeVideoEpoch_.store(0);
             stats_.clientConnected = false;
             std::lock_guard<std::mutex> ilk(stats_.infoMtx);
             stats_.peerAddr = "--";
@@ -487,8 +523,19 @@ private:
 
     void DisconnectClient(SOCKET expected) {
         if (expected == INVALID_SOCKET) return;
-        std::lock_guard<std::mutex> slk(sendMtx_);
-        CloseClientUnderSendLock(expected);
+        {
+            std::lock_guard<std::mutex> slk(sendMtx_);
+            CloseClientUnderSendLock(expected);
+        }
+        std::lock_guard<std::mutex> vlk(videoMtx_);
+        if (!stats_.clientConnected.load()) {
+            videoQueue_.clear();
+        }
+    }
+
+    void ClearVideoQueue() {
+        std::lock_guard<std::mutex> vlk(videoMtx_);
+        videoQueue_.clear();
     }
 
     void SendSessionHeader(int w, int h, int fps) {
@@ -513,19 +560,79 @@ private:
         SendRawPacket(pkt, sizeof(pkt));
     }
 
-    void SendVideoAvcc(const std::vector<uint8_t>& avcc, uint64_t tsUs) {
+    void EnqueueVideoAvcc(std::vector<uint8_t>&& avcc, uint64_t tsUs, bool isIdr) {
         if (avcc.empty()) return;
+        uint64_t epoch = activeVideoEpoch_.load();
+        if (epoch == 0 || !stats_.clientConnected.load()) return;
+
         std::vector<uint8_t> pkt(13 + avcc.size());
         PutU32BE(pkt.data(), (uint32_t)(9 + avcc.size()));
         pkt[4] = kTypeVideo;
         PutU64BE(pkt.data() + 5, tsUs);
         memcpy(pkt.data() + 13, avcc.data(), avcc.size());
-        if (SendRawPacket(pkt.data(), pkt.size())) {
-            stats_.framesSent++;
-            stats_.lastSentTick = GetTickCount64();
-            lastPayloadUs_.store(NowMicros());
-        } else {
-            stats_.framesDropped++;
+
+        bool dropped = false;
+        bool skipThisFrame = false;
+        {
+            std::lock_guard<std::mutex> vlk(videoMtx_);
+            if (isIdr) {
+                // 新关键帧到达时若队列仍有积压，直接清掉过期旧帧，确保画面立刻刷新而不排队卡顿
+                if (!videoQueue_.empty()) {
+                    stats_.framesDropped += videoQueue_.size();
+                    videoQueue_.clear();
+                    dropped = true;
+                }
+            } else if (videoQueue_.size() >= 3) {
+                // 队列积压 >= 3 帧：从队尾清掉待发的非 IDR 帧，跳过本 P 帧并立刻补请求关键帧避免参考链断链
+                while (!videoQueue_.empty() && !videoQueue_.back().isIdr) {
+                    videoQueue_.pop_back();
+                    stats_.framesDropped++;
+                    dropped = true;
+                }
+                if (!dropped || videoQueue_.size() >= 3) {
+                    stats_.framesDropped++;
+                    dropped = true;
+                }
+                skipThisFrame = true;
+                forceKeyframe_.store(true);
+            }
+            if (!skipThisFrame) {
+                videoQueue_.push_back(VideoQueueItem{ std::move(pkt), epoch, isIdr });
+            }
+        }
+        if (!skipThisFrame) {
+            videoCv_.notify_one();
+        }
+        if (dropped) {
+            NoteLocalCongestion(0.0, true);
+        }
+    }
+
+    void VideoSendLoop() {
+        while (alive_.load()) {
+            VideoQueueItem item;
+            {
+                std::unique_lock<std::mutex> vlk(videoMtx_);
+                videoCv_.wait(vlk, [this]() { return !alive_.load() || !videoQueue_.empty(); });
+                if (!alive_.load()) break;
+                item = std::move(videoQueue_.front());
+                videoQueue_.pop_front();
+            }
+            if (item.epoch == 0 || item.epoch != activeVideoEpoch_.load()) {
+                continue;
+            }
+            ULONGLONG t0 = GetTickCount64();
+            if (SendRawPacket(item.pkt.data(), item.pkt.size())) {
+                double sendMs = (double)(GetTickCount64() - t0);
+                stats_.framesSent++;
+                stats_.lastSentTick = GetTickCount64();
+                lastPayloadUs_.store(NowMicros());
+                if (sendMs > 28.0) {
+                    NoteLocalCongestion(sendMs, false);
+                }
+            } else {
+                stats_.framesDropped++;
+            }
         }
     }
 
@@ -663,10 +770,12 @@ private:
             lastPayloadUs_.store(0);
             forceKeyframe_.store(true);
 
-            // 先发会话头再置 clientConnected=true，确保 0x06 总是早于首帧 0x01 到达
+            // 先清视频发送队列、发会话头再开放 activeVideoEpoch_ 与 clientConnected=true，确保 0x06 总是早于首帧 0x01 到达
+            ClearVideoQueue();
             WinVddBounds b = vdd_.Bounds();
             int initHz = ClampHz(b.hz, reqFps_);
             SendSessionHeader(b.width, b.height, initHz);
+            activeVideoEpoch_.store(epoch);
             stats_.clientConnected = true;
 
             {
@@ -985,18 +1094,94 @@ private:
         if (acc.size() > 65536) acc.clear();
     }
 
+    void NoteLocalCongestion(double latencyMs, bool queueDropped) {
+        const double frameBudgetMs = 1000.0 / (double)std::max(24, reqFps_);
+        const double slowThresh = std::max(26.0, frameBudgetMs * 1.6);
+        ULONGLONG nowTick = GetTickCount64();
+
+        int prevMbps = 0, nextMbps = 0, tgtMbps = 0;
+        bool logDrop = false;
+        {
+            std::lock_guard<std::mutex> blk(bitrateMtx_);
+            if (!queueDropped) {
+                if (latencyMs <= slowThresh) {
+                    localSlowStreak_ = 0;
+                    return;
+                }
+                if (++localSlowStreak_ < 4) {
+                    return;
+                }
+            }
+            localSlowStreak_ = 0;
+            if (nowTick - lastDownscaleTick_ < 900ULL) {
+                return;
+            }
+            tgtMbps = targetMbps_.load();
+            prevMbps = curMbps_.load();
+            int minMbps = std::max(15, tgtMbps / 3);
+            nextMbps = std::max(minMbps, (prevMbps * 4) / 5);
+            if (nextMbps < prevMbps) {
+                curMbps_.store(nextMbps);
+                stats_.bitrateMbps = nextMbps;
+                lastDownscaleTick_ = nowTick;
+                lastLocalCongestionTick_ = nowTick;
+                if (nowTick - lastCongestionLogTick_ >= 3000ULL) {
+                    lastCongestionLogTick_ = nowTick;
+                    logDrop = true;
+                }
+            } else {
+                lastLocalCongestionTick_ = nowTick;
+            }
+        }
+        if (logDrop) {
+            char msg[160];
+            snprintf(msg, sizeof(msg),
+                     "WinHost: %s，动态下调码率 %d -> %d Mbps (目标 %dM)",
+                     queueDropped ? "发送队列积压丢帧" : "编码/发送耗时偏高",
+                     prevMbps, nextMbps, tgtMbps);
+            EmitLog(msg);
+        }
+    }
+
     void AdjustAdaptiveBitrate(uint16_t presentP95, uint16_t sourceP95,
                                uint16_t presDrop, uint16_t pacedDrop) {
-        int tgt = targetMbps_.load();
-        int cur = curMbps_.load();
-        int minMbps = std::max(15, tgt / 3);
-        if (presDrop > 2 || pacedDrop > 2 || (presentP95 > sourceP95 + 25 && presentP95 > 45)) {
-            cur = std::max(minMbps, (int)(cur * 0.78));
-        } else if (presDrop == 0 && pacedDrop == 0 && cur < tgt) {
-            cur = std::min(tgt, cur + std::max(2, tgt / 15));
+        ULONGLONG nowTick = GetTickCount64();
+        int prevMbps = 0, nextMbps = 0, tgtMbps = 0;
+        bool logDrop = false;
+        {
+            std::lock_guard<std::mutex> blk(bitrateMtx_);
+            tgtMbps = targetMbps_.load();
+            prevMbps = curMbps_.load();
+            nextMbps = prevMbps;
+            int minMbps = std::max(15, tgtMbps / 3);
+            if (presDrop > 2 || pacedDrop > 2 || (presentP95 > sourceP95 + 25 && presentP95 > 45)) {
+                if (nowTick - lastDownscaleTick_ >= 900ULL) {
+                    nextMbps = std::max(minMbps, (int)(prevMbps * 0.78));
+                    lastDownscaleTick_ = nowTick;
+                }
+                lastRemoteCongestionTick_ = nowTick;
+                if (nextMbps < prevMbps && nowTick - lastCongestionLogTick_ >= 3000ULL) {
+                    lastCongestionLogTick_ = nowTick;
+                    logDrop = true;
+                }
+            } else if (presDrop == 0 && pacedDrop == 0 && prevMbps < tgtMbps) {
+                // 本地发送拥塞或对端丢帧后保留 4 秒冷静期，避免码率在高低之间反复震荡
+                if (nowTick - lastLocalCongestionTick_ >= 4000ULL &&
+                    nowTick - lastRemoteCongestionTick_ >= 4000ULL) {
+                    nextMbps = std::min(tgtMbps, prevMbps + std::max(2, tgtMbps / 15));
+                }
+            }
+            curMbps_.store(nextMbps);
+            stats_.bitrateMbps = nextMbps;
         }
-        curMbps_.store(cur);
-        stats_.bitrateMbps = cur;
+        if (logDrop) {
+            char msg[160];
+            snprintf(msg, sizeof(msg),
+                     "WinHost: Mac 副屏反馈拥塞 (p95=%u/%u drop=%u)，下调码率 %d -> %d Mbps",
+                     (unsigned)presentP95, (unsigned)sourceP95, (unsigned)(presDrop + pacedDrop),
+                     prevMbps, nextMbps);
+            EmitLog(msg);
+        }
     }
 
     // ---- 反向输入注入（Mac 副屏 → Windows 虚拟屏）----
@@ -1584,9 +1769,12 @@ private:
                     }
                     v.ulVal = (ULONG)mbps * 1000000UL;
                     api->SetValue(&CODECAPI_AVEncCommonMeanBitRate, &v);
-                    v.ulVal = (ULONG)std::min(160, mbps * 3 / 2) * 1000000UL;
+                    // 收紧峰值倍率到 1.25x，防止突发画面单帧码流尖峰塞满雷电/解码缓冲
+                    int peakMbps = std::min(160, std::max(mbps + 10, (mbps * 5) / 4));
+                    v.ulVal = (ULONG)peakMbps * 1000000UL;
                     api->SetValue(&CODECAPI_AVEncCommonMaxBitRate, &v);
-                    v.ulVal = (ULONG)(fps * 2);
+                    // 1 秒 GOP，丢包/背压触发补关键帧时最快恢复连贯画面
+                    v.ulVal = (ULONG)std::max(24, fps);
                     api->SetValue(&CODECAPI_AVEncMPVGOPSize, &v);
                     v.ulVal = 0;
                     api->SetValue(&CODECAPI_AVEncMPVDefaultBPictureCount, &v);
@@ -1638,7 +1826,8 @@ private:
             if (SUCCEEDED(codecApi->SetValue(&CODECAPI_AVEncCommonMeanBitRate, &v))) {
                 VARIANT vmax{};
                 vmax.vt = VT_UI4;
-                vmax.ulVal = (ULONG)std::min(160, newMbps * 3 / 2) * 1000000UL;
+                int peakMbps = std::min(160, std::max(newMbps + 10, (newMbps * 5) / 4));
+                vmax.ulVal = (ULONG)peakMbps * 1000000UL;
                 codecApi->SetValue(&CODECAPI_AVEncCommonMaxBitRate, &vmax);
                 lastAppliedMbps = newMbps;
             }
@@ -2087,7 +2276,7 @@ private:
                             if (enc.EncodeTexture(enc.bgraCopy.Get(), true, alive_, avcc, &isIdr, &logFn_, &stats_) && !avcc.empty()) {
                                 encFailStreak = 0;
                                 stats_.framesEncoded++;
-                                SendVideoAvcc(avcc, capUs);
+                                EnqueueVideoAvcc(std::move(avcc), capUs, isIdr);
                                 if (!isIdr) forceKeyframe_.store(true);
                                 continue;
                             } else {
@@ -2180,10 +2369,13 @@ private:
                             stats_.lastEncMs = encMs;
                             stats_.framesEncoded++;
                             encFailStreak = 0;
+                            if (!wantIdr) {
+                                NoteLocalCongestion(encMs, false);
+                            }
                             if (wantIdr && !isIdr) {
                                 forceKeyframe_.store(true);
                             }
-                            SendVideoAvcc(avcc, capUs);
+                            EnqueueVideoAvcc(std::move(avcc), capUs, isIdr);
                         } else {
                             stats_.encodeFail++;
                             if (wantIdr) forceKeyframe_.store(true);

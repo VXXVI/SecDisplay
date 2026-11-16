@@ -600,6 +600,7 @@ final class MacReceiverClient {
     private var _lastMbps: Double = 0
     private var _droppedFrames: UInt64 = 0
     private var _decodeInFlight: Int = 0
+    private var _needRecoveryKeyframe: Bool = false
     private var _decodedFrames: UInt64 = 0
     private var _decodeErrors: UInt64 = 0
     private var _videoWidth: Int = 0
@@ -702,6 +703,8 @@ final class MacReceiverClient {
         _listenerError = nil
         _activePeerHost = ""
         _latestEpoch &+= 1
+        _decodeInFlight = 0
+        _needRecoveryKeyframe = false
         peerDesc = "-"
         stateLock.unlock()
         kvmQueue.async { [weak self] in
@@ -1045,6 +1048,7 @@ final class MacReceiverClient {
         _kvmActive = false
         _activePeerHost = ""
         _decodeInFlight = 0
+        _needRecoveryKeyframe = false
         _lastDecodeFps = 0
         _lastMbps = 0
         _srcIntervalsMs.removeAll()
@@ -1136,10 +1140,18 @@ final class MacReceiverClient {
                 }
             }
             _lastFrameRecvAt = now
-            // 解码队列背压：在途帧数 >= 3 时丢弃非关键帧防止延迟堆积
-            if _decodeInFlight >= 3 && !hasIdr {
+            // 解码队列背压：在途帧数 >= 3 时丢弃非关键帧防止延迟堆积，并立即补求关键帧；
+            // 丢弃 P 帧后跳过后续非 IDR 帧，避免 VideoToolbox 因缺参考帧连续报错与花屏卡顿
+            if hasIdr {
+                _needRecoveryKeyframe = false
+            } else if _needRecoveryKeyframe || _decodeInFlight >= 3 {
+                let firstDrop = !_needRecoveryKeyframe
+                _needRecoveryKeyframe = true
                 _droppedFrames &+= 1
                 stateLock.unlock()
+                if firstDrop || _decodeInFlight >= 3 {
+                    sendKeyframeRequest(throttled: true)
+                }
                 return
             }
             _decodeInFlight += 1
@@ -1190,6 +1202,7 @@ final class MacReceiverClient {
             _sessW = w
             _sessH = h
             _sessFps = fps
+            if changed { _needRecoveryKeyframe = false }
             stateLock.unlock()
             if changed {
                 Log.info("MacReceiver: 收到会话头 \(w)x\(h) @ \(fps)fps")
