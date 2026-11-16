@@ -26,6 +26,7 @@ enum SecDisplayRole: String {
 struct MacReceiverSnapshot {
     var connected = false
     var streaming = false
+    var kvmActive = false
     var listening = false
     var listenerError: String? = nil
     var rejectedPeer: String? = nil
@@ -424,12 +425,144 @@ final class VideoToolboxDecoder {
     }
 }
 
+// MARK: - KVM 远程键鼠穿透注入（接收对端 0x0A/0x0B/0x0C，直接控制 macOS 系统）
+
+final class MacKvmInjector {
+    private let lock = NSLock()
+    private let kb = KeyboardInjector()
+    private var curPos: CGPoint = .zero
+    private var hasPos = false
+    private var buttonsMask: UInt8 = 0
+
+    func setActive(_ active: Bool) {
+        lock.lock()
+        if active {
+            if let loc = CGEvent(source: nil)?.location {
+                curPos = loc
+                hasPos = true
+            }
+            buttonsMask = 0
+        }
+        lock.unlock()
+        if !active {
+            reset()
+        }
+    }
+
+    func reset() {
+        lock.lock()
+        let prevBtns = buttonsMask
+        let pos = hasPos ? curPos : (CGEvent(source: nil)?.location ?? CGPoint(x: 100, y: 100))
+        buttonsMask = 0
+        hasPos = false
+        lock.unlock()
+
+        let src = CGEventSource(stateID: .hidSystemState)
+        if prevBtns & 0x01 != 0 {
+            CGEvent(mouseEventSource: src, mouseType: .leftMouseUp, mouseCursorPosition: pos, mouseButton: .left)?.post(tap: .cghidEventTap)
+        }
+        if prevBtns & 0x02 != 0 {
+            CGEvent(mouseEventSource: src, mouseType: .rightMouseUp, mouseCursorPosition: pos, mouseButton: .right)?.post(tap: .cghidEventTap)
+        }
+        if prevBtns & 0x04 != 0 {
+            CGEvent(mouseEventSource: src, mouseType: .otherMouseUp, mouseCursorPosition: pos, mouseButton: .center)?.post(tap: .cghidEventTap)
+        }
+        kb.reset()
+    }
+
+    func handleMouse(dx: Int16, dy: Int16, buttons: UInt8, wheel: Int16) {
+        lock.lock()
+        if !hasPos {
+            curPos = CGEvent(source: nil)?.location ?? CGPoint(x: 200, y: 200)
+            hasPos = true
+        }
+        var next = CGPoint(x: curPos.x + CGFloat(dx), y: curPos.y + CGFloat(dy))
+        next = Self.clampToOnlineDisplays(next)
+        curPos = next
+        let prevBtns = buttonsMask
+        buttonsMask = buttons
+        lock.unlock()
+
+        let src = CGEventSource(stateID: .hidSystemState)
+        let modFlags = kb.currentFlags()
+        let moved = (dx != 0 || dy != 0)
+
+        func postMouse(_ type: CGEventType, _ btn: CGMouseButton) {
+            guard let ev = CGEvent(mouseEventSource: src, mouseType: type, mouseCursorPosition: next, mouseButton: btn) else { return }
+            ev.flags = modFlags
+            if moved {
+                ev.setIntegerValueField(.mouseEventDeltaX, value: Int64(dx))
+                ev.setIntegerValueField(.mouseEventDeltaY, value: Int64(dy))
+            }
+            ev.post(tap: .cghidEventTap)
+        }
+
+        if moved {
+            if (buttons & 0x01) != 0 { postMouse(.leftMouseDragged, .left) }
+            else if (buttons & 0x02) != 0 { postMouse(.rightMouseDragged, .right) }
+            else if (buttons & 0x04) != 0 { postMouse(.otherMouseDragged, .center) }
+            else { postMouse(.mouseMoved, .left) }
+        }
+
+        let changed = prevBtns ^ buttons
+        if (changed & 0x01) != 0 {
+            postMouse((buttons & 0x01) != 0 ? .leftMouseDown : .leftMouseUp, .left)
+        }
+        if (changed & 0x02) != 0 {
+            postMouse((buttons & 0x02) != 0 ? .rightMouseDown : .rightMouseUp, .right)
+        }
+        if (changed & 0x04) != 0 {
+            postMouse((buttons & 0x04) != 0 ? .otherMouseDown : .otherMouseUp, .center)
+        }
+
+        if wheel != 0 {
+            let scaled = Int32(wheel / 2)
+            let delta = scaled != 0 ? scaled : (wheel > 0 ? Int32(1) : Int32(-1))
+            if let ev = CGEvent(scrollWheelEvent2Source: src, units: .pixel, wheelCount: 1, wheel1: delta, wheel2: 0, wheel3: 0) {
+                ev.flags = modFlags
+                ev.post(tap: .cghidEventTap)
+            }
+        }
+    }
+
+    func handleKey(vk: UInt16, scan: UInt16, down: Bool, flags: UInt8) {
+        kb.handle(vk: vk, scan: scan, down: down, keyFlags: flags)
+    }
+
+    private static func clampToOnlineDisplays(_ pt: CGPoint) -> CGPoint {
+        var count: UInt32 = 0
+        CGGetOnlineDisplayList(16, nil, &count)
+        guard count > 0 else { return pt }
+        var ids = [CGDirectDisplayID](repeating: 0, count: Int(count))
+        CGGetOnlineDisplayList(count, &ids, &count)
+        let rects = ids.prefix(Int(count)).map { CGDisplayBounds($0) }
+        if rects.contains(where: { $0.contains(pt) }) {
+            return pt
+        }
+        // 取距离当前点最近的显示器矩形钳位，支持多屏顺滑过渡
+        var bestPt = pt
+        var bestDist = CGFloat.greatestFiniteMagnitude
+        for r in rects where r.width > 0 && r.height > 0 {
+            let cx = max(r.minX, min(r.maxX - 1, pt.x))
+            let cy = max(r.minY, min(r.maxY - 1, pt.y))
+            let d = (cx - pt.x) * (cx - pt.x) + (cy - pt.y) * (cy - pt.y)
+            if d < bestDist {
+                bestDist = d
+                bestPt = CGPoint(x: cx, y: cy)
+            }
+        }
+        return bestPt
+    }
+}
+
 // MARK: - Mac 副屏网络监听端（9922：Mac 固定监听，Windows 主动直连，绕开 macOS 本地网络 TCC 阻断）
 
 final class MacReceiverClient {
     private let netQueue = DispatchQueue(label: "SecDisplay.macrecv.net")
     private let decodeQueue = DispatchQueue(label: "SecDisplay.macrecv.decode", qos: .userInteractive)
+    private let kvmQueue = DispatchQueue(label: "SecDisplay.macrecv.kvm", qos: .userInteractive)
     private let stateLock = NSLock()
+    private let kvmInjector = MacKvmInjector()
 
     private var listener: NWListener?
     private var conn: NWConnection?
@@ -446,6 +579,7 @@ final class MacReceiverClient {
 
     private var _connected = false
     private var _streaming = false
+    private var _kvmActive = false
     private var _listening = false
     private var _listenerError: String? = nil
     private var _rejectedPeer: String? = nil
@@ -562,12 +696,16 @@ final class MacReceiverClient {
         stopped = true
         _connected = false
         _streaming = false
+        _kvmActive = false
         _listening = false
         _listenerError = nil
         _activePeerHost = ""
         _latestEpoch &+= 1
         peerDesc = "-"
         stateLock.unlock()
+        kvmQueue.async { [weak self] in
+            self?.kvmInjector.setActive(false)
+        }
         netQueue.async { [weak self] in
             guard let self else { return }
             self.connEpoch &+= 1
@@ -615,6 +753,7 @@ final class MacReceiverClient {
         return MacReceiverSnapshot(
             connected: _connected,
             streaming: _streaming,
+            kvmActive: _kvmActive,
             listening: _listening,
             listenerError: _listenerError,
             rejectedPeer: _rejectedPeer,
@@ -902,6 +1041,7 @@ final class MacReceiverClient {
         _latestEpoch = nextEpoch
         _connected = false
         _streaming = false
+        _kvmActive = false
         _activePeerHost = ""
         _decodeInFlight = 0
         _lastDecodeFps = 0
@@ -910,6 +1050,9 @@ final class MacReceiverClient {
         _presIntervalsMs.removeAll()
         peerDesc = "-"
         stateLock.unlock()
+        kvmQueue.async { [weak self] in
+            self?.kvmInjector.setActive(false)
+        }
         decodeQueue.async { [weak self] in
             self?.decoder.reset()
         }
@@ -1051,6 +1194,49 @@ final class MacReceiverClient {
                 Log.info("MacReceiver: 收到会话头 \(w)x\(h) @ \(fps)fps")
                 sendKeyframeRequest(throttled: false)
                 onSessionChanged?(w, h, fps)
+            }
+        case 0x0A:
+            guard payload.count >= 7 else { return }
+            let dx = Int16(bitPattern: readU16BE(payload, 0))
+            let dy = Int16(bitPattern: readU16BE(payload, 2))
+            let buttons = payload[payload.startIndex + 4]
+            let wheel = Int16(bitPattern: readU16BE(payload, 5))
+            stateLock.lock()
+            let epoch = _latestEpoch
+            _cursorRecv &+= 1
+            stateLock.unlock()
+            kvmQueue.async { [weak self] in
+                guard let self else { return }
+                self.stateLock.lock()
+                let ok = !self.stopped && self._connected && self._latestEpoch == epoch
+                self.stateLock.unlock()
+                if ok { self.kvmInjector.handleMouse(dx: dx, dy: dy, buttons: buttons, wheel: wheel) }
+            }
+        case 0x0B:
+            guard payload.count >= 6 else { return }
+            let vk = readU16BE(payload, 0)
+            let scan = readU16BE(payload, 2)
+            let down = payload[payload.startIndex + 4] != 0
+            let flags = payload[payload.startIndex + 5]
+            stateLock.lock()
+            let epoch = _latestEpoch
+            stateLock.unlock()
+            kvmQueue.async { [weak self] in
+                guard let self else { return }
+                self.stateLock.lock()
+                let ok = !self.stopped && self._connected && self._latestEpoch == epoch
+                self.stateLock.unlock()
+                if ok { self.kvmInjector.handleKey(vk: vk, scan: scan, down: down, flags: flags) }
+            }
+        case 0x0C:
+            guard payload.count >= 1 else { return }
+            let active = payload[payload.startIndex] != 0
+            stateLock.lock()
+            _kvmActive = active
+            stateLock.unlock()
+            Log.info(active ? "KVM: Windows 主控已开启键鼠穿透 (正在远程控制本机)" : "KVM: Windows 主控已退出键鼠穿透")
+            kvmQueue.async { [weak self] in
+                self?.kvmInjector.setActive(active)
             }
         default:
             break
