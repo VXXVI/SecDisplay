@@ -224,6 +224,10 @@ public:
         forceKeyframe_.store(true);
     }
 
+    void OnDisplayChange() {
+        displayReconcilePending_.store(true);
+    }
+
     bool IsRunning() const { return alive_.load(); }
 
 private:
@@ -254,6 +258,7 @@ private:
 
     std::atomic<bool> alive_{false};
     std::atomic<bool> forceKeyframe_{true};
+    std::atomic<bool> displayReconcilePending_{false};
     std::atomic<uint64_t> lastPayloadUs_{0};
 
     std::mutex sockMtx_;
@@ -1582,6 +1587,11 @@ private:
         };
 
         while (alive_.load()) {
+            if (displayReconcilePending_.exchange(false)) {
+                if (vdd_.ReconcileExtendedTopology()) {
+                    forceKeyframe_.store(true);
+                }
+            }
             WinVddBounds b = vdd_.RefreshBounds();
             if (b.width <= 0 || b.height <= 0) {
                 backoffSleep("等待虚拟屏就绪", S_OK);
@@ -1662,6 +1672,12 @@ private:
             HRESULT rebuildHr = S_OK;
 
             while (alive_.load()) {
+                if (displayReconcilePending_.exchange(false)) {
+                    if (vdd_.ReconcileExtendedTopology()) {
+                        forceKeyframe_.store(true);
+                        break;
+                    }
+                }
                 enc.UpdateBitrateIfChanged(curMbps_.load());
                 {
                     ULONGLONG nowStat = GetTickCount64();
@@ -1742,6 +1758,7 @@ private:
                 }
 
                 if (hr == DXGI_ERROR_ACCESS_LOST || FAILED(hr)) {
+                    displayReconcilePending_.store(true);
                     needBackoff = true;
                     rebuildReason = "DXGI 输出上下文变更";
                     rebuildHr = hr;

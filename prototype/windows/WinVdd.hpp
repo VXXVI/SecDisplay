@@ -221,6 +221,9 @@ public:
         }
 
         // 把虚拟屏放置在主屏右侧并设置请求分辨率
+        reqWidth_ = width;
+        reqHeight_ = height;
+        reqHz_ = hz;
         lastDpiPercent_ = targetDpiPercent;
         ApplyDisplayMode(devName, width, height, hz);
         ApplyDisplayDpiScale(devName, targetDpiPercent);
@@ -235,11 +238,13 @@ public:
             b.height = height;
             b.hz = hz;
         }
+        bool hasOther = HasOtherAttachedDisplay(devName);
         {
             std::lock_guard<std::mutex> lk(mtx_);
             ++modeGen_;
             bounds_ = b;
             active_ = true;
+            hadOtherDisplay_ = hasOther;
         }
 
         char msg[256];
@@ -261,6 +266,9 @@ public:
         if (width <= 0) width = 2880;
         if (height <= 0) height = 1800;
         if (hz <= 0) hz = 60;
+        reqWidth_ = width;
+        reqHeight_ = height;
+        reqHz_ = hz;
         if (!EnsureCustomResolution(width, height, hz)) {
             EmitLog("WinVDD: 写入 HKLM\\SOFTWARE\\Parsec\\vdd\\0 失败（需管理员权限），动态切分可能回落");
         }
@@ -272,11 +280,13 @@ public:
             EmitLog("WinVDD: 动态切换分辨率后读回显示模式失败");
             return false;
         }
+        bool hasOther = HasOtherAttachedDisplay(devName);
         {
             std::lock_guard<std::mutex> lk(mtx_);
             if (active_ && bounds_.deviceName == devName) {
                 ++modeGen_;
                 bounds_ = b;
+                hadOtherDisplay_ = hasOther;
             }
         }
         char msg[192];
@@ -290,6 +300,85 @@ public:
         }
         EmitLog(msg);
         return (b.width == width && b.height == height);
+    }
+
+    // 检测到笔记本开盖/息屏恢复或系统切回镜像模式时，自动恢复扩展桌面并把虚拟屏摆到物理屏右侧
+    bool ReconcileExtendedTopology() {
+        std::wstring curDev;
+        bool wasOther = false;
+        {
+            std::lock_guard<std::mutex> lk(mtx_);
+            if (!active_ || bounds_.deviceName.empty()) return false;
+            curDev = bounds_.deviceName;
+            wasOther = hadOtherDisplay_;
+        }
+        ULONGLONG nowTick = GetTickCount64();
+        if (nowTick - lastReconcileTick_ < 2500ULL) return false;
+        lastReconcileTick_ = nowTick;
+
+        std::wstring devName;
+        bool cloned = false;
+        bool found = FindParsecSourceDevice(&devName, &cloned);
+        if (!found) {
+            // 系统切成了「仅主屏幕」时 ParsecVDA 路径不活跃，强制扩屏找回
+            LONG er = SetDisplayConfig(0, nullptr, 0, nullptr, SDC_TOPOLOGY_EXTEND | SDC_APPLY);
+            if (er == ERROR_SUCCESS) {
+                for (int i = 0; i < 15; ++i) {
+                    Sleep(100);
+                    if (FindParsecSourceDevice(&devName, &cloned) && !cloned) break;
+                }
+            }
+            if (devName.empty()) return false;
+            cloned = true; // 刚从隐藏恢复，按需重新布置分辨率与右侧位置
+        }
+
+        WinVddBounds curB{};
+        curB.deviceName = devName;
+        bool hasBounds = ReadCurrentBounds(devName, &curB);
+        bool hasOtherNow = HasOtherAttachedDisplay(devName);
+        bool overlapped = hasBounds && DoesOverlapOtherDisplay(devName, curB);
+        bool lidReopened = (!wasOther && hasOtherNow && hasBounds && curB.left == 0 && curB.top == 0);
+
+        if (!cloned && !overlapped && !lidReopened) {
+            std::lock_guard<std::mutex> lk(mtx_);
+            hadOtherDisplay_ = hasOtherNow;
+            return false;
+        }
+
+        if (cloned) {
+            LONG er = SetDisplayConfig(0, nullptr, 0, nullptr, SDC_TOPOLOGY_EXTEND | SDC_APPLY);
+            char msg[128];
+            snprintf(msg, sizeof(msg), "WinVDD: 检测到镜像/拓扑异常，自动恢复扩展桌面 topology r=%ld", er);
+            EmitLog(msg);
+            for (int i = 0; i < 15; ++i) {
+                Sleep(100);
+                bool stillCloned = false;
+                if (FindParsecSourceDevice(&devName, &stillCloned) && !stillCloned) break;
+            }
+        } else {
+            EmitLog("WinVDD: 检测到物理主屏重新接入/位置重叠，自动将虚拟屏归位至主屏右侧");
+        }
+
+        ApplyDisplayMode(devName, reqWidth_, reqHeight_, reqHz_);
+        ApplyDisplayDpiScale(devName, lastDpiPercent_);
+
+        WinVddBounds nb{};
+        nb.deviceName = devName;
+        if (!ReadCurrentBounds(devName, &nb)) return false;
+        bool hasOtherAfter = HasOtherAttachedDisplay(devName);
+        {
+            std::lock_guard<std::mutex> lk(mtx_);
+            if (active_) {
+                ++modeGen_;
+                bounds_ = nb;
+                hadOtherDisplay_ = hasOtherAfter;
+            }
+        }
+        char msg[192];
+        snprintf(msg, sizeof(msg), "WinVDD: 扩展桌面已恢复 %ls  范围 (%d,%d) %dx%d @ %dHz",
+                 nb.deviceName.c_str(), nb.left, nb.top, nb.width, nb.height, nb.hz);
+        EmitLog(msg);
+        return true;
     }
 
     void Stop() {
@@ -399,9 +488,52 @@ private:
     mutable std::mutex mtx_;
     WinVddBounds bounds_{};
     bool active_ = false;
+    bool hadOtherDisplay_ = false;
     uint64_t modeGen_ = 0;
+    int reqWidth_ = 2880;
+    int reqHeight_ = 1800;
+    int reqHz_ = 60;
     int lastDpiPercent_ = 0;
+    ULONGLONG lastReconcileTick_ = 0;
     LogFn logFn_;
+
+    static bool HasOtherAttachedDisplay(const std::wstring& devName) {
+        for (DWORD i = 0; ; ++i) {
+            DISPLAY_DEVICEW dd{}; dd.cb = sizeof(dd);
+            if (!EnumDisplayDevicesW(nullptr, i, &dd, 0)) break;
+            if (!(dd.StateFlags & DISPLAY_DEVICE_ATTACHED_TO_DESKTOP)) continue;
+            if (_wcsicmp(dd.DeviceName, devName.c_str()) == 0) continue;
+            DEVMODEW dm{}; dm.dmSize = sizeof(dm);
+            if (EnumDisplaySettingsW(dd.DeviceName, ENUM_CURRENT_SETTINGS, &dm) &&
+                dm.dmPelsWidth > 0 && dm.dmPelsHeight > 0) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    static bool DoesOverlapOtherDisplay(const std::wstring& devName, const WinVddBounds& b) {
+        if (b.width <= 0 || b.height <= 0) return false;
+        RECT r1{ b.left, b.top, b.left + b.width, b.top + b.height };
+        for (DWORD i = 0; ; ++i) {
+            DISPLAY_DEVICEW dd{}; dd.cb = sizeof(dd);
+            if (!EnumDisplayDevicesW(nullptr, i, &dd, 0)) break;
+            if (!(dd.StateFlags & DISPLAY_DEVICE_ATTACHED_TO_DESKTOP)) continue;
+            if (_wcsicmp(dd.DeviceName, devName.c_str()) == 0) continue;
+            DEVMODEW dm{}; dm.dmSize = sizeof(dm);
+            if (EnumDisplaySettingsW(dd.DeviceName, ENUM_CURRENT_SETTINGS, &dm) &&
+                dm.dmPelsWidth > 0 && dm.dmPelsHeight > 0) {
+                RECT r2{
+                    dm.dmPosition.x, dm.dmPosition.y,
+                    dm.dmPosition.x + (LONG)dm.dmPelsWidth,
+                    dm.dmPosition.y + (LONG)dm.dmPelsHeight
+                };
+                RECT inter{};
+                if (IntersectRect(&inter, &r1, &r2)) return true;
+            }
+        }
+        return false;
+    }
 
     void EmitLog(const char* s) {
         if (logFn_ && s) logFn_(s);
