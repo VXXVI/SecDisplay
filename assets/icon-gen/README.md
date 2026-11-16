@@ -9,6 +9,19 @@
 | `build/glass-b/` | 液态玻璃：亮玻璃双屏 | 对比更强，但 16px 会糊成白块 |
 | `build/alt-a/` | 备选 A：单向箭头 + 双屏 | 轮廓更硬，但 16px 下会糊成亮块 |
 
+## v2 候选设计稿（待选定）
+
+本地通过 Doubao 生图与 `build_icons.py` 产出了四套 v2 候选设计稿（存放于本地被 `.gitignore` 忽略的 `build/v2-*` 目录，待用户选定后再替换正式图标 `assets/app-icon/`）：
+
+| 本地目录 | 方案 | 特点与处理方式 |
+| --- | --- | --- |
+| `build/v2-a/` | v2 候选 A：透视液态玻璃双屏 + ∞ 双向光弧 | 强纵深空间感，体现 Mac/Win 双向互通（直接裁切 squircle） |
+| `build/v2-b/` | v2 候选 B：正向叠层液态玻璃 + ∞ 光弧 | 蓝青双色光环，贴近 Apple Liquid Glass 质感（直接裁切 squircle） |
+| `build/v2-c/` | v2 候选 C：拉丝钛金属双屏 + 脉冲电弧 | 硬朗工程风，金青双脉冲象征零延迟雷电直连（内框裁切去重框后裁 squircle） |
+| `build/v2-d/` | v2 候选 D：浅色磨砂极简 `< >` 双向符号 | 浅色桌面友好，小尺寸轮廓清晰（`--recenter` 居中重构） |
+
+`build/v2-candidates-grid.png` 为上述四套 v2 设计稿的 2×2 对比预览图。
+
 每个目录包含：
 
 - `AppIcon-1024.png` 1024×1024 RGBA，squircle 外透明，可直接上架
