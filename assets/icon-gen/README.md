@@ -8,6 +8,12 @@
 | `build/glass-a/` | 液态玻璃：暗色玻璃双屏，青色内透光 | 最贴近 Apple Liquid Glass，128px 以上效果最佳 |
 | `build/glass-b/` | 液态玻璃：亮玻璃双屏 | 对比更强，但 16px 会糊成白块 |
 | `build/alt-a/` | 备选 A：单向箭头 + 双屏 | 轮廓更硬，但 16px 下会糊成亮块 |
+| `build/v2-a/` | v2 候选 A：透视液态玻璃双屏 + ∞ 双向光弧 | 强纵深空间感，体现 Mac/Win 双向互通 |
+| `build/v2-b/` | v2 候选 B：正向叠层液态玻璃 + ∞ 光弧 | 蓝青双色光环，贴近 Apple Liquid Glass 质感 |
+| `build/v2-c/` | v2 候选 C：拉丝钛金属双屏 + 脉冲电弧 | 硬朗工程风，金蓝双脉冲象征零延迟雷电直连 |
+| `build/v2-d/` | v2 候选 D：浅色磨砂极简 `< >` 双向符号 | 浅色桌面友好，小尺寸（16px/32px）轮廓清晰 |
+
+`build/v2-candidates-grid.png` 为上述四套 v2 设计稿的 2×2 对比预览图，正式替换 `assets/app-icon/` 前可在其中选定最终方案。
 
 每个目录包含：
 
