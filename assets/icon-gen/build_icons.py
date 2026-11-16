@@ -15,6 +15,7 @@ import os
 import shutil
 import subprocess
 import sys
+import tempfile
 
 import numpy as np
 from PIL import Image, ImageFilter
@@ -131,16 +132,14 @@ def main() -> int:
             os.path.join(png_dir, f"{args.name}-{size}.png")
         )
 
-    # macOS .icns
-    iconset = os.path.join(out, f"{args.name}.iconset")
-    if os.path.isdir(iconset):
-        shutil.rmtree(iconset)
-    os.makedirs(iconset)
-    for fname, size in ICONSET:
-        master.resize((size, size), Image.LANCZOS).save(os.path.join(iconset, fname))
+    # macOS .icns（在系统临时目录创建 iconset，避免中断时在输出目录残留临时文件）
     icns_path = os.path.join(out, f"{args.name}.icns")
-    subprocess.run(["iconutil", "-c", "icns", iconset, "-o", icns_path], check=True)
-    shutil.rmtree(iconset)
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        iconset = os.path.join(tmp_dir, f"{args.name}.iconset")
+        os.makedirs(iconset)
+        for fname, size in ICONSET:
+            master.resize((size, size), Image.LANCZOS).save(os.path.join(iconset, fname))
+        subprocess.run(["iconutil", "-c", "icns", iconset, "-o", icns_path], check=True)
 
     # Windows .ico
     ico_path = os.path.join(out, f"{args.name}.ico")
