@@ -2443,6 +2443,16 @@ static int  g_pendingClientW = 0;
 static int  g_pendingClientH = 0;
 static int  g_syncSwapRetry = 0;
 static const UINT_PTR TIMER_SYNC_SWAP = 4;
+static const UINT_PTR TIMER_RESUME_HOST = 5;
+static const UINT_PTR TIMER_SLEEP_WATCHDOG = 6;
+static int g_resumeRetryCount = 0;
+
+#ifndef PBT_APMRESUMECRITICAL
+#define PBT_APMRESUMECRITICAL 0x0006
+#endif
+#ifndef PBT_APMRESUMESTANDBY
+#define PBT_APMRESUMESTANDBY 0x0008
+#endif
 
 static const int IDC_PANEL_FULL     = 2010;
 static const int IDC_PANEL_RECONN   = 2011;
@@ -5485,6 +5495,37 @@ static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
             }
             return 0;
         }
+        if (w == TIMER_SLEEP_WATCHDOG) {
+            KillTimer(h, TIMER_SLEEP_WATCHDOG);
+            if (g_hostMode.load() && g_winHost.IsPausedForSleep()) {
+                Log("电源事件: 休眠可能被取消或阻塞，看门狗自动恢复虚拟屏");
+                g_resumeRetryCount = 0;
+                SetTimer(h, TIMER_RESUME_HOST, 200, nullptr);
+            }
+            return 0;
+        }
+        if (w == TIMER_RESUME_HOST) {
+            KillTimer(h, TIMER_RESUME_HOST);
+            if (g_hostMode.load()) {
+                if (g_winHost.IsPausedForSleep()) {
+                    if (g_winHost.ResumeFromSleep()) {
+                        g_resumeRetryCount = 0;
+                        UpdateControlPanel();
+                    } else if (++g_resumeRetryCount <= 3) {
+                        Log("电源恢复后重建虚拟屏未就绪，2.5 秒后第 %d 次重试", g_resumeRetryCount);
+                        SetTimer(h, TIMER_RESUME_HOST, 2500, nullptr);
+                    } else {
+                        g_winHost.ClearPausedForSleep();
+                        g_resumeRetryCount = 0;
+                        Log("警告: 电源恢复后重建虚拟屏连续失败，可点击控制面板「重挂虚拟屏」");
+                        UpdateControlPanel();
+                    }
+                } else if (g_winHost.IsRunning()) {
+                    g_winHost.OnDisplayChange(true);
+                }
+            }
+            return 0;
+        }
         if (w == kShakeTimer) {
             const double nowQpc = QpcNowMs();
             g_shakeLastRefreshQpcMs = nowQpc;
@@ -5575,28 +5616,32 @@ static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
         return 0;
     case WM_POWERBROADCAST:
         if (w == PBT_APMSUSPEND) {
+            KillTimer(h, TIMER_RESUME_HOST);
             if (g_hostMode.load()) {
                 Log("电源事件: 系统即将进入睡眠/休眠 (PBT_APMSUSPEND)");
-                g_winHost.PauseForSleep();
+                if (g_winHost.PauseForSleep()) {
+                    SetTimer(h, TIMER_SLEEP_WATCHDOG, 30000, nullptr);
+                }
                 UpdateControlPanel();
             }
             return TRUE;
         }
-        if (w == PBT_APMRESUMEAUTOMATIC) {
+        if (w == PBT_APMRESUMEAUTOMATIC || w == PBT_APMRESUMESUSPEND ||
+            w == PBT_APMRESUMECRITICAL || w == PBT_APMRESUMESTANDBY) {
+            KillTimer(h, TIMER_SLEEP_WATCHDOG);
             if (g_hostMode.load()) {
-                Log("电源事件: 系统自动唤醒 (PBT_APMRESUMEAUTOMATIC)");
+                Log("电源事件: 系统唤醒 (wParam=0x%llX)", (unsigned long long)w);
                 SetThreadExecutionState(ES_CONTINUOUS | ES_SYSTEM_REQUIRED | ES_DISPLAY_REQUIRED);
-                g_winHost.ResumeFromSleep();
-                UpdateControlPanel();
-            }
-            return TRUE;
-        }
-        if (w == PBT_APMRESUMESUSPEND) {
-            if (g_hostMode.load()) {
-                Log("电源事件: 系统用户态唤醒 (PBT_APMRESUMESUSPEND)");
-                SetThreadExecutionState(ES_CONTINUOUS | ES_SYSTEM_REQUIRED | ES_DISPLAY_REQUIRED);
-                if (!g_winHost.ResumeFromSleep()) {
-                    g_winHost.OnDisplayChange(true);
+                if (g_winHost.IsPausedForSleep()) {
+                    // 延迟 1.5s 再恢复虚拟屏，给雷电/显示驱动完成重枚举留出窗口并防抖多次唤醒事件
+                    g_resumeRetryCount = 0;
+                    SetTimer(h, TIMER_RESUME_HOST, 1500, nullptr);
+                } else if (w == PBT_APMRESUMESUSPEND) {
+                    if (g_winHost.IsRunning() && g_winHost.VddActive()) {
+                        g_winHost.OnDisplayChange(true);
+                    } else {
+                        secdisplay::WinVirtualDisplay::EnsureInternalPanelAwake([](const char* s) { Log("%s", s); });
+                    }
                 }
                 UpdateControlPanel();
             }
@@ -7274,13 +7319,17 @@ static void CheckWindowsLidPowerPolicy() {
             bool hasAc = (pReadAC(nullptr, activeScheme, &kSubButtons, &kLidAction, &acVal) == ERROR_SUCCESS);
             bool hasDc = (pReadDC(nullptr, activeScheme, &kSubButtons, &kLidAction, &dcVal) == ERROR_SUCCESS);
             if (hasAc || hasDc) {
-                Log("电源合盖策略: 接通电源=%s(%lu)  电池=%s(%lu)",
-                    hasAc ? LidActionName(acVal) : "未知", (unsigned long)acVal,
-                    hasDc ? LidActionName(dcVal) : "未知", (unsigned long)dcVal);
+                char acBuf[32], dcBuf[32];
+                if (hasAc) snprintf(acBuf, sizeof(acBuf), "%s(%lu)", LidActionName(acVal), (unsigned long)acVal);
+                else snprintf(acBuf, sizeof(acBuf), "未知");
+                if (hasDc) snprintf(dcBuf, sizeof(dcBuf), "%s(%lu)", LidActionName(dcVal), (unsigned long)dcVal);
+                else snprintf(dcBuf, sizeof(dcBuf), "未知");
+                Log("电源合盖策略: 接通电源=%s  电池=%s", acBuf, dcBuf);
                 if ((hasAc && acVal != 0) || (hasDc && dcVal != 0)) {
                     Log("警告: 合盖动作非「无操作」，合盖连接雷电屏可能导致休眠黑屏；"
-                        "建议以管理员执行: powercfg /setacvalueindex SCHEME_CURRENT SUB_BUTTONS LIDACTION 0 "
-                        "与 /setdcvalueindex ... LIDACTION 0 后 powercfg /setactive SCHEME_CURRENT");
+                        "建议以管理员执行: powercfg /setacvalueindex SCHEME_CURRENT SUB_BUTTONS LIDACTION 0 && "
+                        "powercfg /setdcvalueindex SCHEME_CURRENT SUB_BUTTONS LIDACTION 0 && "
+                        "powercfg /setactive SCHEME_CURRENT");
                 }
             }
             LocalFree(activeScheme);
@@ -7489,6 +7538,8 @@ int main(int argc, char** argv) {
         }
 
         SetThreadExecutionState(ES_CONTINUOUS);
+        KillTimer(hwnd, TIMER_RESUME_HOST);
+        KillTimer(hwnd, TIMER_SLEEP_WATCHDOG);
         if (hPowerLid) UnregisterPowerSettingNotification(hPowerLid);
         TrayRemove();
         UnregisterHotKey(hwnd, HOTKEY_QUIT_ID);

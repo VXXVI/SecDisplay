@@ -105,6 +105,8 @@ public:
     bool Start(const std::string& targetHost, int width, int height, int fps, int bitrateMbps, uint16_t port, LogFn logFn, int dpiPercent = 0) {
         Stop();
         pausedForSleep_.store(false);
+        displayReconcilePending_.store(false);
+        displayWakeInternal_.store(false);
         logFn_ = std::move(logFn);
         targetHost_ = targetHost.empty() ? "10.10.10.1" : targetHost;
         reqW_ = width > 0 ? width : 2880;
@@ -305,6 +307,9 @@ public:
         displayReconcilePending_.store(true);
     }
 
+    bool IsPausedForSleep() const { return pausedForSleep_.load(); }
+    void ClearPausedForSleep() { pausedForSleep_.store(false); }
+
     bool PauseForSleep() {
         if (!alive_.load() && !vdd_.IsActive()) {
             pausedForSleep_.store(false);
@@ -317,12 +322,17 @@ public:
     }
 
     bool ResumeFromSleep() {
-        if (!pausedForSleep_.exchange(false)) return false;
+        if (!pausedForSleep_.load()) return false;
         EmitLog("WinHost: 系统从休眠恢复，先唤醒内建显示路径再重建虚拟屏");
         WinVirtualDisplay::EnsureInternalPanelAwake(logFn_);
         std::string hostCopy = targetHost_;
         LogFn logCopy = logFn_;
-        return Start(hostCopy, reqW_, reqH_, reqFps_, targetMbps_.load(), port_, std::move(logCopy), reqDpi_);
+        bool ok = Start(hostCopy, reqW_, reqH_, reqFps_, targetMbps_.load(), port_, std::move(logCopy), reqDpi_);
+        if (!ok) {
+            // Start() 内部清除了 pausedForSleep_；若驱动刚唤醒尚未就绪，保留暂停状态供调用方重试
+            pausedForSleep_.store(true);
+        }
+        return ok;
     }
 
     bool IsRunning() const { return alive_.load(); }
