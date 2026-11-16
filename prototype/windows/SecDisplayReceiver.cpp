@@ -5422,11 +5422,14 @@ static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
         return 0;
     }
     case WM_DISPLAYCHANGE:
-    case WM_EXITSIZEMOVE:
         if (g_hostMode.load()) {
-            if (m == WM_DISPLAYCHANGE) g_winHost.OnDisplayChange();
+            g_winHost.OnDisplayChange();
             return 0;
         }
+        UpdateRefreshHz();
+        ResetShakeSamples();
+        return 0;
+    case WM_EXITSIZEMOVE:
         // 显示模式变化或窗口跨屏移动后，刷新率可能变了，--pace 的节拍要跟着更新
         UpdateRefreshHz();
         // 晃动轨迹用屏幕坐标，窗口移动/尺寸变化会让相邻样本出现几百像素的突跳，

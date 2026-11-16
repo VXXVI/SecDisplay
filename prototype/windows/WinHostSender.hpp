@@ -1588,8 +1588,11 @@ private:
 
         while (alive_.load()) {
             if (displayReconcilePending_.exchange(false)) {
-                if (vdd_.ReconcileExtendedTopology()) {
+                bool cd = false;
+                if (vdd_.ReconcileExtendedTopology(&cd)) {
                     forceKeyframe_.store(true);
+                } else if (cd) {
+                    displayReconcilePending_.store(true);
                 }
             }
             WinVddBounds b = vdd_.RefreshBounds();
@@ -1673,9 +1676,12 @@ private:
 
             while (alive_.load()) {
                 if (displayReconcilePending_.exchange(false)) {
-                    if (vdd_.ReconcileExtendedTopology()) {
+                    bool cd = false;
+                    if (vdd_.ReconcileExtendedTopology(&cd)) {
                         forceKeyframe_.store(true);
                         break;
+                    } else if (cd) {
+                        displayReconcilePending_.store(true);
                     }
                 }
                 enc.UpdateBitrateIfChanged(curMbps_.load());
