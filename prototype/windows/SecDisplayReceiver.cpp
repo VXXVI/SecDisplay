@@ -550,6 +550,8 @@ static bool SendCtrlAllUnderLock(SOCKET s, const uint8_t* p, int len) {
         if (r > 0) {
             sent += r;
         } else {
+            // 部分写入失败会破坏无前缀控制流边界，立即断开重连防止对端误判
+            shutdown(s, SD_BOTH);
             return false;
         }
     }
@@ -3751,7 +3753,7 @@ static void PaintControlPanel(HWND h) {
         const bool hm = g_hostMode.load();
         const wchar_t* shortSt = g_panelData.state == 2 ? (hm ? L"主控推送中" : L"正在接收")
                                : (g_panelData.state == 1 ? (hm ? L"准备推流" : L"等待首帧")
-                               : (g_panelData.state == 4 ? L"角色冲突"
+                               : (g_panelData.state == 4 ? L"角色/协议冲突"
                                : (g_panelData.state == 3 ? L"虚拟屏异常"
                                                          : (hm ? L"主控待命" : L"等待重连"))));
         DrawKVRow(hdc, px, rowY, pw, rh, L"连接状态", shortSt, dotCol);

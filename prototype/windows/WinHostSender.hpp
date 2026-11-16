@@ -1180,7 +1180,7 @@ private:
                 uint16_t presDrop   = RdU16BE(acc.data() + pos + 7);
                 uint16_t pacedDrop  = RdU16BE(acc.data() + pos + 9);
                 if (presentP95 > 10000 || sourceP95 > 10000 || decFps10 > 3000) {
-                    return failConflict("角色冲突或控制流损坏（0x07 越界），已断开保护", t);
+                    return failConflict("控制流损坏（0x07 越界），已断开保护", t);
                 }
                 clearConflictErr();
                 AdjustAdaptiveBitrate(presentP95, sourceP95, presDrop, pacedDrop);
