@@ -79,6 +79,8 @@ final class AppModel: ObservableObject {
     @Published var localIPsSummary = "-"
     @Published var recvConnected = false
     @Published var recvStreaming = false
+    @Published var recvKvmActive = false
+    @Published var senderKvmActive = false
     @Published var recvListening = false
     @Published var recvListenerError: String? = nil
     @Published var recvRejectedPeer: String? = nil
@@ -135,6 +137,7 @@ final class AppModel: ObservableObject {
             if let snap = macReceiverClient?.snapshot() {
                 recvConnected = snap.connected
                 recvStreaming = snap.streaming
+                recvKvmActive = snap.kvmActive
                 recvListening = snap.listening
                 recvListenerError = snap.listenerError
                 recvRejectedPeer = snap.rejectedPeer
@@ -159,6 +162,7 @@ final class AppModel: ObservableObject {
         }
 
         connected = sender?.connected ?? false
+        senderKvmActive = kvmPassthrough.isActive
         fps = peakFps
         encMs = lastEncAvgMs
         capMs = lastCapAvgMs
@@ -368,6 +372,9 @@ struct StatusView: View {
                             .controlSize(.mini)
                         }
                         StatRow(label: "对端", value: model.recvPeer)
+                        if model.recvKvmActive {
+                            StatRow(label: "KVM 穿透", value: "Windows 正在控制本机 (Ctrl+Alt+K 退出)", mono: false, warn: .orange)
+                        }
                         if let rej = model.recvRejectedPeer {
                             StatRow(label: "已拦截", value: rej, mono: false, warn: .orange)
                         }
@@ -582,6 +589,10 @@ struct StatusView: View {
 
                 HStack(spacing: 8) {
                     if !model.isReceiverMode {
+                        Button(model.senderKvmActive ? "退出穿透 (Ctrl+Opt+K)" : "键鼠控 Win (Ctrl+Opt+K)") {
+                            kvmPassthrough.toggle()
+                            model.senderKvmActive = kvmPassthrough.isActive
+                        }
                         Button("强制关键帧") {
                             encoder?.forceEncodeLastFrame()
                             Log.info("面板请求强制关键帧")

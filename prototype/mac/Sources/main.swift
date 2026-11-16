@@ -133,6 +133,9 @@ nonisolated(unsafe) var gEncoder: Encoder?
 func resetInjectionState() {
     gKeyboard?.reset()
     gMouse?.resetButtons()
+    DispatchQueue.main.async {
+        kvmPassthrough.setActive(false, notifyPeer: false)
+    }
 }
 
 struct Config {
@@ -1978,6 +1981,59 @@ final class Sender {
         packet.append(0)                     // 保留
         c.send(content: packet, completion: .contentProcessed { _ in })
         lastSessionSent = CFAbsoluteTimeGetCurrent()
+    }
+
+    func sendKvmState(active: Bool) {
+        var packet = Data(capacity: 14)
+        var len = UInt32(10).bigEndian
+        withUnsafeBytes(of: &len) { packet.append(contentsOf: $0) }
+        packet.append(0x0C)
+        var ts = UInt64(CFAbsoluteTimeGetCurrent() * 1_000_000).bigEndian
+        withUnsafeBytes(of: &ts) { packet.append(contentsOf: $0) }
+        packet.append(active ? 1 : 0)
+        queue.async { [weak self] in
+            guard let self, self.connected, let c = self.conn else { return }
+            c.send(content: packet, completion: .contentProcessed { _ in })
+        }
+    }
+
+    func sendKvmMouse(dx: Int16, dy: Int16, buttons: UInt8, wheel: Int16) {
+        var packet = Data(capacity: 20)
+        var len = UInt32(16).bigEndian
+        withUnsafeBytes(of: &len) { packet.append(contentsOf: $0) }
+        packet.append(0x0A)
+        var ts = UInt64(CFAbsoluteTimeGetCurrent() * 1_000_000).bigEndian
+        withUnsafeBytes(of: &ts) { packet.append(contentsOf: $0) }
+        var dxBe = UInt16(bitPattern: dx).bigEndian
+        var dyBe = UInt16(bitPattern: dy).bigEndian
+        var whBe = UInt16(bitPattern: wheel).bigEndian
+        withUnsafeBytes(of: &dxBe) { packet.append(contentsOf: $0) }
+        withUnsafeBytes(of: &dyBe) { packet.append(contentsOf: $0) }
+        packet.append(buttons)
+        withUnsafeBytes(of: &whBe) { packet.append(contentsOf: $0) }
+        queue.async { [weak self] in
+            guard let self, self.connected, let c = self.conn else { return }
+            c.send(content: packet, completion: .contentProcessed { _ in })
+        }
+    }
+
+    func sendKvmKey(vk: UInt16, scan: UInt16, down: Bool, flags: UInt8) {
+        var packet = Data(capacity: 19)
+        var len = UInt32(15).bigEndian
+        withUnsafeBytes(of: &len) { packet.append(contentsOf: $0) }
+        packet.append(0x0B)
+        var ts = UInt64(CFAbsoluteTimeGetCurrent() * 1_000_000).bigEndian
+        withUnsafeBytes(of: &ts) { packet.append(contentsOf: $0) }
+        var vBe = vk.bigEndian
+        var sBe = scan.bigEndian
+        withUnsafeBytes(of: &vBe) { packet.append(contentsOf: $0) }
+        withUnsafeBytes(of: &sBe) { packet.append(contentsOf: $0) }
+        packet.append(down ? 1 : 0)
+        packet.append(flags)
+        queue.async { [weak self] in
+            guard let self, self.connected, let c = self.conn else { return }
+            c.send(content: packet, completion: .contentProcessed { _ in })
+        }
     }
 
     func send(frame: Data, captureTimeMicros: UInt64) {
@@ -4489,6 +4545,7 @@ func shutdown(signal sig: Int32) {
         transferService.stop()
         exit(0)
     }
+    kvmPassthrough.setActive(false, notifyPeer: true)
     cap?.stop()
     transferService.stop()
     sender?.conn?.cancel()
@@ -4847,12 +4904,13 @@ Timer.scheduledTimer(withTimeInterval: 1.0, repeats: true) { _ in
         if appRole == .receiver {
             if let snap = macReceiverClient?.snapshot() {
                 let st = snap.listenerError != nil ? "监听异常"
-                       : (snap.streaming ? "正在接收" : (snap.connected ? "已连接等待" : "等待 Windows 主控"))
+                       : (snap.kvmActive ? "KVM穿透控制中"
+                       : (snap.streaming ? "正在接收" : (snap.connected ? "已连接等待" : "等待 Windows 主控")))
                 info.title = String(format: "%@ · %.0f fps · %.1f Mbps", st, snap.decodeFps, snap.mbps)
             }
         } else if let encoder, let sender {
             let enc = encoder.encLatCount > 0 ? encoder.encLatSum / Double(encoder.encLatCount) : 0
-            let conn = sender.connected ? "已连接" : "等待连接"
+            let conn = kvmPassthrough.isActive ? "KVM穿透中" : (sender.connected ? "已连接" : "等待连接")
             info.title = String(format: "%@ · %.0f fps · 编码 %.0f ms · %ld 在途",
                                 conn, peakFps, enc, sender.inFlight)
         }
@@ -4868,6 +4926,272 @@ if let rp = Bundle.main.resourcePath,
 } else {
     Log.info("构建标记: 无（命令行构建或旧包）")
 }
+final class KvmPassthroughController {
+    private let lock = NSLock()
+    private var _active = false
+    private var tap: CFMachPort?
+    private var runLoopSrc: CFRunLoopSource?
+    private var flushTimer: DispatchSourceTimer?
+    private var accumDx: Int = 0
+    private var accumDy: Int = 0
+    private var buttonsMask: UInt8 = 0
+    private var forwardedKeys = Set<UInt16>()
+    private var heldModifiers = Set<UInt16>()
+
+    var isActive: Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return _active
+    }
+
+    func toggle() {
+        setActive(!isActive)
+    }
+
+    func setActive(_ on: Bool, notifyPeer: Bool = true) {
+        if on {
+            guard appRole == .sender, sender?.connected == true else {
+                Log.info("KVM: Windows 副屏未连接，无法开启键鼠穿透")
+                return
+            }
+            lock.lock()
+            if _active { lock.unlock(); return }
+            lock.unlock()
+
+            if !ensureTapCreated() {
+                Log.info("KVM: 创建 CGEventTap 失败（请检查「辅助功能」权限）")
+                return
+            }
+
+            lock.lock()
+            _active = true
+            accumDx = 0
+            accumDy = 0
+            buttonsMask = 0
+            forwardedKeys.removeAll()
+            heldModifiers.removeAll()
+            lock.unlock()
+
+            CGAssociateMouseAndMouseCursorPosition(boolean_t(0))
+            if let t = tap { CGEvent.tapEnable(tap: t, enable: true) }
+            startFlushTimer()
+            if notifyPeer { sender?.sendKvmState(active: true) }
+            Log.info("KVM: 已开启键鼠穿透（直接操作 Windows 系统），再按 Ctrl+Opt+K 退出")
+        } else {
+            lock.lock()
+            let was = _active
+            let prevBtns = buttonsMask
+            let prevKeys = forwardedKeys
+            let prevMods = heldModifiers
+            _active = false
+            accumDx = 0
+            accumDy = 0
+            buttonsMask = 0
+            forwardedKeys.removeAll()
+            heldModifiers.removeAll()
+            lock.unlock()
+
+            flushTimer?.cancel()
+            flushTimer = nil
+            if let t = tap { CGEvent.tapEnable(tap: t, enable: false) }
+            CGAssociateMouseAndMouseCursorPosition(boolean_t(1))
+            if was {
+                if notifyPeer {
+                    if prevBtns != 0 { sender?.sendKvmMouse(dx: 0, dy: 0, buttons: 0, wheel: 0) }
+                    for kc in prevKeys {
+                        if let wk = MacKeyMap.lookup(kc) {
+                            sender?.sendKvmKey(vk: wk.vk, scan: wk.scan, down: false, flags: wk.extended ? 0x01 : 0)
+                        }
+                    }
+                    for kc in prevMods {
+                        if let wk = MacKeyMap.lookup(kc) {
+                            sender?.sendKvmKey(vk: wk.vk, scan: wk.scan, down: false, flags: wk.extended ? 0x01 : 0)
+                        }
+                    }
+                    sender?.sendKvmState(active: false)
+                }
+                Log.info("KVM: 已退出键鼠穿透，恢复操作 Mac")
+            }
+        }
+    }
+
+    private func ensureTapCreated() -> Bool {
+        if tap != nil { return true }
+        let events: [CGEventType] = [
+            .mouseMoved, .leftMouseDown, .leftMouseUp, .leftMouseDragged,
+            .rightMouseDown, .rightMouseUp, .rightMouseDragged,
+            .otherMouseDown, .otherMouseUp, .otherMouseDragged,
+            .scrollWheel, .keyDown, .keyUp, .flagsChanged
+        ]
+        var mask: CGEventMask = 0
+        for e in events { mask |= CGEventMask(1 << e.rawValue) }
+        guard let created = CGEvent.tapCreate(
+            tap: .cgSessionEventTap,
+            place: .headInsertEventTap,
+            options: .defaultTap,
+            eventsOfInterest: mask,
+            callback: { _, type, event, _ -> Unmanaged<CGEvent>? in
+                return kvmPassthrough.handleEvent(type: type, event: event)
+            },
+            userInfo: nil
+        ) else {
+            return false
+        }
+        tap = created
+        let src = CFMachPortCreateRunLoopSource(kCFAllocatorDefault, created, 0)
+        runLoopSrc = src
+        CFRunLoopAddSource(CFRunLoopGetMain(), src, .commonModes)
+        CGEvent.tapEnable(tap: created, enable: false)
+        return true
+    }
+
+    private func startFlushTimer() {
+        flushTimer?.cancel()
+        let t = DispatchSource.makeTimerSource(queue: DispatchQueue.main)
+        t.schedule(deadline: .now() + .milliseconds(8), repeating: .milliseconds(8))
+        t.setEventHandler { [weak self] in
+            self?.flushMoveIfNeeded()
+        }
+        t.resume()
+        flushTimer = t
+    }
+
+    private func flushMoveIfNeeded() {
+        lock.lock()
+        guard _active, (accumDx != 0 || accumDy != 0) else {
+            lock.unlock()
+            return
+        }
+        let dx = Int16(clamping: accumDx)
+        let dy = Int16(clamping: accumDy)
+        let btns = buttonsMask
+        accumDx = 0
+        accumDy = 0
+        lock.unlock()
+        sender?.sendKvmMouse(dx: dx, dy: dy, buttons: btns, wheel: 0)
+    }
+
+    private func handleEvent(type: CGEventType, event: CGEvent) -> Unmanaged<CGEvent>? {
+        if type == .tapDisabledByTimeout || type == .tapDisabledByUserInput {
+            if isActive, let t = tap { CGEvent.tapEnable(tap: t, enable: true) }
+            return Unmanaged.passUnretained(event)
+        }
+        guard isActive else { return Unmanaged.passUnretained(event) }
+
+        switch type {
+        case .keyDown:
+            let kc = UInt16(event.getIntegerValueField(.keyboardEventKeycode))
+            let mods = event.flags.intersection([.maskControl, .maskAlternate, .maskCommand, .maskShift])
+            if (kc == UInt16(kVK_ANSI_K) || kc == UInt16(kVK_Escape)) && mods == [.maskControl, .maskAlternate] {
+                if event.getIntegerValueField(.keyboardEventAutorepeat) == 0 {
+                    DispatchQueue.main.async { kvmPassthrough.setActive(false) }
+                }
+                return nil
+            }
+            if let wk = MacKeyMap.lookup(kc) {
+                lock.lock()
+                forwardedKeys.insert(kc)
+                lock.unlock()
+                sender?.sendKvmKey(vk: wk.vk, scan: wk.scan, down: true, flags: wk.extended ? 0x01 : 0)
+            }
+            return nil
+
+        case .keyUp:
+            let kc = UInt16(event.getIntegerValueField(.keyboardEventKeycode))
+            lock.lock()
+            let wasFwd = forwardedKeys.remove(kc) != nil
+            lock.unlock()
+            if !wasFwd {
+                return Unmanaged.passUnretained(event)
+            }
+            if let wk = MacKeyMap.lookup(kc) {
+                sender?.sendKvmKey(vk: wk.vk, scan: wk.scan, down: false, flags: wk.extended ? 0x01 : 0)
+            }
+            return nil
+
+        case .flagsChanged:
+            let kc = UInt16(event.getIntegerValueField(.keyboardEventKeycode))
+            guard let wk = MacKeyMap.lookup(kc), let mflag = MacKeyMap.modifierFlag(forKeyCode: kc) else {
+                return Unmanaged.passUnretained(event)
+            }
+            if kc == 0x39 {
+                sender?.sendKvmKey(vk: wk.vk, scan: wk.scan, down: true, flags: 0)
+                sender?.sendKvmKey(vk: wk.vk, scan: wk.scan, down: false, flags: 0)
+                return nil
+            }
+            let flagMap: CGEventFlags
+            switch mflag {
+            case .shift:   flagMap = .maskShift
+            case .control: flagMap = .maskControl
+            case .option:  flagMap = .maskAlternate
+            case .command: flagMap = .maskCommand
+            default:       flagMap = []
+            }
+            lock.lock()
+            let wasDown = heldModifiers.contains(kc)
+            if wasDown {
+                heldModifiers.remove(kc)
+                lock.unlock()
+                sender?.sendKvmKey(vk: wk.vk, scan: wk.scan, down: false, flags: wk.extended ? 0x01 : 0)
+                return nil
+            } else if !flagMap.isEmpty && event.flags.contains(flagMap) {
+                heldModifiers.insert(kc)
+                lock.unlock()
+                sender?.sendKvmKey(vk: wk.vk, scan: wk.scan, down: true, flags: wk.extended ? 0x01 : 0)
+                return nil
+            } else {
+                lock.unlock()
+                return Unmanaged.passUnretained(event)
+            }
+
+        case .mouseMoved, .leftMouseDragged, .rightMouseDragged, .otherMouseDragged,
+             .leftMouseDown, .leftMouseUp, .rightMouseDown, .rightMouseUp, .otherMouseDown, .otherMouseUp,
+             .scrollWheel:
+            let dx = Int(event.getIntegerValueField(.mouseEventDeltaX))
+            let dy = Int(event.getIntegerValueField(.mouseEventDeltaY))
+            var wheel: Int16 = 0
+            var immediate = false
+            lock.lock()
+            accumDx += dx
+            accumDy += dy
+            switch type {
+            case .leftMouseDown:  buttonsMask |= 0x01; immediate = true
+            case .leftMouseUp:    buttonsMask &= ~0x01; immediate = true
+            case .rightMouseDown: buttonsMask |= 0x02; immediate = true
+            case .rightMouseUp:   buttonsMask &= ~0x02; immediate = true
+            case .otherMouseDown: buttonsMask |= 0x04; immediate = true
+            case .otherMouseUp:   buttonsMask &= ~0x04; immediate = true
+            case .scrollWheel:
+                let cont = event.getIntegerValueField(.scrollWheelEventIsContinuous) != 0
+                let raw = cont
+                    ? event.getIntegerValueField(.scrollWheelEventPointDeltaAxis1) * 3
+                    : event.getIntegerValueField(.scrollWheelEventDeltaAxis1) * 120
+                wheel = Int16(clamping: raw)
+                immediate = (wheel != 0)
+            default:
+                break
+            }
+            if immediate {
+                let sdx = Int16(clamping: accumDx)
+                let sdy = Int16(clamping: accumDy)
+                let btns = buttonsMask
+                accumDx = 0
+                accumDy = 0
+                lock.unlock()
+                sender?.sendKvmMouse(dx: sdx, dy: sdy, buttons: btns, wheel: wheel)
+            } else {
+                lock.unlock()
+            }
+            return nil
+
+        default:
+            return Unmanaged.passUnretained(event)
+        }
+    }
+}
+
+nonisolated(unsafe) let kvmPassthrough = KvmPassthroughController()
+
 nonisolated(unsafe) private var globalDropBoxTap: CFMachPort?
 nonisolated(unsafe) private var globalDropBoxRunLoopSource: CFRunLoopSource?
 nonisolated(unsafe) private var globalDropBoxKeyMon: Any?
@@ -4895,6 +5219,12 @@ private func registerGlobalDropBoxHotKey() {
                 }
                 return nil
             }
+            if appRole == .sender && keyCode == Int64(kVK_ANSI_K) && mods == [.maskControl, .maskAlternate] {
+                if event.getIntegerValueField(.keyboardEventAutorepeat) == 0 {
+                    DispatchQueue.main.async { kvmPassthrough.toggle() }
+                }
+                return nil
+            }
             return Unmanaged.passUnretained(event)
         },
         userInfo: nil
@@ -4904,7 +5234,7 @@ private func registerGlobalDropBoxHotKey() {
         globalDropBoxRunLoopSource = src
         CFRunLoopAddSource(CFRunLoopGetMain(), src, .commonModes)
         CGEvent.tapEnable(tap: tap, enable: true)
-        Log.info("全局快捷键 Ctrl+Opt+B 已注册（CGEventTap，一键呼出/隐藏投递盒）")
+        Log.info("全局快捷键已注册（Ctrl+Opt+B 投递盒 / Ctrl+Opt+K 键鼠穿透）")
         return
     }
     // 无辅助功能权限时降级为 NSEvent 全局/本地监听
