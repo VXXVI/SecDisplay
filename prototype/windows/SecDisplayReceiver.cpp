@@ -5422,6 +5422,13 @@ static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
         return 0;
     }
     case WM_DISPLAYCHANGE:
+        if (g_hostMode.load()) {
+            g_winHost.OnDisplayChange();
+            return 0;
+        }
+        UpdateRefreshHz();
+        ResetShakeSamples();
+        return 0;
     case WM_EXITSIZEMOVE:
         // 显示模式变化或窗口跨屏移动后，刷新率可能变了，--pace 的节拍要跟着更新
         UpdateRefreshHz();
