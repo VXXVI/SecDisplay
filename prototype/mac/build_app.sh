@@ -140,6 +140,10 @@ echo "已生成 $APP"
 
 INSTALL_APP="/Applications/SecDisplay.app"
 if [ "$INSTALL" = "1" ]; then
+    OLD_RUNNING=0
+    if pgrep -f "SecDisplay.app/Contents/MacOS/SecDisplay" >/dev/null 2>&1; then
+        OLD_RUNNING=1
+    fi
     HAS_ROOT_PATH_DENY=""
     if [ -r "/Library/Application Support/com.apple.TCC/TCC.db" ] && command -v sqlite3 >/dev/null 2>&1; then
         HAS_ROOT_PATH_DENY="$(sqlite3 -readonly "/Library/Application Support/com.apple.TCC/TCC.db" \
@@ -157,7 +161,7 @@ if [ "$INSTALL" = "1" ]; then
     # 用 ditto 而不是 cp -R：它会保留扩展属性与资源分支，签名校验更稳。
     ditto "$APP" "$INSTALL_APP"
     echo "已安装到 $INSTALL_APP"
-    if pgrep -f "SecDisplay.app/Contents/MacOS/SecDisplay" >/dev/null 2>&1; then
+    if [ "$OLD_RUNNING" = "1" ]; then
         echo "提示: 检测到旧实例正在运行，先退出旧实例后再重新 open \"$INSTALL_APP\""
     fi
     if [ -r "/Library/Application Support/com.apple.TCC/TCC.db" ] && command -v sqlite3 >/dev/null 2>&1; then

@@ -53,6 +53,7 @@ final class AppModel: ObservableObject {
     @Published var senderRoleConflict: String? = nil
     @Published var screenCaptureDenied = false
     @Published var tccConflictWarning: String? = nil
+    @Published var resumeFeedback: String? = nil
     /// 光标的发送计数（位置 / 图像）
     @Published var cursorPosSent = 0
     @Published var cursorImgSent = 0
@@ -214,6 +215,7 @@ final class AppModel: ObservableObject {
         peer = sender?.peerDescription ?? "-"
         senderRoleConflict = sender?.roleConflictMessage
         screenCaptureDenied = isScreenCaptureDenied()
+        if !screenCaptureDenied { resumeFeedback = nil }
         tccConflictWarning = currentTccConflictWarning()
         cursorPosSent = cursor?.sentCount ?? 0
         cursorImgSent = cursorImage?.sentCount ?? 0
@@ -428,9 +430,19 @@ struct StatusView: View {
                                     .font(.caption)
                                     .foregroundStyle(.orange)
                             }
+                            if let hint = model.resumeFeedback {
+                                Text(hint)
+                                    .font(.caption2)
+                                    .foregroundStyle(.red)
+                            }
                             HStack(spacing: 6) {
                                 Button("恢复采集") {
-                                    _ = cap?.resumeAfterPermissionGranted()
+                                    if cap?.resumeAfterPermissionGranted() == true {
+                                        model.resumeFeedback = nil
+                                        model.refresh()
+                                    } else {
+                                        model.resumeFeedback = "仍未检测到录屏授权或已达重建上限，请先在设置勾选后点「重启应用」"
+                                    }
                                 }
                                 .controlSize(.small)
                                 Button("打开录屏设置") {
