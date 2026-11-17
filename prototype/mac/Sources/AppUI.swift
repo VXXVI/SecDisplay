@@ -437,11 +437,12 @@ struct StatusView: View {
                             }
                             HStack(spacing: 6) {
                                 Button("恢复采集") {
-                                    if cap?.resumeAfterPermissionGranted() == true {
-                                        model.resumeFeedback = nil
-                                        model.refresh()
+                                    if let c = cap {
+                                        let err = c.resumeAfterPermissionGranted()
+                                        model.resumeFeedback = err
+                                        if err == nil { model.refresh() }
                                     } else {
-                                        model.resumeFeedback = "仍未检测到录屏授权或已达重建上限，请先在设置勾选后点「重启应用」"
+                                        model.resumeFeedback = "采集器尚未初始化，请点「重启应用」"
                                     }
                                 }
                                 .controlSize(.small)

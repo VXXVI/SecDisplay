@@ -1052,6 +1052,7 @@ final class ScreenshotCapture {
     private var _runtimeDenyCount = 0
     private var _startInProgress = false
     private var _startInProgressSince: CFAbsoluteTime = 0
+    private var _startToken = 0
     private var _lastManualResumeAt: CFAbsoluteTime = 0
     private var _workerGen = 0
     private var _stopRequested = false
@@ -1170,26 +1171,31 @@ final class ScreenshotCapture {
     }
 
     func start() async throws {
-        let shouldProceed: Bool = withGenLock {
+        let myToken: Int? = withGenLock {
             if _stopRequested || _startInProgress || supervisor != nil {
-                return false
+                return nil
             }
+            _startToken &+= 1
             _startInProgress = true
             _startInProgressSince = CFAbsoluteTimeGetCurrent()
-            return true
+            return _startToken
         }
-        guard shouldProceed else { return }
+        guard let myToken else { return }
         defer {
             withGenLock {
-                _startInProgress = false
-                _startInProgressSince = 0
+                if _startToken == myToken {
+                    _startInProgress = false
+                    _startInProgressSince = 0
+                }
             }
         }
         let content = try await currentContent(forceRefresh: true)
-        // await 期间可能已经收到退出请求，这时必须放弃启动，否则会把
-        // running 置回 true 并在 shutdown 清理虚拟屏时仍在采集。
-        if stopRequested {
-            Log.info("启动过程中已收到停止请求，放弃启动采集")
+        // await 期间可能已经收到退出请求，或已被超时的恢复流程接管了新代次，必须放弃旧启动
+        let stillValidStart = withGenLock {
+            !_stopRequested && _startToken == myToken && supervisor == nil
+        }
+        guard stillValidStart else {
+            Log.info("采集启动已取消或被新代次接管，放弃本次启动")
             return
         }
         guard content.displays.contains(where: { isOurVirtualDisplay($0.displayID) }) else {
@@ -1317,7 +1323,7 @@ final class ScreenshotCapture {
             }
         }
         let installed = withGenLock { () -> Bool in
-            if _stopRequested { return false }
+            if _stopRequested || _startToken != myToken || supervisor != nil { return false }
             supervisor = sup
             return true
         }
@@ -1370,13 +1376,14 @@ final class ScreenshotCapture {
         genLock.unlock()
     }
 
+    /// 返回 nil 表示已恢复或已触发启动；非 nil 为界面可直接展示的阻断原因。
     @discardableResult
-    func resumeAfterPermissionGranted() -> Bool {
-        guard !stopRequested else { return false }
+    func resumeAfterPermissionGranted() -> String? {
+        guard !stopRequested else { return "采集器正在停止，请点「重启应用」" }
         guard CGPreflightScreenCaptureAccess() else {
             setScreenCaptureDenied(true)
             Log.info("屏幕录制权限仍未就绪，请在系统设置勾选 SecDisplay 后再试")
-            return false
+            return "仍未检测到录屏授权，请在系统设置勾选 SecDisplay 后再试"
         }
         let now = CFAbsoluteTimeGetCurrent()
         enum Action { case throttled, respawn, startNew, waiting }
@@ -1388,6 +1395,7 @@ final class ScreenshotCapture {
             _lastManualResumeAt = now
             let hasSupervisor = (supervisor != nil)
             if _startInProgress && _startInProgressSince > 0 && now - _startInProgressSince > 6.0 {
+                _startToken &+= 1
                 _startInProgress = false
                 _startInProgressSince = 0
                 clearStuckInFlight = true
@@ -1399,7 +1407,9 @@ final class ScreenshotCapture {
             }
             return _startInProgress ? .waiting : .startNew
         }
-        if action == .throttled { return true }
+        if action == .throttled {
+            return "点击过于频繁，请 1 秒后再试"
+        }
         setScreenCaptureDenied(false)
         resetCaptureCounters()
         withRawLock {
@@ -1412,15 +1422,15 @@ final class ScreenshotCapture {
         }
         switch action {
         case .throttled:
-            return true
+            return "点击过于频繁，请 1 秒后再试"
         case .respawn:
             if spawnWorkers() {
                 Log.info("已手动恢复屏幕录制采集")
-                return true
+                return nil
             }
             setScreenCaptureDenied(true)
             Log.info("采集线程已达重建上限，请点击「重启应用」恢复")
-            return false
+            return "采集线程已达重建上限，请点「重启应用」"
         case .startNew:
             Log.info("已手动触发启动屏幕录制采集")
             Task { [weak self] in
@@ -1435,13 +1445,15 @@ final class ScreenshotCapture {
                     Log.info("手动恢复启动采集失败: \(error)")
                     if isPerm {
                         setScreenCaptureDenied(true)
+                    } else {
+                        setTccConflictWarning("采集启动失败（\(error.localizedDescription)），请点「重启应用」")
                     }
                 }
             }
-            return true
+            return nil
         case .waiting:
             Log.info("屏幕录制权限已就绪，正在等待采集启动")
-            return true
+            return nil
         }
     }
 
@@ -1638,15 +1650,23 @@ final class ScreenshotCapture {
                 }
                 if isCode1004 || isUserDeclined {
                     if CGDisplayIsAsleep(CGMainDisplayID()) != 0 || CGDisplayIsAsleep(displayIDProvider()) != 0 {
+                        withRawLock {
+                            consecutiveCode1004 = 0
+                            firstCode1004At = 0
+                        }
                         try? await Task.sleep(nanoseconds: 500_000_000)
                         continue
                     }
                     let errNow = CFAbsoluteTimeGetCurrent()
                     let (streak, elapsed) = withRawLock { () -> (Int, Double) in
-                        if consecutiveCode1004 == 0 {
+                        // 10 秒滚动窗口：睡眠前残留、偶发单次错误或长期静默后不累积，
+                        // 仅当 10 秒窗口内持续失败 >=8 次且跨度 >=2.0 秒才闩锁。
+                        if consecutiveCode1004 == 0 || (errNow - firstCode1004At) > 10.0 {
                             firstCode1004At = errNow
+                            consecutiveCode1004 = 1
+                        } else {
+                            consecutiveCode1004 += 1
                         }
-                        consecutiveCode1004 += 1
                         return (consecutiveCode1004, errNow - firstCode1004At)
                     }
                     if streak >= 8 && elapsed >= 2.0 {
