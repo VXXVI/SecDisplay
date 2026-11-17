@@ -100,6 +100,8 @@ cd prototype/mac
 open /Applications/SecDisplay.app
 ```
 
+> 若系统 `TCC.db` 曾残留 `/Applications/SecDisplay.app` 的旧路径拒绝条目（`auth_value=0`），`build_app.sh` 会自动改安装到 `/Applications/SecDisplay/SecDisplay.app` 并清理旧路径，按脚本末尾输出的 `open` 路径启动即可。
+
 命令行方式：
 
 ```bash

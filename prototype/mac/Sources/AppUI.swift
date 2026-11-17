@@ -419,7 +419,7 @@ struct StatusView: View {
                     if model.screenCaptureDenied || model.tccConflictWarning != nil {
                         VStack(alignment: .leading, spacing: 6) {
                             if model.screenCaptureDenied {
-                                Text("需要屏幕录制权限（已暂停采集防循环弹窗，授权后若未自动恢复请点「重启应用」）")
+                                Text("需要屏幕录制权限（已暂停采集防循环弹窗，授权后点「恢复采集」或「重启应用」）")
                                     .font(.caption)
                                     .foregroundStyle(.orange)
                             }
@@ -429,12 +429,18 @@ struct StatusView: View {
                                     .foregroundStyle(.orange)
                             }
                             HStack(spacing: 6) {
+                                Button("恢复采集") {
+                                    _ = cap?.resumeAfterPermissionGranted()
+                                }
+                                .controlSize(.small)
                                 Button("打开录屏设置") {
                                     if let url = URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_ScreenCapture") {
                                         NSWorkspace.shared.open(url)
                                     }
                                 }
                                 .controlSize(.small)
+                            }
+                            HStack(spacing: 6) {
                                 Button("清理冲突并重授权") {
                                     resetScreenCaptureTccEntriesAndOpenSettings()
                                 }
