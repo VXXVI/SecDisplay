@@ -208,7 +208,7 @@ final class AppModel: ObservableObject {
             let b = [24, 16, 8, 0].map { UInt8((code >> UInt32($0)) & 0xFF) }
             actual = String(bytes: b, encoding: .ascii) ?? "未知"
         }
-        capturePath = actual + " · 4 路"
+        capturePath = actual + " · " + (cap?.captureBackendLabel ?? "4 路")
         captureRestarts = cap?.captureRestartCount ?? 0
         totalSent = UInt64(max(0, sender?.totalSent ?? 0))
         uptimeSec = CFAbsoluteTimeGetCurrent() - appStartTime

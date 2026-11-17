@@ -999,13 +999,70 @@ final class Encoder {
 
 }
 
-// MARK: - 采集（截图轮询）
+// MARK: - 采集（SkyLight 合成抓屏为主，SCScreenshotManager 作兜底）
 //
-// 背景：macOS 27 上 ScreenCaptureKit 的 SCStream 无法正确采集 CGVirtualDisplay。
-// 实测过滤器指向虚拟屏（SCDisplay id=54 vendor=0xeeee 与身份日志一致），
-// 但回调里拿到的却是主屏画面；同一时刻 SCScreenshotManager 抓同一块屏是正确的。
-// 落盘对比过：SCStream 帧是主屏 Chrome，SCScreenshotManager 帧是虚拟屏空桌面。
-// 所以这里改用 SCScreenshotManager 轮询：单次约 35ms，4 路并发实测约 45fps。
+// 根因说明：
+//   1. macOS 27 上 SCStream / CGDisplayStream 采集 CGVirtualDisplay 会误抓主屏内容。
+//   2. SCScreenshotManager 每帧经 replayd 向 tccd 发送 1 次 preflight=no + 2 次 preflight=yes
+//      校验；4 路 50fps 轮询很快耗尽 root tccd 的 256 个文件描述符上限（100024 EMFILE），
+//      导致 tccd 偶发报 -3801 / Code=1004 并反复弹出「请求屏幕录制权限」系统弹窗。
+//   3. SkyLight 的 SLSHWCaptureWindowList 直接从 WindowServer 合成并抓取虚拟屏窗口列表，
+//      实测 1000 帧 @ 50fps 零失败、单路 ~74fps，且不经过 replayd preflight=no 弹窗链路。
+//   保留 SCScreenshotManager 作为回退（SECDISPLAY_CAPTURE=sck 或 420v 模式时使用）。
+private enum SkyLightCapture {
+    typealias MainConnFn = @convention(c) () -> UInt32
+    typealias HWCWL = @convention(c) (UInt32, UnsafePointer<UInt32>, UInt32, UInt32) -> Unmanaged<CFArray>?
+
+    private static let syms: (cidFn: MainConnFn, hwFn: HWCWL)? = {
+        let rtld = UnsafeMutableRawPointer(bitPattern: -2)
+        var pCid = dlsym(rtld, "SLSMainConnectionID")
+        var pHw = dlsym(rtld, "SLSHWCaptureWindowList")
+        if pCid == nil || pHw == nil,
+           let h = dlopen("/System/Library/PrivateFrameworks/SkyLight.framework/SkyLight", RTLD_LAZY) {
+            pCid = pCid ?? dlsym(h, "SLSMainConnectionID")
+            pHw = pHw ?? dlsym(h, "SLSHWCaptureWindowList")
+        }
+        guard let c = pCid, let f = pHw else { return nil }
+        return (unsafeBitCast(c, to: MainConnFn.self), unsafeBitCast(f, to: HWCWL.self))
+    }()
+
+    static var isAvailable: Bool { syms != nil }
+
+    static func capturePixelBuffer(_ vdID: CGDirectDisplayID, targetW: Int, targetH: Int) -> CVPixelBuffer? {
+        guard let syms else { return nil }
+        let bounds = CGDisplayBounds(vdID)
+        guard bounds.width > 1, bounds.height > 1 else { return nil }
+        guard let infos = CGWindowListCopyWindowInfo([.optionOnScreenOnly], kCGNullWindowID) as? [[String: Any]] else {
+            return nil
+        }
+        var wids: [UInt32] = []
+        wids.reserveCapacity(16)
+        for info in infos {
+            guard let wid = info[kCGWindowNumber as String] as? UInt32,
+                  let bDict = info[kCGWindowBounds as String] as? [String: Any],
+                  let rect = CGRect(dictionaryRepresentation: bDict as CFDictionary),
+                  rect.width > 0, rect.height > 0,
+                  rect.intersects(bounds) else { continue }
+            let alpha = info[kCGWindowAlpha as String] as? Double ?? 1.0
+            if alpha <= 0.01 { continue }
+            wids.append(wid)
+        }
+        guard !wids.isEmpty else { return nil }
+        let cid = syms.cidFn()
+        // 0x800 = kCGSCaptureIgnoreGlobalClipShape, 0x100 = 2x HiDPI 最高分辨率
+        guard let arr = wids.withUnsafeBufferPointer({ buf in
+            syms.hwFn(cid, buf.baseAddress!, UInt32(buf.count), 0x800 | 0x100)?.takeRetainedValue()
+        }), CFArrayGetCount(arr) > 0,
+        let raw = CFArrayGetValueAtIndex(arr, 0) else {
+            return nil
+        }
+        return withExtendedLifetime(arr) {
+            let img = Unmanaged<CGImage>.fromOpaque(raw).takeUnretainedValue()
+            return makePixelBuffer(from: img, targetW: targetW, targetH: targetH)
+        }
+    }
+}
+
 final class ScreenshotCapture {
     let encoder: Encoder
     private let cfg: Config
@@ -1034,6 +1091,13 @@ final class ScreenshotCapture {
     private var lastMissingDisplayRefreshAt: CFAbsoluteTime = 0
     private var consecutiveCode1004 = 0
     private var firstCode1004At: CFAbsoluteTime = 0
+    private var useSkyLight: Bool = (ProcessInfo.processInfo.environment["SECDISPLAY_CAPTURE"] != "sck"
+                                     && pixelFormatChoice != "420v"
+                                     && SkyLightCapture.isAvailable)
+    private var consecutiveSkyLightFails = 0
+    private var lastSkyLightGrabAt: CFAbsoluteTime = 0
+    var isUsingSkyLight: Bool { withRawLock { useSkyLight } }
+    var captureBackendLabel: String { isUsingSkyLight ? "SLSHW · 2 路" : "SCK · 4 路" }
     private var lastDumpAt: CFAbsoluteTime = 0
     private var dumpSeq = 0
     private var lastErrorLogAt: CFAbsoluteTime = 0
@@ -1189,22 +1253,31 @@ final class ScreenshotCapture {
                 }
             }
         }
-        let content = try await currentContent(forceRefresh: true)
-        // await 期间可能已经收到退出请求，或已被超时的恢复流程接管了新代次，必须放弃旧启动
-        let stillValidStart = withGenLock {
-            !_stopRequested && _startToken == myToken && supervisor == nil
-        }
-        guard stillValidStart else {
-            Log.info("采集启动已取消或被新代次接管，放弃本次启动")
-            return
-        }
-        guard content.displays.contains(where: { isOurVirtualDisplay($0.displayID) }) else {
-            let avail = content.displays.map {
-                String(format: "id=%u vendor=0x%x", $0.displayID, CGDisplayVendorNumber($0.displayID))
+        if !isUsingSkyLight {
+            let content = try await currentContent(forceRefresh: true)
+            // await 期间可能已经收到退出请求，或已被超时的恢复流程接管了新代次，必须放弃旧启动
+            let stillValidStart = withGenLock {
+                !_stopRequested && _startToken == myToken && supervisor == nil
             }
-            throw NSError(domain: "Capture", code: 1, userInfo: [
-                NSLocalizedDescriptionKey: "找不到 SecDisplay 虚拟屏，当前: \(avail.joined(separator: ", "))"
-            ])
+            guard stillValidStart else {
+                Log.info("采集启动已取消或被新代次接管，放弃本次启动")
+                return
+            }
+            guard content.displays.contains(where: { isOurVirtualDisplay($0.displayID) }) else {
+                let avail = content.displays.map {
+                    String(format: "id=%u vendor=0x%x", $0.displayID, CGDisplayVendorNumber($0.displayID))
+                }
+                throw NSError(domain: "Capture", code: 1, userInfo: [
+                    NSLocalizedDescriptionKey: "找不到 SecDisplay 虚拟屏，当前: \(avail.joined(separator: ", "))"
+                ])
+            }
+        } else {
+            let vdID = displayIDProvider()
+            guard vdID != 0, isOurVirtualDisplay(vdID), CGDisplayBounds(vdID).width > 1 else {
+                throw NSError(domain: "Capture", code: 1, userInfo: [
+                    NSLocalizedDescriptionKey: "找不到有效的 SecDisplay 虚拟屏 id=\(vdID)"
+                ])
+            }
         }
         running = true
         spawnWorkers()
@@ -1354,12 +1427,13 @@ final class ScreenshotCapture {
             }
             return false
         }
-        let workers = 4
+        let usingSL = isUsingSkyLight
+        let workers = usingSL ? 2 : 4
         let total = bumpTotalSpawns()
         let gen = bumpWorkerGen()
         lastSupervisorAt = CFAbsoluteTimeGetCurrent()
         lastSupervisorCount = capturedRaw
-        Log.info("采集通道: SCScreenshotManager 轮询，\(workers) 路并发（代次 \(gen)，累计第 \(total) 次）")
+        Log.info("采集通道: \(usingSL ? "SkyLight SLSHWCaptureWindowList" : "SCScreenshotManager") 轮询，\(workers) 路并发（代次 \(gen)，累计第 \(total) 次）")
         for i in 0..<workers {
             Task.detached(priority: .userInitiated) { [weak self] in
                 await self?.loop(index: i, gen: gen)
@@ -1481,75 +1555,122 @@ final class ScreenshotCapture {
 
     private func loop(index: Int, gen: Int) async {
         while stillCurrent(gen: gen) {
-            let t0 = CFAbsoluteTimeGetCurrent()
+            var t0 = CFAbsoluteTimeGetCurrent()
             do {
-                let content = try await currentContent()
-                let foundDisplay = content.displays.first(where: { isOurVirtualDisplay($0.displayID) })
-                let d: SCDisplay
-                if let existing = foundDisplay {
-                    d = existing
-                } else {
-                    let nowMissing = CFAbsoluteTimeGetCurrent()
-                    let shouldRefresh = withRawLock {
-                        if nowMissing - lastMissingDisplayRefreshAt >= 2.0 {
-                            lastMissingDisplayRefreshAt = nowMissing
-                            return true
-                        }
-                        return false
-                    }
-                    if shouldRefresh,
-                       let refreshed = try await currentContent(forceRefresh: true).displays.first(where: { isOurVirtualDisplay($0.displayID) }) {
-                        d = refreshed
-                    } else {
-                        try? await Task.sleep(nanoseconds: 200_000_000)
-                        continue
-                    }
-                }
-                let filter = SCContentFilter(display: d, excludingWindows: [])
-                // 两条采集路径，实测数据（2880x1800，4 路并发）：
-                //   captureImage      + BGRA  : 单帧 ~60ms  → 峰值 60~77fps   【默认】
-                //   captureSampleBuffer+ BGRA  : 单帧 ~130ms → 峰值 35fps
-                //   captureSampleBuffer+ 420v  : 单帧 ~200ms → 峰值 20~37fps
-                // 省内存的 420v 路径要以帧率为代价，而帧率是投屏的第一体验，
-                // 所以默认仍走 captureImage（原路径），
-                // 需要压内存（4K 屏/低内存机器）时用 SECDISPLAY_PIXFMT=420v 显式切换。
                 let wantYUV = pixelFormatChoice == "420v"
                 let (targetW, targetH, _, _) = currentVideoSizeSnapshot()
                 let pb: CVPixelBuffer
-                if wantYUV {
-                    let c = SCStreamConfiguration()
-                    c.width = targetW
-                    c.height = targetH
-                    c.showsCursor = false
-                    c.capturesAudio = false
-                    // 直接要 YUV420 双平面（video range），每帧 7.4MB 而不是 19.8MB，
-                    // 也省掉一次全屏 RGB→YUV 的 CGContext 重绘。
-                    c.pixelFormat = kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange
-                    // 420v/420f 才生效的色度矩阵。不显式指定就由 SCK 自选，
-                    // 一旦与接收端按 709 解释的假设不一致就会偏色（不是黑屏，很难查）。
-                    c.colorMatrix = CGDisplayStream.yCbCrMatrix_ITU_R_709_2
-                    if #available(macOS 14.0, *) { c.captureResolution = .best }
-                    let sb = try await Self.captureSample(c, filter: filter)
-                    guard let buf = CMSampleBufferGetImageBuffer(sb) else {
-                        let t = CFAbsoluteTimeGetCurrent()
-                        if t - lastErrorLogAt > 2.0 {
-                            lastErrorLogAt = t
-                            Log.info("采集样本没有 image buffer，丢弃该帧")
+                if isUsingSkyLight && !wantYUV {
+                    // 按目标帧率节拍门控，避免 2 路 SkyLight 在 70+fps 下过度压迫 WindowServer/编码器
+                    let minGap = (1.0 / max(1.0, cfg.captureHz)) * 0.90
+                    let waitSec: Double = withRawLock {
+                        let nowGate = CFAbsoluteTimeGetCurrent()
+                        let dt = nowGate - lastSkyLightGrabAt
+                        if dt >= minGap {
+                            lastSkyLightGrabAt = nowGate
+                            return 0
                         }
+                        return minGap - dt
+                    }
+                    if waitSec > 0.001 {
+                        try? await Task.sleep(nanoseconds: UInt64(waitSec * 1_000_000_000))
                         continue
                     }
-                    pb = buf
+                    t0 = CFAbsoluteTimeGetCurrent()
+                    let vdID = displayIDProvider()
+                    if vdID != 0,
+                       let buf = SkyLightCapture.capturePixelBuffer(vdID, targetW: targetW, targetH: targetH) {
+                        withRawLock { consecutiveSkyLightFails = 0 }
+                        pb = buf
+                    } else {
+                        if !CGPreflightScreenCaptureAccess() {
+                            try? await Task.sleep(nanoseconds: 150_000_000)
+                            guard stillCurrent(gen: gen) else { return }
+                            if !CGPreflightScreenCaptureAccess() {
+                                let alreadyPaused = permissionPaused
+                                setScreenCaptureDenied(true)
+                                pauseForPermission()
+                                if !alreadyPaused {
+                                    Log.info("屏幕录制权限未授予或已撤销，已暂停采集（请在面板授权后点击「恢复采集」或重启应用）")
+                                }
+                                return
+                            }
+                        }
+                        if CGDisplayIsAsleep(CGMainDisplayID()) != 0 || CGDisplayIsAsleep(vdID) != 0 {
+                            withRawLock { consecutiveSkyLightFails = 0 }
+                            try? await Task.sleep(nanoseconds: 500_000_000)
+                            continue
+                        }
+                        let (fails, switched) = withRawLock { () -> (Int, Bool) in
+                            consecutiveSkyLightFails += 1
+                            if consecutiveSkyLightFails >= 10 && useSkyLight {
+                                useSkyLight = false
+                                return (consecutiveSkyLightFails, true)
+                            }
+                            return (consecutiveSkyLightFails, false)
+                        }
+                        if switched {
+                            Log.info("SkyLight 采集连续失败 \(fails) 次，自动回退至 SCScreenshotManager")
+                            _ = spawnWorkers()
+                            return
+                        }
+                        try? await Task.sleep(nanoseconds: 50_000_000)
+                        continue
+                    }
                 } else {
-                    let c = SCStreamConfiguration()
-                    c.width = targetW
-                    c.height = targetH
-                    c.showsCursor = false
-                    c.capturesAudio = false
-                    // 2x HiDPI 下显式要最高清晰度采样，避免 automatic 在负载时降到逻辑分辨率放大
-                    if #available(macOS 14.0, *) { c.captureResolution = .best }
-                    let img = try await SCScreenshotManager.captureImage(contentFilter: filter, configuration: c)
-                    guard let buf = makePixelBuffer(from: img) else { continue }
-                    pb = buf
+                    let content = try await currentContent()
+                    let foundDisplay = content.displays.first(where: { isOurVirtualDisplay($0.displayID) })
+                    let d: SCDisplay
+                    if let existing = foundDisplay {
+                        d = existing
+                    } else {
+                        let nowMissing = CFAbsoluteTimeGetCurrent()
+                        let shouldRefresh = withRawLock {
+                            if nowMissing - lastMissingDisplayRefreshAt >= 2.0 {
+                                lastMissingDisplayRefreshAt = nowMissing
+                                return true
+                            }
+                            return false
+                        }
+                        if shouldRefresh,
+                           let refreshed = try await currentContent(forceRefresh: true).displays.first(where: { isOurVirtualDisplay($0.displayID) }) {
+                            d = refreshed
+                        } else {
+                            try? await Task.sleep(nanoseconds: 200_000_000)
+                            continue
+                        }
+                    }
+                    let filter = SCContentFilter(display: d, excludingWindows: [])
+                    if wantYUV {
+                        let c = SCStreamConfiguration()
+                        c.width = targetW
+                        c.height = targetH
+                        c.showsCursor = false
+                        c.capturesAudio = false
+                        c.pixelFormat = kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange
+                        c.colorMatrix = CGDisplayStream.yCbCrMatrix_ITU_R_709_2
+                        if #available(macOS 14.0, *) { c.captureResolution = .best }
+                        let sb = try await Self.captureSample(c, filter: filter)
+                        guard let buf = CMSampleBufferGetImageBuffer(sb) else {
+                            let t = CFAbsoluteTimeGetCurrent()
+                            if t - lastErrorLogAt > 2.0 {
+                                lastErrorLogAt = t
+                                Log.info("采集样本没有 image buffer，丢弃该帧")
+                            }
+                            continue
+                        }
+                        pb = buf
+                    } else {
+                        let c = SCStreamConfiguration()
+                        c.width = targetW
+                        c.height = targetH
+                        c.showsCursor = false
+                        c.capturesAudio = false
+                        if #available(macOS 14.0, *) { c.captureResolution = .best }
+                        let img = try await SCScreenshotManager.captureImage(contentFilter: filter, configuration: c)
+                        guard let buf = makePixelBuffer(from: img, targetW: targetW, targetH: targetH) else { continue }
+                        pb = buf
+                    }
                 }
                 let now = CFAbsoluteTimeGetCurrent()
                 // 旧代次 worker 可能刚从一个长 await 里返回（单帧 60ms 甚至更久），
@@ -1819,8 +1940,8 @@ final class ScreenshotCapture {
 /// 默认采集路径用它：captureImage 给 CGImage，编码器要吃 CVPixelBuffer。
 /// 这一步是全屏 CGContext 重绘，2880x1800 下每帧 19.8MB、约 20ms；
 /// SECDISPLAY_PIXFMT=420v 走 captureSampleBuffer 时不需要它。
-func makePixelBuffer(from img: CGImage) -> CVPixelBuffer? {
-    let w = img.width, h = img.height
+func makePixelBuffer(from img: CGImage, targetW: Int? = nil, targetH: Int? = nil) -> CVPixelBuffer? {
+    let w = targetW ?? img.width, h = targetH ?? img.height
     var pb: CVPixelBuffer?
     let attrs: [CFString: Any] = [
         kCVPixelBufferIOSurfacePropertiesKey: [:] as CFDictionary,
@@ -4699,10 +4820,17 @@ if appRole == .sender {
     Task {
         let preflightOk = CGPreflightScreenCaptureAccess()
         Log.info("屏幕录制权限预检: \(preflightOk ? "已授权" : "未授权")")
+        let didPromptKey = "SecDisplayDidRequestScreenCapture"
         if !preflightOk {
             setScreenCaptureDenied(true)
-            // 只触发一次系统授权请求，之后静默用 CGPreflightScreenCaptureAccess 轮询，绝不反复弹窗
-            _ = CGRequestScreenCaptureAccess()
+            // 整个应用生命周期内仅在首次未授权时主动触发一次系统授权请求；
+            // 若用户已拒绝或手动关闭权限，后续重启绝不再次弹窗打扰，仅静默等待用户在系统设置授权。
+            if !UserDefaults.standard.bool(forKey: didPromptKey) {
+                UserDefaults.standard.set(true, forKey: didPromptKey)
+                _ = CGRequestScreenCaptureAccess()
+            } else {
+                Log.info("之前已请求过录屏权限且当前未授权，静默等待授权（不再自动弹窗）")
+            }
             while !CGPreflightScreenCaptureAccess() {
                 try? await Task.sleep(nanoseconds: 2_000_000_000)
                 if vdInst.displayID == 0 || capInst.isStopRequested { return }
@@ -4710,6 +4838,8 @@ if appRole == .sender {
             if vdInst.displayID == 0 || capInst.isStopRequested { return }
             setScreenCaptureDenied(false)
             Log.info("屏幕录制权限已通过预检，开始启动采集")
+        } else {
+            UserDefaults.standard.set(true, forKey: didPromptKey)
         }
         do {
             try await capInst.start()
