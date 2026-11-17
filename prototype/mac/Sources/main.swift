@@ -4820,8 +4820,15 @@ if appRole == .sender {
         Log.info("屏幕录制权限预检: \(preflightOk ? "已授权" : "未授权")")
         if !preflightOk {
             setScreenCaptureDenied(true)
-            // 只触发一次系统授权请求，之后静默用 CGPreflightScreenCaptureAccess 轮询，绝不反复弹窗
-            _ = CGRequestScreenCaptureAccess()
+            // 整个应用生命周期内仅在首次未授权时主动触发一次系统授权请求；
+            // 若用户已拒绝或手动关闭权限，后续重启绝不再次弹窗打扰，仅静默等待用户在系统设置授权。
+            let didPromptKey = "SecDisplayDidRequestScreenCapture"
+            if !UserDefaults.standard.bool(forKey: didPromptKey) {
+                UserDefaults.standard.set(true, forKey: didPromptKey)
+                _ = CGRequestScreenCaptureAccess()
+            } else {
+                Log.info("之前已请求过录屏权限且当前未授权，静默等待授权（不再自动弹窗）")
+            }
             while !CGPreflightScreenCaptureAccess() {
                 try? await Task.sleep(nanoseconds: 2_000_000_000)
                 if vdInst.displayID == 0 || capInst.isStopRequested { return }
@@ -4829,6 +4836,8 @@ if appRole == .sender {
             if vdInst.displayID == 0 || capInst.isStopRequested { return }
             setScreenCaptureDenied(false)
             Log.info("屏幕录制权限已通过预检，开始启动采集")
+        } else {
+            UserDefaults.standard.set(true, forKey: "SecDisplayDidRequestScreenCapture")
         }
         do {
             try await capInst.start()
