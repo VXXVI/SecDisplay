@@ -1026,10 +1026,11 @@ final class ScreenshotCapture {
     private(set) var actualFormatCode: UInt32 = 0
 
     private let encodeQueue = DispatchQueue(label: "SecDisplay.encode")
-    private var running = false
     private var cachedContent: SCShareableContent?
     private var cachedAt: CFAbsoluteTime = 0
+    private var contentGen: Int = 0
     private var inFlightContentTask: Task<SCShareableContent, Error>?
+    private var inFlightContentGen: Int = 0
     private var lastMissingDisplayRefreshAt: CFAbsoluteTime = 0
     private var lastDumpAt: CFAbsoluteTime = 0
     private var dumpSeq = 0
@@ -1044,12 +1045,18 @@ final class ScreenshotCapture {
     /// 采集缓冲就翻一倍（每个 worker 同时持有 CGImage + CVPixelBuffer 约 40MB）。
     /// 写方是 supervisor 队列，读方是 worker 任务，用锁保护。
     private let genLock = NSLock()
+    private var _running = false
+    private var _permissionPaused = false
     private var _workerGen = 0
-    /// 已请求停止的粘滞标志。stop() 置位，start() 在 await 返回后必须检查 ——
-    /// 否则退出请求若落在 start() 的 await 期间，start() 恢复后会把 running
-    /// 置回 true 并重新起 worker，而 shutdown 已经走到 destroy 虚拟屏那一步，
-    /// destroy 会被静默拒绝，留下孤儿屏。
     private var _stopRequested = false
+    private var running: Bool {
+        get { genLock.lock(); defer { genLock.unlock() }; return _running }
+        set { genLock.lock(); _running = newValue; genLock.unlock() }
+    }
+    private var permissionPaused: Bool {
+        get { genLock.lock(); defer { genLock.unlock() }; return _permissionPaused }
+        set { genLock.lock(); _permissionPaused = newValue; genLock.unlock() }
+    }
     private var workerGen: Int {
         genLock.lock(); defer { genLock.unlock() }
         return _workerGen
@@ -1177,7 +1184,21 @@ final class ScreenshotCapture {
         supervisor = DispatchSource.makeTimerSource(queue: DispatchQueue(label: "SecDisplay.capture.sup"))
         supervisor?.schedule(deadline: .now() + 3, repeating: 3)
         supervisor?.setEventHandler { [weak self] in
-            guard let self, self.running, !self.stopRequested else { return }
+            guard let self else { return }
+            let isStop = self.stopRequested
+            guard !isStop else { return }
+            if self.permissionPaused || isScreenCaptureDenied() {
+                if CGPreflightScreenCaptureAccess() {
+                    self.permissionPaused = false
+                    setScreenCaptureDenied(false)
+                    self.resetCaptureCounters()
+                    if self.spawnWorkers() {
+                        Log.info("屏幕录制权限已就绪，自动恢复采集")
+                    }
+                }
+                return
+            }
+            guard self.running else { return }
             let now = CFAbsoluteTimeGetCurrent()
 
             // 显示器睡眠时采集本来就拿不到帧，不是故障。此时既不判停滞也不重启，
@@ -1300,14 +1321,22 @@ final class ScreenshotCapture {
         return true
     }
 
+    func pauseForPermission() {
+        genLock.lock()
+        _permissionPaused = true
+        _workerGen &+= 1
+        genLock.unlock()
+    }
+
     /// 停止采集。这是同步函数（只置标志 + 自增代次），调用方不需要
     /// 放到 Task 里 —— 放进去反而让「采集是否停下」取决于调度器。
     func stop() {
         genLock.lock()
         _stopRequested = true
+        _running = false
+        _permissionPaused = false
         _workerGen &+= 1
         genLock.unlock()
-        running = false
         // 停掉看护，避免清理过程中还在判定停滞
         supervisor?.cancel()
         supervisor = nil
@@ -1317,11 +1346,11 @@ final class ScreenshotCapture {
     /// 借 genLock 建立内存屏障，避免 stop() 的写入对 worker 不可见。
     private func stillCurrent(gen: Int) -> Bool {
         genLock.lock(); defer { genLock.unlock() }
-        return _workerGen == gen && !_stopRequested
+        return _running && _workerGen == gen && !_stopRequested && !_permissionPaused
     }
 
     private func loop(index: Int, gen: Int) async {
-        while running && stillCurrent(gen: gen) {
+        while stillCurrent(gen: gen) {
             let t0 = CFAbsoluteTimeGetCurrent()
             do {
                 let content = try await currentContent()
@@ -1464,12 +1493,14 @@ final class ScreenshotCapture {
                 let nsErr = error as NSError
                 let isDenied = (nsErr.domain == "com.apple.ScreenCaptureKit.SCStreamErrorDomain" &&
                                 nsErr.code == SCStreamError.userDeclined.rawValue) ||
-                               nsErr.localizedDescription.lowercased().contains("declined") ||
                                !CGPreflightScreenCaptureAccess()
                 if isDenied {
+                    let alreadyPaused = permissionPaused
                     setScreenCaptureDenied(true)
-                    Log.info("屏幕录制权限未授予或被系统弹窗拒绝，已暂停采集以防循环弹窗（请授权后在面板重连或重启）")
-                    stop()
+                    pauseForPermission()
+                    if !alreadyPaused {
+                        Log.info("屏幕录制权限未授予或被系统弹窗拒绝，已暂停采集防循环弹窗（授权后将自动恢复）")
+                    }
                     return
                 }
                 let now = CFAbsoluteTimeGetCurrent()
@@ -1555,42 +1586,51 @@ final class ScreenshotCapture {
         enum FetchAction {
             case cached(SCShareableContent)
             case join(Task<SCShareableContent, Error>)
-            case start(Task<SCShareableContent, Error>)
+            case start(Task<SCShareableContent, Error>, Int)
         }
         let action: FetchAction = withRawLock {
             if forceRefresh || rebuild {
+                contentGen &+= 1
                 cachedContent = nil
                 cachedAt = 0
             }
             if let c = cachedContent, now - cachedAt < 300.0 {
                 return .cached(c)
             }
-            if let existing = inFlightContentTask {
+            if let existing = inFlightContentTask, inFlightContentGen == contentGen {
                 return .join(existing)
             }
+            let myGen = contentGen
             let t = Task<SCShareableContent, Error> {
                 try await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: false)
             }
             inFlightContentTask = t
-            return .start(t)
+            inFlightContentGen = myGen
+            return .start(t, myGen)
         }
         switch action {
         case .cached(let c):
             return c
         case .join(let t):
             return try await t.value
-        case .start(let t):
+        case .start(let t, let myGen):
             do {
                 let c = try await t.value
                 withRawLock {
-                    cachedContent = c
-                    cachedAt = CFAbsoluteTimeGetCurrent()
-                    inFlightContentTask = nil
+                    if contentGen == myGen {
+                        cachedContent = c
+                        cachedAt = CFAbsoluteTimeGetCurrent()
+                    }
+                    if inFlightContentGen == myGen {
+                        inFlightContentTask = nil
+                    }
                 }
                 return c
             } catch {
                 withRawLock {
-                    inFlightContentTask = nil
+                    if inFlightContentGen == myGen {
+                        inFlightContentTask = nil
+                    }
                 }
                 throw error
             }
@@ -4257,8 +4297,8 @@ func detectConflictingTccPathEntry() -> String? {
     } catch {
         return nil
     }
-    p.waitUntilExit()
     let data = pipe.fileHandleForReading.readDataToEndOfFile()
+    p.waitUntilExit()
     guard let out = String(data: data, encoding: .utf8) else { return nil }
     let bundlePath = Bundle.main.bundlePath
     let exePath = Bundle.main.executablePath ?? ""
@@ -4275,20 +4315,34 @@ func resetScreenCaptureTccEntriesAndOpenSettings() {
     let bundleID = Bundle.main.bundleIdentifier ?? "com.secdisplay.screensender"
     let bundlePath = Bundle.main.bundlePath
     DispatchQueue.global(qos: .userInitiated).async {
+        var allOk = true
         for target in [bundleID, bundlePath] where !target.isEmpty {
             let p = Process()
             p.executableURL = URL(fileURLWithPath: "/usr/bin/tccutil")
             p.arguments = ["reset", "ScreenCapture", target]
             p.standardOutput = FileHandle.nullDevice
             p.standardError = FileHandle.nullDevice
-            try? p.run()
-            p.waitUntilExit()
+            do {
+                try p.run()
+                p.waitUntilExit()
+                if p.terminationStatus != 0 { allOk = false }
+            } catch {
+                allOk = false
+            }
         }
         DispatchQueue.main.async {
+            let cmd = "tccutil reset ScreenCapture \(bundleID) && tccutil reset ScreenCapture \"\(bundlePath)\""
+            if !allOk {
+                let pb = NSPasteboard.general
+                pb.clearContents()
+                pb.setString(cmd, forType: .string)
+                Log.info("提示: 应用内调 tccutil 未能完全重置，已复制终端修复命令到剪贴板: \(cmd)")
+            } else {
+                Log.info("已重置 SecDisplay 录屏授权条目并打开系统设置，请勾选 SecDisplay 后点「重启应用」")
+            }
             if let url = URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_ScreenCapture") {
                 NSWorkspace.shared.open(url)
             }
-            Log.info("已重置 SecDisplay 录屏授权条目并打开系统设置，请重新勾选后重启应用")
         }
     }
 }
@@ -4879,6 +4933,13 @@ final class ClientWatchdog {
     private func tick() {
         guard !fired else { return }
         let now = CFAbsoluteTimeGetCurrent()
+        if isScreenCaptureDenied() {
+            // 等待用户授予屏幕录制权限期间暂停看门狗倒计时，防止 180 秒后误杀进程
+            startedAt = now
+            if everConnected { lastConnectedAt = now }
+            linkDownSince = nil
+            return
+        }
         let link = currentLink()
         let connected = sender?.connected ?? false
 
