@@ -1028,7 +1028,7 @@ private enum SkyLightCapture {
 
     static var isAvailable: Bool { syms != nil }
 
-    static func captureVirtualDisplay(_ vdID: CGDirectDisplayID) -> CGImage? {
+    static func capturePixelBuffer(_ vdID: CGDirectDisplayID, targetW: Int, targetH: Int) -> CVPixelBuffer? {
         guard let syms else { return nil }
         let bounds = CGDisplayBounds(vdID)
         guard bounds.width > 1, bounds.height > 1 else { return nil }
@@ -1056,7 +1056,10 @@ private enum SkyLightCapture {
         let raw = CFArrayGetValueAtIndex(arr, 0) else {
             return nil
         }
-        return Unmanaged<CGImage>.fromOpaque(raw).takeUnretainedValue()
+        return withExtendedLifetime(arr) {
+            let img = Unmanaged<CGImage>.fromOpaque(raw).takeUnretainedValue()
+            return makePixelBuffer(from: img, targetW: targetW, targetH: targetH)
+        }
     }
 }
 
@@ -1576,8 +1579,7 @@ final class ScreenshotCapture {
                     t0 = CFAbsoluteTimeGetCurrent()
                     let vdID = displayIDProvider()
                     if vdID != 0,
-                       let img = SkyLightCapture.captureVirtualDisplay(vdID),
-                       let buf = makePixelBuffer(from: img, targetW: targetW, targetH: targetH) {
+                       let buf = SkyLightCapture.capturePixelBuffer(vdID, targetW: targetW, targetH: targetH) {
                         withRawLock { consecutiveSkyLightFails = 0 }
                         pb = buf
                     } else {
@@ -4818,11 +4820,11 @@ if appRole == .sender {
     Task {
         let preflightOk = CGPreflightScreenCaptureAccess()
         Log.info("屏幕录制权限预检: \(preflightOk ? "已授权" : "未授权")")
+        let didPromptKey = "SecDisplayDidRequestScreenCapture"
         if !preflightOk {
             setScreenCaptureDenied(true)
             // 整个应用生命周期内仅在首次未授权时主动触发一次系统授权请求；
             // 若用户已拒绝或手动关闭权限，后续重启绝不再次弹窗打扰，仅静默等待用户在系统设置授权。
-            let didPromptKey = "SecDisplayDidRequestScreenCapture"
             if !UserDefaults.standard.bool(forKey: didPromptKey) {
                 UserDefaults.standard.set(true, forKey: didPromptKey)
                 _ = CGRequestScreenCaptureAccess()
@@ -4837,7 +4839,7 @@ if appRole == .sender {
             setScreenCaptureDenied(false)
             Log.info("屏幕录制权限已通过预检，开始启动采集")
         } else {
-            UserDefaults.standard.set(true, forKey: "SecDisplayDidRequestScreenCapture")
+            UserDefaults.standard.set(true, forKey: didPromptKey)
         }
         do {
             try await capInst.start()
