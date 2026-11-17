@@ -138,19 +138,37 @@ fi
 
 echo "已生成 $APP"
 
+INSTALL_APP="/Applications/SecDisplay.app"
 if [ "$INSTALL" = "1" ]; then
-    rm -rf "/Applications/SecDisplay.app"
+    OLD_RUNNING=0
+    if pgrep -f "SecDisplay.app/Contents/MacOS/SecDisplay" >/dev/null 2>&1; then
+        OLD_RUNNING=1
+    fi
+    HAS_ROOT_PATH_DENY=""
+    if [ -r "/Library/Application Support/com.apple.TCC/TCC.db" ] && command -v sqlite3 >/dev/null 2>&1; then
+        HAS_ROOT_PATH_DENY="$(sqlite3 -readonly "/Library/Application Support/com.apple.TCC/TCC.db" \
+            "SELECT client FROM access WHERE service='kTCCServiceScreenCapture' AND client_type=1 AND auth_value=0 AND client='/Applications/SecDisplay.app';" 2>/dev/null || true)"
+    fi
+    if [ -n "$HAS_ROOT_PATH_DENY" ]; then
+        INSTALL_APP="/Applications/SecDisplay/SecDisplay.app"
+        mkdir -p "/Applications/SecDisplay"
+        if [ -e "/Applications/SecDisplay.app" ]; then
+            rm -rf "/Applications/SecDisplay.app"
+        fi
+        echo "检测到 TCC.db 存在 /Applications/SecDisplay.app 路径拒绝记录 (auth=0)，改安装到 $INSTALL_APP 以绕开冲突并使 bundle ID 授权生效"
+    fi
+    rm -rf "$INSTALL_APP"
     # 用 ditto 而不是 cp -R：它会保留扩展属性与资源分支，签名校验更稳。
-    ditto "$APP" "/Applications/SecDisplay.app"
-    echo "已安装到 /Applications/SecDisplay.app"
-    if pgrep -f "/Applications/SecDisplay.app/Contents/MacOS/SecDisplay" >/dev/null 2>&1; then
-        echo "提示: 检测到旧实例正在运行，先退出旧实例后再重新 open /Applications/SecDisplay.app"
+    ditto "$APP" "$INSTALL_APP"
+    echo "已安装到 $INSTALL_APP"
+    if [ "$OLD_RUNNING" = "1" ]; then
+        echo "提示: 检测到旧实例正在运行，先退出旧实例后再重新 open \"$INSTALL_APP\""
     fi
     if [ -r "/Library/Application Support/com.apple.TCC/TCC.db" ] && command -v sqlite3 >/dev/null 2>&1; then
         STALE_TCC="$(sqlite3 -readonly "/Library/Application Support/com.apple.TCC/TCC.db" \
-            "SELECT client FROM access WHERE service='kTCCServiceScreenCapture' AND client_type=1 AND auth_value=0 AND (client LIKE '%/SecDisplay.app%' OR client LIKE '%/screensender');" 2>/dev/null || true)"
+            "SELECT client FROM access WHERE service='kTCCServiceScreenCapture' AND client_type=1 AND auth_value=0 AND client != '/Applications/SecDisplay.app' AND (client LIKE '%/SecDisplay.app%' OR client LIKE '%/screensender');" 2>/dev/null || true)"
         if [ -n "$STALE_TCC" ]; then
-            echo "警告: 检测到 TCC.db 中存在冲突的旧路径拒绝记录:"
+            echo "警告: 检测到 TCC.db 中还存在其他冲突路径拒绝记录:"
             echo "$STALE_TCC"
             echo "这会导致 macOS 反复弹出录制权限窗口。请在「系统设置 → 隐私与安全性 → 录屏与系统录音」用「-」删除旧条目后重加，或执行 tccutil reset ScreenCapture com.secdisplay.screensender（全部重置可用 tccutil reset ScreenCapture）"
         fi
@@ -159,7 +177,7 @@ fi
 
 echo
 if [ "$INSTALL" = "1" ]; then
-    echo "启动: open /Applications/SecDisplay.app"
+    echo "启动: open \"$INSTALL_APP\""
 else
     echo "启动: open \"$WORK/SecDisplay.app\""
     echo "  （未安装模式，产物在临时目录 $WORK，系统重启或手动清理后消失；"

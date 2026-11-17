@@ -53,6 +53,7 @@ final class AppModel: ObservableObject {
     @Published var senderRoleConflict: String? = nil
     @Published var screenCaptureDenied = false
     @Published var tccConflictWarning: String? = nil
+    @Published var resumeFeedback: String? = nil
     /// 光标的发送计数（位置 / 图像）
     @Published var cursorPosSent = 0
     @Published var cursorImgSent = 0
@@ -214,6 +215,7 @@ final class AppModel: ObservableObject {
         peer = sender?.peerDescription ?? "-"
         senderRoleConflict = sender?.roleConflictMessage
         screenCaptureDenied = isScreenCaptureDenied()
+        if !screenCaptureDenied { resumeFeedback = nil }
         tccConflictWarning = currentTccConflictWarning()
         cursorPosSent = cursor?.sentCount ?? 0
         cursorImgSent = cursorImage?.sentCount ?? 0
@@ -419,7 +421,7 @@ struct StatusView: View {
                     if model.screenCaptureDenied || model.tccConflictWarning != nil {
                         VStack(alignment: .leading, spacing: 6) {
                             if model.screenCaptureDenied {
-                                Text("需要屏幕录制权限（已暂停采集防循环弹窗，授权后若未自动恢复请点「重启应用」）")
+                                Text("需要屏幕录制权限（已暂停采集防循环弹窗，授权后点「恢复采集」或「重启应用」）")
                                     .font(.caption)
                                     .foregroundStyle(.orange)
                             }
@@ -428,13 +430,30 @@ struct StatusView: View {
                                     .font(.caption)
                                     .foregroundStyle(.orange)
                             }
+                            if let hint = model.resumeFeedback {
+                                Text(hint)
+                                    .font(.caption2)
+                                    .foregroundStyle(.red)
+                            }
                             HStack(spacing: 6) {
+                                Button("恢复采集") {
+                                    if let c = cap {
+                                        let err = c.resumeAfterPermissionGranted()
+                                        model.resumeFeedback = err
+                                        if err == nil { model.refresh() }
+                                    } else {
+                                        model.resumeFeedback = "采集器尚未初始化，请点「重启应用」"
+                                    }
+                                }
+                                .controlSize(.small)
                                 Button("打开录屏设置") {
                                     if let url = URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_ScreenCapture") {
                                         NSWorkspace.shared.open(url)
                                     }
                                 }
                                 .controlSize(.small)
+                            }
+                            HStack(spacing: 6) {
                                 Button("清理冲突并重授权") {
                                     resetScreenCaptureTccEntriesAndOpenSettings()
                                 }

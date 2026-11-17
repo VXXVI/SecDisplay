@@ -1032,6 +1032,8 @@ final class ScreenshotCapture {
     private var inFlightContentTask: Task<SCShareableContent, Error>?
     private var inFlightContentGen: Int = 0
     private var lastMissingDisplayRefreshAt: CFAbsoluteTime = 0
+    private var consecutiveCode1004 = 0
+    private var firstCode1004At: CFAbsoluteTime = 0
     private var lastDumpAt: CFAbsoluteTime = 0
     private var dumpSeq = 0
     private var lastErrorLogAt: CFAbsoluteTime = 0
@@ -1047,6 +1049,11 @@ final class ScreenshotCapture {
     private let genLock = NSLock()
     private var _running = false
     private var _permissionPaused = false
+    private var _runtimeDenyCount = 0
+    private var _startInProgress = false
+    private var _startInProgressSince: CFAbsoluteTime = 0
+    private var _startToken = 0
+    private var _lastManualResumeAt: CFAbsoluteTime = 0
     private var _workerGen = 0
     private var _stopRequested = false
     private var running: Bool {
@@ -1056,6 +1063,14 @@ final class ScreenshotCapture {
     private var permissionPaused: Bool {
         get { genLock.lock(); defer { genLock.unlock() }; return _permissionPaused }
         set { genLock.lock(); _permissionPaused = newValue; genLock.unlock() }
+    }
+    private var runtimeDenyCount: Int {
+        genLock.lock(); defer { genLock.unlock() }
+        return _runtimeDenyCount
+    }
+    private func withGenLock<T>(_ body: () -> T) -> T {
+        genLock.lock(); defer { genLock.unlock() }
+        return body()
     }
     private var workerGen: Int {
         genLock.lock(); defer { genLock.unlock() }
@@ -1156,11 +1171,31 @@ final class ScreenshotCapture {
     }
 
     func start() async throws {
+        let myToken: Int? = withGenLock {
+            if _stopRequested || _startInProgress || supervisor != nil {
+                return nil
+            }
+            _startToken &+= 1
+            _startInProgress = true
+            _startInProgressSince = CFAbsoluteTimeGetCurrent()
+            return _startToken
+        }
+        guard let myToken else { return }
+        defer {
+            withGenLock {
+                if _startToken == myToken {
+                    _startInProgress = false
+                    _startInProgressSince = 0
+                }
+            }
+        }
         let content = try await currentContent(forceRefresh: true)
-        // await 期间可能已经收到退出请求，这时必须放弃启动，否则会把
-        // running 置回 true 并在 shutdown 清理虚拟屏时仍在采集。
-        if stopRequested {
-            Log.info("启动过程中已收到停止请求，放弃启动采集")
+        // await 期间可能已经收到退出请求，或已被超时的恢复流程接管了新代次，必须放弃旧启动
+        let stillValidStart = withGenLock {
+            !_stopRequested && _startToken == myToken && supervisor == nil
+        }
+        guard stillValidStart else {
+            Log.info("采集启动已取消或被新代次接管，放弃本次启动")
             return
         }
         guard content.displays.contains(where: { isOurVirtualDisplay($0.displayID) }) else {
@@ -1181,14 +1216,17 @@ final class ScreenshotCapture {
         // 关键：卡在 await 里的 Task 不会返回，代次对它们无效 —— 每次重启都是
         // 净增 4 个僵尸线程。实测日志里代次一路涨到 104，等于 400 多个线程。
         // 因此这里必须限次退避，不能无限重启。
-        supervisor = DispatchSource.makeTimerSource(queue: DispatchQueue(label: "SecDisplay.capture.sup"))
-        supervisor?.schedule(deadline: .now() + 3, repeating: 3)
-        supervisor?.setEventHandler { [weak self] in
+        let sup = DispatchSource.makeTimerSource(queue: DispatchQueue(label: "SecDisplay.capture.sup"))
+        sup.schedule(deadline: .now() + 3, repeating: 3)
+        sup.setEventHandler { [weak self] in
             guard let self else { return }
             let isStop = self.stopRequested
             guard !isStop else { return }
             if self.permissionPaused || isScreenCaptureDenied() {
-                if CGPreflightScreenCaptureAccess() {
+                // 仅在尚未发生过运行期拒绝/1004 暂停（runtimeDenyCount == 0）时自动恢复（如启动后用户在设置勾选）；
+                // 一旦运行期触发过权限拒绝/1004 暂停（runtimeDenyCount >= 1），绝不自动重拉 worker，
+                // 避免 CGPreflightScreenCaptureAccess() 毫秒级抖动导致无限循环弹窗。
+                if self.runtimeDenyCount == 0 && CGPreflightScreenCaptureAccess() {
                     self.permissionPaused = false
                     setScreenCaptureDenied(false)
                     self.resetCaptureCounters()
@@ -1284,7 +1322,16 @@ final class ScreenshotCapture {
                 }
             }
         }
-        supervisor?.resume()
+        let installed = withGenLock { () -> Bool in
+            if _stopRequested || _startToken != myToken || supervisor != nil { return false }
+            supervisor = sup
+            return true
+        }
+        guard installed else {
+            sup.cancel()
+            return
+        }
+        sup.resume()
     }
 
     /// 拉起采集工作线程。返回 false 表示已到总量上限，没有真的拉起。
@@ -1324,8 +1371,90 @@ final class ScreenshotCapture {
     func pauseForPermission() {
         genLock.lock()
         _permissionPaused = true
+        _runtimeDenyCount &+= 1
         _workerGen &+= 1
         genLock.unlock()
+    }
+
+    /// 返回 nil 表示已恢复或已触发启动；非 nil 为界面可直接展示的阻断原因。
+    @discardableResult
+    func resumeAfterPermissionGranted() -> String? {
+        guard !stopRequested else { return "采集器正在停止，请点「重启应用」" }
+        guard CGPreflightScreenCaptureAccess() else {
+            setScreenCaptureDenied(true)
+            Log.info("屏幕录制权限仍未就绪，请在系统设置勾选 SecDisplay 后再试")
+            return "仍未检测到录屏授权，请在系统设置勾选 SecDisplay 后再试"
+        }
+        let now = CFAbsoluteTimeGetCurrent()
+        enum Action { case throttled, respawn, startNew, waiting }
+        var clearStuckInFlight = false
+        let action: Action = withGenLock {
+            if now - _lastManualResumeAt < 1.0 {
+                return .throttled
+            }
+            _lastManualResumeAt = now
+            let hasSupervisor = (supervisor != nil)
+            if _startInProgress && _startInProgressSince > 0 && now - _startInProgressSince > 6.0 {
+                _startToken &+= 1
+                _startInProgress = false
+                _startInProgressSince = 0
+                clearStuckInFlight = true
+            }
+            _permissionPaused = false
+            if hasSupervisor {
+                _running = true
+                return .respawn
+            }
+            return _startInProgress ? .waiting : .startNew
+        }
+        if action == .throttled {
+            return "点击过于频繁，请 1 秒后再试"
+        }
+        setScreenCaptureDenied(false)
+        resetCaptureCounters()
+        withRawLock {
+            contentGen &+= 1
+            cachedContent = nil
+            cachedAt = 0
+            if clearStuckInFlight { inFlightContentTask = nil }
+            consecutiveCode1004 = 0
+            firstCode1004At = 0
+        }
+        switch action {
+        case .throttled:
+            return "点击过于频繁，请 1 秒后再试"
+        case .respawn:
+            if spawnWorkers() {
+                Log.info("已手动恢复屏幕录制采集")
+                return nil
+            }
+            setScreenCaptureDenied(true)
+            Log.info("采集线程已达重建上限，请点击「重启应用」恢复")
+            return "采集线程已达重建上限，请点「重启应用」"
+        case .startNew:
+            Log.info("已手动触发启动屏幕录制采集")
+            Task { [weak self] in
+                guard let self else { return }
+                do {
+                    try await self.start()
+                } catch {
+                    let nsErr = error as NSError
+                    let isPerm = (nsErr.domain == "com.apple.ScreenCaptureKit.SCStreamErrorDomain" &&
+                                  nsErr.code == SCStreamError.userDeclined.rawValue) ||
+                                 !CGPreflightScreenCaptureAccess()
+                    Log.info("手动恢复启动采集失败: \(error)")
+                    if isPerm {
+                        setScreenCaptureDenied(true)
+                    } else {
+                        setTccConflictWarning("采集启动失败（\(error.localizedDescription)），请点「重启应用」")
+                    }
+                }
+            }
+            return nil
+        case .waiting:
+            Log.info("屏幕录制权限已就绪，正在等待采集启动")
+            return nil
+        }
     }
 
     /// 停止采集。这是同步函数（只置标志 + 自增代次），调用方不需要
@@ -1336,10 +1465,11 @@ final class ScreenshotCapture {
         _running = false
         _permissionPaused = false
         _workerGen &+= 1
+        let sup = supervisor
+        supervisor = nil
         genLock.unlock()
         // 停掉看护，避免清理过程中还在判定停滞
-        supervisor?.cancel()
-        supervisor = nil
+        sup?.cancel()
     }
 
     /// 当前 worker 是否仍应继续（代次未变且未请求停止）。
@@ -1424,10 +1554,14 @@ final class ScreenshotCapture {
                 let now = CFAbsoluteTimeGetCurrent()
                 // 旧代次 worker 可能刚从一个长 await 里返回（单帧 60ms 甚至更久），
                 // 这里再确认一次代次/运行状态，避免逐个多发一帧干扰看护判断。
-                guard running && stillCurrent(gen: gen) else { return }
+                guard stillCurrent(gen: gen) else { return }
                 // 采集健康度计数：在 encode 之前自增，不含编码与排队时间。
                 // 看护用它判断采集本身是否正常，避免 VT 变慢时被误判成采集卡死。
                 bumpCapturedRaw()
+                withRawLock {
+                    consecutiveCode1004 = 0
+                    firstCode1004At = 0
+                }
                 let fw = CVPixelBufferGetWidth(pb)
                 let fh = CVPixelBufferGetHeight(pb)
                 let actualFmt = CVPixelBufferGetPixelFormatType(pb)
@@ -1491,17 +1625,60 @@ final class ScreenshotCapture {
                 }
             } catch {
                 let nsErr = error as NSError
-                let isDenied = (nsErr.domain == "com.apple.ScreenCaptureKit.SCStreamErrorDomain" &&
-                                nsErr.code == SCStreamError.userDeclined.rawValue) ||
-                               !CGPreflightScreenCaptureAccess()
+                let isUserDeclined = (nsErr.domain == "com.apple.ScreenCaptureKit.SCStreamErrorDomain" &&
+                                      nsErr.code == SCStreamError.userDeclined.rawValue)
+                let isCode1004 = (nsErr.domain == "com.apple.ScreenCaptureKit.CoreGraphicsErrorDomain" &&
+                                  nsErr.code == 1004)
+                var isDenied = false
+                if !CGPreflightScreenCaptureAccess() {
+                    // 实测 Code=1004 / -3801 伴随 TCC 抖动时 preflight 可能在 2~11ms 内从 false 跳回 true，
+                    // 间隔 150ms 二次确认再判为权限拒绝，避免单次瞬态抖动误触发永久停采。
+                    try? await Task.sleep(nanoseconds: 150_000_000)
+                    guard stillCurrent(gen: gen) else { return }
+                    if !CGPreflightScreenCaptureAccess() {
+                        isDenied = true
+                    }
+                }
                 if isDenied {
                     let alreadyPaused = permissionPaused
                     setScreenCaptureDenied(true)
                     pauseForPermission()
                     if !alreadyPaused {
-                        Log.info("屏幕录制权限未授予或被系统弹窗拒绝，已暂停采集防循环弹窗（授权后将自动恢复）")
+                        Log.info("屏幕录制权限未授予或被系统弹窗拒绝，已暂停采集防循环弹窗（请在面板授权后点击「恢复采集」或重启应用）")
                     }
                     return
+                }
+                if isCode1004 || isUserDeclined {
+                    if CGDisplayIsAsleep(CGMainDisplayID()) != 0 || CGDisplayIsAsleep(displayIDProvider()) != 0 {
+                        withRawLock {
+                            consecutiveCode1004 = 0
+                            firstCode1004At = 0
+                        }
+                        try? await Task.sleep(nanoseconds: 500_000_000)
+                        continue
+                    }
+                    let errNow = CFAbsoluteTimeGetCurrent()
+                    let (streak, elapsed) = withRawLock { () -> (Int, Double) in
+                        // 10 秒滚动窗口：睡眠前残留、偶发单次错误或长期静默后不累积，
+                        // 仅当 10 秒窗口内持续失败 >=8 次且跨度 >=2.0 秒才闩锁。
+                        if consecutiveCode1004 == 0 || (errNow - firstCode1004At) > 10.0 {
+                            firstCode1004At = errNow
+                            consecutiveCode1004 = 1
+                        } else {
+                            consecutiveCode1004 += 1
+                        }
+                        return (consecutiveCode1004, errNow - firstCode1004At)
+                    }
+                    if streak >= 8 && elapsed >= 2.0 {
+                        let alreadyPaused = permissionPaused
+                        setScreenCaptureDenied(true)
+                        pauseForPermission()
+                        if !alreadyPaused {
+                            Log.info(String(format: "采集在 %.1fs 内连续 %d 次返回权限/1004 失败，已暂停采集防循环弹窗（确认权限后请点击「恢复采集」或重启应用）",
+                                            elapsed, streak))
+                        }
+                        return
+                    }
                 }
                 let now = CFAbsoluteTimeGetCurrent()
                 if now - lastErrorLogAt > 2.0 {
@@ -2044,6 +2221,7 @@ final class Sender {
     var onKey: ((UInt16, UInt16, Bool, UInt8) -> Void)?
 
     private let counterLock = NSLock()
+    private var inFlightStallSince: CFAbsoluteTime = 0
 
     /// 新连接建立时清零在途计数。
     /// 旧连接被重置时，未完成的 send 完成回调可能不再触发，
@@ -2051,6 +2229,7 @@ final class Sender {
     func resetInFlight() {
         counterLock.lock()
         inFlight = 0
+        inFlightStallSince = 0
         counterLock.unlock()
     }
 
@@ -2228,15 +2407,42 @@ final class Sender {
 
     private func transmit(_ frame: Data, captureTimeMicros: UInt64) {
         guard connected, let c = conn else { return }
-        // 在途帧数超限：丢这一帧，保住实时性
+        // 在途帧数超限：丢这一帧，保住实时性；若连续阻塞 >8s 则主动断开卡死连接
+        let now = CFAbsoluteTimeGetCurrent()
+        let epoch = connEpoch
+        var abortStalledConn: (NWConnection, Int, Double, Int)? = nil
         counterLock.lock()
         if inFlight >= maxInFlight {
             dropped += 1
+            if inFlightStallSince == 0 {
+                inFlightStallSince = now
+            } else {
+                let stalledFor = now - inFlightStallSince
+                if stalledFor >= 8.0 {
+                    inFlightStallSince = now
+                    abortStalledConn = (c, epoch, stalledFor, inFlight)
+                }
+            }
             counterLock.unlock()
+            if let (stalledConn, stalledEpoch, stalledFor, inFlightNow) = abortStalledConn {
+                queue.async { [weak self] in
+                    guard let self, self.connEpoch == stalledEpoch, self.conn === stalledConn else { return }
+                    self.connEpoch &+= 1
+                    self.conn = nil
+                    self.connected = false
+                    self.resetInFlight()
+                    self.ctrlBuf.removeAll()
+                    resetInjectionState()
+                    gEncoder?.releaseLastFrame()
+                    Log.info(String(format: "发送在途拥塞卡死 %.1fs（在途 %d），主动断开卡死连接等待重连", stalledFor, inFlightNow))
+                    stalledConn.cancel()
+                }
+            }
             return
         }
         inFlight += 1
-        lastSendAt = CFAbsoluteTimeGetCurrent()
+        inFlightStallSince = 0
+        lastSendAt = now
         counterLock.unlock()
 
         var packet = Data(capacity: frame.count + 13)
@@ -2254,13 +2460,13 @@ final class Sender {
         // 旧连接上未完成的 send 随后会以错误回调；若不区分代数，这个迟到的
         // 错误会把新连接的 connected 打回 false，之后所有帧被 guard 静默丢弃，
         // 表现为「连着却永久黑屏、且不会自愈重连」。
-        let epoch = connEpoch
         c.send(content: packet, completion: .contentProcessed { [weak self] err in
             guard let self else { return }
             self.counterLock.lock()
             // 陈旧连接的回调不计入新连接的在途数（新连接已 resetInFlight）
             if self.connEpoch == epoch {
                 self.inFlight = max(0, self.inFlight - 1)
+                self.inFlightStallSince = 0
             }
             self.counterLock.unlock()
             if err != nil && self.connEpoch == epoch {
@@ -4445,7 +4651,7 @@ if appRole == .sender {
     let axTrusted = AXIsProcessTrusted()
     if !axTrusted {
         Log.info("警告: 未获得辅助功能权限，副屏上的点击/滚轮无法生效")
-        Log.info("      系统设置 → 隐私与安全性 → 辅助功能，勾选 /Applications/SecDisplay.app")
+        Log.info("      系统设置 → 隐私与安全性 → 辅助功能，勾选 \(Bundle.main.bundlePath)")
     } else {
         Log.info("辅助功能权限: 已授权，副屏点击与滚轮可正常回放")
     }
