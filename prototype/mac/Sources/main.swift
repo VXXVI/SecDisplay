@@ -3288,11 +3288,11 @@ final class CursorImageTracker {
                 }
             }
         }
-        var sendW = w, sendH = h, sendHotX = hotX, sendHotY = hotY
+        let clampedHotX = max(0, min(w - 1, hotX))
+        let clampedHotY = max(0, min(h - 1, hotY))
+        var sendW = w, sendH = h, sendHotX = clampedHotX, sendHotY = clampedHotY
         var sendBgra = bgra
         if hasOpaque {
-            let clampedHotX = max(0, min(w - 1, hotX))
-            let clampedHotY = max(0, min(h - 1, hotY))
             minX = max(0, min(minX, clampedHotX) - 1)
             minY = max(0, min(minY, clampedHotY) - 1)
             maxX = min(w - 1, max(maxX, clampedHotX) + 1)

@@ -415,7 +415,8 @@ static HCURSOR g_customCursor = nullptr;   // 仅 UI 线程访问
 // 避免重复的 CreateIconIndirect/DestroyCursor 造成光标闪烁和句柄抖动。
 static uint64_t g_cursorAppliedFp = 0;     // 仅 UI 线程访问
 static int g_cursorAppliedScalePm = 0;     // 仅 UI 线程访问
-struct CachedCursor { uint64_t fp = 0; int scalePm = 0; HCURSOR cur = nullptr; };
+static int g_cursorAppliedCap = 0;         // 仅 UI 线程访问
+struct CachedCursor { uint64_t fp = 0; int scalePm = 0; int maxSideCap = 0; HCURSOR cur = nullptr; };
 static const int kCursorCacheCap = 16;
 static CachedCursor g_cursorCache[kCursorCacheCap];
 static int g_cursorCacheNext = 0;
@@ -5057,29 +5058,26 @@ static double WindowDpiScale(HWND hwnd) {
     return s;
 }
 
-// 查询当前显示器对应的硬件光标最大边长（如 200% DPI 下 Intel Iris Xe 为 64x64）。
+// 查询当前显示器对应的硬件光标最大边长（如 200% DPI 下 Intel Iris Xe 为 64x64；
+// 100% DPI 下系统 SM_CXCURSOR=32 但 WDDM 硬件平面至少支持 64x64，下限设为 64 避免 100% DPI 下缩过头）。
 // 稳态光标严格压在此上限内才能走 GPU 硬件光标层，避免退化成 DWM 软件光标产生拖影/残影。
 static int HardwareCursorMaxSide(HWND hwnd) {
     typedef UINT (WINAPI *GetDpiForWindowFn)(HWND);
     typedef int (WINAPI *GetSysMetricsForDpiFn)(int, UINT);
-    HMODULE u32 = GetModuleHandleA("user32.dll");
-    UINT dpi = 0;
-    if (u32 && hwnd) {
-        auto fnDpi = (GetDpiForWindowFn)GetProcAddress(u32, "GetDpiForWindow");
-        if (fnDpi) dpi = fnDpi(hwnd);
-    }
-    if (dpi > 0 && u32) {
-        auto fnMet = (GetSysMetricsForDpiFn)GetProcAddress(u32, "GetSystemMetricsForDpi");
-        if (fnMet) {
-            int cx = fnMet(SM_CXCURSOR, dpi);
-            int cy = fnMet(SM_CYCURSOR, dpi);
-            int m = (cx < cy ? cx : cy);
-            if (m >= 32 && m <= 128) return m;
-        }
+    static GetDpiForWindowFn fnDpi = (GetDpiForWindowFn)GetProcAddress(GetModuleHandleA("user32.dll"), "GetDpiForWindow");
+    static GetSysMetricsForDpiFn fnMet = (GetSysMetricsForDpiFn)GetProcAddress(GetModuleHandleA("user32.dll"), "GetSystemMetricsForDpi");
+    UINT dpi = (fnDpi && hwnd) ? fnDpi(hwnd) : 0;
+    if (dpi > 0 && fnMet) {
+        int cx = fnMet(SM_CXCURSOR, dpi);
+        int cy = fnMet(SM_CYCURSOR, dpi);
+        int m = (cx < cy ? cx : cy);
+        if (m < 64) m = 64;
+        if (m > 128) m = 128;
+        return m;
     }
     double scale = WindowDpiScale(hwnd);
     int m = (int)(32.0 * scale + 0.5);
-    if (m < 32) m = 32;
+    if (m < 64) m = 64;
     if (m > 128) m = 128;
     return m;
 }
@@ -5127,27 +5125,30 @@ static void ApplyCursorImage() {
     // 晃动放大由 DesiredCursorScalePm 合并进来（DPI × 动画倍数），
     // 这样缩放口径只有一处，日志也不会把 DPI 和放大倍数混在一起。
     const int scalePm = DesiredCursorScalePm();
-    if (g_customCursor && fp == g_cursorAppliedFp && scalePm == g_cursorAppliedScalePm) {
-        return;   // 同一张图同一缩放，沿用现有 HCURSOR
+    const int hwMax = HardwareCursorMaxSide(g_hwnd);
+    // 连续上限函数：zoom=1.0 时为 hwMax，随晃动 zoom 平滑放宽至 min(128, hwMax * zoom)，消除起止帧尺寸硬跳。
+    const double capSide = std::min<double>(128.0, (double)hwMax * std::max(1.0, g_shakeZoom));
+    const int capInt = (int)(capSide + 0.5);
+    if (g_customCursor && fp == g_cursorAppliedFp && scalePm == g_cursorAppliedScalePm && capInt == g_cursorAppliedCap) {
+        return;   // 同一张图同一缩放与上限，沿用现有 HCURSOR
     }
     // 命中稳态缓存：直接切换句柄，零 GDI 分配（箭头/I型/手型间切换不再卡顿）
     for (int i = 0; i < kCursorCacheCap; ++i) {
-        if (g_cursorCache[i].cur && g_cursorCache[i].fp == fp && g_cursorCache[i].scalePm == scalePm) {
+        if (g_cursorCache[i].cur && g_cursorCache[i].fp == fp &&
+            g_cursorCache[i].scalePm == scalePm && g_cursorCache[i].maxSideCap == capInt) {
             HCURSOR old = g_customCursor;
             g_customCursor = g_cursorCache[i].cur;
             g_cursorAppliedFp = fp;
             g_cursorAppliedScalePm = scalePm;
+            g_cursorAppliedCap = capInt;
             if (g_cursorVisible.load()) SetCursor(g_customCursor);
             if (old && old != g_customCursor && !IsInCursorCache(old)) DestroyCursor(old);
             return;
         }
     }
 
-    // 等比缩放：稳态不超过系统硬件光标上限（如 64px），保证走 GPU 硬件光标不产生软件光标残影；
-    // 晃动放大期间允许适度放宽到 min(128, hwMax*2)。
+    // 等比缩放：稳态不超过系统硬件光标上限（如 64px），保证走 GPU 硬件光标不产生软件光标残影。
     double k = (double)scalePm / 1000.0;
-    const int hwMax = HardwareCursorMaxSide(g_hwnd);
-    const double capSide = (g_shakeZoom <= 1.001) ? (double)hwMax : (double)std::min(128, hwMax * 2);
     const double maxSide = (double)(w > h ? w : h) * k;
     if (maxSide > capSide) k *= capSide / maxSide;
 
@@ -5236,9 +5237,9 @@ static void ApplyCursorImage() {
     if (!cur) return;   // 不更新指纹，下一包重试
 
     if (g_shakeZoom == 1.0) {
-        // 稳态切换才记日志，动画每 12ms 刷新一帧不刷屏
-        Log("光标位图 %dx%d hot=(%d,%d) DPI %.2fx → 实际 %dx%d hot=(%d,%d)",
-            rawW, rawH, rawHotX, rawHotY, WindowDpiScale(g_hwnd), w, h, hotX, hotY);
+        // 稳态切换才记日志，动画每 16ms 刷新一帧不刷屏
+        Log("光标位图 %dx%d hot=(%d,%d) DPI %.2fx hwMax=%d → 实际 %dx%d hot=(%d,%d)",
+            rawW, rawH, rawHotX, rawHotY, WindowDpiScale(g_hwnd), hwMax, w, h, hotX, hotY);
     }
 
     // 先挂上新的再销毁旧的：反过来的话，销毁到 SetCursor 之间系统光标句柄是悬空的
@@ -5246,10 +5247,11 @@ static void ApplyCursorImage() {
     g_customCursor = cur;
     g_cursorAppliedFp = fp;
     g_cursorAppliedScalePm = scalePm;   // 唯一权威：当前实际应用的缩放
+    g_cursorAppliedCap = capInt;
     if (g_cursorVisible.load()) SetCursor(cur);
     if (g_shakeZoom == 1.0) {
         HCURSOR victim = g_cursorCache[g_cursorCacheNext].cur;
-        g_cursorCache[g_cursorCacheNext] = CachedCursor{ fp, scalePm, cur };
+        g_cursorCache[g_cursorCacheNext] = CachedCursor{ fp, scalePm, capInt, cur };
         g_cursorCacheNext = (g_cursorCacheNext + 1) % kCursorCacheCap;
         if (victim && victim != cur && victim != old) DestroyCursor(victim);
     }
@@ -5411,13 +5413,13 @@ static bool TickShakeAnim(double nowQpc) {
 }
 
 // 当前应使用的缩放（千分比）。结合「视频有效区域 / Mac 逻辑宽度」与显示器 DPI，
-// 保证窗口模式下桌面缩小时光标同比例缩小、全屏下精确对齐 1:1 视觉大小。
+// 保证窗口模式下桌面缩小时光标同比例缩小、全屏下在不超硬件上限前提下尽量 1:1 视觉对齐。
 static int DesiredCursorScalePm() {
     const double dpi = WindowDpiScale(g_hwnd);
     double targetScale = dpi;
     const int scaleTenths = g_sessScaleTenths.load();
     const int cwCoord = g_coordW.load();
-    if (g_hwnd && scaleTenths >= 5 && cwCoord > 0) {
+    if (g_hwnd && !g_coordUserSpecified && scaleTenths >= 5 && cwCoord > 0) {
         RECT rc{};
         if (GetClientRect(g_hwnd, &rc)) {
             const int cw = rc.right - rc.left;
@@ -5464,7 +5466,7 @@ static void DriveShakeStep(int screenX, int screenY) {
     DetectShake(nowMs, screenX, screenY);
     if (g_shakeActive) {
         const double nowQpc = QpcNowMs();
-        if (!wasActive || (nowQpc - g_shakeLastRefreshQpcMs >= 7.5)) {
+        if (!wasActive || (nowQpc - g_shakeLastRefreshQpcMs >= (double)kShakeTickMs * 0.9)) {
             g_shakeLastRefreshQpcMs = nowQpc;
             const bool keep = TickShakeAnim(nowQpc);
             RefreshCursorScale();
