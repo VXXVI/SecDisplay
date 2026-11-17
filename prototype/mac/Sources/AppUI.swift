@@ -419,7 +419,7 @@ struct StatusView: View {
                     if model.screenCaptureDenied || model.tccConflictWarning != nil {
                         VStack(alignment: .leading, spacing: 6) {
                             if model.screenCaptureDenied {
-                                Text("需要屏幕录制权限（已暂停采集防循环弹窗，授权后自动恢复）")
+                                Text("需要屏幕录制权限（已暂停采集防循环弹窗，授权后若未自动恢复请点「重启应用」）")
                                     .font(.caption)
                                     .foregroundStyle(.orange)
                             }

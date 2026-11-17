@@ -4313,32 +4313,33 @@ func detectConflictingTccPathEntry() -> String? {
 
 func resetScreenCaptureTccEntriesAndOpenSettings() {
     let bundleID = Bundle.main.bundleIdentifier ?? "com.secdisplay.screensender"
-    let bundlePath = Bundle.main.bundlePath
     DispatchQueue.global(qos: .userInitiated).async {
-        var allOk = true
-        for target in [bundleID, bundlePath] where !target.isEmpty {
-            let p = Process()
-            p.executableURL = URL(fileURLWithPath: "/usr/bin/tccutil")
-            p.arguments = ["reset", "ScreenCapture", target]
-            p.standardOutput = FileHandle.nullDevice
-            p.standardError = FileHandle.nullDevice
-            do {
-                try p.run()
-                p.waitUntilExit()
-                if p.terminationStatus != 0 { allOk = false }
-            } catch {
-                allOk = false
-            }
+        let p = Process()
+        p.executableURL = URL(fileURLWithPath: "/usr/bin/tccutil")
+        p.arguments = ["reset", "ScreenCapture", bundleID]
+        p.standardOutput = FileHandle.nullDevice
+        p.standardError = FileHandle.nullDevice
+        var ok = false
+        do {
+            try p.run()
+            p.waitUntilExit()
+            ok = (p.terminationStatus == 0)
+        } catch {
+            ok = false
         }
+        let stillPathConflict = detectConflictingTccPathEntry()
+        setTccConflictWarning(stillPathConflict)
         DispatchQueue.main.async {
-            let cmd = "tccutil reset ScreenCapture \(bundleID) && tccutil reset ScreenCapture \"\(bundlePath)\""
-            if !allOk {
+            let cmd = stillPathConflict != nil
+                ? "tccutil reset ScreenCapture"
+                : "tccutil reset ScreenCapture \(bundleID)"
+            if !ok || stillPathConflict != nil {
                 let pb = NSPasteboard.general
                 pb.clearContents()
                 pb.setString(cmd, forType: .string)
-                Log.info("提示: 应用内调 tccutil 未能完全重置，已复制终端修复命令到剪贴板: \(cmd)")
+                Log.info("提示: 存在路径型 TCC 旧记录（需在系统设置点「-」删除 SecDisplay.app 或终端执行已复制命令: \(cmd)）")
             } else {
-                Log.info("已重置 SecDisplay 录屏授权条目并打开系统设置，请勾选 SecDisplay 后点「重启应用」")
+                Log.info("已重置 \(bundleID) 录屏授权并打开系统设置，勾选 SecDisplay 后点「重启应用」即可")
             }
             if let url = URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_ScreenCapture") {
                 NSWorkspace.shared.open(url)
@@ -4507,9 +4508,19 @@ if appRole == .sender {
         do {
             try await capInst.start()
         } catch {
+            let nsErr = error as NSError
+            let isPerm = (nsErr.domain == "com.apple.ScreenCaptureKit.SCStreamErrorDomain" &&
+                          nsErr.code == SCStreamError.userDeclined.rawValue) ||
+                         !CGPreflightScreenCaptureAccess()
             Log.info("抓屏失败: \(error)")
-            Log.info("需要屏幕录制权限：系统设置 → 隐私与安全性 → 屏幕录制")
-            setScreenCaptureDenied(true)
+            if isPerm {
+                Log.info("需要屏幕录制权限：系统设置 → 隐私与安全性 → 屏幕录制")
+                setScreenCaptureDenied(true)
+            } else {
+                Log.info("非权限类采集启动失败，销毁虚拟屏并退出")
+                vdInst.destroy()
+                exit(4)
+            }
         }
     }
 } else {

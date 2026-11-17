@@ -152,7 +152,7 @@ if [ "$INSTALL" = "1" ]; then
         if [ -n "$STALE_TCC" ]; then
             echo "警告: 检测到 TCC.db 中存在冲突的旧路径拒绝记录:"
             echo "$STALE_TCC"
-            echo "这会导致 macOS 反复弹出录制权限窗口。建议执行: tccutil reset ScreenCapture com.secdisplay.screensender && tccutil reset ScreenCapture /Applications/SecDisplay.app"
+            echo "这会导致 macOS 反复弹出录制权限窗口。请在「系统设置 → 隐私与安全性 → 录屏与系统录音」用「-」删除旧条目后重加，或执行 tccutil reset ScreenCapture com.secdisplay.screensender（全部重置可用 tccutil reset ScreenCapture）"
         fi
     fi
 fi
