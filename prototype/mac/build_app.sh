@@ -146,6 +146,15 @@ if [ "$INSTALL" = "1" ]; then
     if pgrep -f "/Applications/SecDisplay.app/Contents/MacOS/SecDisplay" >/dev/null 2>&1; then
         echo "提示: 检测到旧实例正在运行，先退出旧实例后再重新 open /Applications/SecDisplay.app"
     fi
+    if [ -r "/Library/Application Support/com.apple.TCC/TCC.db" ] && command -v sqlite3 >/dev/null 2>&1; then
+        STALE_TCC="$(sqlite3 -readonly "/Library/Application Support/com.apple.TCC/TCC.db" \
+            "SELECT client FROM access WHERE service='kTCCServiceScreenCapture' AND client_type=1 AND auth_value=0 AND (client LIKE '%/SecDisplay.app%' OR client LIKE '%/screensender');" 2>/dev/null || true)"
+        if [ -n "$STALE_TCC" ]; then
+            echo "警告: 检测到 TCC.db 中存在冲突的旧路径拒绝记录:"
+            echo "$STALE_TCC"
+            echo "这会导致 macOS 反复弹出录制权限窗口。建议执行: tccutil reset ScreenCapture com.secdisplay.screensender && tccutil reset ScreenCapture /Applications/SecDisplay.app"
+        fi
+    fi
 fi
 
 echo

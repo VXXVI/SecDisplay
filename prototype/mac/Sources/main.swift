@@ -422,6 +422,7 @@ final class VirtualDisplayManager {
             }
         }
         object = nil
+        displayID = 0
     }
 
     enum Err: Error { case classesMissing, initFailed, modeFailed, applyFailed }
@@ -1028,6 +1029,8 @@ final class ScreenshotCapture {
     private var running = false
     private var cachedContent: SCShareableContent?
     private var cachedAt: CFAbsoluteTime = 0
+    private var inFlightContentTask: Task<SCShareableContent, Error>?
+    private var lastMissingDisplayRefreshAt: CFAbsoluteTime = 0
     private var lastDumpAt: CFAbsoluteTime = 0
     private var dumpSeq = 0
     private var lastErrorLogAt: CFAbsoluteTime = 0
@@ -1055,6 +1058,7 @@ final class ScreenshotCapture {
         genLock.lock(); defer { genLock.unlock() }
         return _stopRequested
     }
+    var isStopRequested: Bool { stopRequested }
     /// 自增代次并返回新值
     private func bumpWorkerGen() -> Int {
         genLock.lock(); defer { genLock.unlock() }
@@ -1145,7 +1149,7 @@ final class ScreenshotCapture {
     }
 
     func start() async throws {
-        let content = try await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: false)
+        let content = try await currentContent(forceRefresh: true)
         // await 期间可能已经收到退出请求，这时必须放弃启动，否则会把
         // running 置回 true 并在 shutdown 清理虚拟屏时仍在采集。
         if stopRequested {
@@ -1159,10 +1163,6 @@ final class ScreenshotCapture {
             throw NSError(domain: "Capture", code: 1, userInfo: [
                 NSLocalizedDescriptionKey: "找不到 SecDisplay 虚拟屏，当前: \(avail.joined(separator: ", "))"
             ])
-        }
-        withRawLock {
-            cachedContent = content
-            cachedAt = CFAbsoluteTimeGetCurrent()
         }
         running = true
         spawnWorkers()
@@ -1325,9 +1325,26 @@ final class ScreenshotCapture {
             let t0 = CFAbsoluteTimeGetCurrent()
             do {
                 let content = try await currentContent()
-                guard let d = content.displays.first(where: { isOurVirtualDisplay($0.displayID) }) else {
-                    try? await Task.sleep(nanoseconds: 200_000_000)
-                    continue
+                let foundDisplay = content.displays.first(where: { isOurVirtualDisplay($0.displayID) })
+                let d: SCDisplay
+                if let existing = foundDisplay {
+                    d = existing
+                } else {
+                    let nowMissing = CFAbsoluteTimeGetCurrent()
+                    let shouldRefresh = withRawLock {
+                        if nowMissing - lastMissingDisplayRefreshAt >= 2.0 {
+                            lastMissingDisplayRefreshAt = nowMissing
+                            return true
+                        }
+                        return false
+                    }
+                    if shouldRefresh,
+                       let refreshed = try await currentContent(forceRefresh: true).displays.first(where: { isOurVirtualDisplay($0.displayID) }) {
+                        d = refreshed
+                    } else {
+                        try? await Task.sleep(nanoseconds: 200_000_000)
+                        continue
+                    }
                 }
                 let filter = SCContentFilter(display: d, excludingWindows: [])
                 // 两条采集路径，实测数据（2880x1800，4 路并发）：
@@ -1345,6 +1362,7 @@ final class ScreenshotCapture {
                     c.width = targetW
                     c.height = targetH
                     c.showsCursor = false
+                    c.capturesAudio = false
                     // 直接要 YUV420 双平面（video range），每帧 7.4MB 而不是 19.8MB，
                     // 也省掉一次全屏 RGB→YUV 的 CGContext 重绘。
                     c.pixelFormat = kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange
@@ -1367,6 +1385,7 @@ final class ScreenshotCapture {
                     c.width = targetW
                     c.height = targetH
                     c.showsCursor = false
+                    c.capturesAudio = false
                     // 2x HiDPI 下显式要最高清晰度采样，避免 automatic 在负载时降到逻辑分辨率放大
                     if #available(macOS 14.0, *) { c.captureResolution = .best }
                     let img = try await SCScreenshotManager.captureImage(contentFilter: filter, configuration: c)
@@ -1442,6 +1461,17 @@ final class ScreenshotCapture {
                     encoder.encode(pb, pts: pts, captureTimeMicros: UInt64(now * 1_000_000))
                 }
             } catch {
+                let nsErr = error as NSError
+                let isDenied = (nsErr.domain == "com.apple.ScreenCaptureKit.SCStreamErrorDomain" &&
+                                nsErr.code == SCStreamError.userDeclined.rawValue) ||
+                               nsErr.localizedDescription.lowercased().contains("declined") ||
+                               !CGPreflightScreenCaptureAccess()
+                if isDenied {
+                    setScreenCaptureDenied(true)
+                    Log.info("屏幕录制权限未授予或被系统弹窗拒绝，已暂停采集以防循环弹窗（请授权后在面板重连或重启）")
+                    stop()
+                    return
+                }
                 let now = CFAbsoluteTimeGetCurrent()
                 if now - lastErrorLogAt > 2.0 {
                     lastErrorLogAt = now
@@ -1513,22 +1543,58 @@ final class ScreenshotCapture {
         return hash
     }
 
-    private func currentContent() async throws -> SCShareableContent {
+    private func currentContent(forceRefresh: Bool = false) async throws -> SCShareableContent {
         let now = CFAbsoluteTimeGetCurrent()
         // 显示排列变化（Sidecar 接入/拔线、镜像关系变动）时强制刷新一次共享内容，
-        // 否则会继续用旧的 SCDisplay 绑定，抓到的是镜像源画面。
-        if gCaptureRebuildRequested {
+        // 否则复用 300s 缓存，避免 4 个 worker 每 2 秒向 replayd/TCC 重复轮询触发系统弹窗。
+        let rebuild = gCaptureRebuildRequested
+        if rebuild {
             gCaptureRebuildRequested = false
-            withRawLock { cachedContent = nil; cachedAt = 0 }
             Log.info("显示排列变化，刷新采集共享内容")
         }
-        // 缓存被 4 个 worker 并发访问。SCShareableContent 是类引用，
-        // 无同步的读写会撞上 retain/release，所以统一走 rawLock。
-        let (cached, cachedTime) = withRawLock { (cachedContent, cachedAt) }
-        if let c = cached, now - cachedTime < 2.0 { return c }
-        let c = try await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: false)
-        withRawLock { cachedContent = c; cachedAt = now }
-        return c
+        enum FetchAction {
+            case cached(SCShareableContent)
+            case join(Task<SCShareableContent, Error>)
+            case start(Task<SCShareableContent, Error>)
+        }
+        let action: FetchAction = withRawLock {
+            if forceRefresh || rebuild {
+                cachedContent = nil
+                cachedAt = 0
+            }
+            if let c = cachedContent, now - cachedAt < 300.0 {
+                return .cached(c)
+            }
+            if let existing = inFlightContentTask {
+                return .join(existing)
+            }
+            let t = Task<SCShareableContent, Error> {
+                try await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: false)
+            }
+            inFlightContentTask = t
+            return .start(t)
+        }
+        switch action {
+        case .cached(let c):
+            return c
+        case .join(let t):
+            return try await t.value
+        case .start(let t):
+            do {
+                let c = try await t.value
+                withRawLock {
+                    cachedContent = c
+                    cachedAt = CFAbsoluteTimeGetCurrent()
+                    inFlightContentTask = nil
+                }
+                return c
+            } catch {
+                withRawLock {
+                    inFlightContentTask = nil
+                }
+                throw error
+            }
+        }
     }
 }
 
@@ -4155,6 +4221,77 @@ func logicalDisplayBounds(_ id: CGDirectDisplayID) -> CGRect {
 }
 
 let cfgStateLock = NSLock()
+private nonisolated(unsafe) var _screenCaptureDenied = false
+private nonisolated(unsafe) var _tccConflictWarning: String? = nil
+
+func isScreenCaptureDenied() -> Bool {
+    cfgStateLock.lock(); defer { cfgStateLock.unlock() }
+    return _screenCaptureDenied
+}
+
+func setScreenCaptureDenied(_ v: Bool) {
+    cfgStateLock.lock(); _screenCaptureDenied = v; cfgStateLock.unlock()
+}
+
+func currentTccConflictWarning() -> String? {
+    cfgStateLock.lock(); defer { cfgStateLock.unlock() }
+    return _tccConflictWarning
+}
+
+func setTccConflictWarning(_ msg: String?) {
+    cfgStateLock.lock(); _tccConflictWarning = msg; cfgStateLock.unlock()
+}
+
+func detectConflictingTccPathEntry() -> String? {
+    let tccDb = "/Library/Application Support/com.apple.TCC/TCC.db"
+    guard FileManager.default.isReadableFile(atPath: tccDb) else { return nil }
+    let p = Process()
+    p.executableURL = URL(fileURLWithPath: "/usr/bin/sqlite3")
+    p.arguments = ["-readonly", tccDb,
+                   "SELECT client FROM access WHERE service='kTCCServiceScreenCapture' AND client_type=1 AND auth_value=0;"]
+    let pipe = Pipe()
+    p.standardOutput = pipe
+    p.standardError = FileHandle.nullDevice
+    do {
+        try p.run()
+    } catch {
+        return nil
+    }
+    p.waitUntilExit()
+    let data = pipe.fileHandleForReading.readDataToEndOfFile()
+    guard let out = String(data: data, encoding: .utf8) else { return nil }
+    let bundlePath = Bundle.main.bundlePath
+    let exePath = Bundle.main.executablePath ?? ""
+    let rows = out.split(separator: "\n").map { String($0).trimmingCharacters(in: .whitespacesAndNewlines) }
+    for r in rows where !r.isEmpty {
+        if r == bundlePath || r == exePath {
+            return "检测到 TCC 存在旧路径拒绝条目（\(r) auth=0），可能引发反复弹窗"
+        }
+    }
+    return nil
+}
+
+func resetScreenCaptureTccEntriesAndOpenSettings() {
+    let bundleID = Bundle.main.bundleIdentifier ?? "com.secdisplay.screensender"
+    let bundlePath = Bundle.main.bundlePath
+    DispatchQueue.global(qos: .userInitiated).async {
+        for target in [bundleID, bundlePath] where !target.isEmpty {
+            let p = Process()
+            p.executableURL = URL(fileURLWithPath: "/usr/bin/tccutil")
+            p.arguments = ["reset", "ScreenCapture", target]
+            p.standardOutput = FileHandle.nullDevice
+            p.standardError = FileHandle.nullDevice
+            try? p.run()
+            p.waitUntilExit()
+        }
+        DispatchQueue.main.async {
+            if let url = URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_ScreenCapture") {
+                NSWorkspace.shared.open(url)
+            }
+            Log.info("已重置 SecDisplay 录屏授权条目并打开系统设置，请重新勾选后重启应用")
+        }
+    }
+}
 
 func currentVideoSizeSnapshot() -> (w: Int, h: Int, lw: Int, lh: Int) {
     cfgStateLock.lock()
@@ -4292,14 +4429,33 @@ if appRole == .sender {
 
     let capInst = ScreenshotCapture(encoder: encInst, cfg: cfg, displayID: { vdInst.displayID })
     cap = capInst
+    Task.detached(priority: .utility) {
+        if let conflict = detectConflictingTccPathEntry() {
+            setTccConflictWarning(conflict)
+            Log.info("警告: \(conflict)。请在面板点击「清理冲突并重授权」或在终端执行 tccutil reset ScreenCapture")
+        }
+    }
     Task {
+        let preflightOk = CGPreflightScreenCaptureAccess()
+        Log.info("屏幕录制权限预检: \(preflightOk ? "已授权" : "未授权")")
+        if !preflightOk {
+            setScreenCaptureDenied(true)
+            // 只触发一次系统授权请求，之后静默用 CGPreflightScreenCaptureAccess 轮询，绝不反复弹窗
+            _ = CGRequestScreenCaptureAccess()
+            while !CGPreflightScreenCaptureAccess() {
+                try? await Task.sleep(nanoseconds: 2_000_000_000)
+                if vdInst.displayID == 0 || capInst.isStopRequested { return }
+            }
+            if vdInst.displayID == 0 || capInst.isStopRequested { return }
+            setScreenCaptureDenied(false)
+            Log.info("屏幕录制权限已通过预检，开始启动采集")
+        }
         do {
             try await capInst.start()
         } catch {
             Log.info("抓屏失败: \(error)")
             Log.info("需要屏幕录制权限：系统设置 → 隐私与安全性 → 屏幕录制")
-            vdInst.destroy()
-            exit(4)
+            setScreenCaptureDenied(true)
         }
     }
 } else {

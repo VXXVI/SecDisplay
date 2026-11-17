@@ -51,6 +51,8 @@ final class AppModel: ObservableObject {
     /// 对端地址
     @Published var peer = "-"
     @Published var senderRoleConflict: String? = nil
+    @Published var screenCaptureDenied = false
+    @Published var tccConflictWarning: String? = nil
     /// 光标的发送计数（位置 / 图像）
     @Published var cursorPosSent = 0
     @Published var cursorImgSent = 0
@@ -211,6 +213,8 @@ final class AppModel: ObservableObject {
         uptimeSec = CFAbsoluteTimeGetCurrent() - appStartTime
         peer = sender?.peerDescription ?? "-"
         senderRoleConflict = sender?.roleConflictMessage
+        screenCaptureDenied = isScreenCaptureDenied()
+        tccConflictWarning = currentTccConflictWarning()
         cursorPosSent = cursor?.sentCount ?? 0
         cursorImgSent = cursorImage?.sentCount ?? 0
         refreshTransferOnly()
@@ -412,6 +416,30 @@ struct StatusView: View {
                         Button("请求关键帧") { macReceiverClient?.sendKeyframeRequest(throttled: false) }
                     }
                 } else {
+                    if model.screenCaptureDenied || model.tccConflictWarning != nil {
+                        VStack(alignment: .leading, spacing: 6) {
+                            Text(model.screenCaptureDenied
+                                 ? "需要屏幕录制权限（已暂停采集防循环弹窗）"
+                                 : (model.tccConflictWarning ?? "屏幕录制授权异常"))
+                                .font(.caption)
+                                .foregroundStyle(.orange)
+                            HStack(spacing: 8) {
+                                Button("打开录屏设置") {
+                                    if let url = URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_ScreenCapture") {
+                                        NSWorkspace.shared.open(url)
+                                    }
+                                }
+                                .controlSize(.small)
+                                Button("清理冲突并重授权") {
+                                    resetScreenCaptureTccEntriesAndOpenSettings()
+                                }
+                                .controlSize(.small)
+                            }
+                        }
+                        .padding(8)
+                        .background(Color.orange.opacity(0.10))
+                        .clipShape(RoundedRectangle(cornerRadius: 8))
+                    }
                     if let conflict = model.senderRoleConflict {
                         Text(conflict)
                             .font(.caption)
