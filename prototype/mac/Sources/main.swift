@@ -2031,6 +2031,7 @@ final class Sender {
     var sessionWidth = 0
     var sessionHeight = 0
     var sessionFps = 0
+    var sessionScaleTenths: UInt8 = 20
     private var lastSessionSent: CFAbsoluteTime = 0
 
     // 0x07 反馈快照。drainControl 在 net queue 写，Timer 在 main queue 读。
@@ -2433,13 +2434,14 @@ final class Sender {
     /// 与空载荷心跳同为 0x06，靠长度区分：旧接收端只认 9 字节心跳，
     /// 多出来的载荷会被直接忽略，所以两端版本错配不会断流。
     ///
-    /// 载荷（全大端）：[version u8][width u16][height u16][fps u8][reserved u8]
-    func updateSessionInfo(width: Int, height: Int, fps: Int) {
+    /// 载荷（全大端）：[version u8][width u16][height u16][fps u8][scaleTenths u8]
+    func updateSessionInfo(width: Int, height: Int, fps: Int, scaleTenths: UInt8? = nil) {
         queue.async { [weak self] in
             guard let self else { return }
             self.sessionWidth = width
             self.sessionHeight = height
             self.sessionFps = fps
+            if let st = scaleTenths { self.sessionScaleTenths = st }
             self.sendSessionInfo()
         }
     }
@@ -2460,7 +2462,7 @@ final class Sender {
         var h = UInt16(clamping: sessionHeight).bigEndian
         withUnsafeBytes(of: &h) { packet.append(contentsOf: $0) }
         packet.append(UInt8(clamping: sessionFps))
-        packet.append(0)                     // 保留
+        packet.append(sessionScaleTenths)    // Mac 虚拟屏 backing scale × 10（0=未知，20=2.0x）
         c.send(content: packet, completion: .contentProcessed { _ in })
         lastSessionSent = CFAbsoluteTimeGetCurrent()
     }
@@ -3269,16 +3271,60 @@ final class CursorImageTracker {
                                   space: cs, bitmapInfo: bitmapInfo) else { return }
         ctx.draw(cg, in: CGRect(x: 0, y: 0, width: w, height: h))
 
+        // 裁剪四周完全透明（alpha == 0）的空白边距（保留 1pt 安全边且包含热点）。
+        // macOS 默认箭头 28x40pt 底部与右侧有大量透明留白，Windows 2x 放大后达 56x80，
+        // 超过 Intel Iris Xe 64x64 硬件光标上限后会退化为 DWM 软件光标导致拖动残影。
+        var minX = w - 1, maxX = 0, minY = h - 1, maxY = 0
+        var hasOpaque = false
+        for py in 0..<h {
+            let rowOff = py * w * 4
+            for px in 0..<w {
+                if bgra[rowOff + px * 4 + 3] > 0 {
+                    hasOpaque = true
+                    if px < minX { minX = px }
+                    if px > maxX { maxX = px }
+                    if py < minY { minY = py }
+                    if py > maxY { maxY = py }
+                }
+            }
+        }
+        let clampedHotX = max(0, min(w - 1, hotX))
+        let clampedHotY = max(0, min(h - 1, hotY))
+        var sendW = w, sendH = h, sendHotX = clampedHotX, sendHotY = clampedHotY
+        var sendBgra = bgra
+        if hasOpaque {
+            minX = max(0, min(minX, clampedHotX) - 1)
+            minY = max(0, min(minY, clampedHotY) - 1)
+            maxX = min(w - 1, max(maxX, clampedHotX) + 1)
+            maxY = min(h - 1, max(maxY, clampedHotY) + 1)
+            let cw = maxX - minX + 1
+            let ch = maxY - minY + 1
+            if cw < w || ch < h {
+                var cropped = [UInt8](repeating: 0, count: cw * ch * 4)
+                for py in 0..<ch {
+                    let srcStart = ((minY + py) * w + minX) * 4
+                    let dstStart = py * cw * 4
+                    cropped.replaceSubrange(dstStart..<(dstStart + cw * 4),
+                                            with: bgra[srcStart..<(srcStart + cw * 4)])
+                }
+                sendW = cw
+                sendH = ch
+                sendHotX = clampedHotX - minX
+                sendHotY = clampedHotY - minY
+                sendBgra = cropped
+            }
+        }
+
         // 指纹：尺寸 + 热点 + 抽样像素，足以区分不同光标形状
-        var fp: UInt64 = UInt64(w) << 48
-        fp |= UInt64(h) << 32
-        fp |= UInt64(hotX & 0xff) << 24
-        fp |= UInt64(hotY & 0xff) << 16
+        var fp: UInt64 = UInt64(sendW) << 48
+        fp |= UInt64(sendH) << 32
+        fp |= UInt64(sendHotX & 0xff) << 24
+        fp |= UInt64(sendHotY & 0xff) << 16
         var hash: UInt64 = 1469598103934665603
-        let step = max(1, bgra.count / 256)
+        let step = max(1, sendBgra.count / 256)
         var i = 0
-        while i < bgra.count {
-            hash = (hash ^ UInt64(bgra[i])) &* 1099511628211
+        while i < sendBgra.count {
+            hash = (hash ^ UInt64(sendBgra[i])) &* 1099511628211
             i += step
         }
         fp ^= hash & 0xffff
@@ -3305,11 +3351,11 @@ final class CursorImageTracker {
         lastFingerprint = fp
         sentCount += 1
         if force {
-            Log.info("光标图像 \(w)x\(h) hot=(\(hotX),\(hotY))")
+            Log.info("光标图像 \(sendW)x\(sendH) hot=(\(sendHotX),\(sendHotY)) (原始 \(w)x\(h))")
         }
 
-        sender.sendCursorImage(width: w, height: h, hotX: hotX, hotY: hotY,
-                               bgra: Data(bgra))
+        sender.sendCursorImage(width: sendW, height: sendH, hotX: sendHotX, hotY: sendHotY,
+                               bgra: Data(sendBgra))
     }
 }
 
@@ -4764,6 +4810,7 @@ if appRole == .sender {
     }
     Log.info("在线显示器身份: \(idList.joined(separator: "  "))")
 
+    sndInst.sessionScaleTenths = UInt8(clamping: Int((vdBackingScale * 10.0).rounded()))
     sndInst.onKeyframeRequest = { encInst.forceEncodeLastFrame() }
     sndInst.listen(port: cfg.port)
 
@@ -5938,7 +5985,8 @@ DispatchQueue.main.async {
         if pw != oldW || ph != oldH {
             rateCtl.updateTargetMbps(newMbps)
             gCaptureRebuildRequested = true
-            sender.updateSessionInfo(width: pw, height: ph, fps: Int(cfg.captureHz.rounded()))
+            sender.updateSessionInfo(width: pw, height: ph, fps: Int(cfg.captureHz.rounded()),
+                                     scaleTenths: UInt8(clamping: Int((vdBackingScale * 10.0).rounded())))
         }
         AppModel.shared.refresh()
     }
