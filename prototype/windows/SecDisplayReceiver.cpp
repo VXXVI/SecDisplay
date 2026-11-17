@@ -342,6 +342,7 @@ static std::atomic<int> g_coordH{0};
 static std::atomic<int> g_sessW{0};
 static std::atomic<int> g_sessH{0};
 static std::atomic<int> g_sessFps{0};
+static std::atomic<int> g_sessScaleTenths{0};
 // 当前解码/呈现管线实际使用的尺寸。会话头与它不同就断开重连并重建管线。
 static std::atomic<int> g_displayW{0};
 static std::atomic<int> g_displayH{0};
@@ -437,14 +438,14 @@ static bool IsInCursorCache(HCURSOR c) {
 // 放大是立刻的，停下后保留约 1 秒再收缩，收缩本身是连续的缓动而不是瞬切。
 // 原来的实现是硬切，且只靠 120ms 定时器轮询判断结束，实际要 1 秒多才突然变小，
 // 观感上就是「变小很慢、还很突兀」。
-static const int kShakeWinMs = 700;      // 观察窗口
-static const int kShakeMinReversals = 3; // 至少 3 次方向反转才算晃动
-static const int kShakeMinSpanPx = 120;  // 横向/纵向累计摆幅下限，防止细微抖动误触
-static const double kShakeCursorZoom = 2.8;  // 晃动时的目标放大倍数（macOS ~2.8-3.0x）
-static const double kShakeGrowMs = 220.0;    // 平滑放大渐入时长（EaseOutCubic，首帧即起势）
-static const double kShakeHoldMs = 650.0;    // 停晃后保持放大的时长
-static const double kShakeShrinkMs = 300.0;  // 平滑收缩时长（EaseInOutCubic）
-static const int kShakeTickMs = 8;           // ~125Hz 高频动画刷新，配合 timeBeginPeriod(1) + QPC 消除顿挫
+static const int kShakeWinMs = 600;      // 观察窗口
+static const int kShakeMinReversals = 5; // 至少 5 次方向反转才算主动晃动，避免正常鼠标往返误触发放大
+static const int kShakeMinSpanPx = 180;  // 横向/纵向累计摆幅下限，防止细微抖动误触
+static const double kShakeCursorZoom = 1.8;  // 晃动时的目标放大倍数（兼顾显眼度与 DWM 光标上限，防残影）
+static const double kShakeGrowMs = 200.0;    // 平滑放大渐入时长（EaseOutCubic，首帧即起势）
+static const double kShakeHoldMs = 600.0;    // 停晃后保持放大的时长
+static const double kShakeShrinkMs = 280.0;  // 平滑收缩时长（EaseInOutCubic）
+static const int kShakeTickMs = 16;          // ~60Hz 平滑动画刷新，减少高频 CreateIconIndirect/SetCursor 引发 DWM 残影
 static const UINT_PTR kShakeTimer = 4004;
 struct ShakeSample { int64_t t; int x; int y; };
 // 环容量按「发送侧最高 240Hz × 700ms ≈ 170 个样本」留足余量，
@@ -5056,6 +5057,33 @@ static double WindowDpiScale(HWND hwnd) {
     return s;
 }
 
+// 查询当前显示器对应的硬件光标最大边长（如 200% DPI 下 Intel Iris Xe 为 64x64）。
+// 稳态光标严格压在此上限内才能走 GPU 硬件光标层，避免退化成 DWM 软件光标产生拖影/残影。
+static int HardwareCursorMaxSide(HWND hwnd) {
+    typedef UINT (WINAPI *GetDpiForWindowFn)(HWND);
+    typedef int (WINAPI *GetSysMetricsForDpiFn)(int, UINT);
+    HMODULE u32 = GetModuleHandleA("user32.dll");
+    UINT dpi = 0;
+    if (u32 && hwnd) {
+        auto fnDpi = (GetDpiForWindowFn)GetProcAddress(u32, "GetDpiForWindow");
+        if (fnDpi) dpi = fnDpi(hwnd);
+    }
+    if (dpi > 0 && u32) {
+        auto fnMet = (GetSysMetricsForDpiFn)GetProcAddress(u32, "GetSystemMetricsForDpi");
+        if (fnMet) {
+            int cx = fnMet(SM_CXCURSOR, dpi);
+            int cy = fnMet(SM_CYCURSOR, dpi);
+            int m = (cx < cy ? cx : cy);
+            if (m >= 32 && m <= 128) return m;
+        }
+    }
+    double scale = WindowDpiScale(hwnd);
+    int m = (int)(32.0 * scale + 0.5);
+    if (m < 32) m = 32;
+    if (m > 128) m = 128;
+    return m;
+}
+
 // 当前应使用的光标缩放（千分比）：DPI 与晃动动画倍数合并后算。
 // 在 ApplyCursorImage 之前声明，由下面定义。
 static int DesiredCursorScalePm();
@@ -5115,11 +5143,13 @@ static void ApplyCursorImage() {
         }
     }
 
-    // 等比缩放：两轴用同一个系数，再整体夹到 256 上限。
-    // 逐轴独立夹会让非方形光标在放大后变扁（例如 32x64 在 DPI 300% 下被压成 240x256）。
+    // 等比缩放：稳态不超过系统硬件光标上限（如 64px），保证走 GPU 硬件光标不产生软件光标残影；
+    // 晃动放大期间允许适度放宽到 min(128, hwMax*2)。
     double k = (double)scalePm / 1000.0;
+    const int hwMax = HardwareCursorMaxSide(g_hwnd);
+    const double capSide = (g_shakeZoom <= 1.001) ? (double)hwMax : (double)std::min(128, hwMax * 2);
     const double maxSide = (double)(w > h ? w : h) * k;
-    if (maxSide > 256.0) k *= 256.0 / maxSide;
+    if (maxSide > capSide) k *= capSide / maxSide;
 
     int w2 = (int)(w * k + 0.5);
     int h2 = (int)(h * k + 0.5);
@@ -5380,14 +5410,39 @@ static bool TickShakeAnim(double nowQpc) {
     return false;
 }
 
-// 当前应使用的缩放（千分比）。DPI 与晃动倍数合并在这里算，
-// 避免两处各自乘导致口径不一致。
+// 当前应使用的缩放（千分比）。结合「视频有效区域 / Mac 逻辑宽度」与显示器 DPI，
+// 保证窗口模式下桌面缩小时光标同比例缩小、全屏下精确对齐 1:1 视觉大小。
 static int DesiredCursorScalePm() {
     const double dpi = WindowDpiScale(g_hwnd);
-    const int dpiPm = (int)(dpi * 1000.0 + 0.5);
+    double targetScale = dpi;
+    const int scaleTenths = g_sessScaleTenths.load();
+    const int cwCoord = g_coordW.load();
+    if (g_hwnd && scaleTenths >= 5 && cwCoord > 0) {
+        RECT rc{};
+        if (GetClientRect(g_hwnd, &rc)) {
+            const int cw = rc.right - rc.left;
+            const int ch = rc.bottom - rc.top;
+            if (cw >= 64 && ch >= 64) {
+                const RECT vr = VideoRectInClient(cw, ch);
+                const int rw = vr.right - vr.left;
+                if (rw > 0) {
+                    const double macLogicalW = (double)cwCoord / ((double)scaleTenths / 10.0);
+                    if (macLogicalW > 0.0) {
+                        double videoScale = (double)rw / macLogicalW;
+                        const double minS = std::max(0.75, dpi * 0.45);
+                        const double maxS = dpi * 1.5;
+                        if (videoScale < minS) videoScale = minS;
+                        if (videoScale > maxS) videoScale = maxS;
+                        targetScale = videoScale;
+                    }
+                }
+            }
+        }
+    }
+    const int basePm = (int)(targetScale * 1000.0 + 0.5);
     const int zoomPm = (int)(g_shakeZoom * 1000.0 + 0.5);
     // 先用整数乘再除，避免浮点误差在动画期间来回跳变
-    return (int)((int64_t)dpiPm * zoomPm / 1000);
+    return (int)((int64_t)basePm * zoomPm / 1000);
 }
 
 // 放大状态变化后重建 HCURSOR。缩放参与指纹，所以改 g_shakeActive 后
@@ -5515,6 +5570,9 @@ static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
                         Log("交换链同步放弃: 目标 %dx%d 连续失败", tw, th);
                         g_syncSwapRetry = 0;
                     }
+                } else {
+                    g_syncSwapRetry = 0;
+                    RefreshCursorScale();
                 }
             }
             return 0;
@@ -6191,8 +6249,23 @@ static void OnSessionPacket(const uint8_t* p, size_t n) {
     int w = (int)((p[1] << 8) | p[2]);
     int h = (int)((p[3] << 8) | p[4]);
     int fps = (int)p[5];
+    int scaleTenths = (n >= 7) ? (int)p[6] : 0;
     if (w <= 0 || h <= 0 || w > 16384 || h > 16384) return;
-    if (g_sessW.load() == w && g_sessH.load() == h && g_sessFps.load() == fps) return;
+    const bool sizeOrFpsChanged = (g_sessW.load() != w || g_sessH.load() != h || g_sessFps.load() != fps);
+    const bool scaleChanged = (g_sessScaleTenths.load() != scaleTenths);
+    if (!sizeOrFpsChanged && !scaleChanged) return;
+
+    g_sessScaleTenths = scaleTenths;
+    if (!sizeOrFpsChanged) {
+        if (g_hwnd) {
+            {
+                std::lock_guard<std::mutex> lk(g_cursorImage.mtx);
+                if (!g_cursorImage.bgra.empty()) g_cursorImage.pending = true;
+            }
+            PostMessageA(g_hwnd, WM_APPLY_CURSOR, 0, 0);
+        }
+        return;
+    }
 
     g_sessW = w; g_sessH = h; g_sessFps = fps;
     // 坐标基准立即跟随会话头，不与 presenter->Resize 成败绑定：
@@ -6201,7 +6274,8 @@ static void OnSessionPacket(const uint8_t* p, size_t n) {
         g_coordW = w;
         g_coordH = h;
     }
-    Log("会话头: 协议 v%u  虚拟屏 %dx%d @ %d fps", ver, w, h, fps);
+    Log("会话头: 协议 v%u  虚拟屏 %dx%d @ %d fps  scale=%.1fx",
+        ver, w, h, fps, scaleTenths >= 5 ? (scaleTenths / 10.0) : 0.0);
 
     int dw = g_displayW.load(), dh = g_displayH.load();
     if (w != dw || h != dh) {
