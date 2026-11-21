@@ -376,17 +376,14 @@ static void RecordRemoteTarget(LONG x, LONG y, uint64_t ms) {
 }
 
 static bool IsRemoteCursorEcho(LONG x, LONG y, uint64_t nowMs) {
-    // 若最近 150ms 内有真实硬件鼠标活动（WM_INPUT），放行本次移动以便本地瞬间接管
-    if (nowMs - (uint64_t)g_lastHardwareMouseMs.load() < 150) return false;
+    // 判定「程序自己 SetCursorPos 引起的 WM_MOUSEMOVE」。
+    // 关键：窗口必须收得很紧（40ms / 2px），并且删掉原来的 250ms + 32px 兜底。
+    // 远程光标以 60~90Hz 调 SetCursorPos，那条兜底会让「用户慢速小幅移动」全部被判成回声，
+    // 于是 Mac 端光标根本不动、点击落在旧位置，用户体感就是「点不进去」。
     for (int i = 0; i < kRemoteTargetCap; ++i) {
         const RemoteTargetSample& s = g_remoteTargets[i];
-        if (s.ms == 0 || nowMs - s.ms > 300) continue;
-        if (std::abs(x - s.x) <= 4 && std::abs(y - s.y) <= 4) return true;
-    }
-    // 兜底：无硬件鼠标输入且距上次 SetCursorPos 不足 250ms，小幅滞后/插值落点也视为回声
-    if (nowMs - (uint64_t)g_lastRemoteCursorMoveMs.load() < 250) {
-        LONG lx = g_lastRemoteCursorX.load(), ly = g_lastRemoteCursorY.load();
-        if (lx != INT_MIN && std::abs(x - lx) <= 32 && std::abs(y - ly) <= 32) return true;
+        if (s.ms == 0 || nowMs - s.ms > 40) continue;
+        if (std::abs(x - s.x) <= 2 && std::abs(y - s.y) <= 2) return true;
     }
     return false;
 }
@@ -5965,6 +5962,9 @@ static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
         // 直接计入摆幅会误触发放大。清空采样缓冲，从新几何重新累积。
         ResetShakeSamples();
         return 0;
+    case WM_MOUSEACTIVATE:
+        // 明确要求「激活并投递这次点击」，避免第一次点击只用于激活窗口而不转发给 Mac。
+        return MA_ACTIVATE;
     case WM_ACTIVATE:
         if (LOWORD(w) == WA_INACTIVE) {
             // 失焦时结束晃动放大：叠加层是 TOPMOST，留着会盖在别人的窗口上。
