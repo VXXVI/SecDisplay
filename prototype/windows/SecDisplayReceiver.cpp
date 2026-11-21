@@ -377,12 +377,15 @@ static void RecordRemoteTarget(LONG x, LONG y, uint64_t ms) {
 
 static bool IsRemoteCursorEcho(LONG x, LONG y, uint64_t nowMs) {
     // 判定「程序自己 SetCursorPos 引起的 WM_MOUSEMOVE」。
-    // 关键：窗口必须收得很紧（40ms / 2px），并且删掉原来的 250ms + 32px 兜底。
-    // 远程光标以 60~90Hz 调 SetCursorPos，那条兜底会让「用户慢速小幅移动」全部被判成回声，
-    // 于是 Mac 端光标根本不动、点击落在旧位置，用户体感就是「点不进去」。
+    // 窗口必须收得很紧（40ms / 2px），否则远程 60~90Hz 调 SetCursorPos 时，
+    // 「用户慢速小幅移动」会被整片吞掉，Mac 端光标不动、点击落在旧位置（体感「点不进去」）。
+    // 完全没有硬件鼠标输入时（远程/虚拟输入设备不产生 WM_INPUT），
+    // 队列积压可能让回声迟到几十毫秒，这时放宽到 400ms，避免回声被当成真实移动反复回传。
+    const bool hwRecent = (nowMs - (uint64_t)g_lastHardwareMouseMs.load() < 300);
+    const uint64_t win = hwRecent ? 40u : 400u;
     for (int i = 0; i < kRemoteTargetCap; ++i) {
         const RemoteTargetSample& s = g_remoteTargets[i];
-        if (s.ms == 0 || nowMs - s.ms > 40) continue;
+        if (s.ms == 0 || nowMs - s.ms > win) continue;
         if (std::abs(x - s.x) <= 2 && std::abs(y - s.y) <= 2) return true;
     }
     return false;
