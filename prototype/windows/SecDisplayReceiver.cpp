@@ -6254,14 +6254,19 @@ static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
     case WM_CAPTURECHANGED:
         // 捕获被系统/其他窗口夺走时收不到 WM_LBUTTONUP，必须补一个全释放包，
         // 否则 Mac 端会一直停在按下状态（表现为「松手还在拖」）。
+        // 注意：本消息的 lParam 是「抢走捕获的窗口句柄」，不是坐标，不能当坐标解析。
         if (g_buttons.load() != 0) {
             g_buttons = 0;
-            float vx, vy;
-            if (ClientToVideo(GET_X_LPARAM(l), GET_Y_LPARAM(l), &vx, &vy)) {
-                QueueInputEvent(vx, vy, 0, 0);
-            } else {
-                QueueInputEvent(g_moveX.load(), g_moveY.load(), 0, 0);
+            POINT pt{};
+            float vx = g_moveX.load(), vy = g_moveY.load();
+            if (GetCursorPos(&pt)) {
+                POINT cp = pt;
+                if (ScreenToClient(g_hwnd, &cp)) {
+                    float tx, ty;
+                    if (ClientToVideo(cp.x, cp.y, &tx, &ty)) { vx = tx; vy = ty; }
+                }
             }
+            QueueInputEvent(vx, vy, 0, 0);
             Log("鼠标捕获丢失，已补发全释放");
         }
         return 0;
