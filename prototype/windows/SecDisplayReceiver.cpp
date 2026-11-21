@@ -6031,6 +6031,7 @@ static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
         // 否则每次移动都会被夹回副屏窗口，表现为「鼠标被困在副屏里出不去」。
         // 例外：Mac 光标刚重新回到副屏时允许拉回一次（g_pullCursorIn）。
         const bool owned = PortalCursorOwned();
+        if (owned) g_pullCursorIn.store(false);   // 已在画面内，凭证不再需要，避免出去后又被拽回一次
         if (!owned && !g_pullCursorIn.load()) return 0;
         const uint64_t gateNow = GetTickCount64();
         // 本机物理鼠标刚动过时让本地先行一小段（60ms），避免两条位置源互相拉扯产生抖动；

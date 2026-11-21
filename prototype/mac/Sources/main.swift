@@ -3225,7 +3225,8 @@ final class CursorImageTracker {
         // 归一化后 w == logical * scale，两端口径一致；缩放放大则从这张高分辨率图重采样。
         let logicalW = cur.image.size.width
         let logicalH = cur.image.size.height
-        let sendScale = max(1.0, min(4.0, vdBackingScale))
+        // 与会话头里的 scaleTenths 用同一套取整，避免 1.25 这类值两边差 4%（稳态光标略小）。
+        let sendScale = max(1.0, min(4.0, (vdBackingScale * 10).rounded() / 10))
         guard logicalW > 0, logicalH > 0 else { return }
         let rawW = max(1, Int((logicalW * sendScale).rounded()))
         let rawH = max(1, Int((logicalH * sendScale).rounded()))
