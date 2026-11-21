@@ -3170,7 +3170,7 @@ final class CursorImageTracker {
     private var pendingFingerprint: UInt64 = 0
     /// 上次观察到的连接代数，用于连接重建时强制重发
     private var lastEpoch = -1
-    private let maxDim = 128       // 光标不会超过 128 像素，超出则等比缩放到此上限
+    private let maxDim = 256       // 原生位图上限（2x 下 128pt），超出则等比缩到 128pt 等效
     /// 抑制 macOS 系统「晃动鼠标指针以定位」产生的 4fps 临时放大光标帧，
     /// 避免在 Windows 端 125Hz 晃动缩放动画期间出现双重放大与阶梯抖动；
     /// 若放大持续超过 2.2 秒，则视为辅助功能永久放大设置，正常放行。
@@ -3219,27 +3219,30 @@ final class CursorImageTracker {
               let cg = cur.image.cgImage(forProposedRect: nil, context: nil, hints: nil)
         else { return }
 
-        // 统一按 1x 逻辑尺寸发送：NSCursor.size 是点，hotSpot 也是点。
-        // 直接送 cgImage 会把当前屏的 backing scale 带进来（内建屏 2x、
-        // 虚拟屏 1x），热点也按点算，2x 位图下只剩一半，落点会偏半个光标。
-        // 接收端再按画面/逻辑尺寸的比例放大，视觉比例才和桌面元素一致。
-        let targetW = Int(cur.image.size.width.rounded())
-        let targetH = Int(cur.image.size.height.rounded())
-        let rawW = targetW > 0 ? targetW : cg.width
-        let rawH = targetH > 0 ? targetH : cg.height
+        // 按「会话 backing scale」归一化后发送，而不是直接发 cgImage 的真实像素：
+        // 接收端要用 0x06 会话头里的 scale 反推逻辑尺寸，如果这里发的是某个 rep 的原始像素
+        // （自定义光标可能只有 1x rep），接收端会算错一倍，热点也跟着偏。
+        // 归一化后 w == logical * scale，两端口径一致；缩放放大则从这张高分辨率图重采样。
+        let logicalW = cur.image.size.width
+        let logicalH = cur.image.size.height
+        // 与会话头里的 scaleTenths 用同一套取整，避免 1.25 这类值两边差 4%（稳态光标略小）。
+        let sendScale = max(1.0, min(4.0, (vdBackingScale * 10).rounded() / 10))
+        guard logicalW > 0, logicalH > 0 else { return }
+        let rawW = max(1, Int((logicalW * sendScale).rounded()))
+        let rawH = max(1, Int((logicalH * sendScale).rounded()))
         let rawMax = max(rawW, rawH)
-        guard rawW > 0, rawH > 0 else { return }
+        let logicalMax = Int(max(logicalW, logicalH).rounded())
 
         let now = CFAbsoluteTimeGetCurrent()
         if normalCursorMaxDim == 0 {
             enlargedCursorSince = 0
-            normalCursorMaxDim = rawMax
-        } else if rawMax <= 42 {
-            // 常规 1x 系统光标（如 23x22 I型 <-> 28x40 箭头）不高于 42pt，
+            normalCursorMaxDim = logicalMax
+        } else if logicalMax <= 42 {
+            // 常规系统光标（如 23x22 I型 <-> 28x40 箭头）不高于 42pt，
             // 直接放行并维护基线，绝不会在晃动期间把基线抬高到 43+。
             enlargedCursorSince = 0
-            normalCursorMaxDim = rawMax
-        } else if rawMax <= Int(Double(normalCursorMaxDim) * 1.35) {
+            normalCursorMaxDim = logicalMax
+        } else if logicalMax <= Int(Double(normalCursorMaxDim) * 1.35) {
             // 已处于永久大指针模式（例如无障碍 64pt+）时的正常形状切换
             enlargedCursorSince = 0
         } else {
@@ -3249,14 +3252,15 @@ final class CursorImageTracker {
             if now - enlargedCursorSince < 2.2 {
                 return
             }
-            normalCursorMaxDim = rawMax
+            normalCursorMaxDim = logicalMax
         }
 
         let clampScale = rawMax > maxDim ? Double(maxDim) / Double(rawMax) : 1.0
         let w = max(1, Int((Double(rawW) * clampScale).rounded()))
         let h = max(1, Int((Double(rawH) * clampScale).rounded()))
-        let scaleX = targetW > 0 ? Double(w) / Double(targetW) : Double(w) / Double(cg.width)
-        let scaleY = targetH > 0 ? Double(h) / Double(targetH) : Double(h) / Double(cg.height)
+        // 热点按「原生像素 / 逻辑点」的比例换算，落点与视觉完全一致。
+        let scaleX = Double(w) / Double(logicalW)
+        let scaleY = Double(h) / Double(logicalH)
         let hotX = Int((cur.hotSpot.x * scaleX).rounded())
         let hotY = Int((cur.hotSpot.y * scaleY).rounded())
 
