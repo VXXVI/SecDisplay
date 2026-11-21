@@ -431,6 +431,8 @@ static void* g_zoomOverlayBits = nullptr;
 static std::mutex g_spriteMtx;
 static std::vector<uint8_t> g_nativeSprite;
 static int g_nativeW = 0, g_nativeH = 0, g_nativeHotX = 0, g_nativeHotY = 0;
+// 稳态「原生像素 → 屏幕物理像素」的实际比例（已含 hwMax 钳位），供放大叠加层作为基准。
+static double g_steadySpriteK = 0.0;
 
 // 已建好的 HCURSOR 对应的位图指纹与缩放（千分比）。同一张位图、同一缩放不重建，
 // 避免重复的 CreateIconIndirect/DestroyCursor 造成光标闪烁和句柄抖动。
@@ -468,7 +470,7 @@ static const double kShakeCursorZoom = 2.2;  // 目标放大倍数（绘制在�
 static const double kShakeGrowMs = 180.0;    // 起势时长（EaseOutBack，末端轻微过冲）
 static const double kShakeHoldMs = 500.0;    // 停晃后保持时长
 static const double kShakeShrinkMs = 280.0;  // 回落时长（EaseInOutCubic）
-static const double kShakeOvershootC1 = 0.55; // EaseOutBack 过冲系数（0.55 ≈ 3% 过冲）
+static const double kShakeOvershootC1 = 1.2;  // EaseOutBack 过冲系数（≈3% 峰值过冲）
 static const int kShakeTickMs = 16;          // ~60Hz 动画刷新
 static const UINT_PTR kShakeTimer = 4004;
 struct ShakeSample { int64_t t; int x; int y; };
@@ -490,6 +492,9 @@ static double g_shakeAnimFromZoom = 1.0;
 static double g_shakeLastShakeQpcMs = 0.0;
 static double g_shakeLastRefreshQpcMs = 0.0;
 static bool g_shakeTimePeriodOn = false;
+
+// 立即结束晃动放大（失焦、改窗口几何、关闭开关等场景）。定义在后面，控制面板需要先用。
+static void AbortShake();
 
 static void SetShakeTimePeriod(bool enable) {
     if (enable && !g_shakeTimePeriodOn) {
@@ -988,7 +993,17 @@ static void OnCursorImagePacket(const uint8_t* p, size_t payloadLen) {
     int w = rd16(p), h = rd16(p + 2);
     int hotX = rd16(p + 4), hotY = rd16(p + 6);
     uint32_t nBytes = rd32(p + 8);
-    if (w <= 0 || h <= 0 || w > 128 || h > 128) return;
+    // 上限与 Mac 端 CursorImageTracker.maxDim（256 原生像素）保持一致：
+    // 之前这里是 128，Mac 放大指针后整包会被静默丢弃，副屏光标直接停止更新。
+    if (w <= 0 || h <= 0 || w > 256 || h > 256) {
+        static uint64_t s_lastDropLog = 0;
+        const uint64_t nowMs = GetTickCount64();
+        if (nowMs - s_lastDropLog > 5000) {
+            s_lastDropLog = nowMs;
+            Log("警告: 丢弃超尺寸光标位图 %dx%d（上限 256）", w, h);
+        }
+        return;
+    }
     if (nBytes != (uint32_t)(w * h * 4) || payloadLen < 12 + nBytes) return;
 
     {
@@ -4308,15 +4323,9 @@ static LRESULT CALLBACK PanelWndProc(HWND h, UINT msg, WPARAM w, LPARAM l) {
             bool on = (SendMessageW((HWND)l, BM_GETCHECK, 0, 0) == BST_CHECKED);
             g_shakeEnabled = on;
             if (!on) {
-                // 关掉时立刻把可能还处于放大状态的光标收回来
-                g_shakeActive = false;
-                g_shakePhase = SHAKE_IDLE;
-                g_shakeZoom = 1.0;
-                // 定时器是建在主窗口上的（SetTimer(g_hwnd, ...)），
-                // 用面板句柄 KillTimer 杀不掉，必须用 g_hwnd。
-                if (g_hwnd) KillTimer(g_hwnd, kShakeTimer);
-                SetShakeTimePeriod(false);
-                RefreshCursorScale();
+                // 关掉时立刻收起放大叠加层并复位动画：
+                // 只杀定时器不复位叠加层会留下一张冻结的放大光标，同时系统光标仍是隐藏句柄。
+                AbortShake();
             }
             Log("控制面板: 晃动找光标 %s", on ? "开" : "关");
             return 0;
@@ -5114,8 +5123,8 @@ static int DesiredCursorScalePm();
 // 1x1 全透明光标（AND 掩码全 1 = 保留桌面像素），用于「完全不显示指针」的场合。
 static HCURSOR HiddenCursorHandle() {
     if (g_hiddenCursor) return g_hiddenCursor;
-    static const BYTE kAnd[1] = { 0xFF };
-    static const BYTE kXor[1] = { 0x00 };
+    static const BYTE kAnd[2] = { 0xFF, 0xFF };   // 每行按 16 位对齐，1x1 需 2 字节
+    static const BYTE kXor[2] = { 0x00, 0x00 };
     g_hiddenCursor = CreateCursor(GetModuleHandleW(nullptr), 0, 0, 1, 1, kAnd, kXor);
     return g_hiddenCursor;
 }
@@ -5153,8 +5162,8 @@ static bool PortalCursorOwned() {
 // 预乘 alpha 的 BGRA 双线性重采样。放大与缩小共用，避免最近邻锯齿。
 static void ResampleBgraPremul(const uint8_t* src, int sw, int sh,
                                std::vector<uint8_t>& dst, int dw, int dh) {
+    if (sw <= 0 || sh <= 0 || dw <= 0 || dh <= 0 || !src) { dst.clear(); return; }
     dst.assign((size_t)dw * dh * 4, 0);
-    if (sw <= 0 || sh <= 0 || dw <= 0 || dh <= 0) return;
     const double scaleX = (double)sw / (double)dw;
     const double scaleY = (double)sh / (double)dh;
     for (int yy = 0; yy < dh; ++yy) {
@@ -5236,6 +5245,7 @@ static void AbortShake() {
 static void UpdateZoomOverlay(double zoom) {
     if (zoom <= 1.02) { HideZoomOverlay(); return; }
     if (!EnsureZoomOverlay()) return;
+    if (g_steadySpriteK <= 0.0) return;
     std::vector<uint8_t> sprite;
     int sw = 0, sh = 0, shx = 0, shy = 0;
     {
@@ -5244,9 +5254,10 @@ static void UpdateZoomOverlay(double zoom) {
         sprite = g_nativeSprite;
         sw = g_nativeW; sh = g_nativeH; shx = g_nativeHotX; shy = g_nativeHotY;
     }
-    const double nativeScale = (g_sessScaleTenths.load() >= 5) ? (g_sessScaleTenths.load() / 10.0) : 1.0;
-    const double displayScale = DesiredCursorScalePm() / 1000.0;
-    double k = (displayScale / nativeScale) * zoom;
+    // 关键：从「稳态实际绘制比例」出发再乘 zoom。
+    // 若直接重新推导 (displayScale/nativeScale)，会绕过 ApplyCursorImage 里的 hwMax 钳位，
+    // 起晃第一帧就会从被钳过的尺寸跳到未钳尺寸（能差 25%），曲线立刻变得突兀。
+    double k = g_steadySpriteK * zoom;
     if (k <= 0.0) return;
     int dw = (int)(sw * k + 0.5);
     int dh = (int)(sh * k + 0.5);
@@ -5264,12 +5275,14 @@ static void UpdateZoomOverlay(double zoom) {
     if (dw < 1) dw = 1;
     if (dh < 1) dh = 1;
 
-    if (dw != g_zoomOverlayW || dh != g_zoomOverlayH) {
+    // 一次性按上限分配 DIB/DC：放大过程中尺寸每帧变化，反复 CreateDIBSection 会明显拖慢。
+    // 分配后只把当前尺寸的行拷进左上角，UpdateLayeredWindow 用 psize 指定实际区域。
+    if (!g_zoomOverlayBits || !g_zoomOverlayDC) {
         DestroyZoomOverlayResources();
         BITMAPV5HEADER bi{};
         bi.bV5Size = sizeof(bi);
-        bi.bV5Width = dw;
-        bi.bV5Height = -dh;                 // 负值 = 自顶向下
+        bi.bV5Width = kMaxSide;
+        bi.bV5Height = -kMaxSide;           // 负值 = 自顶向下
         bi.bV5Planes = 1;
         bi.bV5BitCount = 32;
         bi.bV5Compression = BI_RGB;
@@ -5283,14 +5296,23 @@ static void UpdateZoomOverlay(double zoom) {
             return;
         }
         SelectObject(g_zoomOverlayDC, g_zoomOverlayBmp);
-        g_zoomOverlayW = dw;
-        g_zoomOverlayH = dh;
+        g_zoomOverlayW = kMaxSide;
+        g_zoomOverlayH = kMaxSide;
     }
+    if (dw > g_zoomOverlayW || dh > g_zoomOverlayH) return;
 
     std::vector<uint8_t> scaled;
     ResampleBgraPremul(sprite.data(), sw, sh, scaled, dw, dh);
-    if (!g_zoomOverlayBits || scaled.size() != (size_t)dw * dh * 4) return;
-    memcpy(g_zoomOverlayBits, scaled.data(), scaled.size());
+    if (scaled.size() != (size_t)dw * dh * 4) return;
+    // 逐行拷贝：DIB 的 stride 是 512*4，不能整块 memcpy
+    {
+        uint8_t* base = (uint8_t*)g_zoomOverlayBits;
+        const size_t dstStride = (size_t)g_zoomOverlayW * 4;
+        const size_t rowBytes = (size_t)dw * 4;
+        for (int y = 0; y < dh; ++y) {
+            memcpy(base + (size_t)y * dstStride, scaled.data() + (size_t)y * rowBytes, rowBytes);
+        }
+    }
 
     POINT cur{};
     if (!GetCursorPos(&cur)) return;
@@ -5306,6 +5328,9 @@ static void UpdateZoomOverlay(double zoom) {
             Log("晃动放大: 叠加层显示 %dx%d (zoom %.2fx)", dw, dh, zoom);
         }
         SetCursor(HiddenCursorHandle());
+    } else {
+        // 更新失败时不能留着上一帧的放大图与隐藏光标
+        HideZoomOverlay();
     }
 }
 
@@ -5351,6 +5376,7 @@ static void ApplyCursorImage() {
     if (maxSide > (double)hwMax) k *= (double)hwMax / maxSide;
     const int scalePm = (int)(k * nativeScale * 1000.0 + 0.5);
     const int capInt = hwMax;
+    g_steadySpriteK = k;   // 叠加层按同一基准放大，避免起晃第一帧尺寸跳变
 
     // 放大动画用的高分辨率源：始终保留原生位图（未缩放），由叠加层按需重采样。
     {
@@ -5374,7 +5400,7 @@ static void ApplyCursorImage() {
             g_cursorAppliedFp = fp;
             g_cursorAppliedScalePm = scalePm;
             g_cursorAppliedCap = capInt;
-            if (g_cursorVisible.load()) SetCursor(g_customCursor);
+            if (!g_zoomOverlayShown && g_cursorVisible.load()) SetCursor(g_customCursor);
             if (old && old != g_customCursor && !IsInCursorCache(old)) DestroyCursor(old);
             return;
         }
@@ -5533,10 +5559,7 @@ static bool DetectShake(int64_t now, int x, int y) {
             SetShakeTimePeriod(true);
             if (SetTimer(g_hwnd, kShakeTimer, kShakeTickMs, nullptr) == 0) {
                 Log("警告: 创建晃动定时器失败，放弃本次放大");
-                SetShakeTimePeriod(false);
-                g_shakeActive = false;
-                g_shakePhase = SHAKE_IDLE;
-                g_shakeZoom = 1.0;
+                AbortShake();
                 return false;
             }
         }
@@ -5814,6 +5837,9 @@ static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
         }
         if (w == kShakeTimer) {
             const double nowQpc = QpcNowMs();
+            // 鼠标移动路径（DriveShakeStep）刚推进过就跳过，避免同一帧算两次、
+            // 重复做一次叠加层重采样与 UpdateLayeredWindow。
+            if (nowQpc - g_shakeLastRefreshQpcMs < (double)kShakeTickMs * 0.5) return 0;
             g_shakeLastRefreshQpcMs = nowQpc;
             const bool keep = TickShakeAnim(nowQpc);
             if (!keep) {
@@ -5836,6 +5862,10 @@ static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
         return 0;
     case WM_APP_CURSOR_VIS:
         // 0x03 的可见性变化：离开副屏就隐藏，回来就恢复自定义光标
+        if (!g_cursorVisible.load()) {
+            // 指针离开副屏时立即收起放大叠加层，避免冻结的放大图滞留到动画结束。
+            AbortShake();
+        }
         if (g_zoomOverlayShown) {
             SetCursor(HiddenCursorHandle());
         } else if (g_cursorVisible.load()) {
@@ -5990,19 +6020,23 @@ static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
         // 门控：
         //   1. 最小化时不移动光标
         //   2. 窗口模式下非前台不抢夺用户在其他软件里的光标；全屏副屏时允许跨弹窗操作
-        //   3. 本机物理鼠标最近 250ms 内有活动时，本地输入优先
+        //   3. 本机物理鼠标最近 60ms 内有活动时，本地输入优先
         if (IsIconic(g_hwnd)) return 0;
         if (!g_isFullscreen && GetForegroundWindow() != g_hwnd) return 0;
         // 指针已经离开视频画面（例如用户把它滑到主屏）时不再拽回来：
         // 远程 0x03 只负责「画面内」的光标，出画面即交还本机光标，
         // 否则每次移动都会被夹回副屏窗口，表现为「鼠标被困在副屏里出不去」。
-        // 例外：Mac 光标刚重新回到副屏时允许拉回一次，保证还能用键盘/触控板把它带回来。
-        if (!PortalCursorOwned() && !g_pullCursorIn.exchange(false)) return 0;
+        // 例外：Mac 光标刚重新回到副屏时允许拉回一次（g_pullCursorIn）。
+        const bool owned = PortalCursorOwned();
+        if (!owned && !g_pullCursorIn.load()) return 0;
         const uint64_t gateNow = GetTickCount64();
         // 本机物理鼠标刚动过时让本地先行一小段（60ms），避免两条位置源互相拉扯产生抖动；
         // 原来 250ms 太长，会看到光标冻结再瞬移。
-        if (gateNow - (uint64_t)g_lastLocalInputMs.load() < 60 ||
-            gateNow - (uint64_t)g_lastHardwareMouseMs.load() < 60) return 0;
+        const bool localBusy = (gateNow - (uint64_t)g_lastLocalInputMs.load() < 60) ||
+                               (gateNow - (uint64_t)g_lastHardwareMouseMs.load() < 60);
+        // 「回到副屏」的一次性拉回必须绕过本地优先门控：用户正是用手把指针推回来，
+        // 硬件鼠标一定刚刚动过，否则这次拉回会被永久丢弃。
+        if (localBusy && owned) return 0;
         double cx = g_cursorX.load(), cy = g_cursorY.load();
         if (cx < 0 || cy < 0) return 0;
         int vw = g_coordW.load(), vh = g_coordH.load();
@@ -6022,6 +6056,8 @@ static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
         if (sx >= tl.x + vr.right) sx = tl.x + vr.right - 1;
         if (sy < tl.y + vr.top) sy = tl.y + vr.top;
         if (sy >= tl.y + vr.bottom) sy = tl.y + vr.bottom - 1;
+        // 真正执行了拉回才消费一次性凭证，避免被后续 return 吞掉。
+        if (!owned) g_pullCursorIn.store(false);
         const uint64_t nowMoveMs = GetTickCount64();
         g_lastRemoteCursorX = sx;
         g_lastRemoteCursorY = sy;
@@ -6132,8 +6168,8 @@ static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
         break;
     }
     case WM_MOUSEMOVE: {
-        // 过滤程序 SetCursorPos 产生的 WM_MOUSEMOVE 回声（16 项历史目标 + WM_INPUT 硬件判定）。
-        // 过滤失败会把远程移动误判为本地鼠标输入，导致 250ms 冻结并向 Mac 回传 0x04 把光标拽回。
+        // 过滤程序 SetCursorPos 产生的 WM_MOUSEMOVE 回声（最近 40ms 内、2px 以内的目标点）。
+        // 过滤失败会把远程移动误判成本地鼠标输入，导致 60ms 冻结并向 Mac 回传 0x04 把光标拽回。
         POINT pt{ GET_X_LPARAM(l), GET_Y_LPARAM(l) };
         ClientToScreen(h, &pt);
         if (IsRemoteCursorEcho(pt.x, pt.y, GetTickCount64())) {
@@ -6215,6 +6251,20 @@ static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
             return 0;
         }
         break;
+    case WM_CAPTURECHANGED:
+        // 捕获被系统/其他窗口夺走时收不到 WM_LBUTTONUP，必须补一个全释放包，
+        // 否则 Mac 端会一直停在按下状态（表现为「松手还在拖」）。
+        if (g_buttons.load() != 0) {
+            g_buttons = 0;
+            float vx, vy;
+            if (ClientToVideo(GET_X_LPARAM(l), GET_Y_LPARAM(l), &vx, &vy)) {
+                QueueInputEvent(vx, vy, 0, 0);
+            } else {
+                QueueInputEvent(g_moveX.load(), g_moveY.load(), 0, 0);
+            }
+            Log("鼠标捕获丢失，已补发全释放");
+        }
+        return 0;
     case WM_LBUTTONDBLCLK: {
         // 双击必须转发给 Mac，而不是被本地「切换全屏」吞掉：
         // 以前双击内容会展成全屏，用户体感就是「点不进去/点错」。全屏请用 F11 或最大化按钮。

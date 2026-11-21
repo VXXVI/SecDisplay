@@ -3219,17 +3219,18 @@ final class CursorImageTracker {
               let cg = cur.image.cgImage(forProposedRect: nil, context: nil, hints: nil)
         else { return }
 
-        // 按「原生像素」发送，而不是先缩成 1x 逻辑点：
-        // 接收端晃动放大时要从这张位图做上采样，1x 源在 2~3 倍放大下会明显发糊
-        // （实测 16x23 放大 3.6 倍极其粗糙）。原生 2x（56x80）下放大到 2.2 倍仍接近 1:1，
-        // 观感与 macOS 自带光标放大接近；稳态由接收端按 DPI/视频比例下采样，依旧锐利。
+        // 按「会话 backing scale」归一化后发送，而不是直接发 cgImage 的真实像素：
+        // 接收端要用 0x06 会话头里的 scale 反推逻辑尺寸，如果这里发的是某个 rep 的原始像素
+        // （自定义光标可能只有 1x rep），接收端会算错一倍，热点也跟着偏。
+        // 归一化后 w == logical * scale，两端口径一致；缩放放大则从这张高分辨率图重采样。
         let logicalW = cur.image.size.width
         let logicalH = cur.image.size.height
-        let rawW = cg.width
-        let rawH = cg.height
+        let sendScale = max(1.0, min(4.0, vdBackingScale))
+        guard logicalW > 0, logicalH > 0 else { return }
+        let rawW = max(1, Int((logicalW * sendScale).rounded()))
+        let rawH = max(1, Int((logicalH * sendScale).rounded()))
         let rawMax = max(rawW, rawH)
         let logicalMax = Int(max(logicalW, logicalH).rounded())
-        guard rawW > 0, rawH > 0, logicalW > 0, logicalH > 0 else { return }
 
         let now = CFAbsoluteTimeGetCurrent()
         if normalCursorMaxDim == 0 {
