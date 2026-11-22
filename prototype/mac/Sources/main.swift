@@ -2084,9 +2084,10 @@ final class ScreenshotCapture {
 
 private let fastPathMissLock = NSLock()
 private var fastPathMissLogged = false
-/// 无名 RGB 色彩空间是否等价 sRGB 的缓存（虚拟屏色彩空间恒定，判定一次即可）。
+/// 无名 RGB 色彩空间是否等价 sRGB 的缓存。键绑定到具体色彩空间对象，
+/// 避免不同空间共用单槽缓存导致静默误判（审查指出的低概率缺陷）。
 private let colorSpaceCheckLock = NSLock()
-private var unnamedRGBIsSRGB: Bool? = nil
+private var lastColorSpaceCheck: (id: ObjectIdentifier, isSRGB: Bool)? = nil
 
 /// 判断色彩空间是否可安全地按 BGRA 直接拷贝：
 /// - nil：SkyLight 合成图有时不带 colorSpace，像素已是 BGRA，按 sRGB 处理；
@@ -2098,7 +2099,10 @@ private func isSRGBEquivalent(_ cs: CGColorSpace?, csName: String?, srgbName: St
     if let srgbName, csName == srgbName { return true }
     guard cs.model == .rgb, !cs.isWideGamutRGB else { return false }
     colorSpaceCheckLock.lock()
-    if let cached = unnamedRGBIsSRGB { colorSpaceCheckLock.unlock(); return cached }
+    if let cached = lastColorSpaceCheck, cached.id == ObjectIdentifier(cs) {
+        colorSpaceCheckLock.unlock()
+        return cached.isSRGB
+    }
     colorSpaceCheckLock.unlock()
     var isSRGB = false
     if let icc = cs.copyICCData(), let rebuilt = CGColorSpace(iccData: icc),
@@ -2106,7 +2110,7 @@ private func isSRGBEquivalent(_ cs: CGColorSpace?, csName: String?, srgbName: St
         isSRGB = true
     }
     colorSpaceCheckLock.lock()
-    unnamedRGBIsSRGB = isSRGB
+    lastColorSpaceCheck = (ObjectIdentifier(cs), isSRGB)
     colorSpaceCheckLock.unlock()
     return isSRGB
 }
@@ -2133,8 +2137,9 @@ private func logFastPathMiss(_ reason: String, img: CGImage, w: Int, h: Int,
 /// SkyLight 抓到的 CGImage 通常已是 32bpp BGRA premultiplied 小端，与
 /// kCVPixelFormatType_32BGRA 一致，直接按行 memcpy 到 IOSurface 像素缓冲，
 /// 省掉 CGContextDrawImage 的颜色管理与格式转换（实测 CPU 82% -> 20%）。
-/// 只接受「无色彩空间」或「明确 sRGB」；未命名的 ICC/显示色彩空间可能是宽色域，
-/// 直接拷贝会偏色，交给回退路径做色彩转换。像素一致性已用探针验证 maxDiff=0。
+/// 色彩空间判据见 isSRGBEquivalent：无色彩空间、明确 sRGB、或 ICC 重建后等价 sRGB
+/// 的无名非宽色域 RGB 才走快路径；宽色域与其它模型交给回退路径做色彩转换。
+/// 像素一致性已用探针验证 maxDiff=0。
 private func makePixelBufferFast(from img: CGImage, w: Int, h: Int) -> CVPixelBuffer? {
     let cs = img.colorSpace
     let csName = cs?.name as String?
