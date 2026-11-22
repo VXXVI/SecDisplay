@@ -1054,6 +1054,8 @@ private enum SkyLightCapture {
     private static var _consecWrong = 0
     private static var _lastWrongW = 0
     private static var _lastWrongH = 0
+    /// 逃生阀启用日志的节流时间戳，与上面的状态共用 sizeStateLock。
+    private static var _lastEscalateLogAt: CFAbsoluteTime = 0
     private static func wrongSizeState() -> (consec: Int, w: Int, h: Int) {
         sizeStateLock.lock(); defer { sizeStateLock.unlock() }
         return (_consecWrong, _lastWrongW, _lastWrongH)
@@ -1105,23 +1107,26 @@ private enum SkyLightCapture {
                 // 数组里可能同时含整屏合成图与单个窗口图；挑尺寸严格等于目标的整屏帧。
                 // 绝不把 2880x60 这类条带拉伸成整屏，否则画面跳变经 H.264 变成拖影。
                 var picked: CGImage? = nil
+                var pickedArea = 0
                 var fallback: CGImage? = nil
+                var fallbackArea = 0
                 var anySize: (Int, Int)? = nil
                 for i in 0..<n {
                     guard let raw = CFArrayGetValueAtIndex(arr, i) else { continue }
                     let img = Unmanaged<CGImage>.fromOpaque(raw).takeUnretainedValue()
                     let iw = img.width, ih = img.height
                     if anySize == nil { anySize = (iw, ih) }
+                    let area = iw * ih
                     if iw == targetW && ih == targetH {
-                        picked = img
-                        break
-                    }
-                    // 逃生阀候选：纵横比与目标一致且面积不小于目标 1/4 的帧。
-                    // 条带帧（如 2880x60）纵横比极端，不会命中。
-                    if fallback == nil, ih > 0,
-                       abs((Double(iw) / Double(ih)) / targetAspect - 1.0) <= 0.02,
-                       iw >= targetW / 2, ih >= targetH / 2 {
-                        fallback = img
+                        // 精确尺寸可能有多个（合成图与正好铺满的窗口），取面积最大者，
+                        // 面积相同保留先出现的（合成图通常在首位）。
+                        if area > pickedArea { picked = img; pickedArea = area }
+                    } else if ih > 0,
+                              abs((Double(iw) / Double(ih)) / targetAspect - 1.0) <= 0.02,
+                              iw >= targetW / 2, ih >= targetH / 2 {
+                        // 逃生阀候选：纵横比与目标一致且面积不小于目标 1/4 的帧。
+                        // 条带帧（如 2880x60）纵横比极端，不会命中。
+                        if area > fallbackArea { fallback = img; fallbackArea = area }
                     }
                 }
                 if let img = picked {
@@ -1133,9 +1138,21 @@ private enum SkyLightCapture {
                 }
                 // 逃生阀：同一非目标尺寸持续 ≥30 帧，用纵横比匹配的候选缩放接受，
                 // 避免虚拟屏分辨率与目标暂时不一致时画面长期冻结。
+                // 接受后不清零计数，保持缩放模式连续出帧；只有精确尺寸分支才清零。
+                // 若在这里清零，会退化成「每 31 帧才放行 1 帧」，等同周期性跳变。
                 let sz = anySize ?? (0, 0)
                 if consec >= 30, sz.0 == lastW, sz.1 == lastH, let img = fallback {
-                    resetWrongSize()
+                    let nowEsc = CFAbsoluteTimeGetCurrent()
+                    var shouldLog = false
+                    sizeStateLock.lock()
+                    if nowEsc - _lastEscalateLogAt > 5.0 {
+                        _lastEscalateLogAt = nowEsc
+                        shouldLog = true
+                    }
+                    sizeStateLock.unlock()
+                    if shouldLog {
+                        Log.info("采集尺寸持续不符 \(sz.0)x\(sz.1) != \(targetW)x\(targetH)，已启用缩放接受")
+                    }
                     guard let pb = makePixelBuffer(from: img, targetW: targetW, targetH: targetH) else {
                         return .unavailable
                     }
