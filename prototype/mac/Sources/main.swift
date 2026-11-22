@@ -1008,7 +1008,13 @@ final class Encoder {
 //      校验；4 路 50fps 轮询很快耗尽 root tccd 的 256 个文件描述符上限（100024 EMFILE），
 //      导致 tccd 偶发报 -3801 / Code=1004 并反复弹出「请求屏幕录制权限」系统弹窗。
 //   3. SkyLight 的 SLSHWCaptureWindowList 直接从 WindowServer 合成并抓取虚拟屏窗口列表，
-//      实测 1000 帧 @ 50fps 零失败、单路 ~74fps，且不经过 replayd preflight=no 弹窗链路。
+//      不经过 replayd preflight=no 弹窗链路。但它返回的合成图尺寸取决于当帧窗口列表的
+//      并集包围盒：实测 120 帧里有 16 帧只合成出菜单栏条带（2880x60）。旧实现盲取
+//      arr[0] 再强行拉伸到 2880x1800，画面在「正常桌面」与「放大的菜单栏」之间跳，
+//      H.264 帧间预测把这种跳变渲染成拖影 / 残影 / 双指针观感。替代 API 实测：
+//      SLWindowListCreateImageFromArray 与 CGDisplayCreateImage 在 macOS 27 上都只返回
+//      纯灰图（diversity=1），不可用。因此这里只接受尺寸严格匹配的整屏帧，条带帧
+//      重新枚举窗口列表重试，全失败则丢帧（绝不拉伸错帧）。
 //   保留 SCScreenshotManager 作为回退（SECDISPLAY_CAPTURE=sck 或 420v 模式时使用）。
 private enum SkyLightCapture {
     typealias MainConnFn = @convention(c) () -> UInt32
@@ -1029,38 +1035,81 @@ private enum SkyLightCapture {
 
     static var isAvailable: Bool { syms != nil }
 
-    static func capturePixelBuffer(_ vdID: CGDirectDisplayID, targetW: Int, targetH: Int) -> CVPixelBuffer? {
-        guard let syms else { return nil }
+    /// 采集结果：尺寸合格的整屏帧 / 条带帧（需重试或丢弃）/ 真的抓不到。
+    enum Result {
+        case frame(CVPixelBuffer)
+        case wrongSize(w: Int, h: Int)
+        case unavailable
+    }
+    /// 累计丢弃的条带帧数，供面板/日志确认修复是否生效。
+    private static let badFrameLock = NSLock()
+    private static var _badFrames = 0
+    static var badFrameCount: Int { badFrameLock.lock(); defer { badFrameLock.unlock() }; return _badFrames }
+    static func noteBadFrame() { badFrameLock.lock(); _badFrames += 1; badFrameLock.unlock() }
+
+    static func captureFrame(_ vdID: CGDirectDisplayID, targetW: Int, targetH: Int) -> Result {
+        guard let syms else { return .unavailable }
         let bounds = CGDisplayBounds(vdID)
-        guard bounds.width > 1, bounds.height > 1 else { return nil }
-        guard let infos = CGWindowListCopyWindowInfo([.optionOnScreenOnly], kCGNullWindowID) as? [[String: Any]] else {
-            return nil
-        }
-        var wids: [UInt32] = []
-        wids.reserveCapacity(16)
-        for info in infos {
-            guard let wid = info[kCGWindowNumber as String] as? UInt32,
-                  let bDict = info[kCGWindowBounds as String] as? [String: Any],
-                  let rect = CGRect(dictionaryRepresentation: bDict as CFDictionary),
-                  rect.width > 0, rect.height > 0,
-                  rect.intersects(bounds) else { continue }
-            let alpha = info[kCGWindowAlpha as String] as? Double ?? 1.0
-            if alpha <= 0.01 { continue }
-            wids.append(wid)
-        }
-        guard !wids.isEmpty else { return nil }
+        guard bounds.width > 1, bounds.height > 1 else { return .unavailable }
         let cid = syms.cidFn()
-        // 0x800 = kCGSCaptureIgnoreGlobalClipShape, 0x100 = 2x HiDPI 最高分辨率
-        guard let arr = wids.withUnsafeBufferPointer({ buf in
-            syms.hwFn(cid, buf.baseAddress!, UInt32(buf.count), 0x800 | 0x100)?.takeRetainedValue()
-        }), CFArrayGetCount(arr) > 0,
-        let raw = CFArrayGetValueAtIndex(arr, 0) else {
-            return nil
+        // 最多尝试 2 次：条带帧多是当帧窗口列表的包围盒暂时只有菜单栏，
+        // 重新枚举窗口列表再抓一次通常就能拿到整屏合成图，减少丢帧。
+        var lastWrongSize = (w: 0, h: 0)
+        for _ in 0..<2 {
+            guard let infos = CGWindowListCopyWindowInfo([.optionOnScreenOnly], kCGNullWindowID) as? [[String: Any]] else {
+                return .unavailable
+            }
+            var wids: [UInt32] = []
+            wids.reserveCapacity(16)
+            for info in infos {
+                guard let wid = info[kCGWindowNumber as String] as? UInt32,
+                      let bDict = info[kCGWindowBounds as String] as? [String: Any],
+                      let rect = CGRect(dictionaryRepresentation: bDict as CFDictionary),
+                      rect.width > 0, rect.height > 0,
+                      rect.intersects(bounds) else { continue }
+                let alpha = info[kCGWindowAlpha as String] as? Double ?? 1.0
+                if alpha <= 0.01 { continue }
+                wids.append(wid)
+            }
+            guard !wids.isEmpty else { return .unavailable }
+            // 0x800 = kCGSCaptureIgnoreGlobalClipShape, 0x100 = 2x HiDPI 最高分辨率
+            guard let arr = wids.withUnsafeBufferPointer({ buf in
+                syms.hwFn(cid, buf.baseAddress!, UInt32(buf.count), 0x800 | 0x100)?.takeRetainedValue()
+            }) else { return .unavailable }
+            let result = withExtendedLifetime(arr) { () -> Result in
+                let n = CFArrayGetCount(arr)
+                // 数组里可能同时含整屏合成图与单个窗口图；挑尺寸严格等于目标的整屏帧。
+                // 绝不把 2880x60 这类条带拉伸成整屏，否则画面跳变经 H.264 变成拖影。
+                var picked: CGImage? = nil
+                var anySize: (Int, Int)? = nil
+                for i in 0..<n {
+                    guard let raw = CFArrayGetValueAtIndex(arr, i) else { continue }
+                    let img = Unmanaged<CGImage>.fromOpaque(raw).takeUnretainedValue()
+                    if anySize == nil { anySize = (img.width, img.height) }
+                    if img.width == targetW && img.height == targetH {
+                        picked = img
+                        break
+                    }
+                }
+                guard let img = picked else {
+                    return .wrongSize(w: anySize?.0 ?? 0, h: anySize?.1 ?? 0)
+                }
+                guard let pb = makePixelBuffer(from: img, targetW: targetW, targetH: targetH) else {
+                    return .unavailable
+                }
+                return .frame(pb)
+            }
+            // 抓到整屏帧或真正的抓取故障都立即返回；只有条带帧才重试。
+            if case .wrongSize(let w, let h) = result {
+                // 保留尺寸供重试耗尽后回传，让外层记录与告警有真实尺寸。
+                lastWrongSize = (w, h)
+                continue
+            }
+            return result
         }
-        return withExtendedLifetime(arr) {
-            let img = Unmanaged<CGImage>.fromOpaque(raw).takeUnretainedValue()
-            return makePixelBuffer(from: img, targetW: targetW, targetH: targetH)
-        }
+        // 两次都是条带帧：按条带帧返回，交给调用方丢帧重抓。
+        // 不返回 .unavailable，避免被计入采集失败、触发误回退。
+        return .wrongSize(w: lastWrongSize.w, h: lastWrongSize.h)
     }
 }
 
@@ -1560,7 +1609,7 @@ final class ScreenshotCapture {
             do {
                 let wantYUV = pixelFormatChoice == "420v"
                 let (targetW, targetH, _, _) = currentVideoSizeSnapshot()
-                let pb: CVPixelBuffer
+                var pb: CVPixelBuffer?
                 if isUsingSkyLight && !wantYUV {
                     // 按目标帧率节拍门控，避免 2 路 SkyLight 在 70+fps 下过度压迫 WindowServer/编码器
                     let minGap = (1.0 / max(1.0, cfg.captureHz)) * 0.90
@@ -1579,11 +1628,32 @@ final class ScreenshotCapture {
                     }
                     t0 = CFAbsoluteTimeGetCurrent()
                     let vdID = displayIDProvider()
-                    if vdID != 0,
-                       let buf = SkyLightCapture.capturePixelBuffer(vdID, targetW: targetW, targetH: targetH) {
-                        withRawLock { consecutiveSkyLightFails = 0 }
-                        pb = buf
-                    } else {
+                    var skyGrabbed = false
+                    if vdID != 0 {
+                        switch SkyLightCapture.captureFrame(vdID, targetW: targetW, targetH: targetH) {
+                        case .frame(let buf):
+                            withRawLock { consecutiveSkyLightFails = 0 }
+                            pb = buf
+                            skyGrabbed = true
+                        case .wrongSize(let w, let h):
+                            // 条带帧（实测 2880x60 菜单栏条带）是 WindowServer 当帧
+                            // 窗口列表的合成包围盒，不是采集故障。绝不拉伸成整屏，
+                            // 那正是拖影/残影的根源。丢帧等下一拍重新枚举即可，
+                            // 不计入连续失败，避免误回退到会弹权限窗的 SCScreenshotManager。
+                            SkyLightCapture.noteBadFrame()
+                            let nowWarn = CFAbsoluteTimeGetCurrent()
+                            if nowWarn - lastSizeWarnAt > 2.0 {
+                                lastSizeWarnAt = nowWarn
+                                Log.info("丢弃尺寸异常的合成帧 \(w)x\(h) != \(targetW)x\(targetH)（累计丢弃 \(SkyLightCapture.badFrameCount) 张）")
+                            }
+                            try? await Task.sleep(nanoseconds: 50_000_000)
+                            continue
+                        case .unavailable:
+                            // 与 vdID == 0 一样，走下方失败处理
+                            break
+                        }
+                    }
+                    if !skyGrabbed {
                         if !CGPreflightScreenCaptureAccess() {
                             try? await Task.sleep(nanoseconds: 150_000_000)
                             guard stillCurrent(gen: gen) else { return }
@@ -1673,6 +1743,7 @@ final class ScreenshotCapture {
                         pb = buf
                     }
                 }
+                guard let pb else { continue }
                 let now = CFAbsoluteTimeGetCurrent()
                 // 旧代次 worker 可能刚从一个长 await 里返回（单帧 60ms 甚至更久），
                 // 这里再确认一次代次/运行状态，避免逐个多发一帧干扰看护判断。
