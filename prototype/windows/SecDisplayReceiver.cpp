@@ -5245,6 +5245,33 @@ static void AbortShake() {
 // 按当前放大倍数把光标绘制到叠加层（以指针热点对齐）。
 // 用分层窗自绘而不是放大 HCURSOR：HCURSOR 一旦超过硬件上限，DWM 会退化为软件光标，
 // 在 D3D 交换链上拖出残影并可能同时显示两个指针。
+// 放大叠加层的几何计算（纯函数，便于自检与复用）。
+// k 为「原生像素 → 屏幕物理像素」比例；返回层尺寸与放大后的热点偏移。
+struct ZoomGeometry { int dw = 0, dh = 0, hx = 0, hy = 0; };
+static ZoomGeometry ComputeZoomGeometry(int sw, int sh, int shx, int shy, double k, int maxSide) {
+    ZoomGeometry g;
+    if (sw <= 0 || sh <= 0 || k <= 0.0) return g;
+    int dw = (int)(sw * k + 0.5);
+    int dh = (int)(sh * k + 0.5);
+    if (dw < 1) dw = 1;
+    if (dh < 1) dh = 1;
+    double fit = 1.0;
+    if (dw > maxSide) fit = std::min(fit, (double)maxSide / dw);
+    if (dh > maxSide) fit = std::min(fit, (double)maxSide / dh);
+    if (fit < 1.0) {
+        k *= fit;
+        dw = (int)(dw * fit + 0.5);
+        dh = (int)(dh * fit + 0.5);
+    }
+    if (dw < 1) dw = 1;
+    if (dh < 1) dh = 1;
+    g.dw = dw;
+    g.dh = dh;
+    g.hx = (int)(shx * k + 0.5);
+    g.hy = (int)(shy * k + 0.5);
+    return g;
+}
+
 static void UpdateZoomOverlay(double zoom) {
     if (zoom <= 1.02) { HideZoomOverlay(); return; }
     if (!EnsureZoomOverlay()) return;
@@ -5262,21 +5289,10 @@ static void UpdateZoomOverlay(double zoom) {
     // 起晃第一帧就会从被钳过的尺寸跳到未钳尺寸（能差 25%），曲线立刻变得突兀。
     double k = g_steadySpriteK * zoom;
     if (k <= 0.0) return;
-    int dw = (int)(sw * k + 0.5);
-    int dh = (int)(sh * k + 0.5);
-    if (dw < 1) dw = 1;
-    if (dh < 1) dh = 1;
     const int kMaxSide = 512;
-    double fit = 1.0;
-    if (dw > kMaxSide) fit = std::min(fit, (double)kMaxSide / dw);
-    if (dh > kMaxSide) fit = std::min(fit, (double)kMaxSide / dh);
-    if (fit < 1.0) {
-        k *= fit;
-        dw = (int)(dw * fit + 0.5);
-        dh = (int)(dh * fit + 0.5);
-    }
-    if (dw < 1) dw = 1;
-    if (dh < 1) dh = 1;
+    const ZoomGeometry geo = ComputeZoomGeometry(sw, sh, shx, shy, k, kMaxSide);
+    const int dw = geo.dw, dh = geo.dh;
+    if (dw <= 0 || dh <= 0) return;
 
     // 一次性按上限分配 DIB/DC：放大过程中尺寸每帧变化，反复 CreateDIBSection 会明显拖慢。
     // 分配后只把当前尺寸的行拷进左上角，UpdateLayeredWindow 用 psize 指定实际区域。
@@ -5319,7 +5335,7 @@ static void UpdateZoomOverlay(double zoom) {
 
     POINT cur{};
     if (!GetCursorPos(&cur)) return;
-    POINT dstPt{ cur.x - (int)(shx * k + 0.5), cur.y - (int)(shy * k + 0.5) };
+    POINT dstPt{ cur.x - geo.hx, cur.y - geo.hy };
     SIZE sz{ dw, dh };
     POINT srcPt{ 0, 0 };
     BLENDFUNCTION bf{ AC_SRC_OVER, 0, 255, AC_SRC_ALPHA };
@@ -7775,6 +7791,153 @@ static LONG WINAPI CrashFilter(EXCEPTION_POINTERS* ep) {
     return EXCEPTION_EXECUTE_HANDLER;
 }
 
+// ---------------------------------------------------------------------------
+// 光标自检：不依赖 Mac，直接验证晃动曲线、叠加层几何与重采样。
+// 用法：SecDisplayReceiver.exe --selftest-cursor
+// 结果同时写 stderr 与 %TEMP%\secdisplay-selftest-cursor.log，退出码 0/1。
+// 目的：远程（无人值守）环境也能客观确认光标放大链路没有回归。
+// ---------------------------------------------------------------------------
+static int RunCursorSelfTest() {
+    char tmpPath[MAX_PATH] = { 0 };
+    if (!GetTempPathA(MAX_PATH, tmpPath)) tmpPath[0] = 0;
+    std::string outPath = std::string(tmpPath) + "secdisplay-selftest-cursor.log";
+    FILE* out = fopen(outPath.c_str(), "w");
+    int fails = 0;
+    auto check = [&](bool ok, const char* what) {
+        if (!ok) ++fails;
+        char line[512];
+        snprintf(line, sizeof(line), "[%s] %s", ok ? "PASS" : "FAIL", what);
+        printf("%s\n", line);
+        fflush(stdout);
+        Log("%s", line);
+        if (out) { fprintf(out, "%s\n", line); fflush(out); }
+    };
+
+    // 1) 合成光标精灵（32x40，完全不透明，便于统计覆盖率）
+    const int W = 32, H = 40;
+    std::vector<uint8_t> sprite((size_t)W * H * 4, 0);
+    for (int y = 0; y < H; ++y) {
+        for (int x = 0; x < W; ++x) {
+            uint8_t* p = &sprite[((size_t)y * W + x) * 4];
+            p[0] = (uint8_t)(x * 8);     // B
+            p[1] = (uint8_t)(y * 6);     // G
+            p[2] = 200;                  // R
+            p[3] = 255;                  // A
+        }
+    }
+    {
+        std::lock_guard<std::mutex> lk(g_spriteMtx);
+        g_nativeSprite = sprite;
+        g_nativeW = W; g_nativeH = H;
+        g_nativeHotX = 4; g_nativeHotY = 3;
+    }
+    g_sessScaleTenths = 20;    // 模拟 2x 会话
+    g_steadySpriteK = 1.0;     // 稳态 1:1（100% 显示比例）
+
+    // 2) 叠加层需要一个 owner 窗口
+    WNDCLASSA wc{};
+    wc.lpfnWndProc = DefWindowProcA;
+    wc.hInstance = GetModuleHandleA(nullptr);
+    wc.lpszClassName = "SecDisplaySelfTest";
+    if (!RegisterClassA(&wc) && GetLastError() != ERROR_CLASS_ALREADY_EXISTS) {
+        printf("[FAIL] 注册自检窗口类失败 err=%lu\n", (unsigned long)GetLastError());
+        fflush(stdout);
+        if (out) fclose(out);
+        return 1;
+    }
+    g_hwnd = CreateWindowExA(0, "SecDisplaySelfTest", "selftest", WS_OVERLAPPEDWINDOW,
+                             0, 0, 800, 600, nullptr, nullptr, wc.hInstance, nullptr);
+    check(g_hwnd != nullptr, "创建测试窗口");
+    if (!g_hwnd) { if (out) fclose(out); return 1; }
+
+    // 3) 曲线：起势单调不减、峰值有轻微过冲、结束精确回到 1.0
+    g_shakeActive = true;
+    g_shakePhase = SHAKE_GROW;
+    g_shakeAnimFromZoom = 1.0;
+    g_shakeAnimStartMs = 1000.0;
+    g_shakeLastShakeQpcMs = 1000.0;
+    g_shakeZoom = 1.0;
+    double prev = 1.0, peak = 1.0;
+    bool reversalSeen = false;   // EaseOutBack 允许一次「升过头再回落」
+    bool secondReversal = false;
+    int dir = 0;
+    const int kSteps = 36;
+    for (int i = 0; i <= kSteps; ++i) {
+        TickShakeAnim(1000.0 + kShakeGrowMs * (double)i / (double)kSteps);
+        const double d = g_shakeZoom - prev;
+        if (std::abs(d) > 1e-9) {
+            const int nd = d > 0 ? 1 : -1;
+            if (dir != 0 && nd != dir) { if (reversalSeen) secondReversal = true; reversalSeen = true; }
+            dir = nd;
+        }
+        prev = g_shakeZoom;
+        if (g_shakeZoom > peak) peak = g_shakeZoom;
+    }
+    check(reversalSeen && !secondReversal, "起势只有一次「冲过头再回落」的方向反转");
+    check(std::abs(g_shakeZoom - kShakeCursorZoom) < 1e-6, "起势结束停在目标倍数");
+    check(peak > kShakeCursorZoom * 1.005 && peak < kShakeCursorZoom * 1.08, "峰值过冲在 0.5%~8% 区间");
+
+    const double tAfterHold = 1000.0 + kShakeGrowMs + kShakeHoldMs + 1.0;
+    TickShakeAnim(tAfterHold);
+    for (int i = 0; i <= 20; ++i) {
+        TickShakeAnim(tAfterHold + kShakeShrinkMs * (double)i / 20.0);
+    }
+    check(!g_shakeActive && std::abs(g_shakeZoom - 1.0) < 1e-6, "回落结束且 zoom 归 1");
+
+    // 4) 几何（纯函数，不依赖会话是否支持分层窗口）
+    const ZoomGeometry geo = ComputeZoomGeometry(W, H, 4, 3, 1.0 * 2.2, 512);
+    check(geo.dw == 70 && geo.dh == 88, "放大几何：尺寸 = 精灵 * 2.2");
+    check(geo.hx == 9 && geo.hy == 7, "放大几何：热点同比缩放");
+    const ZoomGeometry capped = ComputeZoomGeometry(200, 200, 10, 10, 10.0, 512);
+    check(capped.dw <= 512 && capped.dh <= 512 && capped.dw == 512, "放大几何：不超过 512 上限");
+
+    // 5) 叠加层：真实调用一遍（无崩溃 + 若会话支持则校验窗口几何）
+    POINT cur{};
+    GetCursorPos(&cur);
+    UpdateZoomOverlay(2.2);
+    const DWORD overlayErr = GetLastError();   // 立刻取样，后面任何调用都会覆盖它
+    if (g_zoomOverlayShown) {
+        RECT wr{};
+        if (g_zoomOverlay) GetWindowRect(g_zoomOverlay, &wr);
+        check(std::abs((wr.right - wr.left) - geo.dw) <= 2 &&
+              std::abs((wr.bottom - wr.top) - geo.dh) <= 2, "叠加层窗口尺寸与几何一致");
+        check(std::abs(wr.left - (cur.x - geo.hx)) <= 2 &&
+              std::abs(wr.top - (cur.y - geo.hy)) <= 2, "叠加层窗口位置与热点对齐");
+    } else {
+        // SSH / session 0 下 DWM 分层窗不可用，属环境限制，不算失败
+        printf("[INFO] 当前会话不支持分层叠加窗，跳过窗口几何校验 (err=%lu)\n",
+               (unsigned long)overlayErr);
+        fflush(stdout);
+        if (out) { fprintf(out, "[INFO] 当前会话不支持分层叠加窗，跳过窗口几何校验 (err=%lu)\n",
+                            (unsigned long)overlayErr); fflush(out); }
+    }
+
+    // 6) 重采样：输出尺寸与不透明覆盖率
+    std::vector<uint8_t> scaled;
+    ResampleBgraPremul(sprite.data(), W, H, scaled, geo.dw, geo.dh);
+    int opaque = 0;
+    for (size_t i = 3; i < scaled.size(); i += 4) if (scaled[i] > 0) ++opaque;
+    check(scaled.size() == (size_t)geo.dw * geo.dh * 4 && opaque > 0, "重采样输出尺寸与覆盖正确");
+
+    // 7) 收口：隐藏、以及 zoom<=1.02 不显示
+    HideZoomOverlay();
+    check(!g_zoomOverlayShown, "叠加层可正确隐藏");
+    UpdateZoomOverlay(1.0);
+    check(!g_zoomOverlayShown, "zoom<=1.02 不显示叠加层");
+
+    char summary[128];
+    snprintf(summary, sizeof(summary), "SELFTEST_%s fails=%d", fails == 0 ? "PASS" : "FAIL", fails);
+    printf("%s\n", summary);
+    fflush(stdout);
+    Log("%s", summary);
+    if (out) { fprintf(out, "%s\n", summary); fclose(out); }
+
+    if (g_zoomOverlay && IsWindow(g_zoomOverlay)) DestroyWindow(g_zoomOverlay);
+    DestroyWindow(g_hwnd);
+    g_hwnd = nullptr;
+    return fails == 0 ? 0 : 1;
+}
+
 int main(int argc, char** argv) {
     // GUI 子系统下默认无控制台黑框；若用户主动从 cmd/PowerShell 交互运行，则附着父控制台输出日志
     if (GetConsoleWindow() == nullptr) {
@@ -7809,6 +7972,9 @@ int main(int argc, char** argv) {
     }
 
     RunConfig cfg;
+    for (int i = 1; i < argc; ++i) {
+        if (std::string(argv[i]) == "--selftest-cursor") return RunCursorSelfTest();
+    }
     // 免参数启动：先读 exe 同目录 config.ini，再让命令行覆盖。
     // --config 指定别的文件，--no-config 跳过配置文件。
     std::string cfgPath = ExeDir() + "\\config.ini";
