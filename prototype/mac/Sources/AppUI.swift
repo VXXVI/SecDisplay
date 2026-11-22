@@ -330,6 +330,24 @@ struct StatusView: View {
         if model.health >= 0.7 { return .orange }
         return nil
     }
+    private var statusColor: Color {
+        if model.isReceiverMode {
+            return model.recvStreaming ? .green : (model.recvConnected ? .orange : .secondary)
+        }
+        return model.connected ? .green : .orange
+    }
+    private var statusText: String {
+        if model.isReceiverMode {
+            return model.recvStreaming ? "副屏接收中" : (model.recvConnected ? "已连 Windows" : "等待主控端")
+        }
+        return model.connected ? "已连接" : "等待接收端"
+    }
+    private var resolutionText: String {
+        if model.isReceiverMode {
+            return model.recvWidth > 0 ? "\(model.recvWidth)×\(model.recvHeight) @ \(model.recvFps)Hz" : "Win→Mac"
+        }
+        return model.scale > 1.5 ? "\(model.width)×\(model.height) · 2x" : "\(model.width)×\(model.height) · 1x"
+    }
 
     var body: some View {
         // 窗口是 .fullSizeContentView + 透明标题栏，内容会从窗口最上沿开始画，
@@ -340,32 +358,43 @@ struct StatusView: View {
             Color.clear.frame(height: topInset)
             ScrollView {
                 VStack(alignment: .leading, spacing: 14) {
-                // 头部
+                // 头部：图标 + 当前角色 + 连接状态胶囊
                 HStack(spacing: 10) {
-                    if model.isReceiverMode {
-                        Circle()
-                            .fill(model.recvStreaming ? Color.green : (model.recvConnected ? Color.yellow : Color.orange))
-                            .frame(width: 10, height: 10)
-                        Text(model.recvStreaming ? "副屏接收中" : (model.recvConnected ? "已连 Windows" : "等待主控端"))
-                            .font(.headline)
-                        Spacer()
-                        Text(model.recvWidth > 0 ? "\(model.recvWidth)×\(model.recvHeight) @ \(model.recvFps)Hz" : "Win→Mac")
-                            .font(.system(.subheadline, design: .monospaced))
-                            .foregroundStyle(.secondary)
+                    if let icon = NSApp.applicationIconImage {
+                        Image(nsImage: icon)
+                            .resizable()
+                            .frame(width: 28, height: 28)
+                            .clipShape(RoundedRectangle(cornerRadius: 7))
                     } else {
-                        Circle()
-                            .fill(model.connected ? Color.green : Color.orange)
-                            .frame(width: 10, height: 10)
-                        Text(model.connected ? "已连接" : "等待接收端")
-                            .font(.headline)
-                        Spacer()
-                        Text(model.scale > 1.5
-                             ? "\(model.width)×\(model.height) · 2x"
-                             : "\(model.width)×\(model.height) · 1x")
-                            .font(.system(.subheadline, design: .monospaced))
+                        Image(systemName: "display")
+                            .font(.title2)
+                            .frame(width: 28, height: 28)
+                    }
+                    VStack(alignment: .leading, spacing: 1) {
+                        Text("SecDisplay").font(.headline)
+                        Text(model.isReceiverMode ? "Mac 当副屏" : "Mac 当主屏 · 投到 Windows")
+                            .font(.caption)
                             .foregroundStyle(.secondary)
                     }
+                    Spacer()
+                    VStack(alignment: .trailing, spacing: 3) {
+                        HStack(spacing: 6) {
+                            Circle().fill(statusColor).frame(width: 7, height: 7)
+                            Text(statusText).font(.caption.weight(.medium))
+                        }
+                        Text(resolutionText)
+                            .font(.system(size: 10, design: .monospaced))
+                            .foregroundStyle(.secondary)
+                    }
+                    .padding(.horizontal, 9)
+                    .padding(.vertical, 5)
+                    .background(Capsule().fill(statusColor.opacity(0.13)))
                 }
+                .padding(10)
+                .background(
+                    RoundedRectangle(cornerRadius: 10)
+                        .fill(Color.secondary.opacity(0.07))
+                )
 
                 // 角色切换（Mac 当主屏 <-> Mac 当副屏）
                 HStack(spacing: 8) {
