@@ -7839,7 +7839,12 @@ static int RunCursorSelfTest() {
     wc.lpfnWndProc = DefWindowProcA;
     wc.hInstance = GetModuleHandleA(nullptr);
     wc.lpszClassName = "SecDisplaySelfTest";
-    RegisterClassA(&wc);
+    if (!RegisterClassA(&wc) && GetLastError() != ERROR_CLASS_ALREADY_EXISTS) {
+        printf("[FAIL] 注册自检窗口类失败 err=%lu\n", (unsigned long)GetLastError());
+        fflush(stdout);
+        if (out) fclose(out);
+        return 1;
+    }
     g_hwnd = CreateWindowExA(0, "SecDisplaySelfTest", "selftest", WS_OVERLAPPEDWINDOW,
                              0, 0, 800, 600, nullptr, nullptr, wc.hInstance, nullptr);
     check(g_hwnd != nullptr, "创建测试窗口");
@@ -7890,6 +7895,7 @@ static int RunCursorSelfTest() {
     POINT cur{};
     GetCursorPos(&cur);
     UpdateZoomOverlay(2.2);
+    const DWORD overlayErr = GetLastError();   // 立刻取样，后面任何调用都会覆盖它
     if (g_zoomOverlayShown) {
         RECT wr{};
         if (g_zoomOverlay) GetWindowRect(g_zoomOverlay, &wr);
@@ -7900,10 +7906,10 @@ static int RunCursorSelfTest() {
     } else {
         // SSH / session 0 下 DWM 分层窗不可用，属环境限制，不算失败
         printf("[INFO] 当前会话不支持分层叠加窗，跳过窗口几何校验 (err=%lu)\n",
-               (unsigned long)GetLastError());
+               (unsigned long)overlayErr);
         fflush(stdout);
         if (out) { fprintf(out, "[INFO] 当前会话不支持分层叠加窗，跳过窗口几何校验 (err=%lu)\n",
-                            (unsigned long)GetLastError()); fflush(out); }
+                            (unsigned long)overlayErr); fflush(out); }
     }
 
     // 6) 重采样：输出尺寸与不透明覆盖率

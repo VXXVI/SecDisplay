@@ -33,6 +33,7 @@ import ImageIO
 import CoreImage
 import UniformTypeIdentifiers
 import Carbon
+import SwiftUI   // 调试导出控制面板快照时用 NSHostingView
 
 /// 调试用：把采集到的 CVPixelBuffer 落盘成 PNG，用来核对「发送端到底抓了什么」。
 /// SCK 可能给 BGRA 也可能给 YUV，走 CoreImage 转换最稳。
@@ -4587,36 +4588,41 @@ if let w = Int(ProcessInfo.processInfo.environment["SECDISPLAY_W"] ?? ""),
 if let hz = Double(ProcessInfo.processInfo.environment["SECDISPLAY_HZ"] ?? "") {
     cfg.captureHz = hz
 }
+// 面板里调过的帧率/码率持久化在 UserDefaults，启动时覆盖预设。
+// 门控：只有「当前预设档位」与面板保存时一致才套用 —— 否则用户用 preset.sh 或
+// .preset 切了 sharp/smooth/fast 后，旧面板值会静默压掉新档位的帧率与码率。
+// 显式环境变量优先级最高，直接跳过面板值。
+let savedTuningPreset = UserDefaults.standard.string(forKey: "SecDisplayTuningPreset")
+let useSavedTuning = (savedTuningPreset == presetName)
+    && ProcessInfo.processInfo.environment["SECDISPLAY_HZ"] == nil
+    && ProcessInfo.processInfo.environment["SECDISPLAY_MBPS"] == nil
+if useSavedTuning,
+   let hz = UserDefaults.standard.object(forKey: "SecDisplayCaptureHz") as? Double,
+   hz >= 20, hz <= 120 {
+    cfg.captureHz = hz
+}
 // 虚拟屏刷新率默认跟随采集上限，默认 60。
 // 内建屏 120Hz 与 90Hz 虚拟屏同时在线时，WindowServer 要给两套不整除的
 // 节拍排帧，合成开销和光标抖动都会放大。显式指定用 SECDISPLAY_REFRESH。
+// 必须放在帧率覆盖之后，否则面板改 60fps 后虚拟屏仍按预设 50Hz 建模式。
 if let r = Double(ProcessInfo.processInfo.environment["SECDISPLAY_REFRESH"] ?? ""), r >= 24 {
     cfg.refreshRate = r
 } else {
     cfg.refreshRate = cfg.captureHz
 }
-// 码率按像素率估算，系数 0.6（2880x1800@50 约 155 Mbps，2240x1400@60 约 113 Mbps，
-// 1600x1000@60 约 58 Mbps；桌面文字边缘高频信息多，0.35 偏低容易糊）。
-// RateController 会按链路健康度在 [target/3, target] 之间自适应，
-// 上限 clamp 到 200；需要更高画质时用 SECDISPLAY_MBPS 覆盖。
+// 码率按像素率估算，系数 0.6（2880x1800@50 约 155 Mbps，2240x1400@60 约 113 Mbps）。
+// RateController 会按链路健康度在 [target/3, target] 之间自适应，上限 clamp 到 200。
+// 同样必须在帧率覆盖之后算，否则 60fps 仍按 50fps 的像素率给码率。
 if let mbps = Int(ProcessInfo.processInfo.environment["SECDISPLAY_MBPS"] ?? ""),
    mbps >= 10, mbps <= 1000 {
     cfg.bitrateMbps = mbps
+} else if useSavedTuning,
+          let mb = UserDefaults.standard.object(forKey: "SecDisplayMaxMbps") as? Int,
+          mb >= 20, mb <= 300 {
+    cfg.bitrateMbps = mb
 } else {
     let pixelsPerSec = Double(cfg.width * cfg.height) * cfg.captureHz
     cfg.bitrateMbps = max(30, min(200, Int(pixelsPerSec * 0.6 / 1_000_000)))
-}
-// 面板里调过的「采集帧率 / 码率上限」持久化在 UserDefaults，启动时覆盖预设；
-// 显式环境变量仍然最高优先级（上一段已生效，这里只在没有环境变量时套用）。
-if ProcessInfo.processInfo.environment["SECDISPLAY_HZ"] == nil,
-   let hz = UserDefaults.standard.object(forKey: "SecDisplayCaptureHz") as? Double,
-   hz >= 20, hz <= 120 {
-    cfg.captureHz = hz
-}
-if ProcessInfo.processInfo.environment["SECDISPLAY_MBPS"] == nil,
-   let mb = UserDefaults.standard.object(forKey: "SecDisplayMaxMbps") as? Int,
-   mb >= 20, mb <= 300 {
-    cfg.bitrateMbps = mb
 }
 nonisolated(unsafe) var vd: VirtualDisplayManager?
 nonisolated(unsafe) var encoder: Encoder?
@@ -4970,7 +4976,8 @@ struct RateSignals {
 final class RateController {
     let encoder: Encoder
     var targetMbps: Int
-    let captureHz: Double
+    /// 面板可在线改采集帧率；所有读写都在主线程（定时器与面板同线程），无需加锁。
+    private var captureHz: Double
 
     func updateTargetMbps(_ mbps: Int) {
         targetMbps = mbps
@@ -4981,6 +4988,10 @@ final class RateController {
         idleRounds = 0
         revertCooldownUntil = 0
         lastDownAt = 0
+    }
+    /// 面板在线改采集帧率时同步刷新预算判据，否则 health 仍按旧帧率算。
+    func updateCaptureHz(_ hz: Double) {
+        captureHz = hz
     }
     private var current: Int
     private var highRounds = 0
@@ -6024,15 +6035,75 @@ if ProcessInfo.processInfo.environment["SECDISPLAY_SHOW_PANEL"] == "1" {
 // 调试用：SECDISPLAY_GUIDE_DUMP=1 或日志目录下存在 guide_dump.request 时，
 // 把「连接引导」渲染成 3 张 PNG 后退出，供无人值守环境直接检查动画效果。
 let guideDumpReq = (Log.currentPath as NSString).deletingLastPathComponent + "/guide_dump.request"
+let panelDumpReq = (Log.currentPath as NSString).deletingLastPathComponent + "/panel_dump.request"
 if ProcessInfo.processInfo.environment["SECDISPLAY_GUIDE_DUMP"] == "1"
-    || FileManager.default.fileExists(atPath: guideDumpReq) {
+    || FileManager.default.fileExists(atPath: guideDumpReq)
+    || ProcessInfo.processInfo.environment["SECDISPLAY_PANEL_DUMP"] == "1"
+    || FileManager.default.fileExists(atPath: panelDumpReq) {
     let dir = (Log.currentPath as NSString).deletingLastPathComponent
-    let paths = ConnectionGuideOverlay.dumpFrames(to: dir)
-    Log.info("引导动画已导出: \(paths.joined(separator: ", "))")
-    if FileManager.default.fileExists(atPath: guideDumpReq) {
-        try? FileManager.default.removeItem(atPath: guideDumpReq)
+    try? FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true)
+    if ProcessInfo.processInfo.environment["SECDISPLAY_GUIDE_DUMP"] == "1"
+        || FileManager.default.fileExists(atPath: guideDumpReq) {
+        let paths = ConnectionGuideOverlay.dumpFrames(to: dir)
+        Log.info("引导动画已导出: \(paths.joined(separator: ", "))")
+        if FileManager.default.fileExists(atPath: guideDumpReq) {
+            try? FileManager.default.removeItem(atPath: guideDumpReq)
+        }
     }
-    vd?.destroy()
-    exit(0)
+    if ProcessInfo.processInfo.environment["SECDISPLAY_PANEL_DUMP"] == "1"
+        || FileManager.default.fileExists(atPath: panelDumpReq) {
+        // 脱离窗口离屏渲染 SwiftUI 时不会自动带材质背景，强制暗色外观 + 深底，
+        // 否则浅色文字会落在白底上看不见，导图无法用于审阅。
+        let root = ZStack(alignment: .top) {
+            Color(NSColor(calibratedWhite: 0.12, alpha: 1)).ignoresSafeArea()
+            StatusView()
+        }
+        let host = NSHostingView(rootView: root)
+        host.appearance = NSAppearance(named: .darkAqua)
+        let size = NSSize(width: 420, height: 2400)
+        host.frame = NSRect(origin: .zero, size: size)
+        host.wantsLayer = true
+        host.layoutSubtreeIfNeeded()
+        if let rep = host.bitmapImageRepForCachingDisplay(in: host.bounds) {
+            host.cacheDisplay(in: host.bounds, to: rep)
+            if let png = rep.representation(using: .png, properties: [:]) {
+                let p = dir + "/panel.png"
+                do {
+                    try png.write(to: URL(fileURLWithPath: p))
+                    Log.info("控制面板已导出: \(p)")
+                } catch {
+                    Log.info("控制面板导图写入失败: \(error.localizedDescription)")
+                }
+            }
+        }
+        // 单独导出「画质与性能」卡片：ScrollView 离屏只渲染视口，整面板导图看不到下半部分。
+        let settingsRoot = ZStack(alignment: .top) {
+            Color(NSColor(calibratedWhite: 0.12, alpha: 1)).ignoresSafeArea()
+            QualitySettingsCard(model: AppModel.shared).padding(14)
+        }
+        let settingsHost = NSHostingView(rootView: settingsRoot)
+        settingsHost.appearance = NSAppearance(named: .darkAqua)
+        settingsHost.frame = NSRect(origin: .zero, size: NSSize(width: 420, height: 460))
+        settingsHost.wantsLayer = true
+        settingsHost.layoutSubtreeIfNeeded()
+        if let rep2 = settingsHost.bitmapImageRepForCachingDisplay(in: settingsHost.bounds) {
+            settingsHost.cacheDisplay(in: settingsHost.bounds, to: rep2)
+            if let png = rep2.representation(using: .png, properties: [:]) {
+                let p = dir + "/panel_settings.png"
+                do {
+                    try png.write(to: URL(fileURLWithPath: p))
+                    Log.info("画质设置卡片已导出: \(p)")
+                } catch {
+                    Log.info("画质设置卡片导图写入失败: \(error.localizedDescription)")
+                }
+            }
+        }
+        if FileManager.default.fileExists(atPath: panelDumpReq) {
+            try? FileManager.default.removeItem(atPath: panelDumpReq)
+        }
+    }
+    // 走完整 shutdown 清理：直接 vd?.destroy()+exit 不等 WindowServer 收敛，
+    // 实测会留下孤儿虚拟屏，导致下次启动「虚拟屏创建被拒绝」。
+    shutdown(signal: SIGTERM)
 }
 statusApp.run()

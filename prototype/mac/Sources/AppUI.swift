@@ -249,17 +249,19 @@ final class AppModel: ObservableObject {
     func applyCaptureHz(_ idx: Int) {
         guard idx >= 0, idx < Self.captureHzOptions.count else { return }
         let hz = Self.captureHzOptions[idx]
+        guard applyStreamTuning(captureHz: hz, maxMbps: nil) else { return }
         captureHzIndex = idx
         UserDefaults.standard.set(hz, forKey: "SecDisplayCaptureHz")
-        applyStreamTuning(captureHz: hz, maxMbps: nil)
+        UserDefaults.standard.set(presetName, forKey: "SecDisplayTuningPreset")
     }
 
     func applyBitrateCap(_ idx: Int) {
         guard idx >= 0, idx < Self.bitrateOptions.count else { return }
         let mb = Self.bitrateOptions[idx]
+        guard applyStreamTuning(captureHz: nil, maxMbps: mb) else { return }
         bitrateIndex = idx
         UserDefaults.standard.set(mb, forKey: "SecDisplayMaxMbps")
-        applyStreamTuning(captureHz: nil, maxMbps: mb)
+        UserDefaults.standard.set(presetName, forKey: "SecDisplayTuningPreset")
     }
 
     func setShowGuide(_ on: Bool) {
@@ -313,6 +315,95 @@ private func fmtUptime(_ s: Double) -> String {
     let t = Int(max(0, s))
     if t >= 3600 { return String(format: "%d:%02d:%02d", t / 3600, (t / 60) % 60, t % 60) }
     return String(format: "%02d:%02d", t / 60, t % 60)
+}
+
+/// 「画质与性能」设置卡片。单独抽出成 View 是为了能离屏导图审阅
+/// （ScrollView 离屏只渲染视口，整面板导图看不到下半部分）。
+struct QualitySettingsCard: View {
+    @ObservedObject var model: AppModel
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            SectionHeader(title: "画质与性能")
+            VStack(spacing: 9) {
+                HStack {
+                    Text("分辨率").foregroundStyle(.secondary)
+                    Spacer()
+                    Picker("", selection: Binding(
+                        get: { model.resolutionIndex },
+                        set: { idx in
+                            guard !model.suppressResolutionChange, idx >= 0,
+                                  idx < AppModel.resolutions.count else { return }
+                            let r = AppModel.resolutions[idx]
+                            restartWithResolution(r.w, r.h, r.lw, r.lh)
+                        })) {
+                        ForEach(Array(AppModel.resolutions.enumerated()), id: \.offset) { i, r in
+                            Text(r.label).tag(i)
+                        }
+                        if model.resolutionIndex < 0 {
+                            Text("自定义").tag(-1)
+                        }
+                    }
+                    .labelsHidden()
+                    .frame(width: 190)
+                }
+                HStack {
+                    Text("采集帧率").foregroundStyle(.secondary)
+                    Spacer()
+                    Picker("", selection: Binding(
+                        get: { model.captureHzIndex },
+                        set: { model.applyCaptureHz($0) })) {
+                        ForEach(Array(AppModel.captureHzOptions.enumerated()), id: \.offset) { i, hz in
+                            Text("\(Int(hz)) fps").tag(i)
+                        }
+                    }
+                    .labelsHidden()
+                    .frame(width: 120)
+                }
+                HStack {
+                    Text("码率上限").foregroundStyle(.secondary)
+                    Spacer()
+                    Picker("", selection: Binding(
+                        get: { model.bitrateIndex },
+                        set: { model.applyBitrateCap($0) })) {
+                        ForEach(Array(AppModel.bitrateOptions.enumerated()), id: \.offset) { i, mb in
+                            Text("\(mb) Mbps").tag(i)
+                        }
+                    }
+                    .labelsHidden()
+                    .frame(width: 140)
+                }
+                Divider()
+                Toggle("发送真实光标图像", isOn: Binding(
+                    get: { model.cursorImageOn },
+                    set: { on in
+                        disableCursorImage = !on
+                        if on { cursorImage?.start() }
+                        Log.info(on ? "面板开启光标图像(0x05)" : "面板关闭光标图像(0x05)")
+                    }))
+                    .toggleStyle(.switch)
+                Toggle("连接时播放位置引导", isOn: Binding(
+                    get: { model.showGuide },
+                    set: { model.setShowGuide($0) }))
+                    .toggleStyle(.switch)
+                HStack(spacing: 8) {
+                    Button("播放连接引导") {
+                        ConnectionGuideOverlay.shared.show(vdID: vd?.displayID ?? 0)
+                    }
+                    Spacer()
+                    Text("帧率/码率即时生效")
+                        .font(.system(size: 10))
+                        .foregroundStyle(.tertiary)
+                }
+            }
+            .padding(10)
+            .background(
+                RoundedRectangle(cornerRadius: 10)
+                    .fill(Color.secondary.opacity(0.07))
+            )
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+    }
 }
 
 struct StatusView: View {
@@ -676,84 +767,7 @@ struct StatusView: View {
                 Divider()
 
                 if !model.isReceiverMode {
-                    // ---- 画质与性能（卡片） ----
-                    SectionHeader(title: "画质与性能")
-                    VStack(spacing: 9) {
-                        HStack {
-                            Text("分辨率").foregroundStyle(.secondary)
-                            Spacer()
-                            Picker("", selection: Binding(
-                                get: { model.resolutionIndex },
-                                set: { idx in
-                                    guard !model.suppressResolutionChange, idx >= 0,
-                                          idx < AppModel.resolutions.count else { return }
-                                    let r = AppModel.resolutions[idx]
-                                    restartWithResolution(r.w, r.h, r.lw, r.lh)
-                                })) {
-                                ForEach(Array(AppModel.resolutions.enumerated()), id: \.offset) { i, r in
-                                    Text(r.label).tag(i)
-                                }
-                                if model.resolutionIndex < 0 {
-                                    Text("自定义").tag(-1)
-                                }
-                            }
-                            .labelsHidden()
-                            .frame(width: 190)
-                        }
-                        HStack {
-                            Text("采集帧率").foregroundStyle(.secondary)
-                            Spacer()
-                            Picker("", selection: Binding(
-                                get: { model.captureHzIndex },
-                                set: { model.applyCaptureHz($0) })) {
-                                ForEach(Array(AppModel.captureHzOptions.enumerated()), id: \.offset) { i, hz in
-                                    Text("\(Int(hz)) fps").tag(i)
-                                }
-                            }
-                            .labelsHidden()
-                            .frame(width: 120)
-                        }
-                        HStack {
-                            Text("码率上限").foregroundStyle(.secondary)
-                            Spacer()
-                            Picker("", selection: Binding(
-                                get: { model.bitrateIndex },
-                                set: { model.applyBitrateCap($0) })) {
-                                ForEach(Array(AppModel.bitrateOptions.enumerated()), id: \.offset) { i, mb in
-                                    Text("\(mb) Mbps").tag(i)
-                                }
-                            }
-                            .labelsHidden()
-                            .frame(width: 140)
-                        }
-                        Divider()
-                        Toggle("发送真实光标图像", isOn: Binding(
-                            get: { model.cursorImageOn },
-                            set: { on in
-                                disableCursorImage = !on
-                                if on { cursorImage?.start() }
-                                Log.info(on ? "面板开启光标图像(0x05)" : "面板关闭光标图像(0x05)")
-                            }))
-                            .toggleStyle(.switch)
-                        Toggle("连接时播放位置引导", isOn: Binding(
-                            get: { model.showGuide },
-                            set: { model.setShowGuide($0) }))
-                            .toggleStyle(.switch)
-                        HStack(spacing: 8) {
-                            Button("播放连接引导") {
-                                ConnectionGuideOverlay.shared.show(vdID: vd?.displayID ?? 0)
-                            }
-                            Spacer()
-                            Text("帧率/码率即时生效")
-                                .font(.system(size: 10))
-                                .foregroundStyle(.tertiary)
-                        }
-                    }
-                    .padding(10)
-                    .background(
-                        RoundedRectangle(cornerRadius: 10)
-                            .fill(Color.secondary.opacity(0.07))
-                    )
+                    QualitySettingsCard(model: model)
                 }
 
                 HStack(spacing: 8) {
@@ -906,27 +920,39 @@ func restartWithRole(_ role: SecDisplayRole, host: String) {
     }
 }
 
-/// 面板里调「采集帧率 / 码率上限」时在线生效：重建编码器并更新自适应码率目标。
-/// 分辨率仍然需要重启进程（虚拟屏模式表在建屏时确定），这里只处理帧率与码率。
-func applyStreamTuning(captureHz: Double?, maxMbps: Int?) {
+/// 面板里调「采集帧率 / 码率上限」时在线生效。
+/// 事务化：先用候选值重建编码器，成功后才提交 cfg / UserDefaults / UI 状态；
+/// 失败时任何状态都不变，避免「面板显示 60fps、实际仍是 50fps」。
+/// 返回是否真的生效。
+@discardableResult
+func applyStreamTuning(captureHz: Double?, maxMbps: Int?) -> Bool {
     cfgStateLock.lock()
-    if let hz = captureHz, hz >= 20, hz <= 120 { cfg.captureHz = hz }
-    if let mb = maxMbps, mb >= 20, mb <= 300 { cfg.bitrateMbps = mb }
     let w = cfg.width, h = cfg.height
-    let hzNow = cfg.captureHz
-    let mbNow = cfg.bitrateMbps
+    let oldHz = cfg.captureHz, oldMbps = cfg.bitrateMbps
     cfgStateLock.unlock()
 
-    guard let enc = encoder else { return }
-    if enc.reconfigure(width: w, height: h, bitrateMbps: mbNow, captureHz: hzNow) {
-        rateCtl?.updateTargetMbps(mbNow)
-        sender?.sessionFps = Int(hzNow.rounded())
-        sender?.updateSessionInfo(width: w, height: h, fps: Int(hzNow.rounded()),
-                                  scaleTenths: UInt8(clamping: Int((vdBackingScale * 10).rounded())))
-        Log.info("面板应用码率/帧率: \(mbNow) Mbps, \(Int(hzNow)) fps")
-    } else {
+    let hzCandidate = captureHz.flatMap { ($0 >= 20 && $0 <= 120) ? $0 : nil } ?? oldHz
+    let mbpsCandidate = maxMbps.flatMap { ($0 >= 20 && $0 <= 300) ? $0 : nil } ?? oldMbps
+
+    guard let enc = encoder else { return false }
+    guard enc.reconfigure(width: w, height: h,
+                          bitrateMbps: mbpsCandidate, captureHz: hzCandidate) else {
         Log.info("面板应用码率/帧率失败（编码器重建被拒绝），保持原配置")
+        return false
     }
+
+    cfgStateLock.lock()
+    cfg.captureHz = hzCandidate
+    cfg.bitrateMbps = mbpsCandidate
+    cfgStateLock.unlock()
+    rateCtl?.updateTargetMbps(mbpsCandidate)
+    rateCtl?.updateCaptureHz(hzCandidate)
+    let fps = Int(hzCandidate.rounded())
+    // sessionFps 由 updateSessionInfo 在 Sender 的串行队列内更新，避免主线程写竞争。
+    sender?.updateSessionInfo(width: w, height: h, fps: fps,
+                              scaleTenths: UInt8(clamping: Int((vdBackingScale * 10).rounded())))
+    Log.info("面板应用码率/帧率: \(mbpsCandidate) Mbps, \(fps) fps")
+    return true
 }
 
 /// 切换分辨率：虚拟屏和编码器都在启动时按尺寸建好，改尺寸只能重建进程。
@@ -1513,6 +1539,14 @@ func showDropBoxPanel() {
 /// 副屏连上时，在「主屏 → 副屏」之间来回飞一个光标并标出副屏位置。
 /// 用户第一次连上时常常不知道画面去哪了，这个动画直接告诉他「副屏在这里」，
 /// 以及光标可以在两块屏之间来回移动。
+/// 不抢焦点、不成为 key window 的引导层窗口。
+/// 普通 borderless NSWindow 在部分 macOS 版本上会被提升为 key window，
+/// 抢走用户当前正在输入的窗口焦点，也会挡住 TCC 授权弹窗。
+final class GuideOverlayWindow: NSPanel {
+    override var canBecomeKey: Bool { false }
+    override var canBecomeMain: Bool { false }
+}
+
 final class ConnectionGuideOverlay {
     static let shared = ConnectionGuideOverlay()
     private init() {}
@@ -1521,6 +1555,7 @@ final class ConnectionGuideOverlay {
     private var canvas: GuideCanvasView?
     private var timer: Timer?
     private var startedAt: CFAbsoluteTime = 0
+    private var fadeStartedAt: CFAbsoluteTime = 0
     private var cyclesLeft = 0
     private var fading = false
 
@@ -1566,19 +1601,22 @@ final class ConnectionGuideOverlay {
     private var lastAutoShowAt: CFAbsoluteTime = 0
 
     /// 自动播放（连接建立时）。限频：10 分钟内最多一次，避免网络抖动重连时反复弹动画。
+    /// 只有动画真正开始才消耗配额，否则手动重播被挡掉时也会白白吃掉这次自动播放。
     func showIfEnabled(vdID: CGDirectDisplayID) {
         guard Self.isEnabled else { return }
         let now = CFAbsoluteTimeGetCurrent()
         if lastAutoShowAt > 0, now - lastAutoShowAt < 600 { return }
-        lastAutoShowAt = now
-        show(vdID: vdID)
+        if show(vdID: vdID) { lastAutoShowAt = now }
     }
 
-    func show(vdID: CGDirectDisplayID, cycles: Int = 3) {
-        guard window == nil else { return }
-        guard let layout = Self.makeLayout(vdID: vdID) else { return }
-        let w = NSWindow(contentRect: layout.union, styleMask: [.borderless],
-                         backing: .buffered, defer: false)
+    /// 返回是否真的开始了动画（窗口已存在或布局不可用时返回 false）。
+    @discardableResult
+    func show(vdID: CGDirectDisplayID, cycles: Int = 3) -> Bool {
+        guard window == nil else { return false }
+        guard let layout = Self.makeLayout(vdID: vdID) else { return false }
+        let w = GuideOverlayWindow(contentRect: layout.union,
+                                   styleMask: [.borderless, .nonactivatingPanel],
+                                   backing: .buffered, defer: false)
         w.isOpaque = false
         w.backgroundColor = .clear
         w.hasShadow = false
@@ -1596,16 +1634,31 @@ final class ConnectionGuideOverlay {
         canvas = v
         cyclesLeft = max(1, cycles)
         startedAt = CFAbsoluteTimeGetCurrent()
+        fadeStartedAt = 0
         fading = false
         let t = Timer(timeInterval: 1.0 / 60.0, repeats: true) { [weak self] _ in self?.tick() }
         RunLoop.main.add(t, forMode: .common)
         timer = t
         Log.info("连接引导动画: 主屏 → 副屏（id=\(vdID)）")
+        return true
     }
 
     private func tick() {
-        guard let canvas else { finish(); return }
+        guard let canvas, let win = window else { finish(); return }
         let now = CFAbsoluteTimeGetCurrent()
+
+        // 淡出必须先处理：早期实现在这里复用了 startedAt，导致 elapsed 每帧归零，
+        // 淡出分支永远不可达，动画会重播一轮再突然消失（实际停留 13 秒以上）。
+        if fading {
+            let f = (now - fadeStartedAt) / fadeSeconds
+            if f >= 1.0 {
+                finish()
+                return
+            }
+            win.alphaValue = CGFloat(1.0 - f)
+            return
+        }
+
         let elapsed = now - startedAt
         let perCycle = legSeconds * 2 + pauseSeconds * 2
         let total = perCycle * Double(cyclesLeft)
@@ -1625,15 +1678,11 @@ final class ConnectionGuideOverlay {
             canvas.progress = max(0, min(1, p))
             canvas.dashPhase = CGFloat(elapsed.truncatingRemainder(dividingBy: 1.2) / 1.2)
             canvas.pulse = CGFloat(elapsed.truncatingRemainder(dividingBy: 1.4) / 1.4)
-            canvas.alphaValue = 1
+            win.alphaValue = 1
             canvas.needsDisplay = true
-        } else if !fading {
-            fading = true
-            startedAt = now
-        } else if now - startedAt < fadeSeconds {
-            canvas.alphaValue = CGFloat(1 - (now - startedAt) / fadeSeconds)
         } else {
-            finish()
+            fading = true
+            fadeStartedAt = now
         }
     }
 
@@ -1643,10 +1692,12 @@ final class ConnectionGuideOverlay {
         window?.orderOut(nil)
         window = nil
         canvas = nil
+        fading = false
     }
 
     /// 无人值守验证：把动画在 3 个进度点渲染成 PNG，返回文件路径。
     static func dumpFrames(to dir: String) -> [String] {
+        try? FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true)
         var layout = makeLayout(vdID: 0)
         if layout == nil || layout!.vd.width <= 0 {
             let f = NSScreen.screens.first?.frame ?? CGRect(x: 0, y: 0, width: 1512, height: 982)
@@ -1670,8 +1721,12 @@ final class ConnectionGuideOverlay {
             v.cacheDisplay(in: v.bounds, to: rep)
             guard let png = rep.representation(using: .png, properties: [:]) else { continue }
             let path = "\(dir)/guide_\(i).png"
-            try? png.write(to: URL(fileURLWithPath: path))
-            paths.append(path)
+            do {
+                try png.write(to: URL(fileURLWithPath: path))
+                paths.append(path)   // 只有真正写成功才追加，避免日志谎报「已导出」
+            } catch {
+                Log.info("引导动画导图写入失败: \(error.localizedDescription)")
+            }
         }
         return paths
     }
@@ -1707,7 +1762,8 @@ final class GuideCanvasView: NSView {
         // 光标几乎不动，完全没有「从左屏飞到右屏」的观感。
         let a = CGPoint(x: mainRect.minX + mainRect.width * 0.62, y: mainRect.midY)
         let b = CGPoint(x: vdRect.minX + vdRect.width * 0.38, y: vdRect.midY)
-        let ctrl = CGPoint(x: (a.x + b.x) * 0.5, y: max(a.y, b.y) + 210)
+        let ctrl = CGPoint(x: (a.x + b.x) * 0.5,
+                           y: max(a.y, b.y) + min(210, max(mainRect.height, vdRect.height) * 0.22))
 
         // ---- 副屏高亮框：宽描边 + 外发光 ----
         let highlight = vdRect.insetBy(dx: 10, dy: 10)
@@ -1747,7 +1803,7 @@ final class GuideCanvasView: NSView {
         ctx.setStrokeColor(accent.withAlphaComponent(0.92).cgColor)
         ctx.setLineWidth(3.6)
         ctx.setLineCap(.round)
-        ctx.setLineDash(phase: dashPhase * 26, lengths: [15, 12])
+        ctx.setLineDash(phase: dashPhase * 27, lengths: [15, 12])
         ctx.addPath(path)
         ctx.strokePath()
         ctx.restoreGState()
