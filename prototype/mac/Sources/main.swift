@@ -2084,6 +2084,32 @@ final class ScreenshotCapture {
 
 private let fastPathMissLock = NSLock()
 private var fastPathMissLogged = false
+/// 无名 RGB 色彩空间是否等价 sRGB 的缓存（虚拟屏色彩空间恒定，判定一次即可）。
+private let colorSpaceCheckLock = NSLock()
+private var unnamedRGBIsSRGB: Bool? = nil
+
+/// 判断色彩空间是否可安全地按 BGRA 直接拷贝：
+/// - nil：SkyLight 合成图有时不带 colorSpace，像素已是 BGRA，按 sRGB 处理；
+/// - 名字等于 sRGB：直接放行；
+/// - 无名 RGB 非宽色域：用 ICC 数据重建，等价 sRGB 才放行（实测虚拟屏就是这种）；
+/// - 宽色域或其它模型：拒绝，交给回退路径做真正的色彩转换。
+private func isSRGBEquivalent(_ cs: CGColorSpace?, csName: String?, srgbName: String?) -> Bool {
+    guard let cs else { return true }
+    if let srgbName, csName == srgbName { return true }
+    guard cs.model == .rgb, !cs.isWideGamutRGB else { return false }
+    colorSpaceCheckLock.lock()
+    if let cached = unnamedRGBIsSRGB { colorSpaceCheckLock.unlock(); return cached }
+    colorSpaceCheckLock.unlock()
+    var isSRGB = false
+    if let icc = cs.copyICCData(), let rebuilt = CGColorSpace(iccData: icc),
+       let srgbName, (rebuilt.name as String?) == srgbName {
+        isSRGB = true
+    }
+    colorSpaceCheckLock.lock()
+    unnamedRGBIsSRGB = isSRGB
+    colorSpaceCheckLock.unlock()
+    return isSRGB
+}
 
 /// 一次性记录快路径未命中原因（加锁，跨 worker 安全）。
 private func logFastPathMiss(_ reason: String, img: CGImage, w: Int, h: Int,
@@ -2120,7 +2146,7 @@ private func makePixelBufferFast(from img: CGImage, w: Int, h: Int) -> CVPixelBu
             == CGImageAlphaInfo.premultipliedFirst.rawValue
         && (img.bitmapInfo.rawValue & CGBitmapInfo.byteOrderMask.rawValue)
             == CGBitmapInfo.byteOrder32Little.rawValue
-        && (cs == nil || csName == srgbName)
+        && isSRGBEquivalent(cs, csName: csName, srgbName: srgbName)
     guard shapeOK else {
         logFastPathMiss("shape", img: img, w: w, h: h, cs: cs, csName: csName, srgbName: srgbName, dataLen: nil)
         return nil
