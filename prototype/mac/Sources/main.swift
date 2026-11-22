@@ -4593,10 +4593,13 @@ if let hz = Double(ProcessInfo.processInfo.environment["SECDISPLAY_HZ"] ?? "") {
 // .preset 切了 sharp/smooth/fast 后，旧面板值会静默压掉新档位的帧率与码率。
 // 显式环境变量优先级最高，直接跳过面板值。
 let savedTuningPreset = UserDefaults.standard.string(forKey: "SecDisplayTuningPreset")
-let useSavedTuning = (savedTuningPreset == presetName)
+let tuningPresetMatches = (savedTuningPreset == presetName)
+// 帧率与码率分别门控：只设 SECDISPLAY_MBPS 时不该连保存的帧率一起丢掉。
+let useSavedHz = tuningPresetMatches
     && ProcessInfo.processInfo.environment["SECDISPLAY_HZ"] == nil
+let useSavedMbps = tuningPresetMatches
     && ProcessInfo.processInfo.environment["SECDISPLAY_MBPS"] == nil
-if useSavedTuning,
+if useSavedHz,
    let hz = UserDefaults.standard.object(forKey: "SecDisplayCaptureHz") as? Double,
    hz >= 20, hz <= 120 {
     cfg.captureHz = hz
@@ -4616,7 +4619,7 @@ if let r = Double(ProcessInfo.processInfo.environment["SECDISPLAY_REFRESH"] ?? "
 if let mbps = Int(ProcessInfo.processInfo.environment["SECDISPLAY_MBPS"] ?? ""),
    mbps >= 10, mbps <= 1000 {
     cfg.bitrateMbps = mbps
-} else if useSavedTuning,
+} else if useSavedMbps,
           let mb = UserDefaults.standard.object(forKey: "SecDisplayMaxMbps") as? Int,
           mb >= 20, mb <= 300 {
     cfg.bitrateMbps = mb
@@ -5235,7 +5238,7 @@ func vdStillOnline() -> Bool {
 nonisolated(unsafe) private var shutdownStarted = false
 private let shutdownLock = NSLock()
 
-func shutdown(signal sig: Int32) {
+func shutdown(signal sig: Int32, exitCode: Int32 = -1) {
     shutdownLock.lock()
     if shutdownStarted {
         shutdownLock.unlock()
@@ -5270,7 +5273,8 @@ func shutdown(signal sig: Int32) {
     if vdStillOnline() {
         Log.info("警告: 虚拟屏疑似未清理干净，下次启动可能被拒；可注销重登清除")
     }
-    exit(128 + sig)
+    // 导图等调试路径需要 exit(0) 让无人值守脚本判成功；正常退出沿用 128+sig。
+    exit(exitCode >= 0 ? exitCode : 128 + sig)
 }
 
 // 每 100ms 检查一次退出信号
@@ -6046,12 +6050,15 @@ if ProcessInfo.processInfo.environment["SECDISPLAY_GUIDE_DUMP"] == "1"
         || FileManager.default.fileExists(atPath: guideDumpReq) {
         let paths = ConnectionGuideOverlay.dumpFrames(to: dir)
         Log.info("引导动画已导出: \(paths.joined(separator: ", "))")
-        if FileManager.default.fileExists(atPath: guideDumpReq) {
+        // 只有三张都写成功才消耗 request，失败时留给下次重试
+        if paths.count == 3, FileManager.default.fileExists(atPath: guideDumpReq) {
             try? FileManager.default.removeItem(atPath: guideDumpReq)
         }
     }
     if ProcessInfo.processInfo.environment["SECDISPLAY_PANEL_DUMP"] == "1"
         || FileManager.default.fileExists(atPath: panelDumpReq) {
+        var panelOk = false
+        var settingsOk = false
         // 脱离窗口离屏渲染 SwiftUI 时不会自动带材质背景，强制暗色外观 + 深底，
         // 否则浅色文字会落在白底上看不见，导图无法用于审阅。
         let root = ZStack(alignment: .top) {
@@ -6071,6 +6078,7 @@ if ProcessInfo.processInfo.environment["SECDISPLAY_GUIDE_DUMP"] == "1"
                 do {
                     try png.write(to: URL(fileURLWithPath: p))
                     Log.info("控制面板已导出: \(p)")
+                    panelOk = true
                 } catch {
                     Log.info("控制面板导图写入失败: \(error.localizedDescription)")
                 }
@@ -6093,17 +6101,19 @@ if ProcessInfo.processInfo.environment["SECDISPLAY_GUIDE_DUMP"] == "1"
                 do {
                     try png.write(to: URL(fileURLWithPath: p))
                     Log.info("画质设置卡片已导出: \(p)")
+                    settingsOk = true
                 } catch {
                     Log.info("画质设置卡片导图写入失败: \(error.localizedDescription)")
                 }
             }
         }
-        if FileManager.default.fileExists(atPath: panelDumpReq) {
+        if panelOk && settingsOk, FileManager.default.fileExists(atPath: panelDumpReq) {
             try? FileManager.default.removeItem(atPath: panelDumpReq)
         }
     }
     // 走完整 shutdown 清理：直接 vd?.destroy()+exit 不等 WindowServer 收敛，
     // 实测会留下孤儿虚拟屏，导致下次启动「虚拟屏创建被拒绝」。
-    shutdown(signal: SIGTERM)
+    // 导图是调试路径，用 exit(0) 让无人值守脚本能按退出码判成功。
+    shutdown(signal: SIGTERM, exitCode: 0)
 }
 statusApp.run()

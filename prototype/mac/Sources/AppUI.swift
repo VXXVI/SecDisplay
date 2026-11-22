@@ -252,7 +252,9 @@ final class AppModel: ObservableObject {
         guard applyStreamTuning(captureHz: hz, maxMbps: nil) else { return }
         captureHzIndex = idx
         UserDefaults.standard.set(hz, forKey: "SecDisplayCaptureHz")
-        UserDefaults.standard.set(presetName, forKey: "SecDisplayTuningPreset")
+        // 注意：这里必须取「全局 presetName」（main.swift 的 String?），
+        // 不能用 AppModel.presetName（那是面板显示的标签，会被同名属性遮蔽）。
+        UserDefaults.standard.set(currentPresetTag(), forKey: "SecDisplayTuningPreset")
     }
 
     func applyBitrateCap(_ idx: Int) {
@@ -261,7 +263,7 @@ final class AppModel: ObservableObject {
         guard applyStreamTuning(captureHz: nil, maxMbps: mb) else { return }
         bitrateIndex = idx
         UserDefaults.standard.set(mb, forKey: "SecDisplayMaxMbps")
-        UserDefaults.standard.set(presetName, forKey: "SecDisplayTuningPreset")
+        UserDefaults.standard.set(currentPresetTag(), forKey: "SecDisplayTuningPreset")
     }
 
     func setShowGuide(_ on: Bool) {
@@ -277,6 +279,11 @@ private func mainPresetLabel() -> String {
     }
     return presetName ?? "自定义"
 }
+
+/// 文件作用域读取全局 `presetName`（main.swift 的 String?）。
+/// 在 AppModel 方法里直接写 `presetName` 会被 `@Published var presetName` 遮蔽，
+/// 写入 UserDefaults 的会是面板显示标签（如「自定义」），启动时与全局 nil 比较恒 false。
+private func currentPresetTag() -> String? { presetName }
 
 private let accent = Color(red: 0.22, green: 0.55, blue: 0.96)
 
