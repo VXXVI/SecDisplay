@@ -6049,7 +6049,11 @@ if ProcessInfo.processInfo.environment["SECDISPLAY_GUIDE_DUMP"] == "1"
     if ProcessInfo.processInfo.environment["SECDISPLAY_GUIDE_DUMP"] == "1"
         || FileManager.default.fileExists(atPath: guideDumpReq) {
         let paths = ConnectionGuideOverlay.dumpFrames(to: dir)
-        Log.info("引导动画已导出: \(paths.joined(separator: ", "))")
+        if paths.isEmpty {
+            Log.info("引导动画导出失败: 0 张 PNG 写入成功（目录 \(dir)）")
+        } else {
+            Log.info("引导动画已导出 \(paths.count)/3 张: \(paths.joined(separator: ", "))")
+        }
         // 只有三张都写成功才消耗 request，失败时留给下次重试
         if paths.count == 3, FileManager.default.fileExists(atPath: guideDumpReq) {
             try? FileManager.default.removeItem(atPath: guideDumpReq)
