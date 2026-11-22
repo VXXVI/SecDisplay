@@ -2361,7 +2361,9 @@ final class Sender {
             // 新接收端没有参考帧，解出来是花的。等新的 IDR。
             self.counterLock.lock()
             self.hasSentFrame = false
-            self.needsKeyframe = false
+            // 新连接必须等首个 IDR 再放行视频帧；否则重连后残留的 P 帧
+            // 可能先于 IDR 发出，新接收端没有参考帧会花屏。
+            self.needsKeyframe = true
             self.lastSendAt = CFAbsoluteTimeGetCurrent()
             self.counterLock.unlock()
             old?.cancel()
@@ -2807,11 +2809,10 @@ final class Sender {
         if isKey { needsKeyframe = false }
         hasSentFrame = true
         counterLock.unlock()
-        if recovered { Log.info("IDR 已发送，参考链恢复") }
-        transmit(frame, isKey: isKey, captureTimeMicros: captureTimeMicros)
+        transmit(frame, isKey: isKey, recovered: recovered, captureTimeMicros: captureTimeMicros)
     }
 
-    private func transmit(_ frame: Data, isKey: Bool, captureTimeMicros: UInt64) {
+    private func transmit(_ frame: Data, isKey: Bool, recovered: Bool, captureTimeMicros: UInt64) {
         guard connected, let c = conn else { return }
         // 在途帧数超限：丢这一帧，保住实时性；若连续阻塞 >8s 则主动断开卡死连接
         let now = CFAbsoluteTimeGetCurrent()
@@ -2856,6 +2857,9 @@ final class Sender {
         inFlightStallSince = 0
         lastSendAt = now
         counterLock.unlock()
+        // 只有 IDR 真正拿到在途配额、即将发出时才认为参考链恢复；
+        // 若上面因拥塞丢弃了 IDR，标志会重新置位，不会误报。
+        if recovered { Log.info("IDR 已发送，参考链恢复") }
 
         var packet = Data(capacity: frame.count + 13)
         var len = UInt32(frame.count + 9).bigEndian
@@ -2902,13 +2906,15 @@ final class Sender {
             self.counterLock.lock()
             let since = now - self.lastSendAt
             let sent = self.hasSentFrame
-            let canForceIdr = now - self.lastForceIdrAt >= 0.5
-            if sent && canForceIdr { self.lastForceIdrAt = now }
             self.counterLock.unlock()
             guard since >= self.keepAliveGap else { return }
             if sent {
                 // 不再重发旧 P 帧；用最后一帧重新编码 IDR（限流 0.5s），
                 // 既保持画面又不破坏参考链。编码结果经 onFrame → send 正常发出。
+                self.counterLock.lock()
+                let canForceIdr = now - self.lastForceIdrAt >= 0.5
+                if canForceIdr { self.lastForceIdrAt = now }
+                self.counterLock.unlock()
                 if canForceIdr { gEncoder?.forceEncodeLastFrame() }
             } else {
                 // 还没有任何帧(新连接 + 静止桌面)：发心跳维持链路。
