@@ -1534,8 +1534,14 @@ final class ConnectionGuideOverlay {
         return Layout(union: union, main: local(mainScreen.frame), vd: local(vdRect))
     }
 
+    private var lastAutoShowAt: CFAbsoluteTime = 0
+
+    /// 自动播放（连接建立时）。限频：10 分钟内最多一次，避免网络抖动重连时反复弹动画。
     func showIfEnabled(vdID: CGDirectDisplayID) {
         guard Self.isEnabled else { return }
+        let now = CFAbsoluteTimeGetCurrent()
+        if lastAutoShowAt > 0, now - lastAutoShowAt < 600 { return }
+        lastAutoShowAt = now
         show(vdID: vdID)
     }
 
