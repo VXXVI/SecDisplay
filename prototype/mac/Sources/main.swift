@@ -2124,6 +2124,7 @@ final class Sender {
             self.sendSessionInfo()
             // 新连接一上来就准备关键帧，不依赖对端是否及时发 0x02。
             self.onKeyframeRequest?()
+            self.onPeerConnected?()
             self.receiveLoop(epoch: epoch)
         }
         listener.stateUpdateHandler = { [weak self, weak listener] st in
@@ -2337,6 +2338,8 @@ final class Sender {
 
     /// 收到对端 0x02 时回调，由外部接到编码器
     var onKeyframeRequest: (() -> Void)?
+    /// 新连接建立（对端已握手）时回调，用于播放「副屏在这里」的连接引导
+    var onPeerConnected: (() -> Void)?
     /// 收到对端 0x04 输入事件：(x, y, buttons, wheel)
     var onInput: ((Float, Float, UInt8, Int16) -> Void)?
     /// 收到对端 0x09 键盘事件：(vk, scan, down, flags)
@@ -4547,23 +4550,15 @@ if pixelFormatChoice == nil, let rp = Bundle.main.resourcePath {
 }
 if let preset = presetName, !preset.isEmpty {
     switch preset {
-    case "sharp":       // 2880×1800 真 2x Retina（1440×900 逻辑），画质最锐
+    case "sharp", "balanced":   // 别名：sharp 与 balanced 同档（画质优先）
         cfg.width = 2880; cfg.height = 1800
         cfg.logicalWidth = 1440; cfg.logicalHeight = 900
-        cfg.captureHz = 45
-    case "balanced":    // 默认：2880×1800 真 2x Retina（1440×900 逻辑），与 Windows 物理屏 1:1
-        cfg.width = 2880; cfg.height = 1800
-        cfg.logicalWidth = 1440; cfg.logicalHeight = 900
-        cfg.captureHz = 50
+        cfg.captureHz = (preset == "sharp") ? 45 : 50
     case "smooth":      // 2240×1400 真 2x Retina（1120×700 逻辑），流畅度优先
         cfg.width = 2240; cfg.height = 1400
         cfg.logicalWidth = 1120; cfg.logicalHeight = 700
         cfg.captureHz = 60
-    case "compact":     // 1x 小屏（1600×1000），适合 Sidecar 共存或窗口模式
-        cfg.width = 1600; cfg.height = 1000
-        cfg.logicalWidth = 1600; cfg.logicalHeight = 1000
-        cfg.captureHz = 60
-    case "fast":        // 1920×1200 真 2x Retina（960×600 逻辑）
+    case "compact", "fast":     // 别名：compact 映射到省资源档，避免面板出现「自定义」
         cfg.width = 1920; cfg.height = 1200
         cfg.logicalWidth = 960; cfg.logicalHeight = 600
         cfg.captureHz = 60
@@ -4610,6 +4605,18 @@ if let mbps = Int(ProcessInfo.processInfo.environment["SECDISPLAY_MBPS"] ?? ""),
 } else {
     let pixelsPerSec = Double(cfg.width * cfg.height) * cfg.captureHz
     cfg.bitrateMbps = max(30, min(200, Int(pixelsPerSec * 0.6 / 1_000_000)))
+}
+// 面板里调过的「采集帧率 / 码率上限」持久化在 UserDefaults，启动时覆盖预设；
+// 显式环境变量仍然最高优先级（上一段已生效，这里只在没有环境变量时套用）。
+if ProcessInfo.processInfo.environment["SECDISPLAY_HZ"] == nil,
+   let hz = UserDefaults.standard.object(forKey: "SecDisplayCaptureHz") as? Double,
+   hz >= 20, hz <= 120 {
+    cfg.captureHz = hz
+}
+if ProcessInfo.processInfo.environment["SECDISPLAY_MBPS"] == nil,
+   let mb = UserDefaults.standard.object(forKey: "SecDisplayMaxMbps") as? Int,
+   mb >= 20, mb <= 300 {
+    cfg.bitrateMbps = mb
 }
 nonisolated(unsafe) var vd: VirtualDisplayManager?
 nonisolated(unsafe) var encoder: Encoder?
@@ -4816,6 +4823,11 @@ if appRole == .sender {
 
     sndInst.sessionScaleTenths = UInt8(clamping: Int((vdBackingScale * 10.0).rounded()))
     sndInst.onKeyframeRequest = { encInst.forceEncodeLastFrame() }
+    sndInst.onPeerConnected = {
+        DispatchQueue.main.async {
+            ConnectionGuideOverlay.shared.showIfEnabled(vdID: vdInst.displayID)
+        }
+    }
     sndInst.listen(port: cfg.port)
 
     transferService.listen(port: cfg.port &+ 1)
@@ -6007,5 +6019,20 @@ if ProcessInfo.processInfo.environment["SECDISPLAY_SHOW_PANEL"] == "1" {
         Log.info("SECDISPLAY_SHOW_PANEL=1，自动打开面板")
         showControlPanel()
     }
+}
+
+// 调试用：SECDISPLAY_GUIDE_DUMP=1 或日志目录下存在 guide_dump.request 时，
+// 把「连接引导」渲染成 3 张 PNG 后退出，供无人值守环境直接检查动画效果。
+let guideDumpReq = (Log.currentPath as NSString).deletingLastPathComponent + "/guide_dump.request"
+if ProcessInfo.processInfo.environment["SECDISPLAY_GUIDE_DUMP"] == "1"
+    || FileManager.default.fileExists(atPath: guideDumpReq) {
+    let dir = (Log.currentPath as NSString).deletingLastPathComponent
+    let paths = ConnectionGuideOverlay.dumpFrames(to: dir)
+    Log.info("引导动画已导出: \(paths.joined(separator: ", "))")
+    if FileManager.default.fileExists(atPath: guideDumpReq) {
+        try? FileManager.default.removeItem(atPath: guideDumpReq)
+    }
+    vd?.destroy()
+    exit(0)
 }
 statusApp.run()

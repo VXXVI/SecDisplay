@@ -29,6 +29,12 @@ final class AppModel: ObservableObject {
     @Published var cursorImageOn = true
     @Published var logLine = ""
     @Published var resolutionIndex = 0
+    /// 采集帧率 / 码率上限（面板可调，UserDefaults 持久化）
+    static let captureHzOptions: [Double] = [40, 45, 50, 60]
+    static let bitrateOptions: [Int] = [80, 120, 160, 200, 240]
+    @Published var captureHzIndex = 2
+    @Published var bitrateIndex = 2
+    @Published var showGuide = true
     /// 刷新时置位，避免程序化改选中项触发重启
     var suppressResolutionChange = false
 
@@ -105,19 +111,12 @@ final class AppModel: ObservableObject {
     @Published var recvDecoderName = "VideoToolbox (H.264 硬件)"
     private var draftsInitialized = false
 
+    // 只保留 3 档：2x Retina 下分别对应 Windows 2880×1800 的 1:1、轻载和极轻载。
+    // 其他分辨率不再暴露，避免选项过多且与 16:10 物理屏比例不一致导致黑边。
     static let resolutions: [(label: String, w: Int, h: Int, lw: Int, lh: Int)] = [
-        ("1600 × 1000 (1x)", 1600, 1000, 1600, 1000),
-        ("1920 × 1200 (2x Retina)", 1920, 1200, 960, 600),
-        ("2240 × 1400 (2x Retina)", 2240, 1400, 1120, 700),
-        ("2560 × 1600 (2x Retina)", 2560, 1600, 1280, 800),
-        // 真 2x Retina（1440×900 逻辑 / 2880×1800 物理）：
-        // 与 Windows 2880×1800 物理屏 1:1 像素对齐，同时 Mac 端按 2x 渲染字体与正常桌面比例。
-        ("2880 × 1800 (2x Retina · 推荐)", 2880, 1800, 1440, 900),
-        ("2880 × 1800 (1x)", 2880, 1800, 2880, 1800),
-        // 16:9 档位：Windows 显示器为 16:9 时选对应的，全屏才能 1:1
-        ("1920 × 1080 (1x)", 1920, 1080, 1920, 1080),
-        ("2560 × 1440 (2x Retina)", 2560, 1440, 1280, 720),
-        ("3840 × 2160 (2x Retina)", 3840, 2160, 1920, 1080),
+        ("2880 × 1800 · 2x 推荐", 2880, 1800, 1440, 900),
+        ("2240 × 1400 · 2x 流畅", 2240, 1400, 1120, 700),
+        ("1920 × 1200 · 2x 省资源", 1920, 1200, 960, 600),
     ]
 
     private init() {}
@@ -182,6 +181,15 @@ final class AppModel: ObservableObject {
         presetName = mainPresetLabel()
         suppressResolutionChange = true
         resolutionIndex = AppModel.resolutions.firstIndex { $0.w == snap.w && $0.h == snap.h && $0.lw == snap.lw && $0.lh == snap.lh } ?? -1
+        cfgStateLock.lock()
+        let hzNow = cfg.captureHz
+        let mbNow = cfg.bitrateMbps
+        cfgStateLock.unlock()
+        captureHzIndex = AppModel.captureHzOptions.enumerated()
+            .min(by: { abs($0.element - hzNow) < abs($1.element - hzNow) })?.offset ?? 2
+        bitrateIndex = AppModel.bitrateOptions.enumerated()
+            .min(by: { abs($0.element - mbNow) < abs($1.element - mbNow) })?.offset ?? 2
+        showGuide = (UserDefaults.standard.object(forKey: "SecDisplayShowGuide") as? Bool) ?? true
         suppressResolutionChange = false
 
         // 链路与对端
@@ -236,6 +244,28 @@ final class AppModel: ObservableObject {
         transferFeedbackKind = ts.feedbackKind
         transferFeedbackTitle = ts.feedbackTitle
         transferFeedbackDetail = ts.feedbackDetail
+    }
+
+    func applyCaptureHz(_ idx: Int) {
+        guard idx >= 0, idx < Self.captureHzOptions.count else { return }
+        let hz = Self.captureHzOptions[idx]
+        captureHzIndex = idx
+        UserDefaults.standard.set(hz, forKey: "SecDisplayCaptureHz")
+        applyStreamTuning(captureHz: hz, maxMbps: nil)
+    }
+
+    func applyBitrateCap(_ idx: Int) {
+        guard idx >= 0, idx < Self.bitrateOptions.count else { return }
+        let mb = Self.bitrateOptions[idx]
+        bitrateIndex = idx
+        UserDefaults.standard.set(mb, forKey: "SecDisplayMaxMbps")
+        applyStreamTuning(captureHz: nil, maxMbps: mb)
+    }
+
+    func setShowGuide(_ on: Bool) {
+        showGuide = on
+        UserDefaults.standard.set(on, forKey: "SecDisplayShowGuide")
+        Log.info(on ? "连接引导动画已开启" : "连接引导动画已关闭")
     }
 }
 
@@ -617,37 +647,84 @@ struct StatusView: View {
                 Divider()
 
                 if !model.isReceiverMode {
-                    // 设置
-                    HStack {
-                        Text("分辨率").foregroundStyle(.secondary)
-                        Spacer()
-                        Picker("", selection: Binding(
-                            get: { model.resolutionIndex },
-                            set: { idx in
-                                guard !model.suppressResolutionChange, idx >= 0,
-                                      idx < AppModel.resolutions.count else { return }
-                                let r = AppModel.resolutions[idx]
-                                restartWithResolution(r.w, r.h, r.lw, r.lh)
-                            })) {
-                            ForEach(Array(AppModel.resolutions.enumerated()), id: \.offset) { i, r in
-                                Text(r.label).tag(i)
+                    // ---- 画质与性能（卡片） ----
+                    SectionHeader(title: "画质与性能")
+                    VStack(spacing: 9) {
+                        HStack {
+                            Text("分辨率").foregroundStyle(.secondary)
+                            Spacer()
+                            Picker("", selection: Binding(
+                                get: { model.resolutionIndex },
+                                set: { idx in
+                                    guard !model.suppressResolutionChange, idx >= 0,
+                                          idx < AppModel.resolutions.count else { return }
+                                    let r = AppModel.resolutions[idx]
+                                    restartWithResolution(r.w, r.h, r.lw, r.lh)
+                                })) {
+                                ForEach(Array(AppModel.resolutions.enumerated()), id: \.offset) { i, r in
+                                    Text(r.label).tag(i)
+                                }
+                                if model.resolutionIndex < 0 {
+                                    Text("自定义").tag(-1)
+                                }
                             }
-                            if model.resolutionIndex < 0 {
-                                Text("自定义").tag(-1)
-                            }
+                            .labelsHidden()
+                            .frame(width: 190)
                         }
-                        .labelsHidden()
-                        .frame(width: 190)
+                        HStack {
+                            Text("采集帧率").foregroundStyle(.secondary)
+                            Spacer()
+                            Picker("", selection: Binding(
+                                get: { model.captureHzIndex },
+                                set: { model.applyCaptureHz($0) })) {
+                                ForEach(Array(AppModel.captureHzOptions.enumerated()), id: \.offset) { i, hz in
+                                    Text("\(Int(hz)) fps").tag(i)
+                                }
+                            }
+                            .labelsHidden()
+                            .frame(width: 120)
+                        }
+                        HStack {
+                            Text("码率上限").foregroundStyle(.secondary)
+                            Spacer()
+                            Picker("", selection: Binding(
+                                get: { model.bitrateIndex },
+                                set: { model.applyBitrateCap($0) })) {
+                                ForEach(Array(AppModel.bitrateOptions.enumerated()), id: \.offset) { i, mb in
+                                    Text("\(mb) Mbps").tag(i)
+                                }
+                            }
+                            .labelsHidden()
+                            .frame(width: 140)
+                        }
+                        Divider()
+                        Toggle("发送真实光标图像", isOn: Binding(
+                            get: { model.cursorImageOn },
+                            set: { on in
+                                disableCursorImage = !on
+                                if on { cursorImage?.start() }
+                                Log.info(on ? "面板开启光标图像(0x05)" : "面板关闭光标图像(0x05)")
+                            }))
+                            .toggleStyle(.switch)
+                        Toggle("连接时播放位置引导", isOn: Binding(
+                            get: { model.showGuide },
+                            set: { model.setShowGuide($0) }))
+                            .toggleStyle(.switch)
+                        HStack(spacing: 8) {
+                            Button("播放连接引导") {
+                                ConnectionGuideOverlay.shared.show(vdID: vd?.displayID ?? 0)
+                            }
+                            Spacer()
+                            Text("帧率/码率即时生效")
+                                .font(.system(size: 10))
+                                .foregroundStyle(.tertiary)
+                        }
                     }
-
-                    Toggle("发送真实光标图像", isOn: Binding(
-                        get: { model.cursorImageOn },
-                        set: { on in
-                            disableCursorImage = !on
-                            if on { cursorImage?.start() }
-                            Log.info(on ? "面板开启光标图像(0x05)" : "面板关闭光标图像(0x05)")
-                        }))
-                        .toggleStyle(.switch)
+                    .padding(10)
+                    .background(
+                        RoundedRectangle(cornerRadius: 10)
+                            .fill(Color.secondary.opacity(0.07))
+                    )
                 }
 
                 HStack(spacing: 8) {
@@ -797,6 +874,29 @@ func restartWithRole(_ role: SecDisplayRole, host: String) {
     try? p.run()
     DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
         shutdown(signal: SIGTERM)
+    }
+}
+
+/// 面板里调「采集帧率 / 码率上限」时在线生效：重建编码器并更新自适应码率目标。
+/// 分辨率仍然需要重启进程（虚拟屏模式表在建屏时确定），这里只处理帧率与码率。
+func applyStreamTuning(captureHz: Double?, maxMbps: Int?) {
+    cfgStateLock.lock()
+    if let hz = captureHz, hz >= 20, hz <= 120 { cfg.captureHz = hz }
+    if let mb = maxMbps, mb >= 20, mb <= 300 { cfg.bitrateMbps = mb }
+    let w = cfg.width, h = cfg.height
+    let hzNow = cfg.captureHz
+    let mbNow = cfg.bitrateMbps
+    cfgStateLock.unlock()
+
+    guard let enc = encoder else { return }
+    if enc.reconfigure(width: w, height: h, bitrateMbps: mbNow, captureHz: hzNow) {
+        rateCtl?.updateTargetMbps(mbNow)
+        sender?.sessionFps = Int(hzNow.rounded())
+        sender?.updateSessionInfo(width: w, height: h, fps: Int(hzNow.rounded()),
+                                  scaleTenths: UInt8(clamping: Int((vdBackingScale * 10).rounded())))
+        Log.info("面板应用码率/帧率: \(mbNow) Mbps, \(Int(hzNow)) fps")
+    } else {
+        Log.info("面板应用码率/帧率失败（编码器重建被拒绝），保持原配置")
     }
 }
 
@@ -1377,4 +1477,360 @@ func showDropBoxPanel() {
     p.orderFrontRegardless()
     dropBoxPanel = p
     Log.info("Mac 文件投递盒已打开")
+}
+
+// MARK: - 连接引导动画
+
+/// 副屏连上时，在「主屏 → 副屏」之间来回飞一个光标并标出副屏位置。
+/// 用户第一次连上时常常不知道画面去哪了，这个动画直接告诉他「副屏在这里」，
+/// 以及光标可以在两块屏之间来回移动。
+final class ConnectionGuideOverlay {
+    static let shared = ConnectionGuideOverlay()
+    private init() {}
+
+    private var window: NSWindow?
+    private var canvas: GuideCanvasView?
+    private var timer: Timer?
+    private var startedAt: CFAbsoluteTime = 0
+    private var cyclesLeft = 0
+    private var fading = false
+
+    private let legSeconds: Double = 0.90      // 单程
+    private let pauseSeconds: Double = 0.22    // 到端点停顿
+    private let fadeSeconds: Double = 0.40
+
+    struct Layout {
+        let union: CGRect
+        let main: CGRect   // 主屏（主显示器）在 union 内的坐标
+        let vd: CGRect     // 副屏在 union 内的坐标
+    }
+
+    static var isEnabled: Bool {
+        (UserDefaults.standard.object(forKey: "SecDisplayShowGuide") as? Bool) ?? true
+    }
+
+    /// 把 AppKit 全局屏幕坐标转成 union 内的窗口坐标（窗口 y 轴向上，与 AppKit 一致）。
+    static func makeLayout(vdID: CGDirectDisplayID) -> Layout? {
+        let screens = NSScreen.screens
+        guard !screens.isEmpty else { return nil }
+        let mainScreen = screens.first { abs($0.frame.origin.x) < 1 && abs($0.frame.origin.y) < 1 } ?? screens[0]
+        let vdScreen = screens.first { s in
+            (s.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? NSNumber)?.uint32Value == vdID
+        }
+        var union = mainScreen.frame
+        for s in screens { union = union.union(s.frame) }
+        func local(_ r: CGRect) -> CGRect {
+            CGRect(x: r.minX - union.minX, y: r.minY - union.minY, width: r.width, height: r.height)
+        }
+        var vdRect: CGRect
+        if let v = vdScreen {
+            vdRect = v.frame
+        } else {
+            // 找不到副屏（例如还在建屏）：假设它在主屏右侧
+            vdRect = CGRect(x: mainScreen.frame.maxX, y: mainScreen.frame.minY,
+                            width: mainScreen.frame.width, height: mainScreen.frame.height)
+            union = union.union(vdRect)
+        }
+        return Layout(union: union, main: local(mainScreen.frame), vd: local(vdRect))
+    }
+
+    func showIfEnabled(vdID: CGDirectDisplayID) {
+        guard Self.isEnabled else { return }
+        show(vdID: vdID)
+    }
+
+    func show(vdID: CGDirectDisplayID, cycles: Int = 3) {
+        guard window == nil else { return }
+        guard let layout = Self.makeLayout(vdID: vdID) else { return }
+        let w = NSWindow(contentRect: layout.union, styleMask: [.borderless],
+                         backing: .buffered, defer: false)
+        w.isOpaque = false
+        w.backgroundColor = .clear
+        w.hasShadow = false
+        w.level = .screenSaver
+        w.ignoresMouseEvents = true
+        w.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .stationary]
+        w.isReleasedWhenClosed = false
+        let v = GuideCanvasView(frame: CGRect(origin: .zero, size: layout.union.size))
+        v.mainRect = layout.main
+        v.vdRect = layout.vd
+        w.contentView = v
+        w.orderFrontRegardless()
+
+        window = w
+        canvas = v
+        cyclesLeft = max(1, cycles)
+        startedAt = CFAbsoluteTimeGetCurrent()
+        fading = false
+        let t = Timer(timeInterval: 1.0 / 60.0, repeats: true) { [weak self] _ in self?.tick() }
+        RunLoop.main.add(t, forMode: .common)
+        timer = t
+        Log.info("连接引导动画: 主屏 → 副屏（id=\(vdID)）")
+    }
+
+    private func tick() {
+        guard let canvas else { finish(); return }
+        let now = CFAbsoluteTimeGetCurrent()
+        let elapsed = now - startedAt
+        let perCycle = legSeconds * 2 + pauseSeconds * 2
+        let total = perCycle * Double(cyclesLeft)
+
+        if elapsed < total {
+            let t = elapsed.truncatingRemainder(dividingBy: perCycle)
+            var p: CGFloat
+            if t < legSeconds {
+                p = CGFloat(t / legSeconds)
+            } else if t < legSeconds + pauseSeconds {
+                p = 1
+            } else if t < legSeconds * 2 + pauseSeconds {
+                p = CGFloat(1 - (t - legSeconds - pauseSeconds) / legSeconds)
+            } else {
+                p = 0
+            }
+            canvas.progress = max(0, min(1, p))
+            canvas.dashPhase = CGFloat(elapsed.truncatingRemainder(dividingBy: 1.2) / 1.2)
+            canvas.pulse = CGFloat(elapsed.truncatingRemainder(dividingBy: 1.4) / 1.4)
+            canvas.alphaValue = 1
+            canvas.needsDisplay = true
+        } else if !fading {
+            fading = true
+            startedAt = now
+        } else if now - startedAt < fadeSeconds {
+            canvas.alphaValue = CGFloat(1 - (now - startedAt) / fadeSeconds)
+        } else {
+            finish()
+        }
+    }
+
+    private func finish() {
+        timer?.invalidate()
+        timer = nil
+        window?.orderOut(nil)
+        window = nil
+        canvas = nil
+    }
+
+    /// 无人值守验证：把动画在 3 个进度点渲染成 PNG，返回文件路径。
+    static func dumpFrames(to dir: String) -> [String] {
+        var layout = makeLayout(vdID: 0)
+        if layout == nil || layout!.vd.width <= 0 {
+            let f = NSScreen.screens.first?.frame ?? CGRect(x: 0, y: 0, width: 1512, height: 982)
+            let vd = CGRect(x: f.maxX, y: f.minY, width: f.width, height: f.height)
+            let union = f.union(vd)
+            layout = Layout(union: union,
+                            main: CGRect(x: f.minX - union.minX, y: f.minY - union.minY, width: f.width, height: f.height),
+                            vd: CGRect(x: vd.minX - union.minX, y: vd.minY - union.minY, width: vd.width, height: vd.height))
+        }
+        guard let l = layout else { return [] }
+        let v = GuideCanvasView(frame: CGRect(origin: .zero, size: l.union.size))
+        v.mainRect = l.main
+        v.vdRect = l.vd
+        v.opaqueBackdrop = true
+        var paths: [String] = []
+        for (i, p) in [0.2, 0.55, 0.92].enumerated() {
+            v.progress = CGFloat(p)
+            v.dashPhase = CGFloat(0.18 + Double(i) * 0.3)
+            v.pulse = CGFloat(i == 2 ? 0.35 : 0.7)
+            guard let rep = v.bitmapImageRepForCachingDisplay(in: v.bounds) else { continue }
+            v.cacheDisplay(in: v.bounds, to: rep)
+            guard let png = rep.representation(using: .png, properties: [:]) else { continue }
+            let path = "\(dir)/guide_\(i).png"
+            try? png.write(to: URL(fileURLWithPath: path))
+            paths.append(path)
+        }
+        return paths
+    }
+}
+
+/// 引导动画画布：虚线路径 + 副屏高亮框 + 飞行的光标。
+final class GuideCanvasView: NSView {
+    var progress: CGFloat = 0
+    var mainRect: CGRect = .zero
+    var vdRect: CGRect = .zero
+    /// 虚线流动相位（0..1），让连线看起来在「流动」
+    var dashPhase: CGFloat = 0
+    /// 终点脉冲（0..1 循环），用于扩散光环
+    var pulse: CGFloat = 0
+    /// 导出 PNG 时铺一层不透明底，模拟真实桌面，便于离线审阅
+    var opaqueBackdrop = false
+    override var isFlipped: Bool { false }
+
+    override func draw(_ dirtyRect: NSRect) {
+        guard let ctx = NSGraphicsContext.current?.cgContext else { return }
+        let accent = NSColor.controlAccentColor
+
+        // 导出时铺一层不透明底，避免透明背景让画面看起来发白
+        if opaqueBackdrop {
+            ctx.setFillColor(NSColor(calibratedWhite: 0.16, alpha: 1).cgColor)
+            ctx.fill(bounds)
+        }
+        // 轻微压暗（比上一版更淡，避免整屏发灰）
+        ctx.setFillColor(NSColor.black.withAlphaComponent(0.10).cgColor)
+        ctx.fill(bounds)
+
+        // 端点取「屏幕中部偏内」而不是紧贴接缝：两块屏相邻时接缝处两点只有一百多像素，
+        // 光标几乎不动，完全没有「从左屏飞到右屏」的观感。
+        let a = CGPoint(x: mainRect.minX + mainRect.width * 0.62, y: mainRect.midY)
+        let b = CGPoint(x: vdRect.minX + vdRect.width * 0.38, y: vdRect.midY)
+        let ctrl = CGPoint(x: (a.x + b.x) * 0.5, y: max(a.y, b.y) + 210)
+
+        // ---- 副屏高亮框：宽描边 + 外发光 ----
+        let highlight = vdRect.insetBy(dx: 10, dy: 10)
+        let hlPath = CGPath(roundedRect: highlight, cornerWidth: 18, cornerHeight: 18, transform: nil)
+        ctx.saveGState()
+        ctx.setShadow(offset: .zero, blur: 26,
+                      color: accent.withAlphaComponent(0.75).cgColor)
+        ctx.setStrokeColor(accent.withAlphaComponent(0.95).cgColor)
+        ctx.setLineWidth(5)
+        ctx.addPath(hlPath)
+        ctx.strokePath()
+        ctx.restoreGState()
+
+        // 终点扩散光环（两圈，错相位）
+        for k in 0..<2 {
+            let ph = (pulse + CGFloat(k) * 0.5).truncatingRemainder(dividingBy: 1.0)
+            let r = 26 + ph * 70
+            ctx.setStrokeColor(accent.withAlphaComponent(Double(0.55 * (1 - ph))).cgColor)
+            ctx.setLineWidth(2.5)
+            ctx.strokeEllipse(in: CGRect(x: b.x - r, y: b.y - r, width: r * 2, height: r * 2))
+        }
+
+        // ---- 连线：底层粗光晕 + 上层流动虚线 ----
+        let path = CGMutablePath()
+        path.move(to: a)
+        path.addQuadCurve(to: b, control: ctrl)
+
+        ctx.saveGState()
+        ctx.setStrokeColor(accent.withAlphaComponent(0.22).cgColor)
+        ctx.setLineWidth(14)
+        ctx.setLineCap(.round)
+        ctx.addPath(path)
+        ctx.strokePath()
+        ctx.restoreGState()
+
+        ctx.saveGState()
+        ctx.setStrokeColor(accent.withAlphaComponent(0.92).cgColor)
+        ctx.setLineWidth(3.6)
+        ctx.setLineCap(.round)
+        ctx.setLineDash(phase: dashPhase * 26, lengths: [15, 12])
+        ctx.addPath(path)
+        ctx.strokePath()
+        ctx.restoreGState()
+
+        // 端点
+        drawDot(ctx, at: a, radius: 7, color: accent)
+        drawDot(ctx, at: b, radius: 8, color: accent)
+
+        // ---- 文案板 ----
+        drawPill(ctx, text: "主屏", at: CGPoint(x: a.x - 96, y: a.y), small: true)
+        drawPill(ctx, text: "副屏在这里", at: CGPoint(x: vdRect.midX, y: vdRect.midY + 46), small: false)
+        drawPill(ctx, text: "把窗口拖过来，鼠标可来回移动",
+                 at: CGPoint(x: vdRect.midX, y: vdRect.midY - 46), small: true)
+
+        // ---- 飞行光标 + 拖尾 ----
+        for i in stride(from: 6, through: 1, by: -1) {
+            let tp = max(0, progress - CGFloat(i) * 0.035)
+            let pos = quadPoint(a, ctrl, b, tp)
+            let alpha = 0.10 * CGFloat(7 - i) / 6.0
+            ctx.setFillColor(accent.withAlphaComponent(alpha).cgColor)
+            ctx.fillEllipse(in: CGRect(x: pos.x - 5, y: pos.y - 5, width: 10, height: 10))
+        }
+        let pos = quadPoint(a, ctrl, b, progress)
+        drawCursor(ctx, at: pos)
+    }
+
+    private func quadPoint(_ a: CGPoint, _ c: CGPoint, _ b: CGPoint, _ t: CGFloat) -> CGPoint {
+        let mt = 1 - t
+        return CGPoint(x: mt * mt * a.x + 2 * mt * t * c.x + t * t * b.x,
+                       y: mt * mt * a.y + 2 * mt * t * c.y + t * t * b.y)
+    }
+
+    private func drawDot(_ ctx: CGContext, at p: CGPoint, radius: CGFloat, color: NSColor) {
+        ctx.setFillColor(color.withAlphaComponent(0.95).cgColor)
+        ctx.fillEllipse(in: CGRect(x: p.x - radius, y: p.y - radius, width: radius * 2, height: radius * 2))
+    }
+
+    private func drawLabel(_ text: String, centeredAt p: CGPoint, small: Bool = false) -> CGSize {
+        let attrs: [NSAttributedString.Key: Any] = [
+            .font: NSFont.systemFont(ofSize: small ? 13 : 17, weight: small ? .medium : .bold),
+            .foregroundColor: NSColor.white,
+            .strokeColor: NSColor.black.withAlphaComponent(0.55),
+            .strokeWidth: -2.0,
+        ]
+        let s = NSAttributedString(string: text, attributes: attrs)
+        let size = s.size()
+        s.draw(at: CGPoint(x: p.x - size.width / 2, y: p.y - size.height / 2))
+        return size
+    }
+
+    /// 圆角胶囊文案板：深色底 + 主题色描边，比纯文字更醒目。
+    private func drawPill(_ ctx: CGContext, text: String, at p: CGPoint, small: Bool) {
+        let attrs: [NSAttributedString.Key: Any] = [
+            .font: NSFont.systemFont(ofSize: small ? 13 : 20, weight: small ? .medium : .bold),
+            .foregroundColor: NSColor.white,
+        ]
+        let s = NSAttributedString(string: text, attributes: attrs)
+        let textSize = s.size()
+        let padX: CGFloat = small ? 12 : 16
+        let padY: CGFloat = small ? 6 : 8
+        let boxSize = CGSize(width: textSize.width + padX * 2, height: textSize.height + padY * 2)
+        let box = CGRect(x: p.x - boxSize.width / 2, y: p.y - boxSize.height / 2,
+                         width: boxSize.width, height: boxSize.height)
+        let rr = CGPath(roundedRect: box, cornerWidth: boxSize.height / 2,
+                        cornerHeight: boxSize.height / 2, transform: nil)
+        ctx.saveGState()
+        ctx.setShadow(offset: CGSize(width: 0, height: -3), blur: 18,
+                      color: NSColor.black.withAlphaComponent(0.55).cgColor)
+        ctx.setFillColor(NSColor.black.withAlphaComponent(0.62).cgColor)
+        ctx.addPath(rr)
+        ctx.fillPath()
+        ctx.restoreGState()
+        ctx.saveGState()
+        ctx.setStrokeColor(NSColor.controlAccentColor.withAlphaComponent(0.85).cgColor)
+        ctx.setLineWidth(1.6)
+        ctx.addPath(rr)
+        ctx.strokePath()
+        ctx.restoreGState()
+        s.draw(at: CGPoint(x: p.x - textSize.width / 2, y: p.y - textSize.height / 2))
+    }
+
+    private func drawCursor(_ ctx: CGContext, at p: CGPoint) {
+        // 手绘箭头：白色填充 + 黑色描边 + 主题色外发光，尺寸放大到 44pt。
+        let h: CGFloat = 52
+        let pts: [CGPoint] = [
+            CGPoint(x: 0, y: 0),
+            CGPoint(x: 0, y: -h),
+            CGPoint(x: h * 0.30, y: -h * 0.68),
+            CGPoint(x: h * 0.50, y: -h * 0.96),
+            CGPoint(x: h * 0.68, y: -h * 0.86),
+            CGPoint(x: h * 0.50, y: -h * 0.58),
+            CGPoint(x: h * 0.84, y: -h * 0.58),
+        ]
+        let arrow = CGMutablePath()
+        arrow.move(to: pts[0])
+        for q in pts.dropFirst() { arrow.addLine(to: q) }
+        arrow.closeSubpath()
+
+        // 外发光
+        ctx.saveGState()
+        ctx.translateBy(x: p.x, y: p.y)
+        ctx.setShadow(offset: .zero, blur: 22,
+                      color: NSColor.controlAccentColor.withAlphaComponent(0.95).cgColor)
+        ctx.addPath(arrow)
+        ctx.setFillColor(NSColor.white.cgColor)
+        ctx.fillPath()
+        ctx.restoreGState()
+
+        // 主体 + 描边
+        ctx.saveGState()
+        ctx.translateBy(x: p.x, y: p.y)
+        ctx.addPath(arrow)
+        ctx.setFillColor(NSColor.white.cgColor)
+        ctx.fillPath()
+        ctx.addPath(arrow)
+        ctx.setStrokeColor(NSColor.black.withAlphaComponent(0.9).cgColor)
+        ctx.setLineWidth(2.2)
+        ctx.strokePath()
+        ctx.restoreGState()
+    }
 }
