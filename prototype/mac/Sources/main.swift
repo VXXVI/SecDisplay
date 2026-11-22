@@ -1047,11 +1047,33 @@ private enum SkyLightCapture {
     static var badFrameCount: Int { badFrameLock.lock(); defer { badFrameLock.unlock() }; return _badFrames }
     static func noteBadFrame() { badFrameLock.lock(); _badFrames += 1; badFrameLock.unlock() }
 
+    // 连续异尺寸状态（跨 worker 共享，需加锁）。
+    // 用于逃生阀：同一非目标尺寸持续出现，说明不是偶发条带帧，而是虚拟屏
+    // 分辨率与目标暂时不一致（切档过渡、1x 模式等），此时缩放接受避免画面冻结。
+    private static let sizeStateLock = NSLock()
+    private static var _consecWrong = 0
+    private static var _lastWrongW = 0
+    private static var _lastWrongH = 0
+    private static func wrongSizeState() -> (consec: Int, w: Int, h: Int) {
+        sizeStateLock.lock(); defer { sizeStateLock.unlock() }
+        return (_consecWrong, _lastWrongW, _lastWrongH)
+    }
+    private static func noteWrongSize(_ w: Int, _ h: Int) {
+        sizeStateLock.lock(); defer { sizeStateLock.unlock() }
+        if w == _lastWrongW && h == _lastWrongH { _consecWrong += 1 }
+        else { _lastWrongW = w; _lastWrongH = h; _consecWrong = 1 }
+    }
+    private static func resetWrongSize() {
+        sizeStateLock.lock(); _consecWrong = 0; _lastWrongW = 0; _lastWrongH = 0; sizeStateLock.unlock()
+    }
+
     static func captureFrame(_ vdID: CGDirectDisplayID, targetW: Int, targetH: Int) -> Result {
         guard let syms else { return .unavailable }
         let bounds = CGDisplayBounds(vdID)
         guard bounds.width > 1, bounds.height > 1 else { return .unavailable }
         let cid = syms.cidFn()
+        let targetAspect = Double(targetW) / Double(targetH)
+        let (consec, lastW, lastH) = wrongSizeState()
         // 最多尝试 2 次：条带帧多是当帧窗口列表的包围盒暂时只有菜单栏，
         // 重新枚举窗口列表再抓一次通常就能拿到整屏合成图，减少丢帧。
         var lastWrongSize = (w: 0, h: 0)
@@ -1078,26 +1100,48 @@ private enum SkyLightCapture {
             }) else { return .unavailable }
             let result = withExtendedLifetime(arr) { () -> Result in
                 let n = CFArrayGetCount(arr)
+                // 空数组是 WindowServer 侧合成失败，属抓取故障，不能当条带帧。
+                guard n > 0 else { return .unavailable }
                 // 数组里可能同时含整屏合成图与单个窗口图；挑尺寸严格等于目标的整屏帧。
                 // 绝不把 2880x60 这类条带拉伸成整屏，否则画面跳变经 H.264 变成拖影。
                 var picked: CGImage? = nil
+                var fallback: CGImage? = nil
                 var anySize: (Int, Int)? = nil
                 for i in 0..<n {
                     guard let raw = CFArrayGetValueAtIndex(arr, i) else { continue }
                     let img = Unmanaged<CGImage>.fromOpaque(raw).takeUnretainedValue()
-                    if anySize == nil { anySize = (img.width, img.height) }
-                    if img.width == targetW && img.height == targetH {
+                    let iw = img.width, ih = img.height
+                    if anySize == nil { anySize = (iw, ih) }
+                    if iw == targetW && ih == targetH {
                         picked = img
                         break
                     }
+                    // 逃生阀候选：纵横比与目标一致且面积不小于目标 1/4 的帧。
+                    // 条带帧（如 2880x60）纵横比极端，不会命中。
+                    if fallback == nil, ih > 0,
+                       abs((Double(iw) / Double(ih)) / targetAspect - 1.0) <= 0.02,
+                       iw >= targetW / 2, ih >= targetH / 2 {
+                        fallback = img
+                    }
                 }
-                guard let img = picked else {
-                    return .wrongSize(w: anySize?.0 ?? 0, h: anySize?.1 ?? 0)
+                if let img = picked {
+                    resetWrongSize()
+                    guard let pb = makePixelBuffer(from: img, targetW: targetW, targetH: targetH) else {
+                        return .unavailable
+                    }
+                    return .frame(pb)
                 }
-                guard let pb = makePixelBuffer(from: img, targetW: targetW, targetH: targetH) else {
-                    return .unavailable
+                // 逃生阀：同一非目标尺寸持续 ≥30 帧，用纵横比匹配的候选缩放接受，
+                // 避免虚拟屏分辨率与目标暂时不一致时画面长期冻结。
+                let sz = anySize ?? (0, 0)
+                if consec >= 30, sz.0 == lastW, sz.1 == lastH, let img = fallback {
+                    resetWrongSize()
+                    guard let pb = makePixelBuffer(from: img, targetW: targetW, targetH: targetH) else {
+                        return .unavailable
+                    }
+                    return .frame(pb)
                 }
-                return .frame(pb)
+                return .wrongSize(w: sz.0, h: sz.1)
             }
             // 抓到整屏帧或真正的抓取故障都立即返回；只有条带帧才重试。
             if case .wrongSize(let w, let h) = result {
@@ -1109,6 +1153,7 @@ private enum SkyLightCapture {
         }
         // 两次都是条带帧：按条带帧返回，交给调用方丢帧重抓。
         // 不返回 .unavailable，避免被计入采集失败、触发误回退。
+        noteWrongSize(lastWrongSize.w, lastWrongSize.h)
         return .wrongSize(w: lastWrongSize.w, h: lastWrongSize.h)
     }
 }
@@ -1156,6 +1201,9 @@ final class ScreenshotCapture {
     private var lastSupervisorAt: CFAbsoluteTime = 0
     private var loggedFirstFrame = false
     private var lastSizeWarnAt: CFAbsoluteTime = 0
+    /// 条带帧丢弃日志的独立节流时间戳。由多路 worker 共享，
+    /// 必须与 lastSizeWarnAt 分开并走 withRawLock，避免跨 worker 数据竞争。
+    private var lastBadSizeWarnAt: CFAbsoluteTime = 0
     /// worker 代次。spawnWorkers 每次自增，旧代次的循环看到代次变了就退出。
     /// 原来这里是直接再起 4 个 Task 而不停旧的，看护每触发一次线程数与
     /// 采集缓冲就翻一倍（每个 worker 同时持有 CGImage + CVPixelBuffer 约 40MB）。
@@ -1641,12 +1689,21 @@ final class ScreenshotCapture {
                             // 那正是拖影/残影的根源。丢帧等下一拍重新枚举即可，
                             // 不计入连续失败，避免误回退到会弹权限窗的 SCScreenshotManager。
                             SkyLightCapture.noteBadFrame()
+                            // 多路 worker 共享该字段，必须走 withRawLock；
+                            // 与 encodeQueue 内的 lastSizeWarnAt 分开，避免语义串扰。
                             let nowWarn = CFAbsoluteTimeGetCurrent()
-                            if nowWarn - lastSizeWarnAt > 2.0 {
-                                lastSizeWarnAt = nowWarn
+                            let shouldLog = withRawLock { () -> Bool in
+                                if nowWarn - lastBadSizeWarnAt > 2.0 {
+                                    lastBadSizeWarnAt = nowWarn
+                                    return true
+                                }
+                                return false
+                            }
+                            if shouldLog {
                                 Log.info("丢弃尺寸异常的合成帧 \(w)x\(h) != \(targetW)x\(targetH)（累计丢弃 \(SkyLightCapture.badFrameCount) 张）")
                             }
-                            try? await Task.sleep(nanoseconds: 50_000_000)
+                            // 节拍门已按 minGap 限速，直接 continue 即可；
+                            // 原先额外 sleep 50ms 会把坏帧变成 50ms 空洞，压低有效帧率。
                             continue
                         case .unavailable:
                             // 与 vdID == 0 一样，走下方失败处理
