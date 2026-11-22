@@ -2087,35 +2087,31 @@ final class ScreenshotCapture {
 
 private let fastPathMissLock = NSLock()
 private var fastPathMissLogged = false
-/// 无名 RGB 色彩空间是否等价 sRGB 的缓存。键绑定到具体色彩空间对象，
-/// 避免不同空间共用单槽缓存导致静默误判（审查指出的低概率缺陷）。
-private let colorSpaceCheckLock = NSLock()
-private var lastColorSpaceCheck: (id: ObjectIdentifier, isSRGB: Bool)? = nil
+private var unnamedAcceptLogged = false
 
 /// 判断色彩空间是否可安全地按 BGRA 直接拷贝：
 /// - nil：SkyLight 合成图有时不带 colorSpace，像素已是 BGRA，按 sRGB 处理；
-/// - 名字等于 sRGB：直接放行；
-/// - 无名 RGB 非宽色域：用 ICC 数据重建，等价 sRGB 才放行（实测虚拟屏就是这种）；
-/// - 宽色域或其它模型：拒绝，交给回退路径做真正的色彩转换。
+/// - 宽色域或非 RGB：一律拒绝，交给回退做色彩转换；
+/// - 名字等于 sRGB：放行；
+/// - 有名但不是 sRGB 的 RGB 空间（Generic RGB、Adobe RGB 等）：拒绝；
+/// - 无名、RGB、非宽色域：实测虚拟屏这类 profile（3380 字节）直接拷贝与 sRGB
+///   转换像素差 max=0（probe_icc.log），放行以保留快路径。
 private func isSRGBEquivalent(_ cs: CGColorSpace?, csName: String?, srgbName: String?) -> Bool {
     guard let cs else { return true }
-    if let srgbName, csName == srgbName { return true }
+    // 宽色域/非 RGB 先拒绝，避免「名字恰好叫 sRGB 的宽色域 profile」绕过检查。
     guard cs.model == .rgb, !cs.isWideGamutRGB else { return false }
-    colorSpaceCheckLock.lock()
-    if let cached = lastColorSpaceCheck, cached.id == ObjectIdentifier(cs) {
-        colorSpaceCheckLock.unlock()
-        return cached.isSRGB
+    if let srgbName, csName == srgbName { return true }
+    guard csName == nil else { return false }
+    // 首次放行无名空间时打一条 profile 指纹，便于将来出现新的无名 profile 时排查偏色。
+    fastPathMissLock.lock()
+    let shouldLog = !unnamedAcceptLogged
+    if shouldLog { unnamedAcceptLogged = true }
+    fastPathMissLock.unlock()
+    if shouldLog {
+        let iccLen = cs.copyICCData().map { CFDataGetLength($0) } ?? -1
+        Log.info("快路径按 sRGB 等价接受无名色彩空间: model=\(cs.model.rawValue) wideGamut=\(cs.isWideGamutRGB) iccBytes=\(iccLen)")
     }
-    colorSpaceCheckLock.unlock()
-    var isSRGB = false
-    if let icc = cs.copyICCData(), let rebuilt = CGColorSpace(iccData: icc),
-       let srgbName, (rebuilt.name as String?) == srgbName {
-        isSRGB = true
-    }
-    colorSpaceCheckLock.lock()
-    lastColorSpaceCheck = (ObjectIdentifier(cs), isSRGB)
-    colorSpaceCheckLock.unlock()
-    return isSRGB
+    return true
 }
 
 /// 一次性记录快路径未命中原因（加锁，跨 worker 安全）。
@@ -2140,8 +2136,8 @@ private func logFastPathMiss(_ reason: String, img: CGImage, w: Int, h: Int,
 /// SkyLight 抓到的 CGImage 通常已是 32bpp BGRA premultiplied 小端，与
 /// kCVPixelFormatType_32BGRA 一致，直接按行 memcpy 到 IOSurface 像素缓冲，
 /// 省掉 CGContextDrawImage 的颜色管理与格式转换（实测 CPU 82% -> 20%）。
-/// 色彩空间判据见 isSRGBEquivalent：无色彩空间、明确 sRGB、或 ICC 重建后等价 sRGB
-/// 的无名非宽色域 RGB 才走快路径；宽色域与其它模型交给回退路径做色彩转换。
+/// 色彩空间判据见 isSRGBEquivalent：无色彩空间、明确 sRGB、或无名非宽色域 RGB
+/// 才走快路径；宽色域、有名非 sRGB 与其它模型交给回退路径做色彩转换。
 /// 像素一致性已用探针验证 maxDiff=0。
 private func makePixelBufferFast(from img: CGImage, w: Int, h: Int) -> CVPixelBuffer? {
     let cs = img.colorSpace
