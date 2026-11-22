@@ -471,7 +471,7 @@ static const int kShakeMinSpanPx = 150;  // 横向/纵向累计摆幅下限，�
 // 曲线对齐 macOS「晃动鼠标指针以定位」：起势快、带轻微过冲，保持后缓入缓出回落。
 static const double kShakeCursorZoom = 2.2;  // 目标放大倍数（绘制在叠加层，不受硬件光标上限限制）
 static const double kShakeGrowMs = 180.0;    // 起势时长（EaseOutBack，末端轻微过冲）
-static const double kShakeHoldMs = 500.0;    // 停晃后保持时长
+static const double kShakeHoldMs = 500.0;    // 最后一次指针移动后的保持时长
 static const double kShakeShrinkMs = 280.0;  // 回落时长（EaseInOutCubic）
 static const double kShakeOvershootC1 = 1.2;  // EaseOutBack 过冲系数（≈3% 峰值过冲）
 static const int kShakeTickMs = 16;          // ~60Hz 动画刷新
@@ -491,8 +491,9 @@ static std::atomic<bool> g_shakeEnabled{true};
 static double g_shakeZoom = 1.0;
 static double g_shakeAnimStartMs = 0.0;
 static double g_shakeAnimFromZoom = 1.0;
-// 最后一次「判定为正在晃动」的高精度 QPC 时刻（亚毫秒，不受 GetTickCount64 15.6ms 跳变影响）
-static double g_shakeLastShakeQpcMs = 0.0;
+// 最后一次指针位置真正变化的 QPC 时刻（亚毫秒，不受 GetTickCount64 15.6ms 跳变影响）。
+// 晃动触发后的 HOLD 以它为起点：指针还在移动就延长保持期，连续静止 kShakeHoldMs 后才收缩。
+static double g_shakeLastPointerQpcMs = 0.0;
 static double g_shakeLastRefreshQpcMs = 0.0;
 static bool g_shakeTimePeriodOn = false;
 
@@ -5563,7 +5564,7 @@ static bool DetectShake(int64_t now, int x, int y) {
     if (shaking) {
         if (!g_shakeEnabled.load()) return false;
         const double nowQpc = QpcNowMs();
-        g_shakeLastShakeQpcMs = nowQpc;
+        g_shakeLastPointerQpcMs = nowQpc;
         // 平滑接续：处于 IDLE 或正在 SHRINK 时，从当前缩放倍率启动平滑放大曲线（InOutCubic），
         // 不再瞬间跳变到 2.8x；已在 GROW 或 HOLD 时只延长保持时刻，过渡连续不抖动。
         if (!g_shakeActive || g_shakePhase == SHAKE_IDLE || g_shakePhase == SHAKE_SHRINK) {
@@ -5586,7 +5587,8 @@ static bool DetectShake(int64_t now, int x, int y) {
     }
     // 不再晃动。返回值语义是「本次是否判定为晃动」，不是「是否仍处于放大态」——
     // 调用方靠它区分「真晃动」和「收缩期间的孤立噪声包」。
-    // hold 的判定统一交给 TickShakeShrink（按「最后一个光标包」计时）。
+    // HOLD 由 TickShakeAnim 判断：指针还在移动就延长保持期；连续静止
+    // kShakeHoldMs 后才开始 SHRINK。
     return false;
 }
 
@@ -5632,7 +5634,7 @@ static bool TickShakeAnim(double nowQpc) {
         }
     }
     if (g_shakePhase == SHAKE_HOLD) {
-        if (nowQpc - g_shakeLastShakeQpcMs < kShakeHoldMs) {
+        if (nowQpc - g_shakeLastPointerQpcMs < kShakeHoldMs) {
             UpdateZoomOverlay(g_shakeZoom);
             return true;
         }
@@ -5707,9 +5709,13 @@ static void RefreshCursorScale() {
 static void DriveShakeStep(int screenX, int screenY) {
     const int64_t nowMs = GetTickCount64();
     const bool wasActive = g_shakeActive;
+    // 每次真实指针移动都刷新「最后一次移动」时刻：HOLD 以它为起点，
+    // 指针持续移动时保持放大，静止满 kShakeHoldMs 后才收缩。
+    const double moveQpc = QpcNowMs();
+    g_shakeLastPointerQpcMs = moveQpc;
     DetectShake(nowMs, screenX, screenY);
     if (g_shakeActive) {
-        const double nowQpc = QpcNowMs();
+        const double nowQpc = moveQpc;
         if (!wasActive || (nowQpc - g_shakeLastRefreshQpcMs >= (double)kShakeTickMs * 0.9)) {
             g_shakeLastRefreshQpcMs = nowQpc;
             const bool keep = TickShakeAnim(nowQpc);
@@ -7855,7 +7861,7 @@ static int RunCursorSelfTest() {
     g_shakePhase = SHAKE_GROW;
     g_shakeAnimFromZoom = 1.0;
     g_shakeAnimStartMs = 1000.0;
-    g_shakeLastShakeQpcMs = 1000.0;
+    g_shakeLastPointerQpcMs = 1000.0;
     g_shakeZoom = 1.0;
     double prev = 1.0, peak = 1.0;
     bool reversalSeen = false;   // EaseOutBack 允许一次「升过头再回落」
@@ -7877,8 +7883,17 @@ static int RunCursorSelfTest() {
     check(std::abs(g_shakeZoom - kShakeCursorZoom) < 1e-6, "起势结束停在目标倍数");
     check(peak > kShakeCursorZoom * 1.005 && peak < kShakeCursorZoom * 1.08, "峰值过冲在 0.5%~8% 区间");
 
-    const double tAfterHold = 1000.0 + kShakeGrowMs + kShakeHoldMs + 1.0;
+    const double tMoveDuringHold = 1000.0 + kShakeGrowMs + kShakeHoldMs - 1.0;
+    g_shakeLastPointerQpcMs = tMoveDuringHold;
+    const double tHoldExtended = tMoveDuringHold + 1.0;
+    TickShakeAnim(tHoldExtended);
+    check(g_shakeActive && g_shakePhase == SHAKE_HOLD &&
+          std::abs(g_shakeZoom - kShakeCursorZoom) < 1e-6,
+          "最后一次晃动满 500ms 后若指针仍有移动，应保持放大");
+
+    const double tAfterHold = tMoveDuringHold + kShakeHoldMs + 1.0;
     TickShakeAnim(tAfterHold);
+    check(g_shakeActive && g_shakePhase == SHAKE_SHRINK, "指针停止移动满 500ms 后开始收缩");
     for (int i = 0; i <= 20; ++i) {
         TickShakeAnim(tAfterHold + kShakeShrinkMs * (double)i / 20.0);
     }
