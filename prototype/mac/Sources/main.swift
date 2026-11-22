@@ -2082,44 +2082,58 @@ final class ScreenshotCapture {
     }
 }
 
-/// CGImage → CVPixelBuffer(BGRA)。
-/// 默认采集路径用它：captureImage 给 CGImage，编码器要吃 CVPixelBuffer。
-/// 这一步是全屏 CGContext 重绘，2880x1800 下每帧 19.8MB、约 20ms；
-/// SECDISPLAY_PIXFMT=420v 走 captureSampleBuffer 时不需要它。
-/// 快路径：CGImage 已是 32bpp BGRA premultiplied 小端、sRGB 且尺寸与目标一致时，
-/// 直接按行 memcpy 到 IOSurface 像素缓冲，省掉 CGContextDrawImage 的颜色管理与
-/// 格式转换（实测 3.76ms -> 2.45ms/帧，像素一致性已用探针验证 maxDiff=0）。
-/// 格式不符、需要缩放或取不到连续数据时返回 nil，由调用方回退到 CoreGraphics 绘制。
 private let fastPathMissLock = NSLock()
 private var fastPathMissLogged = false
+
+/// 一次性记录快路径未命中原因（加锁，跨 worker 安全）。
+private func logFastPathMiss(_ reason: String, img: CGImage, w: Int, h: Int,
+                             cs: CGColorSpace?, csName: String?, srgbName: String?,
+                             dataLen: Int?) {
+    fastPathMissLock.lock()
+    let shouldLog = !fastPathMissLogged
+    if shouldLog { fastPathMissLogged = true }
+    fastPathMissLock.unlock()
+    guard shouldLog else { return }
+    let csDesc: String
+    if let cs {
+        csDesc = csName ?? "unnamed(model=\(cs.model.rawValue) wideGamut=\(cs.isWideGamutRGB))"
+    } else {
+        csDesc = "null"
+    }
+    Log.info("快路径未命中(\(reason)): size=\(img.width)x\(img.height) target=\(w)x\(h) bpc=\(img.bitsPerComponent) bpp=\(img.bitsPerPixel) bi=\(img.bitmapInfo.rawValue) cs=\(csDesc) srgb=\(srgbName ?? "nil") len=\(dataLen.map(String.init) ?? "-")")
+}
+
+/// CGImage → CVPixelBuffer(BGRA) 的快路径。
+/// SkyLight 抓到的 CGImage 通常已是 32bpp BGRA premultiplied 小端，与
+/// kCVPixelFormatType_32BGRA 一致，直接按行 memcpy 到 IOSurface 像素缓冲，
+/// 省掉 CGContextDrawImage 的颜色管理与格式转换（实测 CPU 82% -> 20%）。
+/// 只接受「无色彩空间」或「明确 sRGB」；未命名的 ICC/显示色彩空间可能是宽色域，
+/// 直接拷贝会偏色，交给回退路径做色彩转换。像素一致性已用探针验证 maxDiff=0。
 private func makePixelBufferFast(from img: CGImage, w: Int, h: Int) -> CVPixelBuffer? {
     let cs = img.colorSpace
     let csName = cs?.name as String?
     let srgbName = CGColorSpace(name: CGColorSpace.sRGB)?.name as String?
-    let data = img.dataProvider?.data
-    let ptr = data.flatMap { CFDataGetBytePtr($0) }
-    let ok = img.width == w && img.height == h
+    // 先做无副作用的廉价判断，最后才取 dataProvider.data（可能触发全帧拷贝）。
+    let shapeOK = img.width == w && img.height == h
         && img.bitsPerComponent == 8 && img.bitsPerPixel == 32
         && (img.bitmapInfo.rawValue & CGBitmapInfo.alphaInfoMask.rawValue)
             == CGImageAlphaInfo.premultipliedFirst.rawValue
         && (img.bitmapInfo.rawValue & CGBitmapInfo.byteOrderMask.rawValue)
             == CGBitmapInfo.byteOrder32Little.rawValue
-        // 颜色空间允许为 nil：SkyLight 合成图有时不带 colorSpace，
-        // 但像素已是 BGRA、编码器按 sRGB 标记，直接拷贝颜色一致。
-        && (csName == nil || csName == srgbName)
-        && ptr != nil
-    guard ok, let data, let src = ptr else {
-        fastPathMissLock.lock()
-        let shouldLog = !fastPathMissLogged
-        if shouldLog { fastPathMissLogged = true }
-        fastPathMissLock.unlock()
-        if shouldLog {
-            Log.info("快路径未命中: size=\(img.width)x\(img.height) target=\(w)x\(h) bpc=\(img.bitsPerComponent) bpp=\(img.bitsPerPixel) bi=\(img.bitmapInfo.rawValue) cs=\(csName ?? "nil") srgb=\(srgbName ?? "nil") ptr=\(ptr != nil) len=\(data.map { CFDataGetLength($0) } ?? -1)")
-        }
+        && (cs == nil || csName == srgbName)
+    guard shapeOK else {
+        logFastPathMiss("shape", img: img, w: w, h: h, cs: cs, csName: csName, srgbName: srgbName, dataLen: nil)
+        return nil
+    }
+    guard let data = img.dataProvider?.data, let src = CFDataGetBytePtr(data) else {
+        logFastPathMiss("data", img: img, w: w, h: h, cs: cs, csName: csName, srgbName: srgbName, dataLen: nil)
         return nil
     }
     let srcRow = img.bytesPerRow
-    guard srcRow >= w * 4, CFDataGetLength(data) >= srcRow * h else { return nil }
+    guard srcRow >= w * 4, CFDataGetLength(data) >= srcRow * h else {
+        logFastPathMiss("rowlen", img: img, w: w, h: h, cs: cs, csName: csName, srgbName: srgbName, dataLen: CFDataGetLength(data))
+        return nil
+    }
     var pb: CVPixelBuffer?
     let attrs: [CFString: Any] = [
         kCVPixelBufferIOSurfacePropertiesKey: [:] as CFDictionary,
@@ -2136,6 +2150,9 @@ private func makePixelBufferFast(from img: CGImage, w: Int, h: Int) -> CVPixelBu
     defer { CVPixelBufferUnlockBaseAddress(pb, []) }
     guard let dst = CVPixelBufferGetBaseAddress(pb) else { return nil }
     let dstRow = CVPixelBufferGetBytesPerRow(pb)
+    // 不变量：CVPixelBuffer 的 bytesPerRow 必须 >= 可见宽度 * 4。
+    // 一旦被打破，min(srcRow,dstRow) 会静默产出横向错位画面，不如回退。
+    guard dstRow >= w * 4 else { return nil }
     let copyBytes = min(srcRow, dstRow)
     for y in 0..<h {
         memcpy(dst.advanced(by: y * dstRow), src.advanced(by: y * srcRow), copyBytes)
@@ -2143,6 +2160,8 @@ private func makePixelBufferFast(from img: CGImage, w: Int, h: Int) -> CVPixelBu
     return pb
 }
 
+/// CGImage → CVPixelBuffer(BGRA) 的回退路径。
+/// 格式/尺寸不满足快路径条件时用它：走 CoreGraphics 全屏重绘（会做色彩转换与缩放）。
 func makePixelBuffer(from img: CGImage, targetW: Int? = nil, targetH: Int? = nil) -> CVPixelBuffer? {
     let w = targetW ?? img.width, h = targetH ?? img.height
     if let fast = makePixelBufferFast(from: img, w: w, h: h) { return fast }
