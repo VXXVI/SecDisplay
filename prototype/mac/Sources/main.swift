@@ -1198,6 +1198,8 @@ final class ScreenshotCapture {
     private(set) var actualFormatCode: UInt32 = 0
 
     private let encodeQueue = DispatchQueue(label: "SecDisplay.encode")
+    /// 已提交给编码器的最大采集序号（仅在 encodeQueue 内访问）。
+    private var lastSubmittedSeq: UInt64 = 0
     private var cachedContent: SCShareableContent?
     private var cachedAt: CFAbsoluteTime = 0
     private var contentGen: Int = 0
@@ -1211,6 +1213,8 @@ final class ScreenshotCapture {
                                      && SkyLightCapture.isAvailable)
     private var consecutiveSkyLightFails = 0
     private var lastSkyLightGrabAt: CFAbsoluteTime = 0
+    /// 采集序号：通过节拍门时分配，用于在 encodeQueue 内丢弃迟到的旧帧。
+    private var captureSeqCounter: UInt64 = 0
     var isUsingSkyLight: Bool { withRawLock { useSkyLight } }
     var captureBackendLabel: String { isUsingSkyLight ? "SLSHW · 2 路" : "SCK · 4 路" }
     private var lastDumpAt: CFAbsoluteTime = 0
@@ -1678,6 +1682,8 @@ final class ScreenshotCapture {
                 let wantYUV = pixelFormatChoice == "420v"
                 let (targetW, targetH, _, _) = currentVideoSizeSnapshot()
                 var pb: CVPixelBuffer?
+                // 采集序号：通过节拍门时分配，供 encodeQueue 丢弃迟到的旧帧。
+                var mySeq: UInt64 = 0
                 if isUsingSkyLight && !wantYUV {
                     // 按目标帧率节拍门控，避免 2 路 SkyLight 在 70+fps 下过度压迫 WindowServer/编码器
                     let minGap = (1.0 / max(1.0, cfg.captureHz)) * 0.90
@@ -1686,6 +1692,8 @@ final class ScreenshotCapture {
                         let dt = nowGate - lastSkyLightGrabAt
                         if dt >= minGap {
                             lastSkyLightGrabAt = nowGate
+                            captureSeqCounter &+= 1
+                            mySeq = captureSeqCounter
                             return 0
                         }
                         return minGap - dt
@@ -1836,6 +1844,13 @@ final class ScreenshotCapture {
                 let fh = CVPixelBufferGetHeight(pb)
                 let actualFmt = CVPixelBufferGetPixelFormatType(pb)
                 encodeQueue.sync {
+                    // 两路 SkyLight worker 采集完成顺序可能与开始顺序不同。
+                    // 迟到的旧帧若被赋予新 PTS 提交，会造成画面回跳/节奏不均。
+                    // 序号检查和提交都在编码串行上下文内，无需额外加锁。
+                    if mySeq > 0 && mySeq <= lastSubmittedSeq {
+                        return
+                    }
+                    if mySeq > 0 { lastSubmittedSeq = mySeq }
                     if !loggedFirstFrame {
                         loggedFirstFrame = true
                         // 打印实际像素格式：SCK 可能忽略 pixelFormat 仍给 BGRA，
@@ -2345,7 +2360,10 @@ final class Sender {
             // 丢掉上个连接的残留帧：那可能是依赖旧参考帧的 P 帧，
             // 新接收端没有参考帧，解出来是花的。等新的 IDR。
             self.counterLock.lock()
-            self.lastPayload = nil
+            self.hasSentFrame = false
+            // 新连接必须等首个 IDR 再放行视频帧；否则重连后残留的 P 帧
+            // 可能先于 IDR 发出，新接收端没有参考帧会花屏。
+            self.needsKeyframe = true
             self.lastSendAt = CFAbsoluteTimeGetCurrent()
             self.counterLock.unlock()
             old?.cancel()
@@ -2612,12 +2630,14 @@ final class Sender {
     }
 
     // --- 静止画面保活 ---
-    // ScreenCaptureKit 是变化驱动的：画面不动就完全不出帧，接收端会长时间没有数据，
-    // 表现为「连上了但不动」或统计里 Mbps 掉到 0。
-    // 这里记住最后一帧的编码数据，空闲超时后重发它（重打时间戳，避免延迟统计虚高）。
-    // 同一个 access unit 重复解码是安全的，解出来还是同一张图。
-    private var lastPayload: Data?
+    // 采集停顿时接收端会长时间没有数据。旧实现重发上一帧编码数据，但它是 P 帧：
+    // 在已更新的参考图像上重复解码会破坏参考链（残影、色块、错位）。
+    // 改为用最后一帧重新编码 IDR（限流），既保持画面又不破坏参考链。
+    private var hasSentFrame = false
     private var lastSendAt: CFAbsoluteTime = 0
+    private var lastForceIdrAt: CFAbsoluteTime = 0
+    /// 参考链已断（拥塞丢帧），在下一个 IDR 发出前阻止后续 P 帧。
+    private var needsKeyframe = false
     private var keepAliveTimer: DispatchSourceTimer?
     /// 超过这么久没有新帧就补一帧；设为 0 可关闭保活
     var keepAliveGap: CFAbsoluteTime = 0.08
@@ -2776,15 +2796,23 @@ final class Sender {
         }
     }
 
-    func send(frame: Data, captureTimeMicros: UInt64) {
+    func send(frame: Data, isKey: Bool, captureTimeMicros: UInt64) {
         guard connected else { return }
         counterLock.lock()
-        lastPayload = frame
+        if needsKeyframe && !isKey {
+            // 参考链已断（拥塞丢帧），丢弃 P 帧，等下一个 IDR 恢复。
+            dropped += 1
+            counterLock.unlock()
+            return
+        }
+        let recovered = isKey && needsKeyframe
+        if isKey { needsKeyframe = false }
+        hasSentFrame = true
         counterLock.unlock()
-        transmit(frame, captureTimeMicros: captureTimeMicros)
+        transmit(frame, isKey: isKey, recovered: recovered, captureTimeMicros: captureTimeMicros)
     }
 
-    private func transmit(_ frame: Data, captureTimeMicros: UInt64) {
+    private func transmit(_ frame: Data, isKey: Bool, recovered: Bool, captureTimeMicros: UInt64) {
         guard connected, let c = conn else { return }
         // 在途帧数超限：丢这一帧，保住实时性；若连续阻塞 >8s 则主动断开卡死连接
         let now = CFAbsoluteTimeGetCurrent()
@@ -2793,6 +2821,9 @@ final class Sender {
         counterLock.lock()
         if inFlight >= maxInFlight {
             dropped += 1
+            // 丢掉了视频帧，参考链出现缺口：请求下一帧 IDR，并在 IDR 发出前阻止 P 帧。
+            let wasNeedsKeyframe = needsKeyframe
+            needsKeyframe = true
             if inFlightStallSince == 0 {
                 inFlightStallSince = now
             } else {
@@ -2803,6 +2834,9 @@ final class Sender {
                 }
             }
             counterLock.unlock()
+            // 在锁外请求关键帧，避免与编码线程的锁产生不必要的交叉。
+            if !wasNeedsKeyframe { Log.info("发送拥塞丢帧，参考链断开：请求 IDR 并暂停 P 帧") }
+            gEncoder?.requestKeyframe()
             if let (stalledConn, stalledEpoch, stalledFor, inFlightNow) = abortStalledConn {
                 queue.async { [weak self] in
                     guard let self, self.connEpoch == stalledEpoch, self.conn === stalledConn else { return }
@@ -2823,6 +2857,9 @@ final class Sender {
         inFlightStallSince = 0
         lastSendAt = now
         counterLock.unlock()
+        // 只有 IDR 真正拿到在途配额、即将发出时才认为参考链恢复；
+        // 若上面因拥塞丢弃了 IDR，标志会重新置位，不会误报。
+        if recovered { Log.info("IDR 已发送，参考链恢复") }
 
         var packet = Data(capacity: frame.count + 13)
         var len = UInt32(frame.count + 9).bigEndian
@@ -2868,12 +2905,17 @@ final class Sender {
             if now - self.lastSessionSent >= 5.0 { self.sendSessionInfo() }
             self.counterLock.lock()
             let since = now - self.lastSendAt
-            let payload = self.lastPayload
+            let sent = self.hasSentFrame
             self.counterLock.unlock()
             guard since >= self.keepAliveGap else { return }
-            if let payload = payload {
-                // 有上一帧就重发它，保持画面（时间戳用当前时刻，避免延迟越算越大）
-                self.transmit(payload, captureTimeMicros: UInt64(now * 1_000_000))
+            if sent {
+                // 不再重发旧 P 帧；用最后一帧重新编码 IDR（限流 0.5s），
+                // 既保持画面又不破坏参考链。编码结果经 onFrame → send 正常发出。
+                self.counterLock.lock()
+                let canForceIdr = now - self.lastForceIdrAt >= 0.5
+                if canForceIdr { self.lastForceIdrAt = now }
+                self.counterLock.unlock()
+                if canForceIdr { gEncoder?.forceEncodeLastFrame() }
             } else {
                 // 还没有任何帧(新连接 + 静止桌面)：发心跳维持链路。
                 // 旧逻辑在这里直接 return，导致连接静默 120s 被 RST。
@@ -5016,7 +5058,7 @@ if appRole == .sender {
     guard encInst.start() else { exit(3) }
 
     encInst.onFrame = { data, isKey, ts in
-        sndInst.send(frame: data, captureTimeMicros: ts)
+        sndInst.send(frame: data, isKey: isKey, captureTimeMicros: ts)
     }
 
     if CommandLine.arguments.contains("--cleanup-orphan")
