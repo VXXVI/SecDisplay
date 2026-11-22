@@ -1097,8 +1097,11 @@ private enum SkyLightCapture {
             }
             guard !wids.isEmpty else { return .unavailable }
             // 0x800 = kCGSCaptureIgnoreGlobalClipShape, 0x100 = 2x HiDPI 最高分辨率
+            // 0x40000 = 实测排除 WindowServer 合成光标（探针：加后两光标区域差分归零，
+            // 图像仍是完整 2880x1800，桌面背景亮度不变）。光标由独立通道绘制，
+            // 避免视频里的低帧率延迟光标与 Windows HCURSOR 同时出现造成双指针/拖影。
             guard let arr = wids.withUnsafeBufferPointer({ buf in
-                syms.hwFn(cid, buf.baseAddress!, UInt32(buf.count), 0x800 | 0x100)?.takeRetainedValue()
+                syms.hwFn(cid, buf.baseAddress!, UInt32(buf.count), 0x800 | 0x100 | 0x40000)?.takeRetainedValue()
             }) else { return .unavailable }
             let result = withExtendedLifetime(arr) { () -> Result in
                 let n = CFArrayGetCount(arr)
