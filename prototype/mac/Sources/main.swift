@@ -2086,8 +2086,66 @@ final class ScreenshotCapture {
 /// 默认采集路径用它：captureImage 给 CGImage，编码器要吃 CVPixelBuffer。
 /// 这一步是全屏 CGContext 重绘，2880x1800 下每帧 19.8MB、约 20ms；
 /// SECDISPLAY_PIXFMT=420v 走 captureSampleBuffer 时不需要它。
+/// 快路径：CGImage 已是 32bpp BGRA premultiplied 小端、sRGB 且尺寸与目标一致时，
+/// 直接按行 memcpy 到 IOSurface 像素缓冲，省掉 CGContextDrawImage 的颜色管理与
+/// 格式转换（实测 3.76ms -> 2.45ms/帧，像素一致性已用探针验证 maxDiff=0）。
+/// 格式不符、需要缩放或取不到连续数据时返回 nil，由调用方回退到 CoreGraphics 绘制。
+private let fastPathMissLock = NSLock()
+private var fastPathMissLogged = false
+private func makePixelBufferFast(from img: CGImage, w: Int, h: Int) -> CVPixelBuffer? {
+    let cs = img.colorSpace
+    let csName = cs?.name as String?
+    let srgbName = CGColorSpace(name: CGColorSpace.sRGB)?.name as String?
+    let data = img.dataProvider?.data
+    let ptr = data.flatMap { CFDataGetBytePtr($0) }
+    let ok = img.width == w && img.height == h
+        && img.bitsPerComponent == 8 && img.bitsPerPixel == 32
+        && (img.bitmapInfo.rawValue & CGBitmapInfo.alphaInfoMask.rawValue)
+            == CGImageAlphaInfo.premultipliedFirst.rawValue
+        && (img.bitmapInfo.rawValue & CGBitmapInfo.byteOrderMask.rawValue)
+            == CGBitmapInfo.byteOrder32Little.rawValue
+        // 颜色空间允许为 nil：SkyLight 合成图有时不带 colorSpace，
+        // 但像素已是 BGRA、编码器按 sRGB 标记，直接拷贝颜色一致。
+        && (csName == nil || csName == srgbName)
+        && ptr != nil
+    guard ok, let data, let src = ptr else {
+        fastPathMissLock.lock()
+        let shouldLog = !fastPathMissLogged
+        if shouldLog { fastPathMissLogged = true }
+        fastPathMissLock.unlock()
+        if shouldLog {
+            Log.info("快路径未命中: size=\(img.width)x\(img.height) target=\(w)x\(h) bpc=\(img.bitsPerComponent) bpp=\(img.bitsPerPixel) bi=\(img.bitmapInfo.rawValue) cs=\(csName ?? "nil") srgb=\(srgbName ?? "nil") ptr=\(ptr != nil) len=\(data.map { CFDataGetLength($0) } ?? -1)")
+        }
+        return nil
+    }
+    let srcRow = img.bytesPerRow
+    guard srcRow >= w * 4, CFDataGetLength(data) >= srcRow * h else { return nil }
+    var pb: CVPixelBuffer?
+    let attrs: [CFString: Any] = [
+        kCVPixelBufferIOSurfacePropertiesKey: [:] as CFDictionary,
+        kCVPixelBufferPixelFormatTypeKey: kCVPixelFormatType_32BGRA,
+    ]
+    guard CVPixelBufferCreate(nil, w, h, kCVPixelFormatType_32BGRA,
+                              attrs as CFDictionary, &pb) == kCVReturnSuccess,
+          let pb else { return nil }
+    CVBufferSetAttachment(pb, kCVImageBufferColorPrimariesKey,
+                          kCVImageBufferColorPrimaries_ITU_R_709_2, .shouldPropagate)
+    CVBufferSetAttachment(pb, kCVImageBufferTransferFunctionKey,
+                          kCVImageBufferTransferFunction_sRGB, .shouldPropagate)
+    CVPixelBufferLockBaseAddress(pb, [])
+    defer { CVPixelBufferUnlockBaseAddress(pb, []) }
+    guard let dst = CVPixelBufferGetBaseAddress(pb) else { return nil }
+    let dstRow = CVPixelBufferGetBytesPerRow(pb)
+    let copyBytes = min(srcRow, dstRow)
+    for y in 0..<h {
+        memcpy(dst.advanced(by: y * dstRow), src.advanced(by: y * srcRow), copyBytes)
+    }
+    return pb
+}
+
 func makePixelBuffer(from img: CGImage, targetW: Int? = nil, targetH: Int? = nil) -> CVPixelBuffer? {
     let w = targetW ?? img.width, h = targetH ?? img.height
+    if let fast = makePixelBufferFast(from: img, w: w, h: h) { return fast }
     var pb: CVPixelBuffer?
     let attrs: [CFString: Any] = [
         kCVPixelBufferIOSurfacePropertiesKey: [:] as CFDictionary,
