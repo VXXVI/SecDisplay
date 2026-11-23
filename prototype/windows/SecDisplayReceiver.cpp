@@ -5340,6 +5340,9 @@ static void UpdateZoomOverlay(double zoom) {
     SIZE sz{ dw, dh };
     POINT srcPt{ 0, 0 };
     BLENDFUNCTION bf{ AC_SRC_OVER, 0, 255, AC_SRC_ALPHA };
+    // 先隐藏硬件光标再提交放大帧。反过来的话，UpdateLayeredWindow 已把放大图
+    // 呈现到屏幕，而旧系统箭头仍可能存活到下一次 WM_SETCURSOR，形成双指针。
+    SetCursor(HiddenCursorHandle());
     if (UpdateLayeredWindow(g_zoomOverlay, nullptr, &dstPt, &sz, g_zoomOverlayDC,
                             &srcPt, 0, &bf, ULW_ALPHA)) {
         if (!g_zoomOverlayShown) {
@@ -5347,7 +5350,6 @@ static void UpdateZoomOverlay(double zoom) {
             g_zoomOverlayShown = true;
             Log("晃动放大: 叠加层显示 %dx%d (zoom %.2fx)", dw, dh, zoom);
         }
-        SetCursor(HiddenCursorHandle());
     } else {
         // 更新失败时不能留着上一帧的放大图与隐藏光标
         HideZoomOverlay();
@@ -6056,10 +6058,10 @@ static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
         if (owned) g_pullCursorIn.store(false);   // 已在画面内，凭证不再需要，避免出去后又被拽回一次
         if (!owned && !g_pullCursorIn.load()) return 0;
         const uint64_t gateNow = GetTickCount64();
-        // 本机物理鼠标刚动过时让本地先行一小段（60ms），避免两条位置源互相拉扯产生抖动；
-        // 原来 250ms 太长，会看到光标冻结再瞬移。
-        const bool localBusy = (gateNow - (uint64_t)g_lastLocalInputMs.load() < 60) ||
-                               (gateNow - (uint64_t)g_lastHardwareMouseMs.load() < 60);
+        // 本机物理 HID 输入刚动过时短暂让位，避免两条位置源互相拉扯。
+        // 不把本地点击、滚轮或 WM_MOUSEMOVE 算进来：后者可能正是 SetCursorPos
+        // 的迟到回声，把它当成让位理由会形成「移动 → 冻结 → 再移动」循环。
+        const bool localBusy = gateNow - (uint64_t)g_lastHardwareMouseMs.load() < 60;
         // 「回到副屏」的一次性拉回必须绕过本地优先门控：用户正是用手把指针推回来，
         // 硬件鼠标一定刚刚动过，否则这次拉回会被永久丢弃。
         if (localBusy && owned) return 0;
@@ -7918,6 +7920,7 @@ static int RunCursorSelfTest() {
               std::abs((wr.bottom - wr.top) - geo.dh) <= 2, "叠加层窗口尺寸与几何一致");
         check(std::abs(wr.left - (cur.x - geo.hx)) <= 2 &&
               std::abs(wr.top - (cur.y - geo.hy)) <= 2, "叠加层窗口位置与热点对齐");
+        check(GetCursor() == HiddenCursorHandle(), "放大帧提交后硬件光标已隐藏，避免双指针");
     } else {
         // SSH / session 0 下 DWM 分层窗不可用，属环境限制，不算失败
         printf("[INFO] 当前会话不支持分层叠加窗，跳过窗口几何校验 (err=%lu)\n",
@@ -7937,6 +7940,7 @@ static int RunCursorSelfTest() {
     // 7) 收口：隐藏、以及 zoom<=1.02 不显示
     HideZoomOverlay();
     check(!g_zoomOverlayShown, "叠加层可正确隐藏");
+    check(GetCursor() != HiddenCursorHandle(), "叠加层隐藏后恢复硬件光标");
     UpdateZoomOverlay(1.0);
     check(!g_zoomOverlayShown, "zoom<=1.02 不显示叠加层");
 

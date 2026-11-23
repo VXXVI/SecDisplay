@@ -2243,7 +2243,7 @@ final class Sender {
     private var connEpoch: Int = 0
     /// 只读暴露给 CursorImageTracker，用于连接重建时强制重发光标图像
     var currentEpoch: Int { queue.sync { connEpoch } }
-    private let queue = DispatchQueue(label: "SecDisplay.net")
+    private let queue = DispatchQueue(label: "SecDisplay.net", qos: .userInteractive)
     /// 监听器必须由 Sender 强引用持有。之前是 listen(port:) 里的局部变量，
     /// 启动后可能被运行时释放，端口随之消失，但进程、采集、编码都还活着，
     /// Windows 侧看到的就是「主机能 ping 通、9922 却 WSAECONNREFUSED」。
@@ -3378,13 +3378,15 @@ final class CursorTracker {
         Log.info("光标通道: \(eventDriven ? "事件驱动" : "定时轮询")，目标 \(Int(targetHz)) Hz")
 
         // 事件驱动时定时器做「保底节拍」：系统在锁屏/高负载下会把 mouseMoved
-        // 事件节流到 ~40Hz，只靠事件光标会掉到 40Hz 以下。9ms 轮询配合实时位置读取，
+        // 事件节流到 ~40Hz，只靠事件光标会掉到 40Hz 以下。短周期轮询配合实时位置读取，
         // 即使事件被压也能维持接近目标频率。emitIfDue 内部按 minInterval 限流，
         // 事件与轮询叠加不会超频。
-        let ms = eventDriven ? 9 : 8
+        // 9ms 与 90Hz 的 11.11ms 限流互质，实际会大量落在 18ms 一拍，只有约 55Hz。
+        // 4ms 保底节拍让 90Hz 大多落在 12ms，也让 240Hz 档不被定时器量化卡住。
+        let ms = 4
         let t = DispatchSource.makeTimerSource(queue: queue)
         t.schedule(deadline: .now(), repeating: .milliseconds(ms),
-                   leeway: .microseconds(eventDriven ? 2000 : 500))
+                   leeway: .microseconds(500))
         t.setEventHandler { [weak self] in self?.emitIfDue() }
         t.resume()
         timer = t
