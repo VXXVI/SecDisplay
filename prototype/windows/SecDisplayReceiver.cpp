@@ -354,13 +354,8 @@ static std::atomic<bool> g_cursorVisible{true};
 // Mac 光标从「离开副屏」重新回到副屏时置位：下一次 0x03 允许把 Windows 光标拉回画面内，
 // 否则用户把指针滑到主屏后就再也收不回来了（远程位置只对画面内生效）。
 static std::atomic<bool> g_pullCursorIn{false};
-// 程序自己调用 SetCursorPos 会引起 WM_MOUSEMOVE；用时间戳把它和用户真实
-// 输入区分开，否则每次跟随都会被当成「用户动了」，导致门控反复自锁。
-static std::atomic<int64_t> g_lastRemoteCursorMoveMs{ 0 };
 // 程序 SetCursorPos 的目标点与 16 槽位历史环形缓冲，配合 WM_INPUT 硬件鼠标记时，
 // 彻底过滤连发覆盖 / 边界舍入 / 异步投递产生的 WM_MOUSEMOVE 回声。
-static std::atomic<LONG> g_lastRemoteCursorX{ INT_MIN };
-static std::atomic<LONG> g_lastRemoteCursorY{ INT_MIN };
 static std::atomic<bool> g_cursorMsgPending{ false };
 static std::atomic<uint64_t> g_lastHardwareMouseMs{ 0 };
 static bool g_coordUserSpecified = false;
@@ -6093,9 +6088,6 @@ static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
         // 真正执行了拉回才消费一次性凭证，避免被后续 return 吞掉。
         if (!owned) g_pullCursorIn.store(false);
         const uint64_t nowMoveMs = GetTickCount64();
-        g_lastRemoteCursorX = sx;
-        g_lastRemoteCursorY = sy;
-        g_lastRemoteCursorMoveMs = (int64_t)nowMoveMs;
         RecordRemoteTarget(sx, sy, nowMoveMs);
         SetCursorPos(sx, sy);
 
@@ -6214,7 +6206,6 @@ static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
             // Raw Input 正常时，远程 SetCursorPos 的迟到回声不能冻结后续跟随。
             if (!g_rawInputReady.load()) g_lastLocalInputMs = GetTickCount64();
             // 只记最新位置，由 inputThread 8ms 合并发送，避免逐消息刷包
-            g_moveX = vx;
             g_moveX = vx;
             g_moveY = vy;
             g_moveDirty = true;
@@ -8382,8 +8373,8 @@ int main(int argc, char** argv) {
     //
     // 现在的实现：0x03 位置变化时 PostMessage(WM_APP_REMOTE_CURSOR)，UI 线程在
     // 窗口可用且本机物理 HID 鼠标 60ms 内没动时才 SetCursorPos；Raw Input 注册
-    // 失败时降级使用窗口鼠标事件。g_lastRemoteCursorMoveMs 配合目标点历史过滤
-    // 程序移动回声，避免门控自锁。0x05 图像由 ApplyCursorImage + WM_SETCURSOR 绘制。
+    // 失败时降级使用窗口鼠标事件。g_remoteTargets 目标点历史过滤程序移动回声，
+    // 避免门控自锁。0x05 图像由 ApplyCursorImage + WM_SETCURSOR 绘制。
 
     // 输入回传线程：每 4ms 轮询，鼠标移动按 8ms 合并发（约 120Hz），
     // 按键/滚轮事件在下一轮立即发。单线程发送，避免与 UI 线程并发 send 同一 socket。
