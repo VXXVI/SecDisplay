@@ -514,6 +514,7 @@ static void SetShakeTimePeriod(bool enable) {
 // 表现就是「点这里，菜单出现在别处」。
 static std::atomic<SOCKET> g_sock{ INVALID_SOCKET };
 static std::atomic<uint8_t> g_buttons{ 0 };
+static std::atomic<bool> g_rawInputReady{ false };
 static std::atomic<int64_t> g_lastLocalInputMs{ 0 };
 
 // 鼠标移动节流：WM_MOUSEMOVE 频率可达每秒数百上千次，逐包发给 Mac 会让
@@ -5342,12 +5343,15 @@ static void UpdateZoomOverlay(double zoom) {
     BLENDFUNCTION bf{ AC_SRC_OVER, 0, 255, AC_SRC_ALPHA };
     // 先隐藏硬件光标再提交放大帧。反过来的话，UpdateLayeredWindow 已把放大图
     // 呈现到屏幕，而旧系统箭头仍可能存活到下一次 WM_SETCURSOR，形成双指针。
-    SetCursor(HiddenCursorHandle());
+    if (g_zoomOverlayShown) SetCursor(HiddenCursorHandle());
     if (UpdateLayeredWindow(g_zoomOverlay, nullptr, &dstPt, &sz, g_zoomOverlayDC,
                             &srcPt, 0, &bf, ULW_ALPHA)) {
         if (!g_zoomOverlayShown) {
-            ShowWindow(g_zoomOverlay, SW_SHOWNOACTIVATE);
+            // 隐藏窗口上的 UpdateLayeredWindow 只更新后备表面。先置状态并隐藏
+            // 硬件光标，再显示首帧，避免双指针，也避免失败路径反复闪烁。
             g_zoomOverlayShown = true;
+            SetCursor(HiddenCursorHandle());
+            ShowWindow(g_zoomOverlay, SW_SHOWNOACTIVATE);
             Log("晃动放大: 叠加层显示 %dx%d (zoom %.2fx)", dw, dh, zoom);
         }
     } else {
@@ -6058,10 +6062,12 @@ static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
         if (owned) g_pullCursorIn.store(false);   // 已在画面内，凭证不再需要，避免出去后又被拽回一次
         if (!owned && !g_pullCursorIn.load()) return 0;
         const uint64_t gateNow = GetTickCount64();
-        // 本机物理 HID 输入刚动过时短暂让位，避免两条位置源互相拉扯。
-        // 不把本地点击、滚轮或 WM_MOUSEMOVE 算进来：后者可能正是 SetCursorPos
-        // 的迟到回声，把它当成让位理由会形成「移动 → 冻结 → 再移动」循环。
-        const bool localBusy = gateNow - (uint64_t)g_lastHardwareMouseMs.load() < 60;
+        // 点击和滚轮仍保留短暂让位，覆盖事件回传到 Mac 再返回的一个 RTT。
+        // WM_MOUSEMOVE 不参与：它可能正是 SetCursorPos 的迟到回声，加入门控会
+        // 形成「移动 → 冻结 → 再移动」循环。Raw Input 不可用时才用本地事件兜底。
+        const bool localBusy = g_rawInputReady.load()
+            ? gateNow - (uint64_t)g_lastHardwareMouseMs.load() < 60
+            : gateNow - (uint64_t)g_lastLocalInputMs.load() < 60;
         // 「回到副屏」的一次性拉回必须绕过本地优先门控：用户正是用手把指针推回来，
         // 硬件鼠标一定刚刚动过，否则这次拉回会被永久丢弃。
         if (localBusy && owned) return 0;
@@ -6205,8 +6211,10 @@ static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
         }
         float vx, vy;
         if (ClientToVideo(GET_X_LPARAM(l), GET_Y_LPARAM(l), &vx, &vy)) {
-            g_lastLocalInputMs = GetTickCount64();
+            // Raw Input 正常时，远程 SetCursorPos 的迟到回声不能冻结后续跟随。
+            if (!g_rawInputReady.load()) g_lastLocalInputMs = GetTickCount64();
             // 只记最新位置，由 inputThread 8ms 合并发送，避免逐消息刷包
+            g_moveX = vx;
             g_moveX = vx;
             g_moveY = vy;
             g_moveDirty = true;
@@ -7920,7 +7928,8 @@ static int RunCursorSelfTest() {
               std::abs((wr.bottom - wr.top) - geo.dh) <= 2, "叠加层窗口尺寸与几何一致");
         check(std::abs(wr.left - (cur.x - geo.hx)) <= 2 &&
               std::abs(wr.top - (cur.y - geo.hy)) <= 2, "叠加层窗口位置与热点对齐");
-        check(GetCursor() == HiddenCursorHandle(), "放大帧提交后硬件光标已隐藏，避免双指针");
+        check(HiddenCursorHandle() != nullptr && GetCursor() == HiddenCursorHandle(),
+              "放大帧提交后硬件光标已隐藏，避免双指针");
     } else {
         // SSH / session 0 下 DWM 分层窗不可用，属环境限制，不算失败
         printf("[INFO] 当前会话不支持分层叠加窗，跳过窗口几何校验 (err=%lu)\n",
@@ -8255,8 +8264,9 @@ int main(int argc, char** argv) {
         rid.usUsage     = 0x02;
         rid.dwFlags     = RIDEV_INPUTSINK;
         rid.hwndTarget  = hwnd;
-        if (!RegisterRawInputDevices(&rid, 1, sizeof(rid))) {
-            Log("警告: RegisterRawInputDevices 失败 %lu", GetLastError());
+        g_rawInputReady.store(RegisterRawInputDevices(&rid, 1, sizeof(rid)) != FALSE);
+        if (!g_rawInputReady.load()) {
+            Log("警告: RegisterRawInputDevices 失败 %lu，本地优先门控降级为窗口鼠标事件", GetLastError());
         }
     }
 
@@ -8371,9 +8381,9 @@ int main(int argc, char** argv) {
     // 会被拽回。该线程已移除，不要再加回轮询版。
     //
     // 现在的实现：0x03 位置变化时 PostMessage(WM_APP_REMOTE_CURSOR)，UI 线程在
-    // 「窗口在前台 + 本机鼠标 250ms 内没动」两个门控都通过时才 SetCursorPos；
-    // g_lastRemoteCursorMoveMs 用来区分程序移动与用户移动，避免门控自锁。
-    // 0x05 图像仍由 ApplyCursorImage + WM_SETCURSOR 本地绘制。
+    // 窗口可用且本机物理 HID 鼠标 60ms 内没动时才 SetCursorPos；Raw Input 注册
+    // 失败时降级使用窗口鼠标事件。g_lastRemoteCursorMoveMs 配合目标点历史过滤
+    // 程序移动回声，避免门控自锁。0x05 图像由 ApplyCursorImage + WM_SETCURSOR 绘制。
 
     // 输入回传线程：每 4ms 轮询，鼠标移动按 8ms 合并发（约 120Hz），
     // 按键/滚轮事件在下一轮立即发。单线程发送，避免与 UI 线程并发 send 同一 socket。

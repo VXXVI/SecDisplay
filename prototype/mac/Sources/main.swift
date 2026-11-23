@@ -3382,7 +3382,7 @@ final class CursorTracker {
         // 即使事件被压也能维持接近目标频率。emitIfDue 内部按 minInterval 限流，
         // 事件与轮询叠加不会超频。
         // 9ms 与 90Hz 的 11.11ms 限流互质，实际会大量落在 18ms 一拍，只有约 55Hz。
-        // 4ms 保底节拍让 90Hz 大多落在 12ms，也让 240Hz 档不被定时器量化卡住。
+        // 4ms 保底节拍让 90Hz 大多落在 12ms；更高档位还可由鼠标事件路径即时发送。
         let ms = 4
         let t = DispatchSource.makeTimerSource(queue: queue)
         t.schedule(deadline: .now(), repeating: .milliseconds(ms),
