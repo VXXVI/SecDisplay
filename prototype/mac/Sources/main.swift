@@ -3537,14 +3537,12 @@ final class CursorImageTracker {
         let logicalMax = Int(max(logicalW, logicalH).rounded())
 
         let now = CFAbsoluteTimeGetCurrent()
-        let pointer = CGEvent(source: nil)?.location
-        if let pointer = pointer {
-            if lastPointerMoveAt == 0 || hypot(pointer.x - lastPointerLocation.x,
-                                               pointer.y - lastPointerLocation.y) >= 1.0 {
-                lastPointerMoveAt = now
-            }
-            lastPointerLocation = pointer
+        guard let pointer = CGEvent(source: nil)?.location else { return }
+        if lastPointerMoveAt == 0 || hypot(pointer.x - lastPointerLocation.x,
+                                           pointer.y - lastPointerLocation.y) >= 1.0 {
+            lastPointerMoveAt = now
         }
+        lastPointerLocation = pointer
         if logicalMax <= 42 {
             // 常规系统光标（如 23x22 I型 <-> 28x40 箭头）不高于 42pt，
             // 直接放行并维护基线，绝不会在晃动期间把基线抬高到 43+。

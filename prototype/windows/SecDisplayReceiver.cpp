@@ -5724,7 +5724,10 @@ static void DriveShakeStep(int screenX, int screenY) {
         return;
     }
     // 拖选、拖窗期间不触发定位放大，与 macOS 的交互语义一致。
-    if (g_buttons.load() != 0) return;
+    if (g_buttons.load() != 0) {
+        ResetShakeSamples();
+        return;
+    }
     const int64_t nowMs = (int64_t)QpcNowMs();
     const bool wasActive = g_shakeActive;
     // 每次真实指针移动都刷新「最后一次移动」时刻：HOLD 以它为起点，
