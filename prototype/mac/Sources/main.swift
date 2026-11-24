@@ -3473,7 +3473,7 @@ final class CursorImageTracker {
     private let maxDim = 256       // 原生位图上限（2x 下 128pt），超出则等比缩到 128pt 等效
     /// 放大期间持续跟踪指针是否还在晃动。只有停止移动后仍长期保持大尺寸，
     /// 才把它视为辅助功能的永久大指针；持续晃动再久也不能抬高稳态基线。
-    private var normalCursorMaxDim = 0
+    private var normalCursorMaxDim = 42
     private var lastPointerLocation = CGPoint.zero
     private var lastPointerMoveAt: CFAbsoluteTime = 0
     private var largeCursorSince: CFAbsoluteTime = 0
@@ -3505,7 +3505,7 @@ final class CursorImageTracker {
         // 运行中拨开关没有任何效果。
         guard !disableCursorImage else {
             lastFingerprint = 0
-            normalCursorMaxDim = 0
+            normalCursorMaxDim = 42
             lastPointerMoveAt = 0
             largeCursorSince = 0
             return
@@ -3513,7 +3513,7 @@ final class CursorImageTracker {
         guard sender.connected else {
             // 断开时清指纹，下次连上强制重发（新接收端没有旧光标）
             lastFingerprint = 0
-            normalCursorMaxDim = 0
+            normalCursorMaxDim = 42
             lastPointerMoveAt = 0
             largeCursorSince = 0
             return
@@ -3537,15 +3537,15 @@ final class CursorImageTracker {
         let logicalMax = Int(max(logicalW, logicalH).rounded())
 
         let now = CFAbsoluteTimeGetCurrent()
-        let pointer = CGEvent(source: nil)?.location ?? NSEvent.mouseLocation
-        if lastPointerMoveAt == 0 || hypot(pointer.x - lastPointerLocation.x,
-                                           pointer.y - lastPointerLocation.y) >= 1.0 {
-            lastPointerMoveAt = now
+        let pointer = CGEvent(source: nil)?.location
+        if let pointer = pointer {
+            if lastPointerMoveAt == 0 || hypot(pointer.x - lastPointerLocation.x,
+                                               pointer.y - lastPointerLocation.y) >= 1.0 {
+                lastPointerMoveAt = now
+            }
+            lastPointerLocation = pointer
         }
-        lastPointerLocation = pointer
-        if normalCursorMaxDim == 0 {
-            normalCursorMaxDim = logicalMax
-        } else if logicalMax <= 42 {
+        if logicalMax <= 42 {
             // 常规系统光标（如 23x22 I型 <-> 28x40 箭头）不高于 42pt，
             // 直接放行并维护基线，绝不会在晃动期间把基线抬高到 43+。
             largeCursorSince = 0

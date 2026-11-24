@@ -5714,6 +5714,17 @@ static void RefreshCursorScale() {
 // 在鼠标移动消息（Mac 0x03 或本机 WM_MOUSEMOVE）里按目标帧率推进晃动动画，
 // 避免高频移动期间低优先级 WM_TIMER 被消息队列饿死导致放大瞬间跳变。
 static void DriveShakeStep(int screenX, int screenY) {
+    // 先判归属再检测，避免黑边或捕获拖出窗口时反复创建/撤销定时器与刷日志。
+    if (g_sock.load() != INVALID_SOCKET && !PortalCursorOwned()) {
+        if (g_shakeActive || g_zoomOverlayShown) {
+            AbortShake();
+            if (g_hwnd) KillTimer(g_hwnd, kShakeTimer);
+            SetShakeTimePeriod(false);
+        }
+        return;
+    }
+    // 拖选、拖窗期间不触发定位放大，与 macOS 的交互语义一致。
+    if (g_buttons.load() != 0) return;
     const int64_t nowMs = (int64_t)QpcNowMs();
     const bool wasActive = g_shakeActive;
     // 每次真实指针移动都刷新「最后一次移动」时刻：HOLD 以它为起点，
@@ -5727,7 +5738,6 @@ static void DriveShakeStep(int screenX, int screenY) {
             g_shakeLastRefreshQpcMs = nowQpc;
             const bool keep = TickShakeAnim(nowQpc);
             if (!keep) {
-                Log("晃动结束，光标已恢复原尺寸");
                 if (g_hwnd) KillTimer(g_hwnd, kShakeTimer);
                 SetShakeTimePeriod(false);
             }
@@ -5875,7 +5885,6 @@ static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
             g_shakeLastRefreshQpcMs = nowQpc;
             const bool keep = TickShakeAnim(nowQpc);
             if (!keep) {
-                Log("晃动结束，光标已恢复原尺寸");
                 KillTimer(h, kShakeTimer);
                 SetShakeTimePeriod(false);
             }
