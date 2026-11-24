@@ -3476,6 +3476,7 @@ final class CursorImageTracker {
     private var normalCursorMaxDim = 0
     private var lastPointerLocation = CGPoint.zero
     private var lastPointerMoveAt: CFAbsoluteTime = 0
+    private var largeCursorSince: CFAbsoluteTime = 0
     /// 上次实际发送时刻，用于限流：光标形状在移动中可能在箭头/I型/手型间频繁切换，
     /// 每切一次就让接收端重建一次 HCURSOR，会造成光标卡顿。限制最小间隔。
     private var lastSendAt: CFAbsoluteTime = 0
@@ -3506,6 +3507,7 @@ final class CursorImageTracker {
             lastFingerprint = 0
             normalCursorMaxDim = 0
             lastPointerMoveAt = 0
+            largeCursorSince = 0
             return
         }
         guard sender.connected else {
@@ -3513,6 +3515,7 @@ final class CursorImageTracker {
             lastFingerprint = 0
             normalCursorMaxDim = 0
             lastPointerMoveAt = 0
+            largeCursorSince = 0
             return
         }
         guard let cur = NSCursor.currentSystem,
@@ -3534,29 +3537,32 @@ final class CursorImageTracker {
         let logicalMax = Int(max(logicalW, logicalH).rounded())
 
         let now = CFAbsoluteTimeGetCurrent()
-        if let pointer = CGEvent(source: nil)?.location {
-            if lastPointerMoveAt == 0 || hypot(pointer.x - lastPointerLocation.x,
-                                               pointer.y - lastPointerLocation.y) >= 1.0 {
-                lastPointerMoveAt = now
-            }
-            lastPointerLocation = pointer
+        let pointer = CGEvent(source: nil)?.location ?? NSEvent.mouseLocation
+        if lastPointerMoveAt == 0 || hypot(pointer.x - lastPointerLocation.x,
+                                           pointer.y - lastPointerLocation.y) >= 1.0 {
+            lastPointerMoveAt = now
         }
+        lastPointerLocation = pointer
         if normalCursorMaxDim == 0 {
             normalCursorMaxDim = logicalMax
         } else if logicalMax <= 42 {
             // 常规系统光标（如 23x22 I型 <-> 28x40 箭头）不高于 42pt，
             // 直接放行并维护基线，绝不会在晃动期间把基线抬高到 43+。
-            lastPointerMoveAt = now
+            largeCursorSince = 0
             normalCursorMaxDim = max(normalCursorMaxDim, logicalMax)
         } else if logicalMax <= Int(Double(normalCursorMaxDim) * 1.35) {
             // 已处于永久大指针模式（例如无障碍 64pt+）时的正常形状切换
-            lastPointerMoveAt = now
+            largeCursorSince = 0
         } else {
-            // macOS 的晃动放大可能在停止后约 0.5~1 秒才回落。持续移动期间
-            // 始终抑制已放大的精灵，避免 Windows 本地曲线之外再叠一层放大。
-            // 停止 1.5 秒后仍是大图才认为是用户设置的永久大指针。
-            if now - lastPointerMoveAt < 1.5 { return }
-            normalCursorMaxDim = logicalMax
+            // macOS 的晃动放大可能在停止后继续存活。移动期间始终抑制，
+            // 停止 2.2 秒后放行原生大图，保证关闭 Windows 本地晃动时仍可定位。
+            // 显示与基线提交解耦：连续静止 5 秒仍是大图才认定为永久大指针，
+            // 延迟回落的系统动画永远不会抬高稳态基线。
+            if largeCursorSince == 0 { largeCursorSince = now }
+            if now - lastPointerMoveAt < 2.2 { return }
+            if now - lastPointerMoveAt >= 5.0 && now - largeCursorSince >= 5.0 {
+                normalCursorMaxDim = logicalMax
+            }
         }
 
         let clampScale = rawMax > maxDim ? Double(maxDim) / Double(rawMax) : 1.0

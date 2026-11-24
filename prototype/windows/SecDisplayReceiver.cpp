@@ -7868,7 +7868,8 @@ static int RunCursorSelfTest() {
     g_shakeActive = false;
     g_shakePhase = SHAKE_IDLE;
     g_shakeZoom = 1.0;
-    const int xs[5] = { 0, 200, 0, 200, 0 };
+    const int shakeTestSpan = (int)(400.0 * WindowDpiScale(g_hwnd) + 0.5);
+    const int xs[5] = { 0, shakeTestSpan, 0, shakeTestSpan, 0 };
     bool detected = false;
     for (int i = 0; i < 5; ++i) detected = DetectShake(1000 + i * 50, xs[i], 100) || detected;
     check(detected && g_shakeActive, "600ms 内三次有效反转可触发放大");
