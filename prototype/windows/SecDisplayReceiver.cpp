@@ -461,8 +461,8 @@ static bool IsInCursorCache(HCURSOR c) {
 // 原来的实现是硬切，且只靠 120ms 定时器轮询判断结束，实际要 1 秒多才突然变小，
 // 观感上就是「变小很慢、还很突兀」。
 static const int kShakeWinMs = 600;      // 观察窗口
-static const int kShakeMinReversals = 5; // 至少 5 次方向反转才算主动晃动，避免正常鼠标往返误触发放大
-static const int kShakeMinSpanPx = 150;  // 横向/纵向累计摆幅下限，防止细微抖动误触
+static const int kShakeMinReversals = 3; // 三次方向反转即触发，对齐 macOS 的快速响应
+static const int kShakeMinSpanPx = 100;  // 横向/纵向累计摆幅下限，防止细微抖动误触
 // 曲线对齐 macOS「晃动鼠标指针以定位」：起势快、带轻微过冲，保持后缓入缓出回落。
 static const double kShakeCursorZoom = 2.2;  // 目标放大倍数（绘制在叠加层，不受硬件光标上限限制）
 static const double kShakeGrowMs = 180.0;    // 起势时长（EaseOutBack，末端轻微过冲）
@@ -5620,6 +5620,12 @@ static double EaseInOutCubic(double t) {
 // 返回 true 表示动画或保持仍在进行，需要继续定时器。
 static bool TickShakeAnim(double nowQpc) {
     if (!g_shakeActive || g_shakePhase == SHAKE_IDLE) return false;
+    // 放大层是 TOPMOST。指针离开视频后要立即撤掉，否则其他窗口的系统光标
+    // 会与冻结的放大图同时显示。自检没有活动连接，不走这条运行态门控。
+    if (g_sock.load() != INVALID_SOCKET && !PortalCursorOwned()) {
+        AbortShake();
+        return false;
+    }
 
     if (g_shakePhase == SHAKE_GROW) {
         double p = (nowQpc - g_shakeAnimStartMs) / kShakeGrowMs;
@@ -5708,7 +5714,7 @@ static void RefreshCursorScale() {
 // 在鼠标移动消息（Mac 0x03 或本机 WM_MOUSEMOVE）里按目标帧率推进晃动动画，
 // 避免高频移动期间低优先级 WM_TIMER 被消息队列饿死导致放大瞬间跳变。
 static void DriveShakeStep(int screenX, int screenY) {
-    const int64_t nowMs = GetTickCount64();
+    const int64_t nowMs = (int64_t)QpcNowMs();
     const bool wasActive = g_shakeActive;
     // 每次真实指针移动都刷新「最后一次移动」时刻：HOLD 以它为起点，
     // 指针持续移动时保持放大，静止满 kShakeHoldMs 后才收缩。
@@ -7857,7 +7863,22 @@ static int RunCursorSelfTest() {
     check(g_hwnd != nullptr, "创建测试窗口");
     if (!g_hwnd) { if (out) fclose(out); return 1; }
 
-    // 3) 曲线：起势单调不减、峰值有轻微过冲、结束精确回到 1.0
+    // 3) 检测：普通往返三次即触发，单向快速拖动不能误触。
+    ResetShakeSamples();
+    g_shakeActive = false;
+    g_shakePhase = SHAKE_IDLE;
+    g_shakeZoom = 1.0;
+    const int xs[5] = { 0, 200, 0, 200, 0 };
+    bool detected = false;
+    for (int i = 0; i < 5; ++i) detected = DetectShake(1000 + i * 50, xs[i], 100) || detected;
+    check(detected && g_shakeActive, "600ms 内三次有效反转可触发放大");
+    AbortShake();
+    ResetShakeSamples();
+    bool straightDetected = false;
+    for (int i = 0; i < 5; ++i) straightDetected = DetectShake(1000 + i * 50, i * 200, 100) || straightDetected;
+    check(!straightDetected && !g_shakeActive, "单向快速拖动不会误触发放大");
+
+    // 4) 曲线：起势单调不减、峰值有轻微过冲、结束精确回到 1.0
     g_shakeActive = true;
     g_shakePhase = SHAKE_GROW;
     g_shakeAnimFromZoom = 1.0;
@@ -7900,14 +7921,14 @@ static int RunCursorSelfTest() {
     }
     check(!g_shakeActive && std::abs(g_shakeZoom - 1.0) < 1e-6, "回落结束且 zoom 归 1");
 
-    // 4) 几何（纯函数，不依赖会话是否支持分层窗口）
+    // 5) 几何（纯函数，不依赖会话是否支持分层窗口）
     const ZoomGeometry geo = ComputeZoomGeometry(W, H, 4, 3, 1.0 * 2.2, 512);
     check(geo.dw == 70 && geo.dh == 88, "放大几何：尺寸 = 精灵 * 2.2");
     check(geo.hx == 9 && geo.hy == 7, "放大几何：热点同比缩放");
     const ZoomGeometry capped = ComputeZoomGeometry(200, 200, 10, 10, 10.0, 512);
     check(capped.dw <= 512 && capped.dh <= 512 && capped.dw == 512, "放大几何：不超过 512 上限");
 
-    // 5) 叠加层：真实调用一遍（无崩溃 + 若会话支持则校验窗口几何）
+    // 6) 叠加层：真实调用一遍（无崩溃 + 若会话支持则校验窗口几何）
     POINT cur{};
     GetCursorPos(&cur);
     UpdateZoomOverlay(2.2);
@@ -7930,14 +7951,14 @@ static int RunCursorSelfTest() {
                             (unsigned long)overlayErr); fflush(out); }
     }
 
-    // 6) 重采样：输出尺寸与不透明覆盖率
+    // 7) 重采样：输出尺寸与不透明覆盖率
     std::vector<uint8_t> scaled;
     ResampleBgraPremul(sprite.data(), W, H, scaled, geo.dw, geo.dh);
     int opaque = 0;
     for (size_t i = 3; i < scaled.size(); i += 4) if (scaled[i] > 0) ++opaque;
     check(scaled.size() == (size_t)geo.dw * geo.dh * 4 && opaque > 0, "重采样输出尺寸与覆盖正确");
 
-    // 7) 收口：隐藏、以及 zoom<=1.02 不显示
+    // 8) 收口：隐藏、以及 zoom<=1.02 不显示
     HideZoomOverlay();
     check(!g_zoomOverlayShown, "叠加层可正确隐藏");
     check(GetCursor() != HiddenCursorHandle(), "叠加层隐藏后恢复硬件光标");
