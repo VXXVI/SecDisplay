@@ -444,7 +444,7 @@ static uint64_t g_zoomMoveOnlyHits = 0;   // 纯位移快路径命中计数，�
 // 稳态「原生像素 → 屏幕物理像素」的实际比例（已含 hwMax 钳位），供放大叠加层作为基准。
 static double g_steadySpriteK = 0.0;
 
-// 0x0D 高分辨率源与 0x05 同源校验：宽高比允许 2% 取整容差，归一化热点允许约 1px 偏差。
+// 0x0D 高分辨率源与 0x05 同源校验：宽高比允许 2% 取整容差，热点位置允许约 1 个 native 像素偏差。
 // 调用方必须持有 g_spriteMtx。
 static bool UseHiresSpriteLocked() {
     if (g_hiresSprite.empty() || g_hiresForSeq != g_nativeSeq ||
@@ -482,9 +482,7 @@ static bool IsInCursorCache(HCURSOR c) {
 // 全部在 UI 线程（WM_APP_REMOTE_CURSOR / WM_TIMER）里做，不额外开线程。
 //
 // 时序对齐系统行为（参考 Accessibility → 指针 → 「晃动鼠标指针以定位」）：
-// 放大是立刻的，停下后保留约 1 秒再收缩，收缩本身是连续的缓动而不是瞬切。
-// 原来的实现是硬切，且只靠 120ms 定时器轮询判断结束，实际要 1 秒多才突然变小，
-// 观感上就是「变小很慢、还很突兀」。
+// 放大是立刻的，持续移动时保持；停止后约 150ms 开始平滑收缩，约 180ms 内恢复。
 static const int kShakeWinMs = 600;      // 观察窗口
 static const int kShakeMinReversals = 3; // 三次方向反转即触发，对齐 macOS 的快速响应
 static const int kShakeMinSpanPx = 100;  // 横向/纵向累计摆幅下限，防止细微抖动误触
@@ -498,16 +496,16 @@ static const double kShakeOvershootC1 = 0.8; // EaseOutBack 过冲系数（相�
 static const UINT_PTR kShakeTimer = 4004;
 
 // 动画刷新步长跟随当前显示器刷新率（如 90Hz → 11ms，60Hz → 16ms），
-// 避免高刷屏上固定 16ms 带来肉眼可见的跳阶。
+// 避免高刷屏上固定 16ms 带来肉眼可见的跳阶；低刷新率或读数异常时保守取 16ms。
 static int ShakeTickMs() {
     const int hz = g_refreshHz;
-    if (hz >= 60 && hz <= 240) {
+    if (hz > 60 && hz <= 240) {
         int ms = (int)(1000.0 / (double)hz + 0.5);
         if (ms < 8) ms = 8;
         if (ms > 16) ms = 16;
         return ms;
     }
-    return 11;
+    return 16;
 }
 struct ShakeSample { int64_t t; int x; int y; };
 // 环容量按「发送侧最高 240Hz × 700ms ≈ 170 个样本」留足余量，
@@ -5383,13 +5381,12 @@ static void UpdateZoomOverlay(double zoom) {
     if (moveOnly) {
         SetCursor(HiddenCursorHandle());
         if (SetWindowPos(g_zoomOverlay, HWND_TOPMOST, dstPt.x, dstPt.y, 0, 0,
-                         SWP_NOSIZE | SWP_NOACTIVATE | SWP_NOZORDER)) {
+                         SWP_NOSIZE | SWP_NOACTIVATE)) {
             ++g_zoomMoveOnlyHits;
             return;
         }
         // 位移失败时不立刻隐藏叠加层，落到下面的全量重绘分支重试一次；
         // 若全量重绘仍失败，再由 HideZoomOverlay 兜底恢复硬件光标。
-        moveOnly = false;
         std::lock_guard<std::mutex> lk(g_spriteMtx);
         if (UseHiresSpriteLocked()) {
             sprite = g_hiresSprite; srcW = g_hiresW; srcH = g_hiresH;
@@ -5399,10 +5396,7 @@ static void UpdateZoomOverlay(double zoom) {
     }
 
     auto abortOverlay = [&]() {
-        if (g_zoomOverlayShown) HideZoomOverlay();
-        else if (g_cursorVisible.load()) {
-            SetCursor(g_customCursor ? g_customCursor : LoadCursor(nullptr, IDC_ARROW));
-        }
+        HideZoomOverlay();
     };
 
     // 一次性按上限分配 DIB/DC：放大过程中尺寸每帧变化，反复 CreateDIBSection 会明显拖慢。
