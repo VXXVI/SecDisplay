@@ -2663,19 +2663,20 @@ final class Sender {
         }
     }
 
-    /// 发送真实系统光标图像。独立类型 0x05，不动 0x03 位置链路，
-    /// 这样两端版本错配时最多是没有自定义光标，位置转发仍正常。
+    /// 发送真实系统光标图像。独立类型 0x05（稳态）或 0x0D（高分辨率放大源），不动 0x03 位置链路，
+    /// 这样两端版本错配时最多是没有自定义光标或退回 0x05 重采样，位置转发仍正常。
     /// 载荷(全大端): [u16 w][u16 h][u16 hotX][u16 hotY][u32 nBytes][BGRA 像素...]
     /// BGRA 是 Windows DIB(32bpp BI_RGB) 直接可用的排布。
     func sendCursorImage(width: Int, height: Int,
-                         hotX: Int, hotY: Int, bgra: Data) {
+                         hotX: Int, hotY: Int, bgra: Data,
+                         packetType: UInt8 = 0x05) {
         let headerBytes = 12
         let payloadLen = headerBytes + bgra.count
         let total = 1 + 8 + payloadLen          // type + ts + payload
         var packet = Data(capacity: 4 + total)
         var len = UInt32(total).bigEndian
         withUnsafeBytes(of: &len) { packet.append(contentsOf: $0) }
-        packet.append(0x05)
+        packet.append(packetType)
         var ts = UInt64(CFAbsoluteTimeGetCurrent() * 1_000_000).bigEndian
         withUnsafeBytes(of: &ts) { packet.append(contentsOf: $0) }
         func put16(_ v: UInt16) { var x = v.bigEndian; withUnsafeBytes(of: &x) { packet.append(contentsOf: $0) } }
@@ -3454,6 +3455,47 @@ final class CursorTracker {
     }
 }
 
+/// 读取 macOS 辅助功能指针缩放倍率（1.0~4.0）。
+/// NSCursor.currentSystem.image.size 始终返回未缩放的基础逻辑尺寸（如 28x40），
+/// 实际大小由 WindowServer 叠加系统指针缩放。这里同步该倍率，副屏稳态指针才不会偏小。
+private enum SystemCursorScale {
+    typealias MainConnFn = @convention(c) () -> Int32
+    typealias GetScaleFn = @convention(c) (Int32, UnsafeMutablePointer<Float>) -> Int32
+
+    private static let syms: (cidFn: MainConnFn, getFn: GetScaleFn)? = {
+        let rtld = UnsafeMutableRawPointer(bitPattern: -2)
+        var pCid = dlsym(rtld, "SLSMainConnectionID")
+        var pGet = dlsym(rtld, "SLSGetCursorScale")
+        if pCid == nil || pGet == nil,
+           let h = dlopen("/System/Library/PrivateFrameworks/SkyLight.framework/SkyLight", RTLD_LAZY) {
+            pCid = pCid ?? dlsym(h, "SLSMainConnectionID")
+            pGet = pGet ?? dlsym(h, "SLSGetCursorScale")
+        }
+        guard let c = pCid, let g = pGet else { return nil }
+        return (unsafeBitCast(c, to: MainConnFn.self), unsafeBitCast(g, to: GetScaleFn.self))
+    }()
+
+    static func readPreferred() -> Double? {
+        CFPreferencesAppSynchronize("com.apple.universalaccess" as CFString)
+        guard let v = CFPreferencesCopyAppValue("mouseDriverCursorSize" as CFString,
+                                                "com.apple.universalaccess" as CFString) as? NSNumber else {
+            return nil
+        }
+        let d = v.doubleValue
+        guard d.isFinite, d >= 1.0, d <= 4.0 else { return nil }
+        return d
+    }
+
+    static func readLive() -> Double? {
+        guard let syms else { return nil }
+        var s: Float = 0
+        guard syms.getFn(syms.cidFn(), &s) == 0, s.isFinite, s >= 1.0, s <= 4.0 else {
+            return nil
+        }
+        return Double(s)
+    }
+}
+
 /// 真实系统光标图像转发。
 ///
 /// 用 NSCursor.currentSystem(本 SDK 名称，旧名 currentSystemCursor) 拿到当前
@@ -3477,6 +3519,12 @@ final class CursorImageTracker {
     private var lastPointerLocation = CGPoint.zero
     private var lastPointerMoveAt: CFAbsoluteTime = 0
     private var largeCursorSince: CFAbsoluteTime = 0
+    /// 缓存系统指针缩放倍率，每秒从偏好同步一次；若系统偏好未设置，则仅在
+    /// SkyLight 实时倍率连续稳定 2.5 秒后采纳，避免物理晃动瞬态倍率污染稳态尺寸。
+    private var cachedCursorScale: Double = 1.0
+    private var lastScalePollAt: CFAbsoluteTime = 0
+    private var pendingLiveScale: Double = 1.0
+    private var pendingLiveSince: CFAbsoluteTime = 0
     /// 上次实际发送时刻，用于限流：光标形状在移动中可能在箭头/I型/手型间频繁切换，
     /// 每切一次就让接收端重建一次 HCURSOR，会造成光标卡顿。限制最小间隔。
     private var lastSendAt: CFAbsoluteTime = 0
@@ -3499,6 +3547,30 @@ final class CursorImageTracker {
 
     func stop() { timer?.cancel(); timer = nil }
 
+    private func effectiveCursorScale(now: CFAbsoluteTime) -> Double {
+        if lastScalePollAt == 0 || now - lastScalePollAt >= 1.0 {
+            lastScalePollAt = now
+            if let pref = SystemCursorScale.readPreferred() {
+                cachedCursorScale = pref
+                pendingLiveSince = 0
+            } else if let live = SystemCursorScale.readLive() {
+                if abs(live - cachedCursorScale) < 0.02 {
+                    pendingLiveSince = 0
+                } else if pendingLiveSince == 0 || abs(live - pendingLiveScale) >= 0.02 {
+                    pendingLiveScale = live
+                    pendingLiveSince = now
+                } else if now - pendingLiveSince >= 2.5 {
+                    cachedCursorScale = live
+                    pendingLiveSince = 0
+                }
+            } else {
+                cachedCursorScale = 1.0
+                pendingLiveSince = 0
+            }
+        }
+        return max(1.0, min(4.0, cachedCursorScale))
+    }
+
     private func tick() {
         // 面板「发送真实光标图像」开关实时生效：关掉后不再发 0x05，
         // 接收端回退 Windows 标准箭头。原来只在启动时读一次环境变量，
@@ -3508,6 +3580,8 @@ final class CursorImageTracker {
             normalCursorMaxDim = 42
             lastPointerMoveAt = 0
             largeCursorSince = 0
+            lastScalePollAt = 0
+            pendingLiveSince = 0
             return
         }
         guard sender.connected else {
@@ -3516,27 +3590,34 @@ final class CursorImageTracker {
             normalCursorMaxDim = 42
             lastPointerMoveAt = 0
             largeCursorSince = 0
+            lastScalePollAt = 0
+            pendingLiveSince = 0
             return
         }
-        guard let cur = NSCursor.currentSystem,
-              let cg = cur.image.cgImage(forProposedRect: nil, context: nil, hints: nil)
-        else { return }
+        guard let cur = NSCursor.currentSystem else { return }
 
-        // 按「会话 backing scale」归一化后发送，而不是直接发 cgImage 的真实像素：
-        // 接收端要用 0x06 会话头里的 scale 反推逻辑尺寸，如果这里发的是某个 rep 的原始像素
-        // （自定义光标可能只有 1x rep），接收端会算错一倍，热点也跟着偏。
-        // 归一化后 w == logical * scale，两端口径一致；缩放放大则从这张高分辨率图重采样。
-        let logicalW = cur.image.size.width
-        let logicalH = cur.image.size.height
+        // 按「会话 backing scale × macOS 系统指针缩放」归一化后发送：
+        // NSCursor.currentSystem.image.size 始终是 1.0x 基础逻辑尺寸（如 28x40），
+        // 辅助功能调大指针时由 WindowServer 叠加缩放，这里同步乘入，副屏稳态指针大小才能对齐主屏。
+        let baseLogicalW = cur.image.size.width
+        let baseLogicalH = cur.image.size.height
+        guard baseLogicalW > 0, baseLogicalH > 0 else { return }
+        let now = CFAbsoluteTimeGetCurrent()
+        let cursorScale = effectiveCursorScale(now: now)
         // 与会话头里的 scaleTenths 用同一套取整，避免 1.25 这类值两边差 4%（稳态光标略小）。
         let sendScale = max(1.0, min(4.0, (vdBackingScale * 10).rounded() / 10))
-        guard logicalW > 0, logicalH > 0 else { return }
-        let rawW = max(1, Int((logicalW * sendScale).rounded()))
-        let rawH = max(1, Int((logicalH * sendScale).rounded()))
+        let rawW = max(1, Int((baseLogicalW * cursorScale * sendScale).rounded()))
+        let rawH = max(1, Int((baseLogicalH * cursorScale * sendScale).rounded()))
         let rawMax = max(rawW, rawH)
-        let logicalMax = Int(max(logicalW, logicalH).rounded())
+        let logicalMax = Int(max(baseLogicalW, baseLogicalH).rounded())
 
-        let now = CFAbsoluteTimeGetCurrent()
+        // 优先取最高分辨率 rep（系统箭头自带 10x 280x400），稳态下采样更锐利，
+        // 同时可提取高分辨率 0x0D 放大源供 Windows 晃动放大时清晰绘制。
+        var propRect = CGRect(x: 0, y: 0, width: Double(rawW) * 4.0, height: Double(rawH) * 4.0)
+        guard let cg = cur.image.cgImage(forProposedRect: &propRect, context: nil, hints: nil)
+                ?? cur.image.cgImage(forProposedRect: nil, context: nil, hints: nil)
+        else { return }
+
         guard let pointer = CGEvent(source: nil)?.location else { return }
         if lastPointerMoveAt == 0 || hypot(pointer.x - lastPointerLocation.x,
                                            pointer.y - lastPointerLocation.y) >= 1.0 {
@@ -3566,9 +3647,9 @@ final class CursorImageTracker {
         let clampScale = rawMax > maxDim ? Double(maxDim) / Double(rawMax) : 1.0
         let w = max(1, Int((Double(rawW) * clampScale).rounded()))
         let h = max(1, Int((Double(rawH) * clampScale).rounded()))
-        // 热点按「原生像素 / 逻辑点」的比例换算，落点与视觉完全一致。
-        let scaleX = Double(w) / Double(logicalW)
-        let scaleY = Double(h) / Double(logicalH)
+        // 热点按「原生像素 / 基础逻辑点」的比例换算，落点与视觉完全一致。
+        let scaleX = Double(w) / Double(baseLogicalW)
+        let scaleY = Double(h) / Double(baseLogicalH)
         let hotX = Int((cur.hotSpot.x * scaleX).rounded())
         let hotY = Int((cur.hotSpot.y * scaleY).rounded())
 
@@ -3581,6 +3662,7 @@ final class CursorImageTracker {
         guard let ctx = CGContext(data: &bgra, width: w, height: h,
                                   bitsPerComponent: 8, bytesPerRow: w * 4,
                                   space: cs, bitmapInfo: bitmapInfo) else { return }
+        ctx.interpolationQuality = .high
         ctx.draw(cg, in: CGRect(x: 0, y: 0, width: w, height: h))
 
         // 裁剪四周完全透明（alpha == 0）的空白边距（保留 1pt 安全边且包含热点）。
@@ -3602,6 +3684,7 @@ final class CursorImageTracker {
         }
         let clampedHotX = max(0, min(w - 1, hotX))
         let clampedHotY = max(0, min(h - 1, hotY))
+        var cropMinX = 0, cropMinY = 0
         var sendW = w, sendH = h, sendHotX = clampedHotX, sendHotY = clampedHotY
         var sendBgra = bgra
         if hasOpaque {
@@ -3619,6 +3702,8 @@ final class CursorImageTracker {
                     cropped.replaceSubrange(dstStart..<(dstStart + cw * 4),
                                             with: bgra[srcStart..<(srcStart + cw * 4)])
                 }
+                cropMinX = minX
+                cropMinY = minY
                 sendW = cw
                 sendH = ch
                 sendHotX = clampedHotX - minX
@@ -3663,11 +3748,42 @@ final class CursorImageTracker {
         lastFingerprint = fp
         sentCount += 1
         if force {
-            Log.info("光标图像 \(sendW)x\(sendH) hot=(\(sendHotX),\(sendHotY)) (原始 \(w)x\(h))")
+            Log.info("光标图像 \(sendW)x\(sendH) hot=(\(sendHotX),\(sendHotY)) (原始 \(w)x\(h) 系统缩放 \(String(format: "%.2fx", cursorScale)))")
         }
 
         sender.sendCursorImage(width: sendW, height: sendH, hotX: sendHotX, hotY: sendHotY,
-                               bgra: Data(sendBgra))
+                               bgra: Data(sendBgra), packetType: 0x05)
+
+        // 附发高分辨率放大源（0x0D），与 0x05 保持完全相同的裁剪区域与归一化热点。
+        // 旧版接收端会自动忽略未知包类型，新版接收端在晃动放大时用它替代 2x 稳态图重采样，边缘清晰无模糊。
+        let maxSendSide = max(sendW, sendH)
+        if (cg.width > w || cg.height > h) && maxSendSide < maxDim {
+            let cgRatio = min(Double(cg.width) / Double(w), Double(cg.height) / Double(h))
+            let hiFactor = min(4.0, min(cgRatio, Double(maxDim) / Double(maxSendSide)))
+            if hiFactor >= 1.25 {
+                let hiW = max(1, min(maxDim, Int((Double(sendW) * hiFactor).rounded())))
+                let hiH = max(1, min(maxDim, Int((Double(sendH) * hiFactor).rounded())))
+                var hiBgra = [UInt8](repeating: 0, count: hiW * hiH * 4)
+                if let hctx = CGContext(data: &hiBgra, width: hiW, height: hiH,
+                                        bitsPerComponent: 8, bytesPerRow: hiW * 4,
+                                        space: cs, bitmapInfo: bitmapInfo) {
+                    hctx.interpolationQuality = .high
+                    let sx = Double(hiW) / Double(sendW)
+                    let sy = Double(hiH) / Double(sendH)
+                    let drawRect = CGRect(
+                        x: -Double(cropMinX) * sx,
+                        y: -Double(h - (cropMinY + sendH)) * sy,
+                        width: Double(w) * sx,
+                        height: Double(h) * sy
+                    )
+                    hctx.draw(cg, in: drawRect)
+                    let hiHotX = max(0, min(hiW - 1, Int((Double(sendHotX) * sx).rounded())))
+                    let hiHotY = max(0, min(hiH - 1, Int((Double(sendHotY) * sy).rounded())))
+                    sender.sendCursorImage(width: hiW, height: hiH, hotX: hiHotX, hotY: hiHotY,
+                                           bgra: Data(hiBgra), packetType: 0x0D)
+                }
+            }
+        }
     }
 }
 
