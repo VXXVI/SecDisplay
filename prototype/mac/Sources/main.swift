@@ -3759,6 +3759,8 @@ final class CursorImageTracker {
         let maxSendSide = max(sendW, sendH)
         if (cg.width > w || cg.height > h) && maxSendSide < maxDim {
             let cgRatio = min(Double(cg.width) / Double(w), Double(cg.height) / Double(h))
+            // 直接按「稳态原图 / 裁剪后尺寸」反推保持等比所需的源分辨率上限（最高 4x），
+            // 避免裁剪区域较大时高分辨率源被提前钳位，导致晃动放大后再次上采样发糊。
             let hiFactor = min(4.0, min(cgRatio, Double(maxDim) / Double(maxSendSide)))
             if hiFactor >= 1.25 {
                 let hiW = max(1, min(maxDim, Int((Double(sendW) * hiFactor).rounded())))

@@ -157,9 +157,13 @@ if [ "$INSTALL" = "1" ]; then
         fi
         echo "检测到 TCC.db 存在 /Applications/SecDisplay.app 路径拒绝记录 (auth=0)，改安装到 $INSTALL_APP 以绕开冲突并使 bundle ID 授权生效"
     elif [ -e "/Applications/SecDisplay/SecDisplay.app" ]; then
-        rm -rf "/Applications/SecDisplay/SecDisplay.app"
-        rmdir "/Applications/SecDisplay" 2>/dev/null || true
-        echo "已清理旧路径副本 /Applications/SecDisplay/SecDisplay.app，避免启动到旧版本"
+        if rm -rf "/Applications/SecDisplay/SecDisplay.app"; then
+            rmdir "/Applications/SecDisplay" 2>/dev/null || true
+            echo "已清理旧路径副本 /Applications/SecDisplay/SecDisplay.app，避免启动到旧版本"
+            echo "注意：若该旧路径曾单独授予录屏权限，请确认当前 /Applications/SecDisplay.app 的权限设置"
+        else
+            echo "警告: 清理旧路径副本失败，请手动删除 /Applications/SecDisplay/SecDisplay.app"
+        fi
     fi
     rm -rf "$INSTALL_APP"
     # 用 ditto 而不是 cp -R：它会保留扩展属性与资源分支，签名校验更稳。

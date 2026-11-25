@@ -480,7 +480,7 @@ static const double kShakeCursorZoom = 3.8;  // 目标放大倍数（绘制在�
 static const double kShakeGrowMs = 140.0;    // 起势时长（EaseOutBack，末端极轻微过冲）
 static const double kShakeHoldMs = 150.0;    // 最后一次指针移动后的保持时长
 static const double kShakeShrinkMs = 180.0;  // 回落时长（EaseInOutCubic）
-static const double kShakeOvershootC1 = 0.8; // EaseOutBack 过冲系数（≈1.7% 峰值过冲）
+static const double kShakeOvershootC1 = 0.8; // EaseOutBack 过冲系数（相对增量约 2.34% 峰值过冲）
 static const UINT_PTR kShakeTimer = 4004;
 
 // 动画刷新步长跟随当前显示器刷新率（如 90Hz → 11ms，60Hz → 16ms），
@@ -5353,7 +5353,11 @@ static void UpdateZoomOverlay(double zoom) {
         if (!moveOnly) {
             const bool useHires = !g_hiresSprite.empty() &&
                                   g_hiresForSeq == g_nativeSeq &&
-                                  g_hiresW > 0 && g_hiresH > 0;
+                                  g_hiresW > 0 && g_hiresH > 0 &&
+                                  // 交叉校验 0x0D 与 0x05 的宽高比和归一化热点，防止形状错配。
+                                  g_hiresW * g_nativeH == g_nativeW * g_hiresH &&
+                                  abs(g_hiresHotX * g_nativeW - g_nativeHotX * g_hiresW) <= g_hiresW &&
+                                  abs(g_hiresHotY * g_nativeH - g_nativeHotY * g_hiresH) <= g_hiresH;
             if (useHires) {
                 sprite = g_hiresSprite; srcW = g_hiresW; srcH = g_hiresH;
             } else {
@@ -5368,13 +5372,30 @@ static void UpdateZoomOverlay(double zoom) {
     POINT dstPt{ cur.x - geo.hx, cur.y - geo.hy };
 
     // HOLD 阶段或相邻两帧取整后尺寸一致时，只搬移分层窗位置，不做像素重采样与上传。
+    // SetWindowPos 仅移动分层窗，不触发 DWM 对整面位图的重新合成，开销远低于 UpdateLayeredWindow。
     if (moveOnly) {
         SetCursor(HiddenCursorHandle());
-        if (!UpdateLayeredWindow(g_zoomOverlay, nullptr, &dstPt, nullptr, nullptr,
-                                 nullptr, 0, nullptr, 0)) {
-            HideZoomOverlay();
+        if (!SetWindowPos(g_zoomOverlay, HWND_TOPMOST, dstPt.x, dstPt.y, 0, 0,
+                          SWP_NOSIZE | SWP_NOACTIVATE)) {
+            // 位移失败时不立刻隐藏叠加层，落到下面的全量重绘分支重试一次；
+            // 若全量重绘仍失败，再由 HideZoomOverlay 兜底恢复硬件光标。
+            g_zoomRenderedGen = 0;
+            moveOnly = false;
+            std::lock_guard<std::mutex> lk(g_spriteMtx);
+            const bool useHires = !g_hiresSprite.empty() &&
+                                  g_hiresForSeq == g_nativeSeq &&
+                                  g_hiresW > 0 && g_hiresH > 0 &&
+                                  g_hiresW * g_nativeH == g_nativeW * g_hiresH &&
+                                  abs(g_hiresHotX * g_nativeW - g_nativeHotX * g_hiresW) <= g_hiresW &&
+                                  abs(g_hiresHotY * g_nativeH - g_nativeHotY * g_hiresH) <= g_hiresH;
+            if (useHires) {
+                sprite = g_hiresSprite; srcW = g_hiresW; srcH = g_hiresH;
+            } else {
+                sprite = g_nativeSprite; srcW = g_nativeW; srcH = g_nativeH;
+            }
+        } else {
+            return;
         }
-        return;
     }
 
     // 一次性按上限分配 DIB/DC：放大过程中尺寸每帧变化，反复 CreateDIBSection 会明显拖慢。
@@ -8045,12 +8066,62 @@ static int RunCursorSelfTest() {
     const ZoomGeometry capped = ComputeZoomGeometry(200, 200, 10, 10, 10.0, 512);
     check(capped.dw <= 512 && capped.dh <= 512 && capped.dw == 512, "放大几何：不超过 512 上限");
 
-    // 6) 叠加层：真实调用一遍（无崩溃 + 若会话支持则校验窗口几何）
+    // 6) 叠加层：先通过真实 0x05 → 0x0D 配对注入高分辨率源，验证清晰源选择与热点映射
+    HideZoomOverlay();
+    g_cursorVisible.store(true);
+    g_customCursor = nullptr;
+    g_cursorAppliedFp = 0;
+    g_cursorAppliedScalePm = 0;
+    g_cursorAppliedCap = 0;
+    for (int i = 0; i < kCursorCacheCap; ++i) {
+        if (g_cursorCache[i].cur) DestroyCursor(g_cursorCache[i].cur);
+        g_cursorCache[i] = CachedCursor{};
+    }
+    g_cursorCacheNext = 0;
+    {
+        const uint32_t nb = (uint32_t)(W * H * 4);
+        std::vector<uint8_t> pkt(12 + nb, 0);
+        pkt[0] = (uint8_t)(W >> 8); pkt[1] = (uint8_t)(W & 0xFF);
+        pkt[2] = (uint8_t)(H >> 8); pkt[3] = (uint8_t)(H & 0xFF);
+        pkt[4] = 0; pkt[5] = 4;
+        pkt[6] = 0; pkt[7] = 3;
+        pkt[8] = (uint8_t)((nb >> 24) & 0xFF); pkt[9] = (uint8_t)((nb >> 16) & 0xFF);
+        pkt[10] = (uint8_t)((nb >> 8) & 0xFF); pkt[11] = (uint8_t)(nb & 0xFF);
+        memcpy(pkt.data() + 12, sprite.data(), nb);
+        OnCursorImagePacket(pkt.data(), pkt.size());
+    }
+    {
+        const int hw = 64, hh = 80;
+        const uint32_t nb = (uint32_t)(hw * hh * 4);
+        std::vector<uint8_t> pkt(12 + nb, 0);
+        pkt[0] = (uint8_t)(hw >> 8); pkt[1] = (uint8_t)(hw & 0xFF);
+        pkt[2] = (uint8_t)(hh >> 8); pkt[3] = (uint8_t)(hh & 0xFF);
+        pkt[4] = 0; pkt[5] = 8;
+        pkt[6] = 0; pkt[7] = 6;
+        pkt[8] = (uint8_t)((nb >> 24) & 0xFF); pkt[9] = (uint8_t)((nb >> 16) & 0xFF);
+        pkt[10] = (uint8_t)((nb >> 8) & 0xFF); pkt[11] = (uint8_t)(nb & 0xFF);
+        for (int y = 0; y < hh; ++y) {
+            for (int x = 0; x < hw; ++x) {
+                uint8_t* p = pkt.data() + 12 + ((size_t)y * hw + x) * 4;
+                p[0] = (uint8_t)(x * 4); p[1] = (uint8_t)(y * 3); p[2] = 180; p[3] = 255;
+            }
+        }
+        OnCursorHiresPacket(pkt.data(), pkt.size());
+    }
+    ApplyCursorImage();
+    check(g_customCursor != nullptr, "真实 0x05 包创建稳态 HCURSOR");
+    {
+        std::lock_guard<std::mutex> lk(g_spriteMtx);
+        check(g_hiresW == 64 && g_hiresH == 80 && g_hiresForSeq == g_nativeSeq,
+              "0x05 与 0x0D 按 seq 正确绑定");
+    }
+
     POINT cur{};
     GetCursorPos(&cur);
     UpdateZoomOverlay(kShakeCursorZoom);
     const DWORD overlayErr = GetLastError();   // 立刻取样，后面任何调用都会覆盖它
     if (g_zoomOverlayShown) {
+        check(g_zoomRenderedW == geo.dw && g_zoomRenderedH == geo.dh, "高分辨率源驱动叠加层几何");
         RECT wr{};
         if (g_zoomOverlay) GetWindowRect(g_zoomOverlay, &wr);
         check(std::abs((wr.right - wr.left) - geo.dw) <= 2 &&
@@ -8059,6 +8130,20 @@ static int RunCursorSelfTest() {
               std::abs(wr.top - (cur.y - geo.hy)) <= 2, "叠加层窗口位置与热点对齐");
         check(HiddenCursorHandle() != nullptr && GetCursor() == HiddenCursorHandle(),
               "放大帧提交后硬件光标已隐藏，避免双指针");
+
+        // 同尺寸再次提交走 SetWindowPos 纯位移快路径，不重采样、不改变已呈现位图。
+        const int prevX = cur.x, prevY = cur.y;
+        SetCursorPos(cur.x + 24, cur.y + 11);
+        UpdateZoomOverlay(kShakeCursorZoom);
+        check(g_zoomRenderedW == geo.dw && g_zoomRenderedH == geo.dh &&
+              g_zoomOverlayShown, "同尺寸帧走纯位移快路径");
+        RECT moved{};
+        if (g_zoomOverlay) GetWindowRect(g_zoomOverlay, &moved);
+        check(std::abs((moved.right - moved.left) - geo.dw) <= 2 &&
+              std::abs((moved.bottom - moved.top) - geo.dh) <= 2, "纯位移后窗口尺寸保持稳定");
+        check(std::abs(moved.left - (prevX + 24 - geo.hx)) <= 2 &&
+              std::abs(moved.top - (prevY + 11 - geo.hy)) <= 2, "纯位移后窗口热点仍对齐指针");
+        SetCursorPos(prevX, prevY);
     } else {
         // SSH / session 0 下 DWM 分层窗不可用，属环境限制，不算失败
         printf("[INFO] 当前会话不支持分层叠加窗，跳过窗口几何校验 (err=%lu)\n",
@@ -8075,10 +8160,17 @@ static int RunCursorSelfTest() {
     for (size_t i = 3; i < scaled.size(); i += 4) if (scaled[i] > 0) ++opaque;
     check(scaled.size() == (size_t)geo.dw * geo.dh * 4 && opaque > 0, "重采样输出尺寸与覆盖正确");
 
-    // 8) 收口：隐藏、高分辨率源包解析以及 zoom<=1.02 不显示
+    // 8) 收口：隐藏、0x05 不匹配时清空高分辨率源、以及 zoom<=1.02 不显示
     HideZoomOverlay();
     check(!g_zoomOverlayShown, "叠加层可正确隐藏");
     check(GetCursor() != HiddenCursorHandle(), "叠加层隐藏后恢复硬件光标");
+    {
+        g_cursorImage.pending = true;
+        ApplyCursorImage();
+        std::lock_guard<std::mutex> lk(g_spriteMtx);
+        check(g_hiresSprite.empty() && g_hiresW == 0 && g_hiresH == 0,
+              "新 0x05 尚未配对 0x0D 时清空旧高分辨率源");
+    }
     UpdateZoomOverlay(1.0);
     check(!g_zoomOverlayShown, "zoom<=1.02 不显示叠加层");
     {
@@ -8107,6 +8199,10 @@ static int RunCursorSelfTest() {
     if (out) { fprintf(out, "%s\n", summary); fclose(out); }
 
     if (g_zoomOverlay && IsWindow(g_zoomOverlay)) DestroyWindow(g_zoomOverlay);
+    if (g_customCursor) { DestroyCursor(g_customCursor); g_customCursor = nullptr; }
+    for (int i = 0; i < kCursorCacheCap; ++i) {
+        if (g_cursorCache[i].cur) { DestroyCursor(g_cursorCache[i].cur); g_cursorCache[i].cur = nullptr; }
+    }
     DestroyWindow(g_hwnd);
     g_hwnd = nullptr;
     return fails == 0 ? 0 : 1;
