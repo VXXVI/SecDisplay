@@ -107,7 +107,7 @@ hotSpot                          = (5.0, 5.0) 点
 
 ### c. 辅助功能的光标大小 / 晃动放大：**排除**
 
-见第五节，`cursorScale` 与 `shakeToLocate` 都不存在（等于默认：大小 1.0、晃动定位关闭）。且这两项一旦开启是全局生效，内建屏上也会变大，与「只在 iPad 上出现」矛盾。
+见第五节，`cursorScale` 是早期遗留键且当前不生效，普通「指针大小」实际由 `mouseDriverCursorSize` 控制（本机为 1.295）。晃动定位开关独立控制，这两项一旦开启是全局生效，内建屏上也会变大，与「只在 iPad 上出现」矛盾。
 
 ### d. 虚拟屏 mode 尺寸/缩放给错，被当成低分屏补偿：**部分支持，但它是现象的必要条件而非充分条件**
 
@@ -139,12 +139,13 @@ switchSweepingCursorSpeed = 5     （切换控制扫描，与指针无关）
 
 判读：
 
-- `cursorScale` **不存在**，等于默认值 1.0，系统光标没有被调大。
+- `cursorScale` **不存在**。该键是早期版本的遗留键，当前 macOS 版本普通「指针大小」滑块对应的生效键为 `mouseDriverCursorSize`（后续实测确认）。
 - `shakeToLocate` **不存在**，晃动放大定位处于关闭状态。
-- `mouseDriverCursorSize = 1.295` 看起来可疑，但同域的 `mouseDriver = 0`、`headMouseEnabled = 0`，说明「头部指针」功能没启用，这个尺寸值不参与渲染。
+- `mouseDriverCursorSize = 1.295` 时 SkyLight `SLSGetCursorScale` 实测也返回 1.2951016；`NSCursor.currentSystem.image.size` 始终为 1x 基础逻辑尺寸，不包含该倍率，需由投屏发送端主动读取并同步。
+- `mouseDriver = 0`、`headMouseEnabled = 0` 表示头部指针功能独立开关，不影响普通指针尺寸键的含义。
 - `com.apple.Accessibility` 里没有任何 cursor / shake / pointer 相关键。
 
-结论：c 候选可以硬排除。**不要**为了这个现象去改 `cursorScale`，改了会让内建屏和 Sidecar 一起变大，反而更糟。
+结论：镜像场景下 iPad 上的指针异常大小仍由合成路径导致。若需调整系统指针大小，应通过辅助功能「指针大小」滑块设置，投屏链路只读取并同步该倍率，不擅自改写系统设置。
 
 ## 六、修复方案
 
@@ -173,7 +174,7 @@ switchSweepingCursorSpeed = 5     （切换控制扫描，与指针无关）
 
 ### F3（不建议）：调系统光标大小
 
-把 `cursorScale` 调小会让所有屏的光标一起变小，包括内建屏。这是用一个全局副作用掩盖一个局部配置错误，不做。
+把 `mouseDriverCursorSize` 调小会让所有屏的光标一起变小，包括内建屏。这是用一个全局副作用掩盖一个局部配置错误，不做。
 
 ### F4（可选，低优先）：刷新率对齐
 
