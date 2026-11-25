@@ -440,8 +440,22 @@ static int g_hiresW = 0, g_hiresH = 0, g_hiresHotX = 0, g_hiresHotY = 0;
 static uint64_t g_hiresForSeq = 0;
 static uint64_t g_spriteGen = 0;
 static std::atomic<uint64_t> g_rxCursorImageSeq{0};
+static uint64_t g_zoomMoveOnlyHits = 0;   // 纯位移快路径命中计数，供自检验证 SetWindowPos 路径
 // 稳态「原生像素 → 屏幕物理像素」的实际比例（已含 hwMax 钳位），供放大叠加层作为基准。
 static double g_steadySpriteK = 0.0;
+
+// 0x0D 高分辨率源与 0x05 同源校验：宽高比允许 2% 取整容差，归一化热点允许约 1px 偏差。
+// 调用方必须持有 g_spriteMtx。
+static bool UseHiresSpriteLocked() {
+    if (g_hiresSprite.empty() || g_hiresForSeq != g_nativeSeq ||
+        g_hiresW <= 0 || g_hiresH <= 0 || g_nativeW <= 0 || g_nativeH <= 0) return false;
+    const int64_t cross = std::abs((int64_t)g_hiresW * g_nativeH - (int64_t)g_nativeW * g_hiresH);
+    const int64_t aspectTol = std::max<int64_t>(2, ((int64_t)g_nativeW * g_hiresH + 49) / 50);
+    if (cross > aspectTol) return false;
+    if (std::abs((int64_t)g_hiresHotX * g_nativeW - (int64_t)g_nativeHotX * g_hiresW) > g_hiresW) return false;
+    if (std::abs((int64_t)g_hiresHotY * g_nativeH - (int64_t)g_nativeHotY * g_hiresH) > g_hiresH) return false;
+    return true;
+}
 
 // 已建好的 HCURSOR 对应的位图指纹与缩放（千分比）。同一张位图、同一缩放不重建，
 // 避免重复的 CreateIconIndirect/DestroyCursor 造成光标闪烁和句柄抖动。
@@ -5351,14 +5365,7 @@ static void UpdateZoomOverlay(double zoom) {
         moveOnly = g_zoomOverlayShown && g_zoomRenderedGen == spriteGen &&
                    g_zoomRenderedW == geo.dw && g_zoomRenderedH == geo.dh;
         if (!moveOnly) {
-            const bool useHires = !g_hiresSprite.empty() &&
-                                  g_hiresForSeq == g_nativeSeq &&
-                                  g_hiresW > 0 && g_hiresH > 0 &&
-                                  // 交叉校验 0x0D 与 0x05 的宽高比和归一化热点，防止形状错配。
-                                  g_hiresW * g_nativeH == g_nativeW * g_hiresH &&
-                                  abs(g_hiresHotX * g_nativeW - g_nativeHotX * g_hiresW) <= g_hiresW &&
-                                  abs(g_hiresHotY * g_nativeH - g_nativeHotY * g_hiresH) <= g_hiresH;
-            if (useHires) {
+            if (UseHiresSpriteLocked()) {
                 sprite = g_hiresSprite; srcW = g_hiresW; srcH = g_hiresH;
             } else {
                 sprite = g_nativeSprite; srcW = g_nativeW; srcH = g_nativeH;
@@ -5375,28 +5382,28 @@ static void UpdateZoomOverlay(double zoom) {
     // SetWindowPos 仅移动分层窗，不触发 DWM 对整面位图的重新合成，开销远低于 UpdateLayeredWindow。
     if (moveOnly) {
         SetCursor(HiddenCursorHandle());
-        if (!SetWindowPos(g_zoomOverlay, HWND_TOPMOST, dstPt.x, dstPt.y, 0, 0,
-                          SWP_NOSIZE | SWP_NOACTIVATE)) {
-            // 位移失败时不立刻隐藏叠加层，落到下面的全量重绘分支重试一次；
-            // 若全量重绘仍失败，再由 HideZoomOverlay 兜底恢复硬件光标。
-            g_zoomRenderedGen = 0;
-            moveOnly = false;
-            std::lock_guard<std::mutex> lk(g_spriteMtx);
-            const bool useHires = !g_hiresSprite.empty() &&
-                                  g_hiresForSeq == g_nativeSeq &&
-                                  g_hiresW > 0 && g_hiresH > 0 &&
-                                  g_hiresW * g_nativeH == g_nativeW * g_hiresH &&
-                                  abs(g_hiresHotX * g_nativeW - g_nativeHotX * g_hiresW) <= g_hiresW &&
-                                  abs(g_hiresHotY * g_nativeH - g_nativeHotY * g_hiresH) <= g_hiresH;
-            if (useHires) {
-                sprite = g_hiresSprite; srcW = g_hiresW; srcH = g_hiresH;
-            } else {
-                sprite = g_nativeSprite; srcW = g_nativeW; srcH = g_nativeH;
-            }
-        } else {
+        if (SetWindowPos(g_zoomOverlay, HWND_TOPMOST, dstPt.x, dstPt.y, 0, 0,
+                         SWP_NOSIZE | SWP_NOACTIVATE | SWP_NOZORDER)) {
+            ++g_zoomMoveOnlyHits;
             return;
         }
+        // 位移失败时不立刻隐藏叠加层，落到下面的全量重绘分支重试一次；
+        // 若全量重绘仍失败，再由 HideZoomOverlay 兜底恢复硬件光标。
+        moveOnly = false;
+        std::lock_guard<std::mutex> lk(g_spriteMtx);
+        if (UseHiresSpriteLocked()) {
+            sprite = g_hiresSprite; srcW = g_hiresW; srcH = g_hiresH;
+        } else {
+            sprite = g_nativeSprite; srcW = g_nativeW; srcH = g_nativeH;
+        }
     }
+
+    auto abortOverlay = [&]() {
+        if (g_zoomOverlayShown) HideZoomOverlay();
+        else if (g_cursorVisible.load()) {
+            SetCursor(g_customCursor ? g_customCursor : LoadCursor(nullptr, IDC_ARROW));
+        }
+    };
 
     // 一次性按上限分配 DIB/DC：放大过程中尺寸每帧变化，反复 CreateDIBSection 会明显拖慢。
     // 分配后只把当前尺寸的行拷进左上角，UpdateLayeredWindow 用 psize 指定实际区域。
@@ -5416,17 +5423,18 @@ static void UpdateZoomOverlay(double zoom) {
         if (screen) ReleaseDC(nullptr, screen);
         if (!g_zoomOverlayBmp || !g_zoomOverlayDC || !g_zoomOverlayBits) {
             DestroyZoomOverlayResources();
+            abortOverlay();
             return;
         }
         SelectObject(g_zoomOverlayDC, g_zoomOverlayBmp);
         g_zoomOverlayW = kMaxSide;
         g_zoomOverlayH = kMaxSide;
     }
-    if (dw > g_zoomOverlayW || dh > g_zoomOverlayH) return;
+    if (dw > g_zoomOverlayW || dh > g_zoomOverlayH) { abortOverlay(); return; }
 
     std::vector<uint8_t> scaled;
     ResampleBgraPremul(sprite.data(), srcW, srcH, scaled, dw, dh);
-    if (scaled.size() != (size_t)dw * dh * 4) return;
+    if (scaled.size() != (size_t)dw * dh * 4) { abortOverlay(); return; }
     // 逐行拷贝：DIB 的 stride 是 512*4，不能整块 memcpy
     {
         uint8_t* base = (uint8_t*)g_zoomOverlayBits;
@@ -8058,7 +8066,7 @@ static int RunCursorSelfTest() {
     check(!g_shakeActive && std::abs(g_shakeZoom - 1.0) < 1e-6, "回落结束且 zoom 归 1");
 
     // 5) 几何（纯函数，不依赖会话是否支持分层窗口）
-    const ZoomGeometry geo = ComputeZoomGeometry(W, H, 4, 3, 1.0 * kShakeCursorZoom, 512);
+    ZoomGeometry geo = ComputeZoomGeometry(W, H, 4, 3, 1.0 * kShakeCursorZoom, 512);
     check(geo.dw == (int)(W * kShakeCursorZoom + 0.5) &&
           geo.dh == (int)(H * kShakeCursorZoom + 0.5), "放大几何：尺寸 = 精灵 * 目标倍数");
     check(geo.hx == (int)(4 * kShakeCursorZoom + 0.5) &&
@@ -8078,34 +8086,32 @@ static int RunCursorSelfTest() {
         g_cursorCache[i] = CachedCursor{};
     }
     g_cursorCacheNext = 0;
-    {
-        const uint32_t nb = (uint32_t)(W * H * 4);
+    auto makeCursorPkt = [](int pw, int ph, int hx, int hy, bool hires) {
+        const uint32_t nb = (uint32_t)(pw * ph * 4);
         std::vector<uint8_t> pkt(12 + nb, 0);
-        pkt[0] = (uint8_t)(W >> 8); pkt[1] = (uint8_t)(W & 0xFF);
-        pkt[2] = (uint8_t)(H >> 8); pkt[3] = (uint8_t)(H & 0xFF);
-        pkt[4] = 0; pkt[5] = 4;
-        pkt[6] = 0; pkt[7] = 3;
+        pkt[0] = (uint8_t)(pw >> 8); pkt[1] = (uint8_t)(pw & 0xFF);
+        pkt[2] = (uint8_t)(ph >> 8); pkt[3] = (uint8_t)(ph & 0xFF);
+        pkt[4] = (uint8_t)(hx >> 8); pkt[5] = (uint8_t)(hx & 0xFF);
+        pkt[6] = (uint8_t)(hy >> 8); pkt[7] = (uint8_t)(hy & 0xFF);
         pkt[8] = (uint8_t)((nb >> 24) & 0xFF); pkt[9] = (uint8_t)((nb >> 16) & 0xFF);
         pkt[10] = (uint8_t)((nb >> 8) & 0xFF); pkt[11] = (uint8_t)(nb & 0xFF);
-        memcpy(pkt.data() + 12, sprite.data(), nb);
+        for (int y = 0; y < ph; ++y) {
+            for (int x = 0; x < pw; ++x) {
+                uint8_t* p = pkt.data() + 12 + ((size_t)y * pw + x) * 4;
+                p[0] = (uint8_t)(x * (hires ? 4 : 8));
+                p[1] = (uint8_t)(y * (hires ? 3 : 6));
+                p[2] = (uint8_t)(hires ? 180 : 200);
+                p[3] = 255;
+            }
+        }
+        return pkt;
+    };
+    {
+        const auto pkt = makeCursorPkt(W, H, 4, 3, false);
         OnCursorImagePacket(pkt.data(), pkt.size());
     }
     {
-        const int hw = 64, hh = 80;
-        const uint32_t nb = (uint32_t)(hw * hh * 4);
-        std::vector<uint8_t> pkt(12 + nb, 0);
-        pkt[0] = (uint8_t)(hw >> 8); pkt[1] = (uint8_t)(hw & 0xFF);
-        pkt[2] = (uint8_t)(hh >> 8); pkt[3] = (uint8_t)(hh & 0xFF);
-        pkt[4] = 0; pkt[5] = 8;
-        pkt[6] = 0; pkt[7] = 6;
-        pkt[8] = (uint8_t)((nb >> 24) & 0xFF); pkt[9] = (uint8_t)((nb >> 16) & 0xFF);
-        pkt[10] = (uint8_t)((nb >> 8) & 0xFF); pkt[11] = (uint8_t)(nb & 0xFF);
-        for (int y = 0; y < hh; ++y) {
-            for (int x = 0; x < hw; ++x) {
-                uint8_t* p = pkt.data() + 12 + ((size_t)y * hw + x) * 4;
-                p[0] = (uint8_t)(x * 4); p[1] = (uint8_t)(y * 3); p[2] = 180; p[3] = 255;
-            }
-        }
+        const auto pkt = makeCursorPkt(64, 80, 8, 6, true);
         OnCursorHiresPacket(pkt.data(), pkt.size());
     }
     ApplyCursorImage();
@@ -8114,9 +8120,18 @@ static int RunCursorSelfTest() {
         std::lock_guard<std::mutex> lk(g_spriteMtx);
         check(g_hiresW == 64 && g_hiresH == 80 && g_hiresForSeq == g_nativeSeq,
               "0x05 与 0x0D 按 seq 正确绑定");
+        // 模拟 Mac 对宽高分别取整导致的比例微小偏差，确认容差不会误杀高分辨率源。
+        const int oldW = g_hiresW;
+        g_hiresW = 63;
+        check(UseHiresSpriteLocked(), "0x0D 比例取整偏差在容差内仍被采纳");
+        g_hiresW = oldW;
     }
+    // ApplyCursorImage 会按窗口 DPI 重算稳态比例，几何断言必须使用该实时比例，不能写死 1.0。
+    const double actualK = g_steadySpriteK * kShakeCursorZoom;
+    geo = ComputeZoomGeometry(W, H, 4, 3, actualK, 512);
 
     POINT cur{};
+    SetCursorPos(GetSystemMetrics(SM_CXSCREEN) / 2, GetSystemMetrics(SM_CYSCREEN) / 2);
     GetCursorPos(&cur);
     UpdateZoomOverlay(kShakeCursorZoom);
     const DWORD overlayErr = GetLastError();   // 立刻取样，后面任何调用都会覆盖它
@@ -8133,10 +8148,12 @@ static int RunCursorSelfTest() {
 
         // 同尺寸再次提交走 SetWindowPos 纯位移快路径，不重采样、不改变已呈现位图。
         const int prevX = cur.x, prevY = cur.y;
+        const uint64_t prevMoveHits = g_zoomMoveOnlyHits;
         SetCursorPos(cur.x + 24, cur.y + 11);
         UpdateZoomOverlay(kShakeCursorZoom);
         check(g_zoomRenderedW == geo.dw && g_zoomRenderedH == geo.dh &&
-              g_zoomOverlayShown, "同尺寸帧走纯位移快路径");
+              g_zoomOverlayShown && g_zoomMoveOnlyHits > prevMoveHits,
+              "同尺寸帧命中 SetWindowPos 纯位移快路径");
         RECT moved{};
         if (g_zoomOverlay) GetWindowRect(g_zoomOverlay, &moved);
         check(std::abs((moved.right - moved.left) - geo.dw) <= 2 &&
@@ -8165,7 +8182,8 @@ static int RunCursorSelfTest() {
     check(!g_zoomOverlayShown, "叠加层可正确隐藏");
     check(GetCursor() != HiddenCursorHandle(), "叠加层隐藏后恢复硬件光标");
     {
-        g_cursorImage.pending = true;
+        const auto pkt = makeCursorPkt(W, H, 4, 3, false);
+        OnCursorImagePacket(pkt.data(), pkt.size());
         ApplyCursorImage();
         std::lock_guard<std::mutex> lk(g_spriteMtx);
         check(g_hiresSprite.empty() && g_hiresW == 0 && g_hiresH == 0,
@@ -8174,20 +8192,11 @@ static int RunCursorSelfTest() {
     UpdateZoomOverlay(1.0);
     check(!g_zoomOverlayShown, "zoom<=1.02 不显示叠加层");
     {
-        const uint64_t prevSeq = g_rxCursorImageSeq.load();
-        g_rxCursorImageSeq.store(prevSeq + 1);
-        const int hw = 64, hh = 80;
-        const uint32_t nb = (uint32_t)(hw * hh * 4);
-        std::vector<uint8_t> pkt(12 + nb, 255);
-        pkt[0] = (uint8_t)(hw >> 8); pkt[1] = (uint8_t)(hw & 0xFF);
-        pkt[2] = (uint8_t)(hh >> 8); pkt[3] = (uint8_t)(hh & 0xFF);
-        pkt[4] = 0; pkt[5] = 8;
-        pkt[6] = 0; pkt[7] = 6;
-        pkt[8] = (uint8_t)((nb >> 24) & 0xFF); pkt[9] = (uint8_t)((nb >> 16) & 0xFF);
-        pkt[10] = (uint8_t)((nb >> 8) & 0xFF); pkt[11] = (uint8_t)(nb & 0xFF);
+        const auto pkt = makeCursorPkt(64, 80, 8, 6, true);
+        const uint64_t expectedSeq = g_rxCursorImageSeq.load();
         OnCursorHiresPacket(pkt.data(), pkt.size());
         std::lock_guard<std::mutex> lk(g_spriteMtx);
-        check(g_hiresW == hw && g_hiresH == hh && g_hiresForSeq == prevSeq + 1,
+        check(g_hiresW == 64 && g_hiresH == 80 && g_hiresForSeq == expectedSeq,
               "0x0D 高分辨率放大源解析与 seq 绑定正确");
     }
 
@@ -8198,8 +8207,10 @@ static int RunCursorSelfTest() {
     Log("%s", summary);
     if (out) { fprintf(out, "%s\n", summary); fclose(out); }
 
+    SetCursor(LoadCursor(nullptr, IDC_ARROW));
     if (g_zoomOverlay && IsWindow(g_zoomOverlay)) DestroyWindow(g_zoomOverlay);
-    if (g_customCursor) { DestroyCursor(g_customCursor); g_customCursor = nullptr; }
+    if (g_customCursor && !IsInCursorCache(g_customCursor)) DestroyCursor(g_customCursor);
+    g_customCursor = nullptr;
     for (int i = 0; i < kCursorCacheCap; ++i) {
         if (g_cursorCache[i].cur) { DestroyCursor(g_cursorCache[i].cur); g_cursorCache[i].cur = nullptr; }
     }
