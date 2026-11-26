@@ -23,6 +23,11 @@ enum SecDisplayRole: String {
     case receiver = "receiver" // Mac 当副屏，Windows 当主控
 }
 
+enum SecDisplayDisplayMode: String {
+    case extend = "extend"     // 扩展屏幕（独立虚拟副屏，默认）
+    case mirror = "mirror"     // 镜像主屏（同步物理主屏画面）
+}
+
 struct MacReceiverSnapshot {
     var connected = false
     var streaming = false
@@ -732,6 +737,20 @@ final class MacReceiverClient {
         }
         decodeQueue.async { [weak self] in
             self?.decoder.reset()
+        }
+    }
+
+    /// 本机主动解除 Windows 远程 KVM 穿透控制（控制面板按钮 / 快捷键 / 关闭副屏窗口兜底）
+    func forceReleaseLocalKvm() {
+        stateLock.lock()
+        let was = _kvmActive
+        _kvmActive = false
+        stateLock.unlock()
+        kvmQueue.async { [weak self] in
+            self?.kvmInjector.setActive(false)
+        }
+        if was {
+            Log.info("KVM: 本机已主动解除 Windows 远程键鼠穿透")
         }
     }
 
@@ -1740,6 +1759,22 @@ final class ReceiverCanvasView: NSView {
             }
             return
         }
+        // Cmd+Q 本地退出 SecDisplay，不再误转发给 Windows 关掉远端前台应用
+        if event.keyCode == 0x0C && mods == [.command] {
+            if !event.isARepeat {
+                releaseAllInputs()
+                DispatchQueue.main.async { shutdown(signal: SIGTERM) }
+            }
+            return
+        }
+        // Cmd+W 本地关闭副屏窗口（保留后台监听与控制面板）
+        if event.keyCode == 0x0D && mods == [.command] {
+            if !event.isARepeat {
+                releaseAllInputs()
+                window?.performClose(nil)
+            }
+            return
+        }
         guard let wk = MacKeyMap.lookup(event.keyCode) else { return }
         heldKeys.insert(event.keyCode)
         client?.sendKeyInput(vk: wk.vk, scan: wk.scan, down: true, flags: wk.extended ? 0x01 : 0)
@@ -1775,6 +1810,7 @@ final class ReceiverWindowController: NSObject, NSWindowDelegate {
     let window: NSWindow
     let canvas: ReceiverCanvasView
     private weak var client: MacReceiverClient?
+    private var userDismissedWindow = false
 
     init(client: MacReceiverClient) {
         self.client = client
@@ -1793,7 +1829,7 @@ final class ReceiverWindowController: NSObject, NSWindowDelegate {
             backing: .buffered,
             defer: false
         )
-        win.title = "SecDisplay 副屏 (Windows 主控) · Ctrl+Cmd+F 全屏"
+        win.title = "SecDisplay 副屏 (Windows 主控) · Ctrl+Cmd+F 全屏 · Cmd+Q 退出"
         win.isReleasedWhenClosed = false
         win.backgroundColor = .black
         win.acceptsMouseMovedEvents = true
@@ -1808,8 +1844,11 @@ final class ReceiverWindowController: NSObject, NSWindowDelegate {
         super.init()
         win.delegate = self
 
-        client.onVideoFrame = { [weak view] pb, vw, vh in
+        client.onVideoFrame = { [weak view, weak self] pb, vw, vh in
             DispatchQueue.main.async {
+                if let self, !self.window.isVisible, !self.userDismissedWindow {
+                    self.show()
+                }
                 view?.displayFrame(pb, width: vw, height: vh)
             }
         }
@@ -1826,7 +1865,7 @@ final class ReceiverWindowController: NSObject, NSWindowDelegate {
         client.onSessionChanged = { [weak win] vw, vh, fps in
             DispatchQueue.main.async {
                 guard let win else { return }
-                win.title = "SecDisplay 副屏 (\(vw)×\(vh) @ \(fps)Hz) · Ctrl+Cmd+F 全屏"
+                win.title = "SecDisplay 副屏 (\(vw)×\(vh) @ \(fps)Hz) · Ctrl+Cmd+F 全屏 · Cmd+Q 退出"
                 // 窗口模式下按 1:1 Retina 物理像素自适应窗口尺寸，避免非整数缩放发虚
                 if !win.styleMask.contains(.fullScreen),
                    let scr = win.screen ?? NSScreen.main {
@@ -1852,15 +1891,17 @@ final class ReceiverWindowController: NSObject, NSWindowDelegate {
                 }
             }
         }
-        client.onDisconnected = { [weak view, weak win] in
+        client.onDisconnected = { [weak view, weak win, weak self] in
             DispatchQueue.main.async {
+                self?.userDismissedWindow = false
                 view?.showDisconnected("连接已断开，等待 Windows 主控重连…")
-                win?.title = "SecDisplay 副屏 (等待重连) · Ctrl+Cmd+F 全屏"
+                win?.title = "SecDisplay 副屏 (等待重连) · Ctrl+Cmd+F 全屏 · Cmd+Q 退出"
             }
         }
     }
 
     func show() {
+        userDismissedWindow = false
         NSApp.setActivationPolicy(.regular)
         window.makeKeyAndOrderFront(nil)
         NSApp.activate(ignoringOtherApps: true)
@@ -1881,7 +1922,9 @@ final class ReceiverWindowController: NSObject, NSWindowDelegate {
     }
 
     func windowWillClose(_ notification: Notification) {
+        userDismissedWindow = true
         canvas.releaseAllInputs()
+        client?.forceReleaseLocalKvm()
         if !isControlPanelVisible {
             NSApp.setActivationPolicy(.accessory)
         }

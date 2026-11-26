@@ -70,6 +70,7 @@
 #include <chrono>
 #include <condition_variable>
 #include <memory>
+#include <functional>
 
 #pragma comment(lib, "ws2_32.lib")
 #pragma comment(lib, "psapi.lib")
@@ -396,6 +397,9 @@ static const UINT WM_APP_REMOTE_CURSOR = WM_APP + 3;
 static const UINT WM_APP_CURSOR_VIS = WM_APP + 4;
 // 投屏状态/最小化/开关变化：UI 线程据此更新 SetThreadExecutionState 防熄屏锁
 static const UINT WM_APP_UPDATE_POWER = WM_APP + 6;
+// 二次启动唤醒或后台任务完成通知 UI 线程
+static const UINT WM_APP_SHOW_PANEL = WM_APP + 12;
+static const UINT WM_APP_HOST_ACTION_DONE = WM_APP + 13;
 // 保持屏幕常亮（防止投屏期间因无 Windows 本地输入而自动熄屏）
 static std::atomic<bool> g_keepScreenOn{true};
 // 老 SDK 的 winuser.h 可能没定义 WM_DPICHANGED（需要 WINVER >= 0x0603）
@@ -817,11 +821,10 @@ static void SleepAlive(int ms) {
 }
 
 // ---------------------------------------------------------------------------
-// 系统托盘：全屏置顶无边框窗口没有关闭按钮，唯一退出口是 Esc。
-// 加一个托盘小图标，让「退出」永远点得到，不用盲敲命令。
-//   - 左键单击托盘图标 = 直接退出
-//   - 右键 = 菜单（退出 / 全屏·窗口切换 / 关于）
-//   - 全局热键 Ctrl+Alt+Q = 兜底强退（连托盘都被盖住时）
+// 系统托盘：提供控制面板、模式切换与安全退出入口。
+//   - 左键单击托盘图标 = 打开/前置控制面板（与 Mac 菜单栏一致，防误触退出）
+//   - 右键 = 快捷菜单（控制面板 / 投递盒 / 角色与扩展镜像切换 / 退出）
+//   - 全局热键 Ctrl+Alt+Q = 兜底安全退出（双端统一）
 // ---------------------------------------------------------------------------
 static const UINT WM_TRAY      = WM_USER + 1;   // Shell_NotifyIcon 回调消息
 static const UINT ID_TRAY_EXIT = 1001;
@@ -832,8 +835,9 @@ static const UINT ID_TRAY_PANEL = 1005;
 static const UINT ID_TRAY_DROPBOX = 1006;
 static const UINT ID_TRAY_MODE = 1007;
 static const UINT ID_TRAY_KVM  = 1008;
+static const UINT ID_TRAY_DISP_MODE = 1009;
 static const int  HOTKEY_QUIT_ID = 1;
-static const int  HOTKEY_HIDE_ID = 2;   // Ctrl+Alt+H：最小化让位/还原，不退出
+static const int  HOTKEY_HIDE_ID = 2;   // Ctrl+Alt+H：接收端最小化让位 / 主控端隐藏或显示面板
 static const int  HOTKEY_DROPBOX_ID = 3; // Ctrl+Alt+B：一键呼出/隐藏文件投递盒
 static const int  HOTKEY_KVM_ID = 4;     // Ctrl+Alt+K：主机模式切换 KVM 键鼠穿透到 Mac
 // 用 W 版托盘结构与宽字符提示：A 版在 CP936 下会把 UTF-8 中文按 GBK 解码，
@@ -875,10 +879,10 @@ static void TrayCreate(HWND hwnd) {
     // lstrcpynW 来自 windows.h，保证按缓冲区截断并以 L'\0' 结尾，
     // MinGW / MSVC 都可用，不用 strcpy_s 这类 MSVC 扩展。
     lstrcpynW(g_nid.szTip,
-              L"SecDisplay - 左键退出 / 右键菜单 / Ctrl+Alt+Q 强退",
+              L"SecDisplay - 左键控制面板 / 右键菜单 / Ctrl+Alt+Q 退出",
               (int)(sizeof(g_nid.szTip) / sizeof(g_nid.szTip[0])));
     g_trayAdded = Shell_NotifyIconW(NIM_ADD, &g_nid) == TRUE;
-    if (!g_trayAdded) Log("托盘图标添加失败（不影响 Esc / 热键退出）");
+    if (!g_trayAdded) Log("托盘图标添加失败（不影响热键与面板退出）");
 }
 
 static void TrayRemove() {
@@ -889,6 +893,10 @@ static void TrayRemove() {
 }
 
 static std::atomic<bool> g_hostMode{ false };
+static std::atomic<bool> g_hostMirrorMode{ false };
+static std::atomic<bool> g_hostActionBusy{ false };
+static std::mutex        g_hostActionMtx;
+static std::thread       g_hostActionThread;
 static std::atomic<bool> g_switchRoleRequested{ false };
 static std::atomic<bool> g_switchRoleToHost{ false };
 static HANDLE g_instMutex = nullptr;
@@ -896,8 +904,11 @@ static std::string g_activeCfgPath;
 static bool g_useConfigFile = true;
 static std::vector<std::string> g_preservedArgs;
 
-// 前向声明：主控模式切换与托盘菜单联动
+// 前向声明：主控模式切换、显示模式切换、配置写回与面板切换
 static void SwitchAppMode(bool toHostMode);
+static void SwitchHostDisplayMode(bool mirrorMode);
+static bool SaveConfigKey(const std::string& key, const std::string& value);
+static void ToggleControlPanelVisibility();
 
 static void TrayShowMenu(HWND hwnd) {
     POINT pt{};
@@ -905,11 +916,13 @@ static void TrayShowMenu(HWND hwnd) {
     HMENU menu = CreatePopupMenu();
     if (!menu) return;
     // W 版菜单 + 宽字符：绕开 CP936 对 UTF-8 中文的 GBK 误解码
-    AppendMenuW(menu, MF_STRING, ID_TRAY_PANEL, L"控制面板");
+    AppendMenuW(menu, MF_STRING, ID_TRAY_PANEL, L"打开控制面板");
     AppendMenuW(menu, MF_STRING, ID_TRAY_DROPBOX, L"文件投递盒（悬浮窗）  (Ctrl+Alt+B)");
     AppendMenuW(menu, MF_STRING, ID_TRAY_MODE,
-                g_hostMode.load() ? L"切到副屏模式 (接收 Mac 画面)" : L"切到主控模式 (Mac 当 Windows 副屏)");
+                g_hostMode.load() ? L"切换：Windows 当副屏 (接收 Mac)" : L"切换：Mac 当副屏 (本机主控)");
     if (g_hostMode.load()) {
+        AppendMenuW(menu, MF_STRING, ID_TRAY_DISP_MODE,
+                    g_hostMirrorMode.load() ? L"显示方式：切为扩展屏幕" : L"显示方式：切为镜像主屏");
         AppendMenuW(menu, MF_STRING, ID_TRAY_KVM,
                     g_winHost.IsKvmActive() ? L"退出键鼠穿透 Mac  (Ctrl+Alt+K)" : L"键鼠穿透控制 Mac  (Ctrl+Alt+K)");
     } else {
@@ -920,11 +933,12 @@ static void TrayShowMenu(HWND hwnd) {
     AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
     AppendMenuW(menu, MF_STRING, ID_TRAY_ABOUT,  L"关于 SecDisplay");
     AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
-    AppendMenuW(menu, MF_STRING | MF_DEFAULT, ID_TRAY_EXIT, L"退出 SecDisplay");
-    // 前置，否则菜单可能被置顶窗口盖住
+    AppendMenuW(menu, MF_STRING | MF_DEFAULT, ID_TRAY_EXIT, L"退出 SecDisplay  (Ctrl+Alt+Q)");
+    // 前置并在菜单关闭后补发 WM_NULL，避免点击菜单外空白处菜单滞留
     SetForegroundWindow(hwnd);
     TrackPopupMenu(menu, TPM_RIGHTBUTTON | TPM_BOTTOMALIGN,
                    pt.x, pt.y, 0, hwnd, nullptr);
+    PostMessageW(hwnd, WM_NULL, 0, 0);
     DestroyMenu(menu);
 }
 
@@ -2404,13 +2418,22 @@ static RECT g_savedRect{};
 static HWND    g_hintHwnd = nullptr;
 static HBRUSH  g_hintBrush = nullptr;
 static HFONT   g_hintFont = nullptr;
+static int     g_hintFontDpi = 0;
 static const wchar_t* kDefaultHint =
-    L"F11 或 Esc 返回窗口      Ctrl+Alt+H 最小化让位      再按一次 Esc 退出";
+    L"F11 或 Esc 返回窗口      Ctrl+Alt+H 最小化让位      Ctrl+Alt+Q 安全退出";
 static const wchar_t* g_hintText = kDefaultHint;
 static const UINT     WM_APP_HIDE_HINT = WM_APP + 1;
 static const UINT     WM_APP_SHOW_STATUS = WM_APP + 5;
 static const wchar_t* g_pendingStatus = nullptr;
 static const UINT_PTR TIMER_HINT_HIDE  = 3;
+
+static int HintTargetDpi() {
+    HMODULE u32 = GetModuleHandleA("user32.dll");
+    typedef UINT (WINAPI *GetDpiForWindowFn)(HWND);
+    auto fw = u32 ? (GetDpiForWindowFn)GetProcAddress(u32, "GetDpiForWindow") : nullptr;
+    int dpi = (fw && g_hwnd) ? (int)fw(g_hwnd) : 96;
+    return dpi >= 96 ? dpi : 96;
+}
 
 static LRESULT CALLBACK HintWndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
     if (m == WM_PAINT) {
@@ -2420,8 +2443,9 @@ static LRESULT CALLBACK HintWndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
         SetBkMode(dc, TRANSPARENT);
         SetTextColor(dc, RGB(255, 255, 255));
         HFONT old = (HFONT)SelectObject(dc, g_hintFont ? g_hintFont : GetStockObject(DEFAULT_GUI_FONT));
-        RECT tr = rc; tr.left += 18; tr.right -= 18;
-        DrawTextW(dc, g_hintText, -1, &tr, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
+        int pad = MulDiv(16, HintTargetDpi(), 96);
+        RECT tr = rc; tr.left += pad; tr.right -= pad;
+        DrawTextW(dc, g_hintText, -1, &tr, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS | DT_NOPREFIX);
         SelectObject(dc, old);
         EndPaint(h, &ps);
         return 0;
@@ -2436,11 +2460,18 @@ static void HideFullscreenHint() {
 
 static void ShowFullscreenHint() {
     if (!g_hwnd) return;
-    if (!g_hintHwnd) {
-        g_hintBrush = CreateSolidBrush(RGB(18, 18, 18));
-        g_hintFont = CreateFontW(-26, 0, 0, 0, FW_SEMIBOLD, FALSE, FALSE, FALSE,
+    const int dpi = HintTargetDpi();
+    const int hintW = MulDiv(680, dpi, 96);
+    const int hintH = MulDiv(44, dpi, 96);
+    if (!g_hintBrush) g_hintBrush = CreateSolidBrush(RGB(18, 18, 18));
+    if (!g_hintFont || g_hintFontDpi != dpi) {
+        if (g_hintFont) { DeleteObject(g_hintFont); g_hintFont = nullptr; }
+        g_hintFont = CreateFontW(-MulDiv(14, dpi, 72), 0, 0, 0, FW_SEMIBOLD, FALSE, FALSE, FALSE,
             DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
-            CLEARTYPE_QUALITY, DEFAULT_PITCH, L"Microsoft YaHei");
+            CLEARTYPE_QUALITY, DEFAULT_PITCH, L"Microsoft YaHei UI");
+        g_hintFontDpi = dpi;
+    }
+    if (!g_hintHwnd) {
         static bool clsReg = false;
         if (!clsReg) {
             WNDCLASSEXW wc{}; wc.cbSize = sizeof(wc);
@@ -2456,16 +2487,24 @@ static void ShowFullscreenHint() {
             WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_NOACTIVATE,
             L"SecDisplayHint", L"",
             WS_POPUP,
-            0, 0, 920, 60, g_hwnd, nullptr, inst, nullptr);
+            0, 0, hintW, hintH, g_hwnd, nullptr, inst, nullptr);
         if (g_hintHwnd)
             SetLayeredWindowAttributes(g_hintHwnd, 0, 235, LWA_ALPHA);
     }
     if (!g_hintHwnd) return;
     HMONITOR mon = MonitorFromWindow(g_hwnd, MONITOR_DEFAULTTONEAREST);
     MONITORINFO mi{}; mi.cbSize = sizeof(mi);
-    int px = 16, py = 16;
-    if (GetMonitorInfoW(mon, &mi)) { px = mi.rcMonitor.left + 16; py = mi.rcMonitor.top + 16; }
-    SetWindowPos(g_hintHwnd, HWND_TOP, px, py, 920, 60, SWP_SHOWWINDOW | SWP_NOACTIVATE);
+    int margin = MulDiv(16, dpi, 96);
+    int px = margin, py = margin;
+    int w = hintW;
+    if (GetMonitorInfoW(mon, &mi)) {
+        px = mi.rcMonitor.left + margin;
+        py = mi.rcMonitor.top + margin;
+        int maxW = (mi.rcMonitor.right - mi.rcMonitor.left) - margin * 2;
+        if (maxW > 200 && w > maxW) w = maxW;
+    }
+    SetWindowPos(g_hintHwnd, HWND_TOP, px, py, w, hintH, SWP_SHOWWINDOW | SWP_NOACTIVATE);
+    InvalidateRect(g_hintHwnd, nullptr, FALSE);
     SetTimer(g_hwnd, TIMER_HINT_HIDE, 5000, nullptr);   // 5 秒后自动隐藏
 }
 
@@ -2604,6 +2643,10 @@ static const int IDC_PANEL_MBPS_50   = 2039;
 static const int IDC_PANEL_MBPS_80   = 2040;
 static const int IDC_PANEL_VDD_RETRY = 2041;
 static const int IDC_PANEL_KVM       = 2042;
+static const int IDC_PANEL_ROLE_WIN    = 2043;
+static const int IDC_PANEL_ROLE_MAC    = 2044;
+static const int IDC_PANEL_DISP_EXTEND = 2045;
+static const int IDC_PANEL_DISP_MIRROR = 2046;
 
 static std::atomic<int> g_hostReqW{2880};
 static std::atomic<int> g_hostReqH{1800};
@@ -3056,9 +3099,9 @@ static Graphics* g_gfx = nullptr;
 // 无操作就会自动息屏。必须在 UI 主线程调用 SetThreadExecutionState 声明保持常亮，
 // 并在断连、最小化或取消勾选时由同一线程释放。
 static void UpdateExecutionState() {
-    const bool active = g_keepScreenOn.load() &&
-                        g_sock.load() != INVALID_SOCKET &&
-                        g_hwnd && !IsIconic(g_hwnd);
+    const bool active = g_hostMode.load()
+        ? (g_keepScreenOn.load() && g_winHost.IsRunning())
+        : (g_keepScreenOn.load() && g_sock.load() != INVALID_SOCKET && g_hwnd && !IsIconic(g_hwnd));
     static bool applied = false;
     if (active) {
         SetThreadExecutionState(ES_CONTINUOUS | ES_DISPLAY_REQUIRED | ES_SYSTEM_REQUIRED);
@@ -3075,7 +3118,10 @@ static void UpdateExecutionState() {
     }
 }
 
-// 实时读取窗口所在显示器的 DPI，不再静态永久缓存（跨屏拖动可正确重排）
+static const int kPanelLogicalW = 960;
+static const int kPanelLogicalH = 736;
+
+// 实时读取窗口所在显示器的有效 DPI，并在高缩放小屏上按工作区高度自动收敛，避免面板底部被裁切
 static int PanelWindowDpi(HWND h) {
     HMODULE u32 = GetModuleHandleA("user32.dll");
     typedef UINT (WINAPI *GetDpiForWindowFn)(HWND);
@@ -3084,9 +3130,30 @@ static int PanelWindowDpi(HWND h) {
     auto fs = (GetDpiForSystemFn)GetProcAddress(u32, "GetDpiForSystem");
     int dpi = 0;
     if (fw && h) dpi = (int)fw(h);
-    if (dpi <= 0 && fw && g_hwnd) dpi = (int)fw(g_hwnd);
+    if (dpi <= 0 && fw && g_hwnd && !g_hostMode.load()) dpi = (int)fw(g_hwnd);
     if (dpi <= 0 && fs) dpi = (int)fs();
-    return dpi > 0 ? dpi : 96;
+    if (dpi <= 0) dpi = 96;
+
+    RECT wa{};
+    if (h) {
+        HMONITOR mon = MonitorFromWindow(h, MONITOR_DEFAULTTONEAREST);
+        MONITORINFO mi{}; mi.cbSize = sizeof(mi);
+        if (GetMonitorInfoW(mon, &mi)) wa = mi.rcWork;
+    }
+    if (wa.right <= wa.left || wa.bottom <= wa.top) {
+        SystemParametersInfoW(SPI_GETWORKAREA, 0, &wa, 0);
+    }
+    if (wa.right > wa.left && wa.bottom > wa.top) {
+        int availW = (wa.right - wa.left) - 32;
+        int availH = (wa.bottom - wa.top) - 64;
+        if (availW > 320 && availH > 320) {
+            int maxDpiW = MulDiv(availW, 96, kPanelLogicalW);
+            int maxDpiH = MulDiv(availH, 96, kPanelLogicalH);
+            int cap = std::min(maxDpiW, maxDpiH);
+            if (cap >= 72 && dpi > cap) dpi = cap;
+        }
+    }
+    return dpi >= 72 ? dpi : 96;
 }
 
 static int DpiPx(int logicalPx, int dpi) {
@@ -3256,17 +3323,22 @@ static void RequestKeyframe() {
 }
 
 static void OpenConfigFile() {
-    char exe[MAX_PATH] = {};
-    DWORD n = GetModuleFileNameA(nullptr, exe, MAX_PATH);
-    std::string dir = ".";
-    if (n > 0 && n < MAX_PATH) {
-        std::string p(exe, n);
-        size_t pos = p.find_last_of("\\/");
-        if (pos != std::string::npos) dir = p.substr(0, pos);
+    std::string cfg = g_activeCfgPath;
+    if (cfg.empty()) {
+        char exe[MAX_PATH] = {};
+        DWORD n = GetModuleFileNameA(nullptr, exe, MAX_PATH);
+        std::string dir = ".";
+        if (n > 0 && n < MAX_PATH) {
+            std::string p(exe, n);
+            size_t pos = p.find_last_of("\\/");
+            if (pos != std::string::npos) dir = p.substr(0, pos);
+        }
+        cfg = dir + "\\config.ini";
     }
-    std::string cfg = dir + "\\config.ini";
     std::wstring target = ToWide(cfg.c_str(), (int)cfg.size());
     if (GetFileAttributesA(cfg.c_str()) == INVALID_FILE_ATTRIBUTES) {
+        size_t pos = cfg.find_last_of("\\/");
+        std::string dir = (pos != std::string::npos) ? cfg.substr(0, pos) : ".";
         std::wstring wd = ToWide(dir.c_str(), (int)dir.size());
         ShellExecuteW(nullptr, L"open", wd.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
         return;
@@ -3309,18 +3381,19 @@ static void CopyDiagnostics() {
         }
         ULONGLONG hStart = hs.connStartTick.load();
         unsigned long long hUp = (hs.clientConnected.load() && hStart) ? (GetTickCount64() - hStart) / 1000 : 0;
-        bool vddOk = g_winHost.VddActive();
+        bool mirrorMode = g_hostMirrorMode.load();
+        bool srcOk = g_winHost.CaptureSourceReady();
         std::string hostErr;
         {
             std::lock_guard<std::mutex> lk(hs.infoMtx);
             hostErr = hs.lastError;
         }
         swprintf(buf, 2048,
-            L"SecDisplay 诊断（主控发送端 Win→Mac）\r\n"
+            L"SecDisplay 诊断（主控发送端 Win→Mac · %s）\r\n"
             L"状态: %s\r\n"
-            L"虚拟屏(VDD): %s%hs%s%hs\r\n"
+            L"画面源: %s%hs%s%hs\r\n"
             L"Mac 副屏: %hs\r\n"
-            L"虚拟屏分辨率: %dx%d @ %dHz\r\n"
+            L"推流分辨率: %dx%d @ %dHz\r\n"
             L"连接时长: %llu 秒\r\n"
             L"帧率: %.1f fps  码率: %.1f Mbps (当前 %d / 目标 %d Mbps)\r\n"
             L"编码耗时: %.2f ms  失败: %llu  围栏超时: %llu  丢弃: %llu\r\n"
@@ -3329,8 +3402,9 @@ static void CopyDiagnostics() {
             L"进程内存: 工作集 %.0f MB / 私有 %.0f MB\r\n"
             L"日志: %hs\r\n"
             L"程序: %hs",
+            mirrorMode ? L"镜像主屏" : L"扩展屏幕",
             hs.clientConnected.load() ? L"已连接" : L"尝试连接 Mac 副屏",
-            vddOk ? L"已挂载" : L"未就绪",
+            mirrorMode ? (srcOk ? L"Windows 物理主屏" : L"主屏未就绪") : (srcOk ? L"Parsec VDD 已挂载" : L"Parsec VDD 未就绪"),
             hostErr.empty() ? "" : " (",
             hostErr.empty() ? L"" : ToWide(hostErr.c_str(), (int)hostErr.size()).c_str(),
             hostErr.empty() ? "" : ")",
@@ -3430,27 +3504,37 @@ static void UpdateControlPanel() {
         g_uiMbps.store(mbps);
 
         bool connected = hs.clientConnected.load();
-        bool vddOk = g_winHost.VddActive();
+        bool mirrorMode = g_hostMirrorMode.load();
+        bool srcOk = g_winHost.CaptureSourceReady();
+        bool busy = g_hostActionBusy.load();
         bool kvmOn = hs.kvmActive.load();
         ULONGLONG lastTx = hs.lastSentTick.load();
         bool staticIdle = connected && sentF > 0 && lastTx > 0 && (GetTickCount64() - lastTx > 1500ULL);
         bool streaming = connected && sentF > 0;
-        if (!vddOk) {
+        if (busy) {
+            g_panelData.state = 1;
+            g_panelData.statusText = mirrorMode ? L"正在切换至镜像主屏…" : L"正在切换虚拟屏配置…";
+        } else if (!srcOk) {
             g_panelData.state = 3;
-            g_panelData.statusText = L"虚拟屏异常 · 请检查 Parsec VDD 或点击重挂";
+            g_panelData.statusText = mirrorMode
+                ? L"主屏采集未就绪 · 点击重新检测主屏"
+                : L"虚拟屏异常 · 请检查 Parsec VDD 或点击重挂";
         } else if (kvmOn) {
             g_panelData.state = 2;
             g_panelData.statusText = L"KVM 穿透中 · 键鼠正控制 Mac (Ctrl+Alt+K 退出)";
         } else if (streaming) {
             g_panelData.state = 2;
-            g_panelData.statusText = staticIdle ? L"主控在线 · 桌面静止省流中" : L"主控发送中 · Mac 副屏在线";
+            g_panelData.statusText = staticIdle
+                ? (mirrorMode ? L"镜像主屏在线 · 桌面静止省流中" : L"扩展主控在线 · 桌面静止省流中")
+                : (mirrorMode ? L"镜像主屏发送中 · Mac 副屏在线" : L"扩展屏幕发送中 · Mac 副屏在线");
         } else if (connected) {
             g_panelData.state = 1;
             g_panelData.statusText = L"Mac 已连接 · 准备推流";
         } else {
             g_panelData.state = 0;
             wchar_t waitBuf[128];
-            swprintf(waitBuf, 128, L"主控待命 · 连接 Mac 副屏 (%d)", g_peerPort);
+            swprintf(waitBuf, 128, L"%s待命 · 连接 Mac 副屏 (%d)",
+                     mirrorMode ? L"镜像主屏" : L"扩展主控", g_peerPort);
             g_panelData.statusText = waitBuf;
         }
 
@@ -3465,7 +3549,7 @@ static void UpdateControlPanel() {
             g_panelData.decoderText = encNameCopy.empty() ? L"--" : encNameCopy;
             errCopy = hs.lastError;
         }
-        if (vddOk && !connected && !errCopy.empty()) {
+        if (srcOk && !connected && !errCopy.empty()) {
             g_panelData.state = 4;
             g_panelData.statusText = ToWide(errCopy.c_str(), (int)errCopy.size());
         }
@@ -3522,9 +3606,13 @@ static void UpdateControlPanel() {
         } else {
             g_panelData.cpuText = L"--";
         }
-        g_panelData.gpuMemText = vddOk ? L"Parsec VDD 已挂载" : L"Parsec VDD 未挂载";
-        g_panelData.keepOnActive = vddOk;
-        g_panelData.keepOnText = vddOk ? L"虚拟屏运行中" : L"虚拟屏未就绪";
+        g_panelData.gpuMemText = mirrorMode
+            ? (srcOk ? L"Windows 物理主屏" : L"主屏未就绪")
+            : (srcOk ? L"Parsec VDD 已挂载" : L"Parsec VDD 未挂载");
+        g_panelData.keepOnActive = srcOk;
+        g_panelData.keepOnText = mirrorMode
+            ? (srcOk ? L"镜像采集中" : L"主屏未就绪")
+            : (srcOk ? L"虚拟屏运行中" : L"虚拟屏未就绪");
         g_panelData.xferConnected = g_xferConnected.load();
         {
             std::lock_guard<std::mutex> lk(g_xferMtx);
@@ -3537,11 +3625,18 @@ static void UpdateControlPanel() {
             size_t startIdx = (total > 4) ? (total - 4) : 0;
             for (size_t i = startIdx; i < total; ++i) g_panelData.recentLogs.push_back(g_recentLogs[i]);
         }
-        SetWindowTextW(GetDlgItem(g_panel, IDC_PANEL_MODE), L"切回副屏模式");
-        SetWindowTextW(GetDlgItem(g_panel, IDC_PANEL_FULL), L"显示设置");
+        SetWindowTextW(GetDlgItem(g_panel, IDC_PANEL_FULL), L"系统显示设置");
         SetWindowTextW(GetDlgItem(g_panel, IDC_PANEL_RECONN), L"断开重连");
+        SetWindowTextW(GetDlgItem(g_panel, IDC_PANEL_VDD_RETRY),
+                       mirrorMode ? L"重检主屏" : L"重挂虚拟屏");
         SetWindowTextW(GetDlgItem(g_panel, IDC_PANEL_KVM),
                        hs.kvmActive.load() ? L"退出穿透 (Ctrl+Alt+K)" : L"键鼠控 Mac (Ctrl+Alt+K)");
+        for (int id : { IDC_PANEL_RES_2880, IDC_PANEL_RES_2560, IDC_PANEL_RES_1920 }) {
+            if (HWND c = GetDlgItem(g_panel, id)) EnableWindow(c, (!mirrorMode && !busy) ? TRUE : FALSE);
+        }
+        for (int id : { IDC_PANEL_DISP_EXTEND, IDC_PANEL_DISP_MIRROR, IDC_PANEL_VDD_RETRY }) {
+            if (HWND c = GetDlgItem(g_panel, id)) EnableWindow(c, !busy ? TRUE : FALSE);
+        }
         InvalidateRect(g_panel, nullptr, FALSE);
         return;
     }
@@ -3719,7 +3814,6 @@ static void UpdateControlPanel() {
         }
     }
 
-    SetWindowTextW(GetDlgItem(g_panel, IDC_PANEL_MODE), L"切到主控(Mac当副屏)");
     SetWindowTextW(GetDlgItem(g_panel, IDC_PANEL_FULL),
                    g_isFullscreen ? L"回到窗口" : L"全屏显示");
     SetWindowTextW(GetDlgItem(g_panel, IDC_PANEL_TOP),
@@ -3820,7 +3914,7 @@ static void PaintControlPanel(HWND h) {
         DeleteObject(db); DeleteObject(dp);
     }
     {
-        RECT rt{ S(58), S(12), S(455), S(56) };
+        RECT rt{ S(58), S(12), S(540), S(56) };
         SelectObject(hdc, g_theme.fontTitle);
         SetTextColor(hdc, titleCol);
         DrawTextW(hdc, g_panelData.statusText.c_str(), -1, &rt,
@@ -3830,14 +3924,43 @@ static void PaintControlPanel(HWND h) {
         std::wstring summary = g_panelData.peerText + L"   ·   " +
                                g_panelData.sizeText + L"   ·   " +
                                g_panelData.uptimeText;
-        RECT rs{ S(455), S(12), S(752), S(56) };
+        RECT rs{ S(545), S(12), S(924), S(56) };
         SelectObject(hdc, g_theme.fontBody);
         SetTextColor(hdc, mutedCol);
         DrawTextW(hdc, summary.c_str(), -1, &rs,
                   DT_RIGHT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
     }
 
-    // 2. 中部三张信息卡片 (y=66, h=228)
+    // 1.5 副屏归属与扩展/镜像选择卡片 (20, 64, 920, 50)
+    DrawPanelCard(hdc, S(20), S(64), S(920), S(50), S(8), cardFill, cardBorder);
+    {
+        RECT rlRole{ S(36), S(64), S(148), S(114) };
+        SelectObject(hdc, g_theme.fontSection);
+        SetTextColor(hdc, titleCol);
+        DrawTextW(hdc, L"哪台当副屏", -1, &rlRole, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
+
+        HPEN sp = CreatePen(PS_SOLID, 1, sepColor);
+        HGDIOBJ op = SelectObject(hdc, sp);
+        MoveToEx(hdc, S(444), S(74), nullptr);
+        LineTo(hdc, S(444), S(104));
+        SelectObject(hdc, op);
+        DeleteObject(sp);
+
+        RECT rlDisp{ S(460), S(64), S(530), S(114) };
+        SelectObject(hdc, g_theme.fontSection);
+        SetTextColor(hdc, titleCol);
+        DrawTextW(hdc, L"显示方式", -1, &rlDisp, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
+
+        if (!g_hostMode.load()) {
+            RECT rlHint{ S(534), S(64), S(924), S(114) };
+            SelectObject(hdc, g_theme.fontBody);
+            SetTextColor(hdc, mutedCol);
+            DrawTextW(hdc, L"当前 Windows 当副屏 · 扩展 / 镜像请在 Mac 控制面板切换",
+                      -1, &rlHint, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
+        }
+    }
+
+    // 2. 中部三张信息卡片 (y=122, h=226)
     auto drawSectionHeader = [&](int x, int y, int w, const wchar_t* title) {
         RECT rt{ x + S(16), y + S(9), x + w - S(16), y + S(32) };
         SelectObject(hdc, g_theme.fontSection);
@@ -3851,17 +3974,17 @@ static void PaintControlPanel(HWND h) {
         DeleteObject(sp);
     };
 
-    // 卡片 1：连接与速率 (20, 66, 286, 228)
-    const int c1x = S(20), c1w = S(286), cy = S(66), chCard = S(228);
+    // 卡片 1：连接与速率 (20, 122, 286, 226)
+    const int c1x = S(20), c1w = S(286), cy = S(122), chCard = S(226);
     DrawPanelCard(hdc, c1x, cy, c1w, chCard, S(8), cardFill, cardBorder);
     drawSectionHeader(c1x, cy, c1w, L"连接与速率");
     {
         int px = c1x + S(16), pw = c1w - S(32), rowY = cy + S(44), step = S(29), rh = S(25);
         const bool hm = g_hostMode.load();
-        const wchar_t* shortSt = g_panelData.state == 2 ? (hm ? L"主控推送中" : L"正在接收")
+        const wchar_t* shortSt = g_panelData.state == 2 ? (hm ? (g_hostMirrorMode.load() ? L"镜像推送中" : L"扩展推送中") : L"正在接收")
                                : (g_panelData.state == 1 ? (hm ? L"准备推流" : L"等待首帧")
                                : (g_panelData.state == 4 ? L"角色/协议冲突"
-                               : (g_panelData.state == 3 ? L"虚拟屏异常"
+                               : (g_panelData.state == 3 ? (g_hostMirrorMode.load() ? L"主屏异常" : L"虚拟屏异常")
                                                          : (hm ? L"主控待命" : L"等待重连"))));
         DrawKVRow(hdc, px, rowY, pw, rh, L"连接状态", shortSt, dotCol);
         DrawKVRow(hdc, px, rowY + step * 1, pw, rh, L"对端地址", g_panelData.peerText.c_str(), valCol);
@@ -3871,7 +3994,7 @@ static void PaintControlPanel(HWND h) {
         DrawKVRow(hdc, px, rowY + step * 5, pw, rh, L"实时码率", g_panelData.mbpsText.c_str(), valCol);
     }
 
-    // 卡片 2：延迟与质量 (320, 66, 292, 228)
+    // 卡片 2：延迟与质量 (320, 122, 292, 226)
     const int c2x = S(320), c2w = S(292);
     DrawPanelCard(hdc, c2x, cy, c2w, chCard, S(8), cardFill, cardBorder);
     drawSectionHeader(c2x, cy, c2w, g_hostMode.load() ? L"编码与输入" : L"延迟与质量");
@@ -3889,7 +4012,7 @@ static void PaintControlPanel(HWND h) {
                   g_panelData.dropWarn ? warnCol : valCol);
     }
 
-    // 卡片 3：硬件与资源 (626, 66, 314, 228)
+    // 卡片 3：硬件与资源 (626, 122, 314, 226)
     const int c3x = S(626), c3w = S(314);
     DrawPanelCard(hdc, c3x, cy, c3w, chCard, S(8), cardFill, cardBorder);
     drawSectionHeader(c3x, cy, c3w, L"硬件与资源");
@@ -3911,16 +4034,16 @@ static void PaintControlPanel(HWND h) {
         int r2 = rowY + S(46), step = S(31);
         DrawKVRow(hdc, px, r2,            pw, rh, L"进程内存", g_panelData.procMemText.c_str(), valCol);
         DrawKVRow(hdc, px, r2 + step * 1, pw, rh, hm ? L"编码管线" : L"CPU 占用", g_panelData.cpuText.c_str(), valCol);
-        DrawKVRow(hdc, px, r2 + step * 2, pw, rh, hm ? L"虚拟副屏" : L"GPU 显存", g_panelData.gpuMemText.c_str(), valCol);
-        DrawKVRow(hdc, px, r2 + step * 3, pw, rh, hm ? L"挂载状态" : L"屏幕常亮", g_panelData.keepOnText.c_str(),
+        DrawKVRow(hdc, px, r2 + step * 2, pw, rh, hm ? (g_hostMirrorMode.load() ? L"画面来源" : L"虚拟副屏") : L"GPU 显存", g_panelData.gpuMemText.c_str(), valCol);
+        DrawKVRow(hdc, px, r2 + step * 3, pw, rh, hm ? L"采集状态" : L"屏幕常亮", g_panelData.keepOnText.c_str(),
                   g_panelData.keepOnActive ? okCol : warnCol);
     }
 
-    // 3. 雷电双向文件中转站卡片 (20, 304, 920, 64)
-    DrawPanelCard(hdc, S(20), S(304), S(920), S(64), S(8), cardFill, cardBorder);
+    // 3. 雷电双向文件中转站卡片 (20, 356, 920, 64)
+    DrawPanelCard(hdc, S(20), S(356), S(920), S(64), S(8), cardFill, cardBorder);
     {
         COLORREF xCol = g_panelData.xferConnected ? okCol : RGB(148, 163, 184);
-        int xd = S(8), xdx = S(36), xdy = S(316) + (S(20) - xd) / 2;
+        int xd = S(8), xdx = S(36), xdy = S(368) + (S(20) - xd) / 2;
         HPEN xpen = CreatePen(PS_SOLID, 1, xCol);
         HBRUSH xbr = CreateSolidBrush(xCol);
         HGDIOBJ op = SelectObject(hdc, xpen), ob = SelectObject(hdc, xbr);
@@ -3928,7 +4051,7 @@ static void PaintControlPanel(HWND h) {
         SelectObject(hdc, ob); SelectObject(hdc, op);
         DeleteObject(xbr); DeleteObject(xpen);
 
-        RECT rxt{ S(52), S(312), S(490), S(336) };
+        RECT rxt{ S(52), S(364), S(490), S(388) };
         SelectObject(hdc, g_theme.fontSection);
         SetTextColor(hdc, titleCol);
         DrawTextW(hdc, g_panelData.xferConnected
@@ -3936,35 +4059,35 @@ static void PaintControlPanel(HWND h) {
                   : L"雷电文件中转站 · 等待连接 (9923)",
                   -1, &rxt, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
 
-        RECT rxs{ S(36), S(337), S(495), S(362) };
+        RECT rxs{ S(36), S(389), S(495), S(414) };
         SelectObject(hdc, g_theme.fontBody);
         SetTextColor(hdc, mutedCol);
         DrawTextW(hdc, g_panelData.xferStatusText.c_str(), -1, &rxs,
                   DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
     }
 
-    // 4. 控制区卡片 (20, 378, 920, 156)
-    DrawPanelCard(hdc, S(20), S(378), S(920), S(156), S(8), cardFill, cardBorder);
+    // 4. 控制区卡片 (20, 428, 920, 156)
+    DrawPanelCard(hdc, S(20), S(428), S(920), S(156), S(8), cardFill, cardBorder);
     {
         HPEN sp = CreatePen(PS_SOLID, 1, sepColor);
         HGDIOBJ op = SelectObject(hdc, sp);
-        MoveToEx(hdc, S(38), S(482), nullptr);
-        LineTo(hdc, S(922), S(482));
+        MoveToEx(hdc, S(38), S(532), nullptr);
+        LineTo(hdc, S(922), S(532));
         SelectObject(hdc, op);
         DeleteObject(sp);
     }
 
-    // 5. 内嵌实时运行日志卡片 (20, 544, 920, 104) —— 替代后台 cmd 黑框
-    DrawPanelCard(hdc, S(20), S(544), S(920), S(104), S(8), cardFill, cardBorder);
+    // 5. 内嵌实时运行日志卡片 (20, 592, 920, 106) —— 替代后台 cmd 黑框
+    DrawPanelCard(hdc, S(20), S(592), S(920), S(106), S(8), cardFill, cardBorder);
     {
-        RECT rlh{ S(36), S(551), S(240), S(573) };
+        RECT rlh{ S(36), S(599), S(240), S(621) };
         SelectObject(hdc, g_theme.fontSection);
         SetTextColor(hdc, titleCol);
         DrawTextW(hdc, L"运行日志（实时）", -1, &rlh, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
 
         if (!g_logPath.empty()) {
             std::wstring wp = ToWide(g_logPath.c_str(), (int)g_logPath.size());
-            RECT rlp{ S(240), S(551), S(924), S(573) };
+            RECT rlp{ S(240), S(599), S(924), S(621) };
             SelectObject(hdc, g_theme.fontSmall);
             SetTextColor(hdc, mutedCol);
             DrawTextW(hdc, wp.c_str(), -1, &rlp, DT_RIGHT | DT_VCENTER | DT_SINGLELINE | DT_PATH_ELLIPSIS);
@@ -3972,19 +4095,19 @@ static void PaintControlPanel(HWND h) {
 
         HPEN sp = CreatePen(PS_SOLID, 1, sepColor);
         HGDIOBJ op = SelectObject(hdc, sp);
-        MoveToEx(hdc, S(36), S(576), nullptr);
-        LineTo(hdc, S(924), S(576));
+        MoveToEx(hdc, S(36), S(624), nullptr);
+        LineTo(hdc, S(924), S(624));
         SelectObject(hdc, op);
         DeleteObject(sp);
 
         SelectObject(hdc, g_theme.fontMono ? g_theme.fontMono : g_theme.fontSmall);
         SetTextColor(hdc, RGB(51, 65, 85));
         if (g_panelData.recentLogs.empty()) {
-            RECT rle{ S(36), S(582), S(924), S(640) };
+            RECT rle{ S(36), S(630), S(924), S(690) };
             DrawTextW(hdc, L"暂无日志输出", -1, &rle, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
         } else {
             for (size_t i = 0; i < g_panelData.recentLogs.size() && i < 4; ++i) {
-                int ly = S(581) + (int)i * S(15);
+                int ly = S(629) + (int)i * S(15);
                 RECT rl{ S(36), ly, S(924), ly + S(15) };
                 DrawTextW(hdc, g_panelData.recentLogs[i].c_str(), -1, &rl,
                           DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS | DT_NOPREFIX);
@@ -3992,13 +4115,15 @@ static void PaintControlPanel(HWND h) {
         }
     }
 
-    // 6. 最底部快捷键提示 (20, 654, 920, 22)
+    // 6. 最底部快捷键提示 (20, 704, 920, 24)
     {
-        RECT rf{ S(20), S(654), S(940), S(676) };
+        RECT rf{ S(20), S(704), S(940), S(728) };
         SelectObject(hdc, g_theme.fontSmall);
         SetTextColor(hdc, mutedCol);
-        DrawTextW(hdc, L"Esc 退出投屏   ·   Ctrl+Alt+H 让位   ·   Ctrl+Alt+B 文件投递盒   ·   F11 切换全屏   ·   拖入文件直传 Mac",
-                  -1, &rf, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+        const wchar_t* footerHint = g_hostMode.load()
+            ? L"Ctrl+Alt+Q 安全退出   ·   Ctrl+Alt+H 显隐面板   ·   Ctrl+Alt+K 键鼠穿透   ·   Ctrl+Alt+B 投递盒   ·   Esc 隐藏面板"
+            : L"Ctrl+Alt+Q 安全退出   ·   F11 全屏切换   ·   全屏按 Esc 返回窗口   ·   Ctrl+Alt+H 让位   ·   Ctrl+Alt+B 投递盒";
+        DrawTextW(hdc, footerHint, -1, &rf, DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
     }
 
     BitBlt(screenDc, 0, 0, cw, ch, hdc, 0, 0, SRCCOPY);
@@ -4014,10 +4139,16 @@ static void DrawPanelButton(const DRAWITEMSTRUCT* dis, int dpi) {
     HDC hdc = dis->hDC;
     RECT rc = dis->rcItem;
     const int id = (int)dis->CtlID;
-    const bool pressed = (dis->itemState & ODS_SELECTED) != 0;
-    const bool hovered = (dis->hwndItem == g_hoverBtn);
+    const bool disabled = (dis->itemState & ODS_DISABLED) != 0;
+    const bool pressed = !disabled && (dis->itemState & ODS_SELECTED) != 0;
+    const bool hovered = !disabled && (dis->hwndItem == g_hoverBtn);
     const bool isExit = (id == IDC_PANEL_EXIT);
     const bool isPrimary = (id == IDC_PANEL_FULL);
+    const bool isSelectedChoice =
+        (id == IDC_PANEL_ROLE_WIN && !g_hostMode.load()) ||
+        (id == IDC_PANEL_ROLE_MAC && g_hostMode.load()) ||
+        (id == IDC_PANEL_DISP_EXTEND && g_hostMode.load() && !g_hostMirrorMode.load()) ||
+        (id == IDC_PANEL_DISP_MIRROR && g_hostMode.load() && g_hostMirrorMode.load());
 
     // 先用白卡底色填充四周死角，避免圆角外露出黑边
     FillRect(hdc, &rc, g_theme.cardBrush);
@@ -4025,7 +4156,11 @@ static void DrawPanelButton(const DRAWITEMSTRUCT* dis, int dpi) {
     COLORREF bg = RGB(248, 250, 252);
     COLORREF bd = RGB(214, 221, 232);
     COLORREF fg = RGB(30, 41, 59);
-    if (isExit) {
+    if (disabled) {
+        bg = RGB(241, 245, 249);
+        bd = RGB(226, 232, 240);
+        fg = RGB(148, 163, 184);
+    } else if (isExit) {
         bg = pressed ? RGB(254, 202, 202) : (hovered ? RGB(254, 226, 226) : RGB(254, 242, 242));
         bd = RGB(252, 165, 165);
         fg = RGB(185, 28, 28);
@@ -4033,6 +4168,10 @@ static void DrawPanelButton(const DRAWITEMSTRUCT* dis, int dpi) {
         bg = pressed ? RGB(29, 78, 216) : (hovered ? RGB(37, 99, 235) : RGB(59, 130, 246));
         bd = bg;
         fg = RGB(255, 255, 255);
+    } else if (isSelectedChoice) {
+        bg = pressed ? RGB(219, 234, 254) : (hovered ? RGB(224, 242, 254) : RGB(239, 246, 255));
+        bd = RGB(37, 99, 235);
+        fg = RGB(29, 78, 216);
     } else {
         if (pressed)      { bg = RGB(226, 232, 240); bd = RGB(148, 163, 184); }
         else if (hovered) { bg = RGB(241, 245, 249); bd = RGB(180, 190, 206); }
@@ -4048,7 +4187,7 @@ static void DrawPanelButton(const DRAWITEMSTRUCT* dis, int dpi) {
                      (float)rad, (float)rad, (float)rad, (float)rad);
     Gdiplus::SolidBrush br(ToGpColor(bg));
     g.FillPath(&br, &path);
-    Gdiplus::Pen pen(ToGpColor(bd), 1.0f);
+    Gdiplus::Pen pen(ToGpColor(bd), isSelectedChoice ? 1.5f : 1.0f);
     g.DrawPath(&pen, &path);
 
     wchar_t text[128] = {};
@@ -4056,7 +4195,11 @@ static void DrawPanelButton(const DRAWITEMSTRUCT* dis, int dpi) {
     SetBkMode(hdc, TRANSPARENT);
     SelectObject(hdc, g_theme.fontValue);
     SetTextColor(hdc, fg);
-    DrawTextW(hdc, text, -1, &rc, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+    RECT tr = rc;
+    int pad = DpiPx(6, dpi);
+    tr.left += pad;
+    tr.right -= pad;
+    DrawTextW(hdc, text, -1, &tr, DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
 }
 
 static void LayoutPanelControls(HWND h) {
@@ -4071,27 +4214,33 @@ static void LayoutPanelControls(HWND h) {
         MoveWindow(c, S(x), S(y), S(w), S(ch), TRUE);
     };
 
-    // 顶部横幅右侧角色切换按钮
-    mv(IDC_PANEL_MODE,       762, 18,  166, 32);
+    // 副屏归属与扩展/镜像选择栏 (y=64..114)
+    mv(IDC_PANEL_ROLE_WIN,    150, 73, 140, 32);
+    mv(IDC_PANEL_ROLE_MAC,    298, 73, 130, 32);
+    const int dispShow = g_hostMode.load() ? SW_SHOW : SW_HIDE;
+    mv(IDC_PANEL_DISP_EXTEND, 534, 73, 186, 32);
+    mv(IDC_PANEL_DISP_MIRROR, 730, 73, 190, 32);
+    if (HWND c = GetDlgItem(h, IDC_PANEL_DISP_EXTEND)) ShowWindow(c, dispShow);
+    if (HWND c = GetDlgItem(h, IDC_PANEL_DISP_MIRROR)) ShowWindow(c, dispShow);
 
     // 中转站右侧按钮（发送文件 / 粘贴截图 / 悬浮盒 / 打开目录）
-    mv(IDC_PANEL_SENDFILE,   504, 319, 108, 34);
-    mv(IDC_PANEL_PASTEXFER,  620, 319, 102, 34);
-    mv(IDC_PANEL_DROPBOX,    730, 319, 94,  34);
-    mv(IDC_PANEL_OPENXFER,   832, 319, 90,  34);
+    mv(IDC_PANEL_SENDFILE,   504, 371, 108, 34);
+    mv(IDC_PANEL_PASTEXFER,  620, 371, 102, 34);
+    mv(IDC_PANEL_DROPBOX,    730, 371, 94,  34);
+    mv(IDC_PANEL_OPENXFER,   832, 371, 90,  34);
 
     // 两行 4 列按钮：卡片宽 920 (20..940)，内边距 18 -> 38..922 (宽 884)，
     // 4 * 210 + 3 * 14 = 882，左右居中
     const int bx[4] = { 39, 263, 487, 711 };
     const int bw = 210, bh = 36;
-    mv(IDC_PANEL_FULL,   bx[0], 392, bw, bh);
-    mv(IDC_PANEL_TOP,    bx[1], 392, bw, bh);
-    mv(IDC_PANEL_KEY,    bx[2], 392, bw, bh);
-    mv(IDC_PANEL_RECONN, bx[3], 392, bw, bh);
-    mv(IDC_PANEL_LOG,    bx[0], 436, bw, bh);
-    mv(IDC_PANEL_CFG,    bx[1], 436, bw, bh);
-    mv(IDC_PANEL_COPY,   bx[2], 436, bw, bh);
-    mv(IDC_PANEL_EXIT,   bx[3], 436, bw, bh);
+    mv(IDC_PANEL_FULL,   bx[0], 442, bw, bh);
+    mv(IDC_PANEL_TOP,    bx[1], 442, bw, bh);
+    mv(IDC_PANEL_KEY,    bx[2], 442, bw, bh);
+    mv(IDC_PANEL_RECONN, bx[3], 442, bw, bh);
+    mv(IDC_PANEL_LOG,    bx[0], 486, bw, bh);
+    mv(IDC_PANEL_CFG,    bx[1], 486, bw, bh);
+    mv(IDC_PANEL_COPY,   bx[2], 486, bw, bh);
+    mv(IDC_PANEL_EXIT,   bx[3], 486, bw, bh);
 
     // 5 个选项开关均匀排在分隔线下方（主控发送模式下隐藏接收端开关，改为展示主控虚拟屏/码率控制）
     const int chkShow = g_hostMode.load() ? SW_HIDE : SW_SHOW;
@@ -4104,20 +4253,63 @@ static void LayoutPanelControls(HWND h) {
         mv(id, x, y, w, ch);
         if (HWND c = GetDlgItem(h, id)) ShowWindow(c, hostShow);
     };
-    mvChk(IDC_PANEL_VSYNC,    39,  494, 130, 28);
-    mvChk(IDC_PANEL_PACE,     185, 494, 130, 28);
-    mvChk(IDC_PANEL_FEEDBACK, 331, 494, 130, 28);
-    mvChk(IDC_PANEL_SHAKE,    477, 494, 165, 28);
-    mvChk(IDC_PANEL_KEEPON,   658, 494, 250, 28);
+    mvChk(IDC_PANEL_VSYNC,    39,  544, 130, 28);
+    mvChk(IDC_PANEL_PACE,     185, 544, 130, 28);
+    mvChk(IDC_PANEL_FEEDBACK, 331, 544, 130, 28);
+    mvChk(IDC_PANEL_SHAKE,    477, 544, 165, 28);
+    mvChk(IDC_PANEL_KEEPON,   658, 544, 250, 28);
 
-    mvHost(IDC_PANEL_RES_2880,  39,  491, 96,  32);
-    mvHost(IDC_PANEL_RES_2560,  143, 491, 96,  32);
-    mvHost(IDC_PANEL_RES_1920,  247, 491, 96,  32);
-    mvHost(IDC_PANEL_MBPS_30,   355, 491, 68,  32);
-    mvHost(IDC_PANEL_MBPS_50,   431, 491, 68,  32);
-    mvHost(IDC_PANEL_MBPS_80,   507, 491, 68,  32);
-    mvHost(IDC_PANEL_VDD_RETRY, 587, 491, 134, 32);
-    mvHost(IDC_PANEL_KVM,       731, 491, 190, 32);
+    mvHost(IDC_PANEL_RES_2880,  39,  541, 88,  32);
+    mvHost(IDC_PANEL_RES_2560,  133, 541, 88,  32);
+    mvHost(IDC_PANEL_RES_1920,  227, 541, 88,  32);
+    mvHost(IDC_PANEL_MBPS_30,   327, 541, 62,  32);
+    mvHost(IDC_PANEL_MBPS_50,   395, 541, 62,  32);
+    mvHost(IDC_PANEL_MBPS_80,   463, 541, 62,  32);
+    mvHost(IDC_PANEL_VDD_RETRY, 537, 541, 118, 32);
+    mvHost(IDC_PANEL_KVM,       663, 541, 258, 32);
+}
+
+static void JoinHostActionThread() {
+    std::thread th;
+    {
+        std::lock_guard<std::mutex> lk(g_hostActionMtx);
+        if (g_hostActionThread.joinable()) th = std::move(g_hostActionThread);
+    }
+    if (th.joinable()) th.join();
+}
+
+static void RunHostAsyncAction(std::function<void()> fn) {
+    if (!g_alive.load()) return;
+    if (g_hostActionBusy.exchange(true)) {
+        Log("控制面板: 正在切换显示配置，请稍候");
+        return;
+    }
+    UpdateControlPanel();
+    JoinHostActionThread();
+    std::lock_guard<std::mutex> lk(g_hostActionMtx);
+    g_hostActionThread = std::thread([fn = std::move(fn)]() {
+        if (g_alive.load()) fn();
+        g_hostActionBusy.store(false);
+        if (g_hwnd && g_alive.load()) PostMessageW(g_hwnd, WM_APP_HOST_ACTION_DONE, 0, 0);
+    });
+}
+
+static void SwitchHostDisplayMode(bool mirrorMode) {
+    if (!g_hostMode.load()) return;
+    if (g_hostMirrorMode.load() == mirrorMode && g_winHost.CaptureSourceReady()) return;
+    g_hostMirrorMode.store(mirrorMode);
+    SaveConfigKey("displaymode", mirrorMode ? "mirror" : "extend");
+    Log("控制面板: 切换主控显示方式 -> %s", mirrorMode ? "镜像主屏" : "扩展屏幕");
+    std::string host = g_peerHost;
+    int w = g_hostReqW.load(), h = g_hostReqH.load();
+    int fps = g_hostReqFps.load(), mbps = g_hostReqMbps.load(), dpi = g_hostReqDpi.load();
+    uint16_t port = (uint16_t)g_peerPort;
+    RunHostAsyncAction([host, w, h, fps, mbps, port, dpi, mirrorMode]() {
+        if (!g_winHost.Start(host, w, h, fps, mbps, port,
+                             [](const char* s) { Log("%s", s); }, dpi, mirrorMode)) {
+            Log("警告: 切换至%s模式失败", mirrorMode ? "镜像主屏" : "扩展屏幕");
+        }
+    });
 }
 
 static LRESULT CALLBACK PanelWndProc(HWND h, UINT msg, WPARAM w, LPARAM l) {
@@ -4148,7 +4340,10 @@ static LRESULT CALLBACK PanelWndProc(HWND h, UINT msg, WPARAM w, LPARAM l) {
             return c;
         };
 
-        mkBtn(g_hostMode.load() ? L"切回副屏模式" : L"切到主控(Mac当副屏)", IDC_PANEL_MODE);
+        mkBtn(L"Windows 当副屏", IDC_PANEL_ROLE_WIN);
+        mkBtn(L"Mac 当副屏", IDC_PANEL_ROLE_MAC);
+        mkBtn(L"扩展屏幕 (独立副屏)", IDC_PANEL_DISP_EXTEND);
+        mkBtn(L"镜像主屏 (同步主屏)", IDC_PANEL_DISP_MIRROR);
         mkBtn(L"发送文件", IDC_PANEL_SENDFILE);
         mkBtn(L"粘贴发送", IDC_PANEL_PASTEXFER);
         mkBtn(L"悬浮盒", IDC_PANEL_DROPBOX);
@@ -4213,17 +4408,32 @@ static LRESULT CALLBACK PanelWndProc(HWND h, UINT msg, WPARAM w, LPARAM l) {
         }
         return FALSE;
     case WM_DPICHANGED: {
+        const int realDpi = PanelWindowDpi(h);
+        DWORD style = (DWORD)GetWindowLongPtrW(h, GWL_STYLE);
+        DWORD exStyle = (DWORD)GetWindowLongPtrW(h, GWL_EXSTYLE);
+        RECT r2{ 0, 0, DpiPx(kPanelLogicalW, realDpi), DpiPx(kPanelLogicalH, realDpi) };
+        AdjustRectDpi(&r2, style, exStyle, realDpi);
         const RECT* suggested = (const RECT*)l;
-        if (suggested) {
-            SetWindowPos(h, nullptr, suggested->left, suggested->top,
-                         suggested->right - suggested->left,
-                         suggested->bottom - suggested->top,
-                         SWP_NOZORDER | SWP_NOACTIVATE);
-        }
+        int x = suggested ? suggested->left : 0;
+        int y = suggested ? suggested->top : 0;
+        SetWindowPos(h, nullptr, x, y,
+                     r2.right - r2.left, r2.bottom - r2.top,
+                     SWP_NOZORDER | SWP_NOACTIVATE | (suggested ? 0 : SWP_NOMOVE));
         LayoutPanelControls(h);
         InvalidateRect(h, nullptr, FALSE);
         return 0;
     }
+    case WM_KEYDOWN:
+        if (w == VK_ESCAPE) {
+            KillTimer(h, 1);
+            ShowWindow(h, SW_HIDE);
+            return 0;
+        }
+        if (w == 'Q' && (GetKeyState(VK_CONTROL) & 0x8000) && !(GetKeyState(VK_SHIFT) & 0x8000)) {
+            RequestQuit();
+            return 0;
+        }
+        break;
     case WM_TIMER:
         if (w == 1) UpdateControlPanel();
         return 0;
@@ -4261,6 +4471,18 @@ static LRESULT CALLBACK PanelWndProc(HWND h, UINT msg, WPARAM w, LPARAM l) {
             ShellExecuteW(nullptr, L"open", dir.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
             return 0;
         }
+        case IDC_PANEL_ROLE_WIN:
+            if (g_hostMode.load()) SwitchAppMode(false);
+            return 0;
+        case IDC_PANEL_ROLE_MAC:
+            if (!g_hostMode.load()) SwitchAppMode(true);
+            return 0;
+        case IDC_PANEL_DISP_EXTEND:
+            SwitchHostDisplayMode(false);
+            return 0;
+        case IDC_PANEL_DISP_MIRROR:
+            SwitchHostDisplayMode(true);
+            return 0;
         case IDC_PANEL_MODE:
             SwitchAppMode(!g_hostMode.load());
             return 0;
@@ -4287,27 +4509,37 @@ static LRESULT CALLBACK PanelWndProc(HWND h, UINT msg, WPARAM w, LPARAM l) {
             return 0;
         }
         case IDC_PANEL_RES_2880:
-            if (g_hostMode.load()) {
+            if (g_hostMode.load() && !g_hostMirrorMode.load()) {
                 g_hostReqW = 2880; g_hostReqH = 1800;
-                g_winHost.SetResolution(2880, 1800, g_hostReqFps.load());
+                SaveConfigKey("hostwidth", "2880");
+                SaveConfigKey("hostheight", "1800");
+                int fps = g_hostReqFps.load();
+                RunHostAsyncAction([fps]() { g_winHost.SetResolution(2880, 1800, fps); });
             }
             return 0;
         case IDC_PANEL_RES_2560:
-            if (g_hostMode.load()) {
+            if (g_hostMode.load() && !g_hostMirrorMode.load()) {
                 g_hostReqW = 2560; g_hostReqH = 1600;
-                g_winHost.SetResolution(2560, 1600, g_hostReqFps.load());
+                SaveConfigKey("hostwidth", "2560");
+                SaveConfigKey("hostheight", "1600");
+                int fps = g_hostReqFps.load();
+                RunHostAsyncAction([fps]() { g_winHost.SetResolution(2560, 1600, fps); });
             }
             return 0;
         case IDC_PANEL_RES_1920:
-            if (g_hostMode.load()) {
+            if (g_hostMode.load() && !g_hostMirrorMode.load()) {
                 g_hostReqW = 1920; g_hostReqH = 1200;
-                g_winHost.SetResolution(1920, 1200, g_hostReqFps.load());
+                SaveConfigKey("hostwidth", "1920");
+                SaveConfigKey("hostheight", "1200");
+                int fps = g_hostReqFps.load();
+                RunHostAsyncAction([fps]() { g_winHost.SetResolution(1920, 1200, fps); });
             }
             return 0;
         case IDC_PANEL_MBPS_30:
             if (g_hostMode.load()) {
                 g_hostReqMbps = 30;
                 g_winHost.SetTargetMbps(30);
+                SaveConfigKey("bitrate", "30");
                 Log("控制面板: 调整主控目标码率 -> 30 Mbps");
             }
             return 0;
@@ -4315,6 +4547,7 @@ static LRESULT CALLBACK PanelWndProc(HWND h, UINT msg, WPARAM w, LPARAM l) {
             if (g_hostMode.load()) {
                 g_hostReqMbps = 50;
                 g_winHost.SetTargetMbps(50);
+                SaveConfigKey("bitrate", "50");
                 Log("控制面板: 调整主控目标码率 -> 50 Mbps");
             }
             return 0;
@@ -4322,18 +4555,26 @@ static LRESULT CALLBACK PanelWndProc(HWND h, UINT msg, WPARAM w, LPARAM l) {
             if (g_hostMode.load()) {
                 g_hostReqMbps = 80;
                 g_winHost.SetTargetMbps(80);
+                SaveConfigKey("bitrate", "80");
                 Log("控制面板: 调整主控目标码率 -> 80 Mbps");
             }
             return 0;
         case IDC_PANEL_VDD_RETRY:
             if (g_hostMode.load()) {
-                Log("控制面板: 请求重挂 Parsec 虚拟屏并重启主控推送");
-                if (!g_winHost.Start(g_peerHost, g_hostReqW.load(), g_hostReqH.load(),
-                                     g_hostReqFps.load(), g_hostReqMbps.load(),
-                                     (uint16_t)g_peerPort, [](const char* s) { Log("%s", s); },
-                                     g_hostReqDpi.load())) {
-                    Log("警告: 重挂 Parsec 虚拟屏仍失败，请检查驱动是否安装");
-                }
+                bool mirror = g_hostMirrorMode.load();
+                Log(mirror ? "控制面板: 请求重新检测物理主屏并重启镜像推流"
+                           : "控制面板: 请求重挂 Parsec 虚拟屏并重启主控推送");
+                std::string host = g_peerHost;
+                int rw = g_hostReqW.load(), rh = g_hostReqH.load();
+                int fps = g_hostReqFps.load(), mbps = g_hostReqMbps.load(), dpi = g_hostReqDpi.load();
+                uint16_t port = (uint16_t)g_peerPort;
+                RunHostAsyncAction([host, rw, rh, fps, mbps, port, dpi, mirror]() {
+                    if (!g_winHost.Start(host, rw, rh, fps, mbps, port,
+                                         [](const char* s) { Log("%s", s); }, dpi, mirror)) {
+                        Log(mirror ? "警告: 重新检测物理主屏失败"
+                                   : "警告: 重挂 Parsec 虚拟屏仍失败，请检查驱动是否安装");
+                    }
+                });
             }
             return 0;
         case IDC_PANEL_KVM:
@@ -4375,19 +4616,23 @@ static LRESULT CALLBACK PanelWndProc(HWND h, UINT msg, WPARAM w, LPARAM l) {
         case IDC_PANEL_VSYNC:
             g_vsyncEnabled = (SendMessageW((HWND)l, BM_GETCHECK, 0, 0) == BST_CHECKED);
             if (g_presenter) g_presenter->setUseVsync(g_vsyncEnabled.load());
+            SaveConfigKey("vsync", g_vsyncEnabled.load() ? "1" : "0");
             Log("控制面板: 垂直同步 %s", g_vsyncEnabled.load() ? "开" : "关");
             return 0;
         case IDC_PANEL_PACE:
             g_paceEnabled = (SendMessageW((HWND)l, BM_GETCHECK, 0, 0) == BST_CHECKED);
+            SaveConfigKey("pace", g_paceEnabled.load() ? "1" : "0");
             Log("控制面板: 抖动缓冲 %s", g_paceEnabled.load() ? "开" : "关");
             return 0;
         case IDC_PANEL_FEEDBACK:
             g_feedbackEnabled = (SendMessageW((HWND)l, BM_GETCHECK, 0, 0) == BST_CHECKED);
+            SaveConfigKey("feedback", g_feedbackEnabled.load() ? "1" : "0");
             Log("控制面板: 反馈 %s", g_feedbackEnabled.load() ? "开" : "关");
             return 0;
         case IDC_PANEL_SHAKE: {
             bool on = (SendMessageW((HWND)l, BM_GETCHECK, 0, 0) == BST_CHECKED);
             g_shakeEnabled = on;
+            SaveConfigKey("shake", on ? "1" : "0");
             if (!on) {
                 // 关掉时立刻收起放大叠加层并复位动画：
                 // 只杀定时器不复位叠加层会留下一张冻结的放大光标，同时系统光标仍是隐藏句柄。
@@ -4399,6 +4644,7 @@ static LRESULT CALLBACK PanelWndProc(HWND h, UINT msg, WPARAM w, LPARAM l) {
         case IDC_PANEL_KEEPON: {
             bool on = (SendMessageW((HWND)l, BM_GETCHECK, 0, 0) == BST_CHECKED);
             g_keepScreenOn = on;
+            SaveConfigKey("keepon", on ? "1" : "0");
             if (g_hwnd) PostMessageW(g_hwnd, WM_APP_UPDATE_POWER, 0, 0);
             UpdateControlPanel();
             Log("控制面板: 保持屏幕常亮 %s", on ? "开" : "关");
@@ -4420,7 +4666,9 @@ static LRESULT CALLBACK PanelWndProc(HWND h, UINT msg, WPARAM w, LPARAM l) {
 
 static void ShowControlPanel() {
     if (g_panel) {
-        ShowWindow(g_panel, SW_SHOW);
+        if (IsIconic(g_panel)) ShowWindow(g_panel, SW_RESTORE);
+        else ShowWindow(g_panel, SW_SHOW);
+        SetTimer(g_panel, 1, 1000, nullptr);
         SetForegroundWindow(g_panel);
         UpdateControlPanel();
         return;
@@ -4444,7 +4692,7 @@ static void ShowControlPanel() {
 
     const int dpi = PanelWindowDpi(nullptr);
     DWORD style = WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX | WS_CLIPCHILDREN;
-    RECT rc{ 0, 0, DpiPx(960, dpi), DpiPx(680, dpi) };
+    RECT rc{ 0, 0, DpiPx(kPanelLogicalW, dpi), DpiPx(kPanelLogicalH, dpi) };
     AdjustRectDpi(&rc, style, WS_EX_APPWINDOW, dpi);
     int w = rc.right - rc.left;
     int hgt = rc.bottom - rc.top;
@@ -4459,7 +4707,7 @@ static void ShowControlPanel() {
         // 创建后校准一次真实所在屏幕 DPI，避免多屏 DPI 不同时窗口外框与内绘比例错配
         const int realDpi = PanelWindowDpi(g_panel);
         if (realDpi != dpi) {
-            RECT r2{ 0, 0, DpiPx(960, realDpi), DpiPx(680, realDpi) };
+            RECT r2{ 0, 0, DpiPx(kPanelLogicalW, realDpi), DpiPx(kPanelLogicalH, realDpi) };
             AdjustRectDpi(&r2, style, WS_EX_APPWINDOW, realDpi);
             SetWindowPos(g_panel, nullptr, 0, 0, r2.right - r2.left, r2.bottom - r2.top,
                          SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE);
@@ -4471,6 +4719,47 @@ static void ShowControlPanel() {
         UpdateControlPanel();
     } else {
         Log("控制面板创建失败 %lu", GetLastError());
+    }
+}
+
+static bool HandlePanelLoopHotkey(const MSG& msg) {
+    if (msg.message != WM_KEYDOWN && msg.message != WM_SYSKEYDOWN) return false;
+    HWND act = GetActiveWindow();
+    HWND hp = g_panel.load();
+    HWND db = g_dropBox.load();
+    const bool inPanel = (act && hp && (act == hp || IsChild(hp, act)));
+    const bool inDrop = (act && db && (act == db || IsChild(db, act)));
+    if (!inPanel && !inDrop) return false;
+    const bool ctrl = (GetKeyState(VK_CONTROL) & 0x8000) != 0;
+    const bool alt = (GetKeyState(VK_MENU) & 0x8000) != 0;
+    const bool shift = (GetKeyState(VK_SHIFT) & 0x8000) != 0;
+    const bool repeat = (msg.lParam & 0x40000000) != 0;
+    if (msg.wParam == 'V' && ctrl && !alt && !shift) {
+        PasteClipboardToTransfer(act);
+        return true;
+    }
+    if (inPanel && msg.wParam == VK_ESCAPE && !ctrl && !alt && !shift) {
+        if (!repeat) {
+            KillTimer(hp, 1);
+            ShowWindow(hp, SW_HIDE);
+        }
+        return true;
+    }
+    if (inPanel && msg.wParam == 'Q' && ctrl && !shift) {
+        if (!repeat) RequestQuit();
+        return true;
+    }
+    return false;
+}
+
+static void ToggleControlPanelVisibility() {
+    HWND hp = g_panel.load();
+    if (hp && IsWindowVisible(hp) && !IsIconic(hp)) {
+        KillTimer(hp, 1);
+        ShowWindow(hp, SW_HIDE);
+        Log("控制面板已隐藏（可按 Ctrl+Alt+H 或单击托盘图标重新打开）");
+    } else {
+        ShowControlPanel();
     }
 }
 
@@ -6044,6 +6333,15 @@ static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
     case WM_APP_UPDATE_POWER:
         UpdateExecutionState();
         return 0;
+    case WM_APP_SHOW_PANEL:
+        if (!g_hostMode.load() && IsIconic(h)) ShowWindow(h, SW_RESTORE);
+        ShowControlPanel();
+        return 0;
+    case WM_APP_HOST_ACTION_DONE:
+        if (g_panel) LayoutPanelControls(g_panel);
+        UpdateControlPanel();
+        UpdateExecutionState();
+        return 0;
     case WM_APP_SET_CLIP_TEXT: {
         std::deque<PendingClipText> batch;
         {
@@ -6121,9 +6419,9 @@ static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
                     g_resumeRetryCount = 0;
                     SetTimer(h, TIMER_RESUME_HOST, 1500, nullptr);
                 } else if (w == PBT_APMRESUMESUSPEND) {
-                    if (g_winHost.IsRunning() && g_winHost.VddActive()) {
+                    if (g_winHost.IsRunning() && g_winHost.CaptureSourceReady()) {
                         g_winHost.OnDisplayChange(true);
-                    } else {
+                    } else if (!g_hostMirrorMode.load()) {
                         secdisplay::WinVirtualDisplay::EnsureInternalPanelAwake([](const char* s) { Log("%s", s); });
                     }
                 }
@@ -6140,9 +6438,9 @@ static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
                 DWORD lidOpen = *reinterpret_cast<const DWORD*>(pbs->Data);
                 Log("电源事件: 笔记本合盖开关状态变化 -> %s", lidOpen ? "已开盖" : "已合盖");
                 if (lidOpen && g_hostMode.load()) {
-                    if (g_winHost.IsRunning() && g_winHost.VddActive()) {
+                    if (g_winHost.IsRunning() && g_winHost.CaptureSourceReady()) {
                         g_winHost.OnDisplayChange(true);
-                    } else {
+                    } else if (!g_hostMirrorMode.load()) {
                         secdisplay::WinVirtualDisplay::EnsureInternalPanelAwake([](const char* s) { Log("%s", s); });
                     }
                 }
@@ -6237,16 +6535,17 @@ static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
     case WM_TRAY:
         // 托盘图标的鼠标事件（lParam = 具体消息）
         if (LOWORD(l) == WM_LBUTTONUP) {
-            RequestQuit();                 // 左键：直接退出
+            ShowControlPanel();            // 左键：打开/前置控制面板（防误触退出）
         } else if (LOWORD(l) == WM_RBUTTONUP) {
             TrayShowMenu(h);               // 右键：菜单
         }
         return 0;
     case WM_COMMAND:
         switch (LOWORD(w)) {
-        case ID_TRAY_PANEL:   ShowControlPanel(); return 0;
-        case ID_TRAY_DROPBOX: ShowDropBoxWindow(); return 0;
-        case ID_TRAY_MODE:    SwitchAppMode(!g_hostMode.load()); return 0;
+        case ID_TRAY_PANEL:     ShowControlPanel(); return 0;
+        case ID_TRAY_DROPBOX:   ShowDropBoxWindow(); return 0;
+        case ID_TRAY_MODE:      SwitchAppMode(!g_hostMode.load()); return 0;
+        case ID_TRAY_DISP_MODE: SwitchHostDisplayMode(!g_hostMirrorMode.load()); return 0;
         case ID_TRAY_KVM:
             if (g_hostMode.load()) {
                 g_winHost.ToggleKvm();
@@ -6261,18 +6560,23 @@ static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
         case ID_TRAY_ABOUT:
             MessageBoxW(h,
                 L"SecDisplay\n"
-                L"左键托盘图标 或 Ctrl+Alt+Q 退出\n"
-                L"Ctrl+Alt+H 最小化让位 / 还原（不退出）\n"
-                L"Ctrl+Alt+B 一键呼出 / 隐藏悬浮文件投递盒\n"
-                L"F11 切换全屏 / 窗口\n"
-                L"Esc 也可退出",
+                L"左键托盘图标：打开控制面板\n"
+                L"Ctrl+Alt+Q：全局安全退出（与 Mac 端 Ctrl+Opt+Q 统一）\n"
+                L"Alt+F4：关闭窗口退出\n"
+                L"F11 / 全屏按 Esc：切换全屏 / 返回窗口\n"
+                L"Ctrl+Alt+H：接收端最小化让位 / 主控端显隐控制面板\n"
+                L"Ctrl+Alt+B：呼出 / 隐藏悬浮文件投递盒\n"
+                L"Ctrl+Alt+K：主控端键鼠穿透控制 Mac",
                 L"关于 SecDisplay", MB_OK | MB_ICONINFORMATION);
             return 0;
         }
         return 0;
     case WM_HOTKEY:
         if (w == HOTKEY_QUIT_ID) RequestQuit();
-        else if (w == HOTKEY_HIDE_ID) ToggleMinimize();
+        else if (w == HOTKEY_HIDE_ID) {
+            if (g_hostMode.load()) ToggleControlPanelVisibility();
+            else ToggleMinimize();
+        }
         else if (w == HOTKEY_DROPBOX_ID) ToggleDropBoxWindow();
         else if (w == HOTKEY_KVM_ID && g_hostMode.load()) {
             g_winHost.ToggleKvm();
@@ -6285,22 +6589,32 @@ static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
     case WM_SYSKEYUP: {
         const bool down = (m == WM_KEYDOWN || m == WM_SYSKEYDOWN);
         const bool sysKey = (m == WM_SYSKEYDOWN || m == WM_SYSKEYUP);
-        // lParam bit30 = 前一次状态已按下，用来识别系统自动重复。
-        // 不区分的话按住 Esc 会先退出全屏、再被重复事件当成「再按一次」而直接退出进程。
         const bool repeat = (l & 0x40000000) != 0;
-        // 本地快捷键只保留「退出」和「全屏」两个，且不转发，避免误触。
-        // 原来还有 'F' 切全屏——键盘转发接入后按 F 会把远端画面放大，已移除。
-        // 按下与抬起必须成对消费：只吞 keyDown 会向 Mac 投出无配对的 keyUp。
+        // 本地快捷键优先处理且成对消费，避免向 Mac 发出无配对的 keyUp。
+        // 窗口模式下 Esc 不再强杀进程，而是透传给 Mac；全屏时按 Esc 返回窗口。
+        static bool s_escConsumedLocal = false;
         if (w == VK_ESCAPE) {
-            if (down && !repeat) {
-                if (g_isFullscreen) ExitFullscreen(); else RequestQuit();
+            if (down) {
+                if (g_isFullscreen) {
+                    s_escConsumedLocal = true;
+                    if (!repeat) ExitFullscreen();
+                    return 0;
+                }
+                if (s_escConsumedLocal) return 0;
+            } else if (s_escConsumedLocal) {
+                s_escConsumedLocal = false;
+                return 0;
             }
-            return 0;
         }
         if (w == VK_F11) {
             if (down && !repeat) {
                 if (g_isFullscreen) ExitFullscreen(); else EnterFullscreen();
             }
+            return 0;
+        }
+        // 即使全局 Ctrl+Alt+Q 被其他软件占用，窗口聚焦时仍兜底响应安全退出
+        if (w == 'Q' && (GetKeyState(VK_CONTROL) & 0x8000) && (GetKeyState(VK_MENU) & 0x8000)) {
+            if (down && !repeat) RequestQuit();
             return 0;
         }
         // Alt+F4 交给系统走 SC_CLOSE。本分支接管了 WM_SYSKEYDOWN，若直接 return 0
@@ -6476,11 +6790,15 @@ struct RunConfig {
     bool pace = false;        // --pace：1~3 帧抖动缓冲，按自适应节拍上屏，抹平源端小抖动
     bool feedback = false;    // --feedback：每 2 秒向 Mac 回传 0x07 健康度，供自适应码率环使用
     bool hostMode = false;    // --mode sender：Windows 作为主控发送端（Mac 当副屏）
+    bool hostMirror = false;  // --mirror / displaymode=mirror：主控端镜像本机物理主屏
     int hostWidth = 2880;     // 主控虚拟屏宽（默认 2880x1800 匹配 Retina 16:10 清晰度，不与 receiver 的 1600x1000 混淆）
     int hostHeight = 1800;    // 主控虚拟屏高
     int hostFps = 60;         // 主控发送帧率上限
     int hostBitrateMbps = 50; // 主控发送目标码率（Mbps，PeakConstrainedVBR）
     int hostDpi = 0;          // 虚拟屏独立 DPI 缩放百分比（0=跟随系统，100..300）
+    bool shake = true;        // 晃动找光标开关
+    bool keepScreenOn = true; // 投屏期间保持屏幕常亮
+    bool showPanelOnStart = true; // 启动时自动显示控制面板（--no-panel 可关闭）
     int waitLockMs = 0;       // 角色切换重启时等待旧实例释放单实例锁的毫秒数
     std::string logFile;      // 非空则同时写日志文件
 };
@@ -6509,6 +6827,24 @@ static void ParseArgs(int argc, char** argv, RunConfig& cfg) {
             cfg.hostMode = true;
         } else if (a == "--receiver") {
             cfg.hostMode = false;
+        } else if (a == "--mirror") {
+            cfg.hostMirror = true;
+        } else if (a == "--extend") {
+            cfg.hostMirror = false;
+        } else if (a == "--display-mode" && i + 1 < argc) {
+            std::string dm = argv[++i];
+            std::transform(dm.begin(), dm.end(), dm.begin(), [](unsigned char c) { return (char)std::tolower(c); });
+            if (dm == "mirror" || dm == "clone" || dm == "1") cfg.hostMirror = true;
+            else if (dm == "extend" || dm == "0") cfg.hostMirror = false;
+            else Log("警告: 未知 --display-mode 参数 %s，保持默认扩展模式", dm.c_str());
+        } else if (a == "--no-panel") {
+            cfg.showPanelOnStart = false;
+        } else if (a == "--panel") {
+            cfg.showPanelOnStart = true;
+        } else if (a == "--no-shake") {
+            cfg.shake = false;
+        } else if (a == "--no-keepon") {
+            cfg.keepScreenOn = false;
         } else if (a == "--mode" && i + 1 < argc) {
             std::string m = argv[++i];
             std::transform(m.begin(), m.end(), m.begin(), [](unsigned char c) { return (char)std::tolower(c); });
@@ -6629,45 +6965,92 @@ static void LoadConfigFile(RunConfig& cfg, const std::string& path) {
             std::string mv = val;
             std::transform(mv.begin(), mv.end(), mv.begin(), [](unsigned char c) { return (char)std::tolower(c); });
             cfg.hostMode = (mv == "sender" || mv == "host" || mv == "1");
+        } else if (key == "displaymode") {
+            std::string dv = val;
+            std::transform(dv.begin(), dv.end(), dv.begin(), [](unsigned char c) { return (char)std::tolower(c); });
+            cfg.hostMirror = (dv == "mirror" || dv == "clone" || dv == "1");
         } else if (key == "hostwidth") cfg.hostWidth = atoi(val.c_str());
         else if (key == "hostheight") cfg.hostHeight = atoi(val.c_str());
         else if (key == "fps") cfg.hostFps = atoi(val.c_str());
         else if (key == "bitrate") cfg.hostBitrateMbps = atoi(val.c_str());
         else if (key == "hostdpi") cfg.hostDpi = atoi(val.c_str());
+        else if (key == "shake") cfg.shake = Truthy(val);
+        else if (key == "keepon") cfg.keepScreenOn = Truthy(val);
+        else if (key == "showpanel") cfg.showPanelOnStart = Truthy(val);
         else continue;
         ++applied;
     }
     Log("已读取配置 %s（%d 项）", path.c_str(), applied);
 }
 
-static void SaveModeToConfigFile(bool toHostMode) {
-    if (!g_useConfigFile) return;
+static bool SaveConfigKey(const std::string& key, const std::string& value) {
+    if (!g_useConfigFile) return false;
+    static std::mutex s_cfgMtx;
+    std::lock_guard<std::mutex> lk(s_cfgMtx);
     std::string cfgPath = g_activeCfgPath.empty() ? (ExeDir() + "\\config.ini") : g_activeCfgPath;
+    std::string keyLow = key;
+    std::transform(keyLow.begin(), keyLow.end(), keyLow.begin(),
+                   [](unsigned char c) { return (char)std::tolower(c); });
     std::vector<std::string> lines;
     bool replaced = false;
     {
         std::ifstream fin(cfgPath);
         if (fin) {
             std::string ln;
+            bool firstLine = true;
             while (std::getline(fin, ln)) {
-                std::string t = TrimStr(ln);
-                std::string low = t;
-                std::transform(low.begin(), low.end(), low.begin(),
-                               [](unsigned char c) { return (char)std::tolower(c); });
-                if (low.rfind("mode=", 0) == 0 || low.rfind("mode ", 0) == 0) {
-                    lines.push_back(toHostMode ? "mode=sender" : "mode=receiver");
-                    replaced = true;
-                } else {
-                    lines.push_back(ln);
+                std::string check = ln;
+                if (firstLine && check.size() >= 3 &&
+                    (unsigned char)check[0] == 0xEF &&
+                    (unsigned char)check[1] == 0xBB &&
+                    (unsigned char)check[2] == 0xBF) {
+                    check.erase(0, 3);
                 }
+                firstLine = false;
+                std::string t = TrimStr(check);
+                if (!t.empty() && t[0] != '#' && t[0] != ';') {
+                    size_t eq = t.find('=');
+                    if (eq != std::string::npos) {
+                        std::string k = TrimStr(t.substr(0, eq));
+                        std::transform(k.begin(), k.end(), k.begin(),
+                                       [](unsigned char c) { return (char)std::tolower(c); });
+                        if (k == keyLow) {
+                            lines.push_back(keyLow + "=" + value);
+                            replaced = true;
+                            continue;
+                        }
+                    }
+                }
+                lines.push_back(ln);
             }
         }
     }
-    if (!replaced) lines.push_back(toHostMode ? "mode=sender" : "mode=receiver");
-    std::ofstream fout(cfgPath, std::ios::trunc);
-    if (fout) {
+    if (!replaced) lines.push_back(keyLow + "=" + value);
+    std::string tmpPath = cfgPath + ".tmp";
+    {
+        std::ofstream fout(tmpPath, std::ios::trunc | std::ios::binary);
+        if (!fout) {
+            std::ofstream direct(cfgPath, std::ios::trunc | std::ios::binary);
+            if (!direct) return false;
+            for (const auto& l : lines) direct << l << "\n";
+            return direct.good();
+        }
         for (const auto& l : lines) fout << l << "\n";
+        fout.flush();
+        if (!fout.good()) return false;
     }
+    if (!MoveFileExA(tmpPath.c_str(), cfgPath.c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
+        DeleteFileA(tmpPath.c_str());
+        std::ofstream direct(cfgPath, std::ios::trunc | std::ios::binary);
+        if (!direct) return false;
+        for (const auto& l : lines) direct << l << "\n";
+        return direct.good();
+    }
+    return true;
+}
+
+static void SaveModeToConfigFile(bool toHostMode) {
+    SaveConfigKey("mode", toHostMode ? "sender" : "receiver");
 }
 
 static void LaunchSelfForModeSwitch(bool toHostMode) {
@@ -8263,9 +8646,9 @@ int main(int argc, char** argv) {
         } else if (a == "--no-config") {
             useConfigFile = false;
             g_preservedArgs.push_back(a);
-        } else if (a == "--sender" || a == "--host" || a == "--receiver") {
+        } else if (a == "--sender" || a == "--host" || a == "--receiver" || a == "--mirror" || a == "--extend") {
             continue;
-        } else if ((a == "--mode" || a == "--wait-lock") && i + 1 < argc) {
+        } else if ((a == "--mode" || a == "--display-mode" || a == "--wait-lock") && i + 1 < argc) {
             ++i;
             continue;
         } else {
@@ -8279,7 +8662,7 @@ int main(int argc, char** argv) {
 
     // 单实例。旧实例被新实例踢掉后收流线程退出、交换链停止 Present，
     // 窗口会永久停在最后一帧，看起来就像「显示的是别的屏」。
-    // 这里直接拒绝第二个实例，并把已有窗口提到前台（角色切换重启时短暂等待旧实例释放锁）。
+    // 这里直接拒绝第二个实例，并唤醒已有实例的控制面板（角色切换重启时短暂等待旧实例释放锁）。
     {
         int waited = 0;
         for (;;) {
@@ -8288,11 +8671,13 @@ int main(int argc, char** argv) {
             if (g_instMutex) { CloseHandle(g_instMutex); g_instMutex = nullptr; }
             if (waited >= cfg.waitLockMs) {
                 HWND existing = FindWindowA("SecDisplayReceiver", nullptr);
-                if (existing) { ShowWindow(existing, SW_RESTORE); SetForegroundWindow(existing); }
+                if (existing) {
+                    PostMessageW(existing, WM_APP_SHOW_PANEL, 0, 0);
+                }
                 if (cfg.waitLockMs > 0) {
                     Log("等待旧实例释放互斥锁超时 (%d ms)，本次启动退出", cfg.waitLockMs);
                 } else {
-                    Log("已有 SecDisplay 实例在运行，本次启动退出");
+                    Log("已有 SecDisplay 实例在运行，已唤醒控制面板");
                 }
                 return 0;
             }
@@ -8309,10 +8694,14 @@ int main(int argc, char** argv) {
     }
 
     g_hostMode = cfg.hostMode;
+    g_hostMirrorMode = cfg.hostMirror;
+    g_shakeEnabled = cfg.shake;
+    g_keepScreenOn = cfg.keepScreenOn;
     Log(cfg.hostMode ? "================ SecDisplay 主控发送端 (Win→Mac) ================"
                      : "================ SecDisplay 接收端 ================");
     if (cfg.hostMode) {
-        Log("模式: 主控发送  端口 %d/%d  虚拟屏 %dx%d@%dHz  码率 %dMbps",
+        Log("模式: 主控发送（%s）  端口 %d/%d  目标尺寸 %dx%d@%dHz  码率 %dMbps",
+            cfg.hostMirror ? "镜像主屏" : "扩展屏幕",
             cfg.port, cfg.port + 1, cfg.hostWidth, cfg.hostHeight, cfg.hostFps, cfg.hostBitrateMbps);
     } else {
         Log("目标 %s:%d  分辨率 %dx%d  %s  重连 %s",
@@ -8364,13 +8753,14 @@ int main(int argc, char** argv) {
 
         TrayCreate(hwnd);
         RegisterHotKey(hwnd, HOTKEY_QUIT_ID, MOD_CONTROL | MOD_ALT, 'Q');
+        RegisterHotKey(hwnd, HOTKEY_HIDE_ID, MOD_CONTROL | MOD_ALT, 'H');
         RegisterHotKey(hwnd, HOTKEY_DROPBOX_ID, MOD_CONTROL | MOD_ALT, 'B');
         RegisterHotKey(hwnd, HOTKEY_KVM_ID, MOD_CONTROL | MOD_ALT, 'K');
         static const GUID kGuidLidSwitchHost = {
             0xBA3E0F4D, 0xB817, 0x4094, { 0xA2, 0xD1, 0xD5, 0x63, 0x79, 0xE6, 0xA0, 0xF3 }
         };
         HPOWERNOTIFY hPowerLid = RegisterPowerSettingNotification(hwnd, &kGuidLidSwitchHost, DEVICE_NOTIFY_WINDOW_HANDLE);
-        SetThreadExecutionState(ES_CONTINUOUS | ES_SYSTEM_REQUIRED | ES_DISPLAY_REQUIRED);
+        UpdateExecutionState();
         CheckWindowsLidPowerPolicy();
 
         g_hostReqW = cfg.hostWidth;
@@ -8380,26 +8770,18 @@ int main(int argc, char** argv) {
         g_hostReqDpi = cfg.hostDpi;
 
         if (!g_winHost.Start(cfg.host, cfg.hostWidth, cfg.hostHeight, cfg.hostFps, cfg.hostBitrateMbps,
-                             (uint16_t)cfg.port, [](const char* s) { Log("%s", s); }, cfg.hostDpi)) {
-            Log("警告: 主控发送端启动失败（检查 Parsec VDD 驱动是否就绪）");
+                             (uint16_t)cfg.port, [](const char* s) { Log("%s", s); }, cfg.hostDpi, cfg.hostMirror)) {
+            Log(cfg.hostMirror
+                ? "警告: 主控镜像启动失败（检查物理主屏 DXGI 采集状态）"
+                : "警告: 主控发送端启动失败（检查 Parsec VDD 驱动是否就绪）");
         }
+        UpdateExecutionState();
         std::thread xfer(TransferLoop, cfg);
-        ShowControlPanel();
+        if (cfg.showPanelOnStart) ShowControlPanel();
 
         MSG msg;
         while (GetMessage(&msg, nullptr, 0, 0)) {
-            if (msg.message == WM_KEYDOWN && msg.wParam == 'V' &&
-                (GetKeyState(VK_CONTROL) & 0x8000) &&
-                !(GetKeyState(VK_MENU) & 0x8000) &&
-                !(GetKeyState(VK_SHIFT) & 0x8000)) {
-                HWND act = GetActiveWindow();
-                HWND hp = g_panel.load();
-                HWND db = g_dropBox.load();
-                if (act && (act == hp || act == db || (hp && IsChild(hp, act)))) {
-                    PasteClipboardToTransfer(act);
-                    continue;
-                }
-            }
+            if (HandlePanelLoopHotkey(msg)) continue;
             TranslateMessage(&msg);
             DispatchMessage(&msg);
         }
@@ -8410,9 +8792,11 @@ int main(int argc, char** argv) {
         if (hPowerLid) UnregisterPowerSettingNotification(hPowerLid);
         TrayRemove();
         UnregisterHotKey(hwnd, HOTKEY_QUIT_ID);
+        UnregisterHotKey(hwnd, HOTKEY_HIDE_ID);
         UnregisterHotKey(hwnd, HOTKEY_DROPBOX_ID);
         UnregisterHotKey(hwnd, HOTKEY_KVM_ID);
         g_alive = false;
+        JoinHostActionThread();
         g_winHost.Stop();
         g_xferCv.notify_all();
         {
@@ -8526,12 +8910,12 @@ int main(int argc, char** argv) {
     // 窗口模式标题含中文，用 W 版单独设，绕开 A 版在 CP936 下的 GBK 误解码。
     // 全屏标题 "SecDisplay" 是纯 ASCII，保持 CreateWindowExA 传入的值即可。
     if (!cfg.fullscreen) {
-        SetWindowTextW(hwnd, L"SecDisplay - 按标题栏最大化或 F11 全屏放大 / Ctrl+Alt+H 让位 / Esc 退出");
+        SetWindowTextW(hwnd, L"SecDisplay - F11 或最大化全屏 / Ctrl+Alt+H 让位 / Ctrl+Alt+Q 退出");
     }
 
     // 系统托盘小图标 + 全局热键
     TrayCreate(hwnd);
-    // Ctrl+Alt+Q 兜底强退；注册失败也不影响托盘和 Esc
+    // Ctrl+Alt+Q 兜底安全退出（双端统一）；注册失败时窗口聚焦仍可响应
     if (!RegisterHotKey(hwnd, HOTKEY_QUIT_ID, MOD_CONTROL | MOD_ALT, 'Q')) {
         Log("全局热键 Ctrl+Alt+Q 注册失败（可能已被占用）");
     }
@@ -8543,7 +8927,7 @@ int main(int argc, char** argv) {
     if (!RegisterHotKey(hwnd, HOTKEY_DROPBOX_ID, MOD_CONTROL | MOD_ALT, 'B')) {
         Log("全局热键 Ctrl+Alt+B 注册失败（可能已被占用）");
     }
-    Log("退出方式: 窗口模式按 Esc / 左键托盘图标 / 右键菜单 / Ctrl+Alt+Q；全屏时 Esc 先回窗口");
+    Log("退出方式: Ctrl+Alt+Q / Alt+F4 / 右键托盘菜单 / 控制面板退出（左键托盘打开面板，窗口模式 Esc 透传给 Mac）");
     Log("让位方式: Ctrl+Alt+H 最小化/还原，或托盘菜单；窗口可 Alt-Tab、可 Win+M 最小化");
     Log("放大方式: 点标题栏最大化按钮 / F11 / Win+向上键，均切换整屏放大；不置顶、可随时让位");
     Log("输入回传: 鼠标移动约 120Hz 合并发送，按键/滚轮即时");
@@ -8681,22 +9065,12 @@ int main(int argc, char** argv) {
 
     std::thread net(NetworkLoop, cfg, &gfx, &presenter);
     std::thread xfer(TransferLoop, cfg);
+    if (cfg.showPanelOnStart) ShowControlPanel();
 
     MSG msg;
     while (GetMessage(&msg, nullptr, 0, 0)) {
-        // 控制面板或悬浮投递盒处于激活态时，拦截纯 Ctrl+V 一键发送剪贴板截图/文件
-        if (msg.message == WM_KEYDOWN && msg.wParam == 'V' &&
-            (GetKeyState(VK_CONTROL) & 0x8000) &&
-            !(GetKeyState(VK_MENU) & 0x8000) &&
-            !(GetKeyState(VK_SHIFT) & 0x8000)) {
-            HWND act = GetActiveWindow();
-            HWND hp = g_panel.load();
-            HWND db = g_dropBox.load();
-            if (act && (act == hp || act == db || (hp && IsChild(hp, act)))) {
-                PasteClipboardToTransfer(act);
-                continue;
-            }
-        }
+        // 控制面板或悬浮投递盒处于激活态时，拦截快捷键（Ctrl+V 粘贴发送 / Esc 隐藏面板 / Ctrl+Q 退出）
+        if (HandlePanelLoopHotkey(msg)) continue;
         TranslateMessage(&msg);
         DispatchMessage(&msg);
     }
@@ -8735,6 +9109,7 @@ int main(int argc, char** argv) {
     if (net.joinable()) net.join();
     if (xfer.joinable()) xfer.join();
     if (inputThread.joinable()) inputThread.join();
+    JoinHostActionThread();
     HWND panelToDestroy = g_panel.exchange(nullptr);
     if (panelToDestroy) { DestroyWindow(panelToDestroy); }
     HWND dbToDestroy = g_dropBox.exchange(nullptr);

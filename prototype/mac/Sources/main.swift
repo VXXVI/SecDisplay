@@ -442,12 +442,17 @@ enum MirrorGuard {
     nonisolated(unsafe) private static var lastAttempt: CFAbsoluteTime = 0
 
     /// 记下要守护的虚拟屏，并挂上显示重配置回调（只挂一次）。
+    /// id == 0 时仅注册显示重配置回调（用于镜像主屏模式监听主屏分辨率变化，不干预镜像关系）。
     static func install(_ id: CGDirectDisplayID) {
         target = id
         guard !registered else { return }
         registered = true
         CGDisplayRegisterReconfigurationCallback(mirrorReconfigCallback, nil)
-        Log.info("镜像守护: 已接管虚拟屏 id=\(id)，建屏后与每次显示重配置都会检查镜像关系")
+        if id != 0 {
+            Log.info("镜像守护: 已接管虚拟屏 id=\(id)，建屏后与每次显示重配置都会检查镜像关系")
+        } else {
+            Log.info("显示重配置监听已启用（镜像主屏模式，不干预系统镜像关系）")
+        }
     }
 
     /// 解除与虚拟屏相关的镜像关系：
@@ -1385,19 +1390,26 @@ final class ScreenshotCapture {
                 Log.info("采集启动已取消或被新代次接管，放弃本次启动")
                 return
             }
-            guard content.displays.contains(where: { isOurVirtualDisplay($0.displayID) }) else {
+            let targetID = displayIDProvider()
+            let matched = content.displays.contains(where: { d in
+                appDisplayMode == .mirror ? (d.displayID == targetID || d.displayID == CGMainDisplayID()) : isOurVirtualDisplay(d.displayID)
+            })
+            guard matched else {
                 let avail = content.displays.map {
                     String(format: "id=%u vendor=0x%x", $0.displayID, CGDisplayVendorNumber($0.displayID))
                 }
+                let label = appDisplayMode == .mirror ? "主屏" : "SecDisplay 虚拟屏"
                 throw NSError(domain: "Capture", code: 1, userInfo: [
-                    NSLocalizedDescriptionKey: "找不到 SecDisplay 虚拟屏，当前: \(avail.joined(separator: ", "))"
+                    NSLocalizedDescriptionKey: "找不到目标\(label)，当前: \(avail.joined(separator: ", "))"
                 ])
             }
         } else {
-            let vdID = displayIDProvider()
-            guard vdID != 0, isOurVirtualDisplay(vdID), CGDisplayBounds(vdID).width > 1 else {
+            let targetID = displayIDProvider()
+            let idOk = appDisplayMode == .mirror ? (targetID != 0) : (targetID != 0 && isOurVirtualDisplay(targetID))
+            guard idOk, CGDisplayBounds(targetID).width > 1 else {
+                let label = appDisplayMode == .mirror ? "主屏" : "SecDisplay 虚拟屏"
                 throw NSError(domain: "Capture", code: 1, userInfo: [
-                    NSLocalizedDescriptionKey: "找不到有效的 SecDisplay 虚拟屏 id=\(vdID)"
+                    NSLocalizedDescriptionKey: "找不到有效的\(label) id=\(targetID)"
                 ])
             }
         }
@@ -1774,8 +1786,14 @@ final class ScreenshotCapture {
                         continue
                     }
                 } else {
+                    let targetID = displayIDProvider()
+                    let matchDisplay: (SCDisplay) -> Bool = { disp in
+                        appDisplayMode == .mirror
+                            ? (disp.displayID == targetID || disp.displayID == CGMainDisplayID())
+                            : isOurVirtualDisplay(disp.displayID)
+                    }
                     let content = try await currentContent()
-                    let foundDisplay = content.displays.first(where: { isOurVirtualDisplay($0.displayID) })
+                    let foundDisplay = content.displays.first(where: matchDisplay)
                     let d: SCDisplay
                     if let existing = foundDisplay {
                         d = existing
@@ -1789,7 +1807,7 @@ final class ScreenshotCapture {
                             return false
                         }
                         if shouldRefresh,
-                           let refreshed = try await currentContent(forceRefresh: true).displays.first(where: { isOurVirtualDisplay($0.displayID) }) {
+                           let refreshed = try await currentContent(forceRefresh: true).displays.first(where: matchDisplay) {
                             d = refreshed
                         } else {
                             try? await Task.sleep(nanoseconds: 200_000_000)
@@ -4902,6 +4920,34 @@ nonisolated(unsafe) var appRole: SecDisplayRole = {
     return .sender
 }()
 
+nonisolated(unsafe) var appDisplayMode: SecDisplayDisplayMode = {
+    let args = CommandLine.arguments
+    if args.contains("--mirror") { return .mirror }
+    if args.contains("--extend") { return .extend }
+    if let i = args.firstIndex(of: "--display-mode"), i + 1 < args.count {
+        let m = args[i + 1].lowercased()
+        if m == "mirror" || m == "clone" { return .mirror }
+        if m == "extend" || m == "extended" { return .extend }
+    }
+    if let env = ProcessInfo.processInfo.environment["SECDISPLAY_DISPLAY_MODE"]?.lowercased() {
+        if env == "mirror" || env == "clone" { return .mirror }
+        if env == "extend" || env == "extended" { return .extend }
+    }
+    if let saved = UserDefaults.standard.string(forKey: "SecDisplayDisplayMode"),
+       let d = SecDisplayDisplayMode(rawValue: saved) {
+        return d
+    }
+    return .extend
+}()
+
+private let suppressAutoPanelOnLaunch: Bool = {
+    let args = CommandLine.arguments
+    if args.contains("--no-panel") { return true }
+    if ProcessInfo.processInfo.environment["SECDISPLAY_HIDE_PANEL"] == "1" { return true }
+    if ProcessInfo.processInfo.environment["SECDISPLAY_SHOW_PANEL"] == "0" { return true }
+    return false
+}()
+
 nonisolated(unsafe) var winHostAddress: String = {
     let args = CommandLine.arguments
     if let i = args.firstIndex(of: "--host"), i + 1 < args.count {
@@ -4927,8 +4973,11 @@ private let waitLockMs: Int = {
     return 0
 }()
 
+let kShowPanelDistributedNotification = Notification.Name("com.secdisplay.showControlPanel")
+
 // 单实例：两个发送端会各建一块虚拟屏，还会抢 9922 端口，表现为画面来回跳。
 // 用 flock 而不是 pid 文件：锁在进程退出时由内核释放，不存在 pid 被回收后的误判。
+// 重复打开软件时通知已运行实例弹出控制面板，再安全退出。
 do {
     let dir = (NSHomeDirectory() as NSString).appendingPathComponent("Library/Application Support/SecDisplay")
     try? FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true)
@@ -4938,7 +4987,13 @@ do {
         var waited = 0
         while flock(fd, LOCK_EX | LOCK_NB) != 0 {
             if waited >= waitLockMs {
-                Log.info("已有 SecDisplay 实例在运行，本次启动退出。如需重启先结束旧进程。")
+                DistributedNotificationCenter.default().postNotificationName(
+                    kShowPanelDistributedNotification,
+                    object: nil,
+                    userInfo: nil,
+                    deliverImmediately: true
+                )
+                Log.info("已有 SecDisplay 实例在运行，已唤醒其控制面板后退出。")
                 exit(0)
             }
             usleep(50_000)
@@ -5169,11 +5224,47 @@ func currentVideoSizeSnapshot() -> (w: Int, h: Int, lw: Int, lh: Int) {
     return (cfg.width, cfg.height, cfg.logicalWidth, cfg.logicalHeight)
 }
 
+func activeCaptureDisplayID() -> CGDirectDisplayID {
+    if appDisplayMode == .mirror {
+        return CGMainDisplayID()
+    }
+    return vd?.displayID ?? 0
+}
+
+func evenDimension(_ v: Int) -> Int {
+    let clamped = max(320, v)
+    return clamped & ~1
+}
+
 if appRole == .sender {
     let vdInst = VirtualDisplayManager()
+    vd = vdInst
+
+    if appDisplayMode == .mirror {
+        let mainID = CGMainDisplayID()
+        let curMode = CGDisplayCopyDisplayMode(mainID)
+        let rawPW = curMode?.pixelWidth ?? Int(CGDisplayPixelsWide(mainID))
+        let rawPH = curMode?.pixelHeight ?? Int(CGDisplayPixelsHigh(mainID))
+        let rawLW = curMode?.width ?? Int(CGDisplayBounds(mainID).width)
+        let rawLH = curMode?.height ?? Int(CGDisplayBounds(mainID).height)
+        let pw = evenDimension(rawPW > 0 ? rawPW : cfg.width)
+        let ph = evenDimension(rawPH > 0 ? rawPH : cfg.height)
+        let lw = max(320, rawLW > 0 ? rawLW : pw)
+        let lh = max(200, rawLH > 0 ? rawLH : ph)
+        cfg.width = pw
+        cfg.height = ph
+        cfg.logicalWidth = lw
+        cfg.logicalHeight = lh
+        vdBackingScale = Double(pw) / Double(lw)
+        if ProcessInfo.processInfo.environment["SECDISPLAY_MBPS"] == nil && !useSavedMbps {
+            let pixelsPerSec = Double(cfg.width * cfg.height) * cfg.captureHz
+            cfg.bitrateMbps = max(30, min(200, Int(pixelsPerSec * 0.6 / 1_000_000)))
+        }
+        Log.info("镜像主屏模式启动: displayID=\(mainID) \(cfg.width)x\(cfg.height) 逻辑=\(lw)x\(lh) scale=\(String(format: "%.2f", vdBackingScale))")
+    }
+
     let encInst = Encoder(width: cfg.width, height: cfg.height, bitrateMbps: cfg.bitrateMbps, captureHz: cfg.captureHz)
     let sndInst = Sender()
-    vd = vdInst
     encoder = encInst
     gEncoder = encInst
     sender = sndInst
@@ -5189,57 +5280,61 @@ if appRole == .sender {
         sndInst.send(frame: data, isKey: isKey, captureTimeMicros: ts)
     }
 
-    if CommandLine.arguments.contains("--cleanup-orphan")
-        || ProcessInfo.processInfo.environment["SECDISPLAY_CLEANUP_ORPHAN"] == "1" {
-        let residual = listSecDisplays()
-        if !residual.isEmpty {
-            Log.info("启动前发现残留虚拟屏 \(residual.count) 块，执行显示重配置清理")
-            reconfigureDisplays()
+    if appDisplayMode == .extend {
+        if CommandLine.arguments.contains("--cleanup-orphan")
+            || ProcessInfo.processInfo.environment["SECDISPLAY_CLEANUP_ORPHAN"] == "1" {
+            let residual = listSecDisplays()
+            if !residual.isEmpty {
+                Log.info("启动前发现残留虚拟屏 \(residual.count) 块，执行显示重配置清理")
+                reconfigureDisplays()
+            }
         }
-    }
 
-    if LinkMonitor.probe() == false {
-        Log.info("雷雳链路未就绪（\(LinkMonitor.ifName) 无 carrier），最多等 8 秒…")
-        var waited = 0.0
-        while LinkMonitor.probe() == false && waited < 8.0 {
-            usleep(500_000); waited += 0.5
+        if LinkMonitor.probe() == false {
+            Log.info("雷雳链路未就绪（\(LinkMonitor.ifName) 无 carrier），最多等 8 秒…")
+            var waited = 0.0
+            while LinkMonitor.probe() == false && waited < 8.0 {
+                usleep(500_000); waited += 0.5
+            }
+            switch LinkMonitor.probe() {
+            case .some(true):
+                Log.info("雷雳链路已就绪，耗时 \(String(format: "%.1f", waited)) 秒")
+            case .some(false):
+                Log.info("链路仍未就绪，先建屏；接收端连上后仍可用")
+            case .none:
+                Log.info("未找到链路接口 \(LinkMonitor.ifName)，跳过等待")
+            }
         }
-        switch LinkMonitor.probe() {
-        case .some(true):
-            Log.info("雷雳链路已就绪，耗时 \(String(format: "%.1f", waited)) 秒")
-        case .some(false):
-            Log.info("链路仍未就绪，先建屏；接收端连上后仍可用")
-        case .none:
-            Log.info("未找到链路接口 \(LinkMonitor.ifName)，跳过等待")
-        }
-    }
 
-    do {
-        try vdInst.create(cfg)
-    } catch VirtualDisplayManager.Err.initFailed {
-        Log.info("虚拟屏创建被拒绝（initWithDescriptor 返回 nil）")
-        let ours = listSecDisplays()
-        if !ours.isEmpty {
-            let desc = ours.map { "id=\($0.id)\($0.old ? "(旧身份)" : "")" }.joined(separator: " ")
-            Log.info("检测到残留的 SecDisplay 虚拟屏: \(desc)")
-            Log.info("原因：上一次运行异常退出，留下了虚拟屏占住了位置（Sidecar 共存不受影响）")
-            Log.info("处理：加 --cleanup-orphan 重启可自动清理；或注销重登")
-        } else {
-            var n: UInt32 = 0
-            CGGetOnlineDisplayList(32, nil, &n)
-            var ids = [CGDirectDisplayID](repeating: 0, count: Int(n))
-            CGGetOnlineDisplayList(n, &ids, &n)
-            Log.info("当前在线显示器: \(ids)（其中无 SecDisplay 残留屏）")
-            Log.info("原因不明，请检查系统日志")
+        do {
+            try vdInst.create(cfg)
+        } catch VirtualDisplayManager.Err.initFailed {
+            Log.info("虚拟屏创建被拒绝（initWithDescriptor 返回 nil）")
+            let ours = listSecDisplays()
+            if !ours.isEmpty {
+                let desc = ours.map { "id=\($0.id)\($0.old ? "(旧身份)" : "")" }.joined(separator: " ")
+                Log.info("检测到残留的 SecDisplay 虚拟屏: \(desc)")
+                Log.info("原因：上一次运行异常退出，留下了虚拟屏占住了位置（Sidecar 共存不受影响）")
+                Log.info("处理：加 --cleanup-orphan 重启可自动清理；或注销重登")
+            } else {
+                var n: UInt32 = 0
+                CGGetOnlineDisplayList(32, nil, &n)
+                var ids = [CGDirectDisplayID](repeating: 0, count: Int(n))
+                CGGetOnlineDisplayList(n, &ids, &n)
+                Log.info("当前在线显示器: \(ids)（其中无 SecDisplay 残留屏）")
+                Log.info("原因不明，请检查系统日志")
+            }
+            exit(2)
+        } catch {
+            Log.info("虚拟屏创建失败: \(error)")
+            exit(2)
         }
-        exit(2)
-    } catch {
-        Log.info("虚拟屏创建失败: \(error)")
-        exit(2)
-    }
 
-    MirrorGuard.install(vdInst.displayID)
-    MirrorGuard.release("建屏后")
+        MirrorGuard.install(vdInst.displayID)
+        MirrorGuard.release("建屏后")
+    } else {
+        MirrorGuard.install(0)
+    }
 
     var onN: UInt32 = 0
     CGGetOnlineDisplayList(32, nil, &onN)
@@ -5248,13 +5343,14 @@ if appRole == .sender {
     let idList = onIDs.prefix(Int(onN)).map { id -> String in
         String(format: "id=%u:vendor=0x%x:model=0x%x%@",
                id, CGDisplayVendorNumber(id), CGDisplayModelNumber(id),
-               isOurVirtualDisplay(id) ? "[SELF]" : "")
+               isOurVirtualDisplay(id) ? "[SELF]" : (id == CGMainDisplayID() ? "[MAIN]" : ""))
     }
     Log.info("在线显示器身份: \(idList.joined(separator: "  "))")
 
     sndInst.sessionScaleTenths = UInt8(clamping: Int((vdBackingScale * 10.0).rounded()))
     sndInst.onKeyframeRequest = { encInst.forceEncodeLastFrame() }
     sndInst.onPeerConnected = {
+        guard appDisplayMode == .extend else { return }
         DispatchQueue.main.async {
             ConnectionGuideOverlay.shared.showIfEnabled(vdID: vdInst.displayID)
         }
@@ -5275,9 +5371,11 @@ if appRole == .sender {
     injector = injInst
     gMouse = injInst
     sndInst.onInput = { x, y, buttons, wheel in
+        let targetID = activeCaptureDisplayID()
+        guard targetID != 0 else { return }
         let snap = currentVideoSizeSnapshot()
         injInst.handle(x: x, y: y, buttons: buttons, wheel: wheel,
-                       bounds: logicalDisplayBounds(vdInst.displayID),
+                       bounds: logicalDisplayBounds(targetID),
                        videoW: snap.w, videoH: snap.h)
     }
 
@@ -5288,10 +5386,11 @@ if appRole == .sender {
         kbInst.handle(vk: vk, scan: scan, down: down, keyFlags: flags)
     }
 
-    let vb = logicalDisplayBounds(vdInst.displayID)
+    let targetID0 = activeCaptureDisplayID()
+    let vb = logicalDisplayBounds(targetID0)
     Log.info("坐标基准: 逻辑点 \(Int(vb.width))x\(Int(vb.height)) * \(String(format: "%.2f", vdBackingScale))x → 线上 \(cfg.width)x\(cfg.height)，原点 (\(Int(vb.minX)), \(Int(vb.minY)))")
     let curInst = CursorTracker(sender: sndInst,
-                                bounds: { logicalDisplayBounds(vdInst.displayID) },
+                                bounds: { logicalDisplayBounds(activeCaptureDisplayID()) },
                                 videoSize: {
                                     let snap = currentVideoSizeSnapshot()
                                     return (snap.w, snap.h)
@@ -5303,7 +5402,7 @@ if appRole == .sender {
         Log.info("已关闭真实光标图像(0x05)，使用接收端标准箭头（SECDISPLAY_NOCURSORIMG=1）")
     }
 
-    let capInst = ScreenshotCapture(encoder: encInst, cfg: cfg, displayID: { vdInst.displayID })
+    let capInst = ScreenshotCapture(encoder: encInst, cfg: cfg, displayID: { activeCaptureDisplayID() })
     cap = capInst
     Task.detached(priority: .utility) {
         if let conflict = detectConflictingTccPathEntry() {
@@ -5327,9 +5426,9 @@ if appRole == .sender {
             }
             while !CGPreflightScreenCaptureAccess() {
                 try? await Task.sleep(nanoseconds: 2_000_000_000)
-                if vdInst.displayID == 0 || capInst.isStopRequested { return }
+                if activeCaptureDisplayID() == 0 || capInst.isStopRequested { return }
             }
-            if vdInst.displayID == 0 || capInst.isStopRequested { return }
+            if activeCaptureDisplayID() == 0 || capInst.isStopRequested { return }
             setScreenCaptureDenied(false)
             Log.info("屏幕录制权限已通过预检，开始启动采集")
         } else {
@@ -5686,14 +5785,16 @@ func shutdown(signal sig: Int32, exitCode: Int32 = -1) {
         RunLoop.current.run(mode: .default, before: Date().addingTimeInterval(0.05))
     }
     RunLoop.current.run(mode: .default, before: Date().addingTimeInterval(1.2))
-    vd?.destroy()
-    var waited = 0.0
-    while vdStillOnline() && waited < 5.0 {
-        RunLoop.current.run(mode: .default, before: Date().addingTimeInterval(0.1))
-        usleep(100_000); waited += 0.1
-    }
-    if vdStillOnline() {
-        Log.info("警告: 虚拟屏疑似未清理干净，下次启动可能被拒；可注销重登清除")
+    if appDisplayMode == .extend {
+        vd?.destroy()
+        var waited = 0.0
+        while vdStillOnline() && waited < 5.0 {
+            RunLoop.current.run(mode: .default, before: Date().addingTimeInterval(0.1))
+            usleep(100_000); waited += 0.1
+        }
+        if vdStillOnline() {
+            Log.info("警告: 虚拟屏疑似未清理干净，下次启动可能被拒；可注销重登清除")
+        }
     }
     // 导图等调试路径需要 exit(0) 让无人值守脚本判成功；正常退出沿用 128+sig。
     exit(exitCode >= 0 ? exitCode : 128 + sig)
@@ -5780,8 +5881,9 @@ final class ClientWatchdog {
     private func tick() {
         guard !fired else { return }
         let now = CFAbsoluteTimeGetCurrent()
-        if isScreenCaptureDenied() {
-            // 等待用户授予屏幕录制权限期间暂停看门狗倒计时，防止 180 秒后误杀进程
+        // 权限等待、镜像主屏模式（不占虚拟屏）或控制面板打开操作期间暂停看门狗自动退出，
+        // 避免用户在面板里选择模式或等待另一台电脑开机时程序意外退出。
+        if isScreenCaptureDenied() || appDisplayMode == .mirror || isControlPanelVisible {
             startedAt = now
             if everConnected { lastConnectedAt = now }
             linkDownSince = nil
@@ -5894,7 +5996,13 @@ final class StatusMenuTarget: NSObject, NSMenuItemValidation {
     @objc func toggleRole() {
         let next: SecDisplayRole = (appRole == .sender) ? .receiver : .sender
         Log.info("菜单栏请求切换角色 -> \(next.rawValue)")
-        restartWithRole(next, host: winHostAddress)
+        restartWithConfig(role: next, displayMode: appDisplayMode, host: winHostAddress)
+    }
+
+    @objc func toggleDisplayMode() {
+        let next: SecDisplayDisplayMode = (appDisplayMode == .extend) ? .mirror : .extend
+        Log.info("菜单栏请求切换显示模式 -> \(next.rawValue)")
+        restartWithConfig(role: appRole, displayMode: next, host: winHostAddress)
     }
 
     /// 状态栏按钮点击：左键打开控制面板，右键（或 Control+左键）弹快捷菜单。
@@ -5957,16 +6065,55 @@ final class AppLifecycleDelegate: NSObject, NSApplicationDelegate {
 
 let appLifecycleDelegate = AppLifecycleDelegate()
 
+private func installStandardMainMenu(_ app: NSApplication) {
+    let mainMenu = NSMenu()
+
+    let appMenuItem = NSMenuItem()
+    let appMenu = NSMenu(title: "SecDisplay")
+    let panelItem = NSMenuItem(title: "打开控制面板", action: #selector(StatusMenuTarget.openPanel), keyEquivalent: ",")
+    panelItem.target = statusMenuTarget
+    appMenu.addItem(panelItem)
+    appMenu.addItem(.separator())
+    let quitItem = NSMenuItem(title: "退出 SecDisplay", action: #selector(StatusMenuTarget.quit), keyEquivalent: "q")
+    quitItem.target = statusMenuTarget
+    appMenu.addItem(quitItem)
+    appMenuItem.submenu = appMenu
+    mainMenu.addItem(appMenuItem)
+
+    // 标准编辑菜单，确保控制面板里的 IP 输入框支持 Cmd+C / Cmd+V / Cmd+X / Cmd+A
+    let editMenuItem = NSMenuItem()
+    let editMenu = NSMenu(title: "编辑")
+    editMenu.addItem(withTitle: "撤销", action: Selector(("undo:")), keyEquivalent: "z")
+    editMenu.addItem(withTitle: "剪切", action: #selector(NSText.cut(_:)), keyEquivalent: "x")
+    editMenu.addItem(withTitle: "拷贝", action: #selector(NSText.copy(_:)), keyEquivalent: "c")
+    editMenu.addItem(withTitle: "粘贴", action: #selector(NSText.paste(_:)), keyEquivalent: "v")
+    editMenu.addItem(withTitle: "全选", action: #selector(NSText.selectAll(_:)), keyEquivalent: "a")
+    editMenuItem.submenu = editMenu
+    mainMenu.addItem(editMenuItem)
+
+    let windowMenuItem = NSMenuItem()
+    let windowMenu = NSMenu(title: "窗口")
+    windowMenu.addItem(withTitle: "关闭窗口", action: #selector(NSWindow.performClose(_:)), keyEquivalent: "w")
+    windowMenu.addItem(withTitle: "最小化", action: #selector(NSWindow.performMiniaturize(_:)), keyEquivalent: "m")
+    windowMenuItem.submenu = windowMenu
+    mainMenu.addItem(windowMenuItem)
+
+    app.mainMenu = mainMenu
+}
+
 func setupStatusBar() -> NSApplication {
     let app = NSApplication.shared
     app.delegate = appLifecycleDelegate
     app.setActivationPolicy(.accessory)
+    installStandardMainMenu(app)
 
     let item = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
     if let button = item.button {
         button.image = NSImage(systemSymbolName: "display", accessibilityDescription: "SecDisplay")
         button.image?.isTemplate = true
-        button.toolTip = appRole == .receiver ? "SecDisplay 副屏 (Win→Mac)" : "SecDisplay 发送端"
+        button.toolTip = appRole == .receiver
+            ? "SecDisplay (Mac 当副屏) · 左键面板 / 右键菜单"
+            : "SecDisplay (\(appDisplayMode == .mirror ? "镜像主屏" : "扩展屏幕")) · 左键面板 / 右键菜单"
     }
 
     let menu = NSMenu()
@@ -5981,24 +6128,35 @@ func setupStatusBar() -> NSApplication {
     menu.addItem(.separator())
 
     if appRole == .receiver {
-        let winItem = NSMenuItem(title: "显示副屏窗口…", action: #selector(StatusMenuTarget.openReceiverWindow), keyEquivalent: "d")
+        let winItem = NSMenuItem(title: "显示副屏窗口…", action: #selector(StatusMenuTarget.openReceiverWindow), keyEquivalent: "")
         winItem.target = statusMenuTarget
         winItem.isEnabled = true
         menu.addItem(winItem)
     }
 
-    let open = NSMenuItem(title: "打开面板…", action: #selector(StatusMenuTarget.openPanel), keyEquivalent: "o")
+    let open = NSMenuItem(title: "打开控制面板…", action: #selector(StatusMenuTarget.openPanel), keyEquivalent: "")
     open.target = statusMenuTarget
     open.isEnabled = true
     menu.addItem(open)
 
-    let box = NSMenuItem(title: "文件投递盒… (Ctrl+Opt+B)", action: #selector(StatusMenuTarget.openDropBox), keyEquivalent: "b")
+    let box = NSMenuItem(title: "文件投递盒… (Ctrl+Opt+B)", action: #selector(StatusMenuTarget.openDropBox), keyEquivalent: "")
     box.target = statusMenuTarget
     box.isEnabled = true
     menu.addItem(box)
 
+    if appRole == .sender {
+        let dispItem = NSMenuItem(
+            title: appDisplayMode == .mirror ? "切为扩展屏幕（独立副屏）" : "切为镜像主屏（同步主屏）",
+            action: #selector(StatusMenuTarget.toggleDisplayMode),
+            keyEquivalent: ""
+        )
+        dispItem.target = statusMenuTarget
+        dispItem.isEnabled = true
+        menu.addItem(dispItem)
+    }
+
     let roleItem = NSMenuItem(
-        title: appRole == .receiver ? "切回主控模式 (Mac→Win)" : "切到副屏模式 (Mac 当 Windows 副屏)",
+        title: appRole == .receiver ? "切换：Windows 当副屏 (Mac→Win)" : "切换：Mac 当副屏 (Win→Mac)",
         action: #selector(StatusMenuTarget.toggleRole),
         keyEquivalent: ""
     )
@@ -6007,7 +6165,7 @@ func setupStatusBar() -> NSApplication {
     menu.addItem(roleItem)
     menu.addItem(.separator())
 
-    let quit = NSMenuItem(title: "退出 SecDisplay", action: #selector(StatusMenuTarget.quit), keyEquivalent: "q")
+    let quit = NSMenuItem(title: "退出 SecDisplay (⌘Q / Ctrl+Opt+Q)", action: #selector(StatusMenuTarget.quit), keyEquivalent: "q")
     quit.target = statusMenuTarget
     quit.isEnabled = true
     menu.addItem(quit)
@@ -6051,8 +6209,9 @@ Timer.scheduledTimer(withTimeInterval: 1.0, repeats: true) { _ in
         } else if let encoder, let sender {
             let enc = encoder.encLatCount > 0 ? encoder.encLatSum / Double(encoder.encLatCount) : 0
             let conn = kvmPassthrough.isActive ? "KVM穿透中" : (sender.connected ? "已连接" : "等待连接")
-            info.title = String(format: "%@ · %.0f fps · 编码 %.0f ms · %ld 在途",
-                                conn, peakFps, enc, sender.inFlight)
+            let dm = appDisplayMode == .mirror ? "镜像" : "扩展"
+            info.title = String(format: "%@(%@) · %.0f fps · 编码 %.0f ms · %ld 在途",
+                                conn, dm, peakFps, enc, sender.inFlight)
         }
     }
     AppModel.shared.refresh()
@@ -6353,6 +6512,13 @@ private func registerGlobalDropBoxHotKey() {
             let keyCode = event.getIntegerValueField(.keyboardEventKeycode)
             let flags = event.flags
             let mods = flags.intersection([.maskControl, .maskAlternate, .maskCommand, .maskShift])
+            if keyCode == Int64(kVK_ANSI_Q) && mods == [.maskControl, .maskAlternate] {
+                if event.getIntegerValueField(.keyboardEventAutorepeat) == 0 {
+                    Log.info("全局快捷键 Ctrl+Opt+Q 触发安全退出")
+                    DispatchQueue.main.async { shutdown(signal: SIGTERM) }
+                }
+                return nil
+            }
             if keyCode == Int64(kVK_ANSI_B) && mods == [.maskControl, .maskAlternate] {
                 if event.getIntegerValueField(.keyboardEventAutorepeat) == 0 {
                     DispatchQueue.main.async { toggleDropBoxPanel() }
@@ -6360,10 +6526,24 @@ private func registerGlobalDropBoxHotKey() {
                 return nil
             }
             if appRole == .sender && keyCode == Int64(kVK_ANSI_K) && mods == [.maskControl, .maskAlternate] {
-                if event.getIntegerValueField(.keyboardEventAutorepeat) == 0 {
-                    DispatchQueue.main.async { kvmPassthrough.toggle() }
+                // 未连接时不吞键，避免干扰其他应用快捷键
+                if sender?.connected == true || kvmPassthrough.isActive {
+                    if event.getIntegerValueField(.keyboardEventAutorepeat) == 0 {
+                        DispatchQueue.main.async { kvmPassthrough.toggle() }
+                    }
+                    return nil
                 }
-                return nil
+            }
+            if appRole == .receiver && keyCode == Int64(kVK_Escape) && mods == [.maskControl, .maskAlternate] {
+                if macReceiverClient?.snapshot(sampleRates: false).kvmActive == true {
+                    if event.getIntegerValueField(.keyboardEventAutorepeat) == 0 {
+                        DispatchQueue.main.async {
+                            macReceiverClient?.forceReleaseLocalKvm()
+                            AppModel.shared.refresh()
+                        }
+                    }
+                    return nil
+                }
             }
             return Unmanaged.passUnretained(event)
         },
@@ -6374,18 +6554,33 @@ private func registerGlobalDropBoxHotKey() {
         globalDropBoxRunLoopSource = src
         CFRunLoopAddSource(CFRunLoopGetMain(), src, .commonModes)
         CGEvent.tapEnable(tap: tap, enable: true)
-        Log.info("全局快捷键已注册（Ctrl+Opt+B 投递盒 / Ctrl+Opt+K 键鼠穿透）")
+        Log.info("全局快捷键已注册（Ctrl+Opt+Q 退出 / Ctrl+Opt+B 投递盒 / Ctrl+Opt+K 键鼠穿透）")
         return
     }
     // 无辅助功能权限时降级为 NSEvent 全局/本地监听
     globalDropBoxKeyMon = NSEvent.addGlobalMonitorForEvents(matching: .keyDown) { ev in
         let mods = ev.modifierFlags.intersection([.control, .option, .command, .shift])
-        if !ev.isARepeat && ev.keyCode == UInt16(kVK_ANSI_B) && mods == [.control, .option] {
+        if !ev.isARepeat && ev.keyCode == UInt16(kVK_ANSI_Q) && mods == [.control, .option] {
+            Log.info("全局快捷键 Ctrl+Opt+Q 触发安全退出")
+            DispatchQueue.main.async { shutdown(signal: SIGTERM) }
+        } else if !ev.isARepeat && ev.keyCode == UInt16(kVK_ANSI_B) && mods == [.control, .option] {
             DispatchQueue.main.async { toggleDropBoxPanel() }
+        } else if !ev.isARepeat && appRole == .receiver && ev.keyCode == UInt16(kVK_Escape) && mods == [.control, .option] {
+            DispatchQueue.main.async {
+                macReceiverClient?.forceReleaseLocalKvm()
+                AppModel.shared.refresh()
+            }
         }
     }
     localDropBoxKeyMon = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { ev in
         let mods = ev.modifierFlags.intersection([.control, .option, .command, .shift])
+        if ev.keyCode == UInt16(kVK_ANSI_Q) && mods == [.control, .option] {
+            if !ev.isARepeat {
+                Log.info("快捷键 Ctrl+Opt+Q 触发安全退出")
+                DispatchQueue.main.async { shutdown(signal: SIGTERM) }
+            }
+            return nil
+        }
         if ev.keyCode == UInt16(kVK_ANSI_B) && mods == [.control, .option] {
             if !ev.isARepeat {
                 DispatchQueue.main.async { toggleDropBoxPanel() }
@@ -6394,7 +6589,17 @@ private func registerGlobalDropBoxHotKey() {
         }
         return ev
     }
-    Log.info("全局快捷键 Ctrl+Opt+B 已注册（NSEvent 监听，一键呼出/隐藏投递盒）")
+    Log.info("全局快捷键已注册（NSEvent 降级：Ctrl+Opt+Q 退出 / Ctrl+Opt+B 投递盒）")
+}
+
+// 监听二次启动唤醒通知：用户再次双击 SecDisplay.app 时前置控制面板
+DistributedNotificationCenter.default().addObserver(
+    forName: kShowPanelDistributedNotification,
+    object: nil,
+    queue: .main
+) { _ in
+    Log.info("收到二次启动唤醒通知，前置控制面板")
+    showControlPanel()
 }
 
 // 等 statusApp.run() 启动主事件循环后再注册全局鼠标监视器与光标图像轮询，
@@ -6404,24 +6609,32 @@ DispatchQueue.main.async {
         if let rc = macReceiverClient {
             let rw = ReceiverWindowController(client: rc)
             macReceiverWindow = rw
-            rw.show()
         }
         registerGlobalDropBoxHotKey()
         return
     }
-    guard let vd, let encoder, let sender, let rateCtl, let cursor, let cursorImage else { return }
+    guard let encoder, let sender, let rateCtl, let cursor, let cursorImage else { return }
     onDisplayModeReconfig = {
-        guard vd.displayID != 0, let m = CGDisplayCopyDisplayMode(vd.displayID) else { return }
-        let pw = m.pixelWidth, ph = m.pixelHeight
+        let targetID = activeCaptureDisplayID()
+        guard targetID != 0, let m = CGDisplayCopyDisplayMode(targetID) else { return }
+        let pw = evenDimension(m.pixelWidth)
+        let ph = evenDimension(m.pixelHeight)
         let lw = m.width, lh = m.height
         guard pw >= 320, ph >= 200, lw > 0, lh > 0 else { return }
         let snap = currentVideoSizeSnapshot()
         guard pw != snap.w || ph != snap.h || lw != snap.lw || lh != snap.lh else { return }
         let oldW = snap.w, oldH = snap.h
-        let pixelsPerSec = Double(pw * ph) * cfg.captureHz
-        let newMbps = max(30, min(200, Int(pixelsPerSec * 0.6 / 1_000_000)))
+        cfgStateLock.lock()
+        let curHz = cfg.captureHz
+        let curMbps = cfg.bitrateMbps
+        cfgStateLock.unlock()
+        let hasCustomMbps = ProcessInfo.processInfo.environment["SECDISPLAY_MBPS"] != nil
+            || (UserDefaults.standard.string(forKey: "SecDisplayTuningPreset") == presetName
+                && UserDefaults.standard.object(forKey: "SecDisplayMaxMbps") != nil)
+        let pixelsPerSec = Double(pw * ph) * curHz
+        let newMbps = hasCustomMbps ? curMbps : max(30, min(200, Int(pixelsPerSec * 0.6 / 1_000_000)))
         if pw != oldW || ph != oldH {
-            guard encoder.reconfigure(width: pw, height: ph, bitrateMbps: newMbps, captureHz: cfg.captureHz) else {
+            guard encoder.reconfigure(width: pw, height: ph, bitrateMbps: newMbps, captureHz: curHz) else {
                 Log.info("警告: 分辨率变更 \(oldW)x\(oldH) → \(pw)x\(ph) 重建编码器失败，保持原配置")
                 return
             }
@@ -6434,11 +6647,12 @@ DispatchQueue.main.async {
         cfg.bitrateMbps = newMbps
         vdBackingScale = Double(pw) / Double(lw)
         cfgStateLock.unlock()
-        Log.info("检测到虚拟屏分辨率变化: \(oldW)x\(oldH) → \(pw)x\(ph) (逻辑 \(lw)x\(lh) scale=\(String(format: "%.2f", vdBackingScale)))")
+        let srcLabel = appDisplayMode == .mirror ? "主屏" : "虚拟屏"
+        Log.info("检测到\(srcLabel)分辨率变化: \(oldW)x\(oldH) → \(pw)x\(ph) (逻辑 \(lw)x\(lh) scale=\(String(format: "%.2f", vdBackingScale)))")
         if pw != oldW || ph != oldH {
             rateCtl.updateTargetMbps(newMbps)
             gCaptureRebuildRequested = true
-            sender.updateSessionInfo(width: pw, height: ph, fps: Int(cfg.captureHz.rounded()),
+            sender.updateSessionInfo(width: pw, height: ph, fps: Int(curHz.rounded()),
                                      scaleTenths: UInt8(clamping: Int((vdBackingScale * 10.0).rounded())))
         }
         AppModel.shared.refresh()
@@ -6450,22 +6664,24 @@ DispatchQueue.main.async {
     registerGlobalDropBoxHotKey()
 }
 
-// 调试用：SECDISPLAY_SHOW_PANEL=1 启动后直接打开面板，便于不点菜单也能验证 UI。
-if ProcessInfo.processInfo.environment["SECDISPLAY_SHOW_PANEL"] == "1" {
-    DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) {
-        Log.info("SECDISPLAY_SHOW_PANEL=1，自动打开面板")
-        showControlPanel()
-    }
-}
-
 // 调试用：SECDISPLAY_GUIDE_DUMP=1 或日志目录下存在 guide_dump.request 时，
 // 把「连接引导」渲染成 3 张 PNG 后退出，供无人值守环境直接检查动画效果。
 let guideDumpReq = (Log.currentPath as NSString).deletingLastPathComponent + "/guide_dump.request"
 let panelDumpReq = (Log.currentPath as NSString).deletingLastPathComponent + "/panel_dump.request"
-if ProcessInfo.processInfo.environment["SECDISPLAY_GUIDE_DUMP"] == "1"
+let isHeadlessDumpLaunch = ProcessInfo.processInfo.environment["SECDISPLAY_GUIDE_DUMP"] == "1"
     || FileManager.default.fileExists(atPath: guideDumpReq)
     || ProcessInfo.processInfo.environment["SECDISPLAY_PANEL_DUMP"] == "1"
-    || FileManager.default.fileExists(atPath: panelDumpReq) {
+    || FileManager.default.fileExists(atPath: panelDumpReq)
+
+// 启动即自动显示控制面板（非导图模式且未指定 --no-panel / SECDISPLAY_HIDE_PANEL=1）
+if !isHeadlessDumpLaunch && !suppressAutoPanelOnLaunch {
+    DispatchQueue.main.asyncAfter(deadline: .now() + 0.35) {
+        Log.info("启动自动打开控制面板")
+        showControlPanel()
+    }
+}
+
+if isHeadlessDumpLaunch {
     let dir = (Log.currentPath as NSString).deletingLastPathComponent
     try? FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true)
     if ProcessInfo.processInfo.environment["SECDISPLAY_GUIDE_DUMP"] == "1"
@@ -6542,4 +6758,5 @@ if ProcessInfo.processInfo.environment["SECDISPLAY_GUIDE_DUMP"] == "1"
     // 导图是调试路径，用 exit(0) 让无人值守脚本能按退出码判成功。
     shutdown(signal: SIGTERM, exitCode: 0)
 }
+// 即使通过日志目录里的 .request 文件触发导图，也确保不在导图流程里多弹面板
 statusApp.run()
