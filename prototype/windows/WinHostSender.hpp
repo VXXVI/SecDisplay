@@ -33,6 +33,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <cwchar>
 #include <deque>
 #include <functional>
 #include <map>
@@ -104,101 +105,8 @@ public:
     const WinHostStats& Stats() const { return stats_; }
 
     bool Start(const std::string& targetHost, int width, int height, int fps, int bitrateMbps, uint16_t port, LogFn logFn, int dpiPercent = 0, bool mirrorMode = false) {
-        Stop();
-        pausedForSleep_.store(false);
-        displayReconcilePending_.store(false);
-        displayWakeInternal_.store(false);
-        mirrorMode_.store(mirrorMode);
-        logFn_ = std::move(logFn);
-        targetHost_ = targetHost.empty() ? "10.10.10.1" : targetHost;
-        reqW_ = width > 0 ? width : 2880;
-        reqH_ = height > 0 ? height : 1800;
-        reqFps_ = (fps >= 24 && fps <= 144) ? fps : 60;
-        reqDpi_ = dpiPercent;
-        if (bitrateMbps < 10) bitrateMbps = 10;
-        if (bitrateMbps > 200) bitrateMbps = 200;
-        targetMbps_.store(bitrateMbps);
-        curMbps_.store(bitrateMbps);
-        port_ = port > 0 ? port : 9922;
-
-        stats_.targetBitrateMbps = bitrateMbps;
-        stats_.bitrateMbps = bitrateMbps;
-        stats_.fps = reqFps_;
-        stats_.lastSentTick = 0;
-        {
-            std::lock_guard<std::mutex> ilk(stats_.infoMtx);
-            stats_.lastError.clear();
-        }
-
-        WinVddBounds b{};
-        if (mirrorMode) {
-            if (!ReadPrimaryDisplayBounds(&b) || b.width <= 0 || b.height <= 0) {
-                {
-                    std::lock_guard<std::mutex> ilk(stats_.infoMtx);
-                    stats_.lastError = "未找到可用的 Windows 物理主屏";
-                }
-                EmitLog("WinHost: 镜像主屏启动失败，未找到可用物理主屏");
-                return false;
-            }
-            {
-                std::lock_guard<std::mutex> clk(captureMtx_);
-                primaryBounds_ = b;
-            }
-            stats_.width = b.width;
-            stats_.height = b.height;
-            stats_.fps = ClampHz(b.hz, reqFps_);
-            char msg[192];
-            snprintf(msg, sizeof(msg), "WinHost: 镜像主屏模式启动 (%ls %dx%d @ %dHz)，准备连接 Mac 副屏 %s:%u",
-                     b.deviceName.c_str(), b.width, b.height, stats_.fps.load(), targetHost_.c_str(), port_);
-            EmitLog(msg);
-        } else {
-            if (!vdd_.Start(reqW_, reqH_, reqFps_, logFn_, dpiPercent)) {
-                std::string drvDesc;
-                WinVirtualDisplay::QueryDriverStatus(&drvDesc);
-                {
-                    std::lock_guard<std::mutex> ilk(stats_.infoMtx);
-                    stats_.lastError = drvDesc.empty() ? "虚拟屏启动失败" : drvDesc;
-                }
-                EmitLog("WinHost: 虚拟屏启动失败");
-                return false;
-            }
-            b = vdd_.Bounds();
-            if (b.width <= 0 || b.height <= 0) {
-                {
-                    std::lock_guard<std::mutex> ilk(stats_.infoMtx);
-                    stats_.lastError = "虚拟屏尺寸无效";
-                }
-                EmitLog("WinHost: 虚拟屏报告无效尺寸，停止启动");
-                vdd_.Stop();
-                return false;
-            }
-            stats_.width = b.width;
-            stats_.height = b.height;
-            stats_.fps = ClampHz(b.hz, reqFps_);
-            char msg[160];
-            snprintf(msg, sizeof(msg), "WinHost: 扩展屏幕模式启动 (%dx%d @ %dHz)，准备连接 Mac 副屏 %s:%u",
-                     b.width, b.height, stats_.fps.load(), targetHost_.c_str(), port_);
-            EmitLog(msg);
-        }
-
-        {
-            std::lock_guard<std::mutex> blk(bitrateMtx_);
-            localSlowStreak_ = 0;
-            lastDownscaleTick_ = 0;
-            lastLocalCongestionTick_ = 0;
-            lastRemoteCongestionTick_ = 0;
-            lastCongestionLogTick_ = 0;
-        }
-        ClearVideoQueue();
-        activeVideoEpoch_.store(0);
-        stats_.clientConnected = false;
-        alive_.store(true);
-        acceptThread_ = std::thread(&WinHostSender::ConnectLoop, this);
-        captureThread_ = std::thread(&WinHostSender::CaptureEncodeLoop, this);
-        cursorThread_ = std::thread(&WinHostSender::CursorLoop, this);
-        videoSendThread_ = std::thread(&WinHostSender::VideoSendLoop, this);
-        kvmSendThread_ = std::thread(&WinHostSender::KvmSendLoop, this);
-        return true;
+        std::lock_guard<std::mutex> llk(lifecycleMtx_);
+        return StartLocked(targetHost, width, height, fps, bitrateMbps, port, std::move(logFn), dpiPercent, mirrorMode);
     }
 
     // 不断虚拟屏的快速重连：仅关闭当前 TCP 套接字，ConnectLoop 在 1.5~3.5s 内自动重连
@@ -216,6 +124,7 @@ public:
     }
 
     bool SetResolution(int width, int height, int hz = 0) {
+        std::lock_guard<std::mutex> llk(lifecycleMtx_);
         if (mirrorMode_.load()) {
             EmitLog("WinHost: 镜像主屏模式自动跟随物理主屏分辨率，无需切换虚拟屏分辨率");
             return false;
@@ -244,43 +153,18 @@ public:
 
     bool IsMirrorMode() const { return mirrorMode_.load(); }
     bool VddActive() const { return vdd_.IsActive(); }
-    bool CaptureSourceReady() const { return mirrorMode_.load() ? alive_.load() : vdd_.IsActive(); }
+    bool CaptureSourceReady() const { return mirrorMode_.load() ? (alive_.load() && captureHealthy_.load()) : vdd_.IsActive(); }
 
     void Stop() {
-        SetKvmActive(false);
-        alive_.store(false);
-        videoCv_.notify_all();
-        kvmCv_.notify_all();
-        // 按 sendMtx_ -> sockMtx_ 顺序校验身份并一起 shutdown+closesocket，彻底消除锁外句柄复用竞态
-        {
-            std::lock_guard<std::mutex> slk(sendMtx_);
-            std::lock_guard<std::mutex> lk(sockMtx_);
-            if (clientSock_ != INVALID_SOCKET) {
-                shutdown(clientSock_, SD_BOTH);
-                closesocket(clientSock_);
-                clientSock_ = INVALID_SOCKET;
-            }
-        }
-        activeVideoEpoch_.store(0);
-        stats_.clientConnected = false;
-
-        if (acceptThread_.joinable()) acceptThread_.join();
-        if (captureThread_.joinable()) captureThread_.join();
-        if (cursorThread_.joinable()) cursorThread_.join();
-        if (videoSendThread_.joinable()) videoSendThread_.join();
-        if (kvmHookThread_.joinable()) kvmHookThread_.join();
-        if (kvmSendThread_.joinable()) kvmSendThread_.join();
-        ClearVideoQueue();
-
-        ReleaseAllInputs();
-        vdd_.Stop();
-        EmitLog("WinHost: 发送端已停止");
+        std::lock_guard<std::mutex> llk(lifecycleMtx_);
+        StopLocked();
     }
 
     bool IsKvmActive() const { return kvmActive_.load(); }
     bool ToggleKvm() { return SetKvmActive(!kvmActive_.load()); }
 
     bool SetKvmActive(bool on) {
+        std::lock_guard<std::mutex> opLk(kvmOpMtx_);
         if (on) {
             if (!alive_.load() || !stats_.clientConnected.load()) {
                 EmitLog("WinHost: Mac 副屏未连接，无法开启 KVM 键鼠穿透");
@@ -357,6 +241,7 @@ public:
     void ClearPausedForSleep() { pausedForSleep_.store(false); }
 
     bool PauseForSleep() {
+        std::lock_guard<std::mutex> llk(lifecycleMtx_);
         if (!alive_.load() && !vdd_.IsActive()) {
             return pausedForSleep_.load();
         }
@@ -364,11 +249,12 @@ public:
         EmitLog(mirrorMode_.load()
                 ? "WinHost: 系统即将进入休眠，暂停镜像主屏推流"
                 : "WinHost: 系统即将进入休眠，暂停推流并卸载虚拟屏以保护内建屏");
-        Stop();
+        StopLocked();
         return true;
     }
 
     bool ResumeFromSleep() {
+        std::lock_guard<std::mutex> llk(lifecycleMtx_);
         if (!pausedForSleep_.load()) return false;
         const bool wasMirror = mirrorMode_.load();
         EmitLog(wasMirror
@@ -379,9 +265,9 @@ public:
         }
         std::string hostCopy = targetHost_;
         LogFn logCopy = logFn_;
-        bool ok = Start(hostCopy, reqW_, reqH_, reqFps_, targetMbps_.load(), port_, std::move(logCopy), reqDpi_, wasMirror);
+        bool ok = StartLocked(hostCopy, reqW_, reqH_, reqFps_, targetMbps_.load(), port_, std::move(logCopy), reqDpi_, wasMirror);
         if (!ok) {
-            // Start() 内部清除了 pausedForSleep_；若驱动刚唤醒尚未就绪，保留暂停状态供调用方重试
+            // StartLocked() 内部清除了 pausedForSleep_；若驱动刚唤醒尚未就绪，保留暂停状态供调用方重试
             pausedForSleep_.store(true);
         }
         return ok;
@@ -390,6 +276,141 @@ public:
     bool IsRunning() const { return alive_.load(); }
 
 private:
+    bool StartLocked(const std::string& targetHost, int width, int height, int fps, int bitrateMbps, uint16_t port, LogFn logFn, int dpiPercent, bool mirrorMode) {
+        StopLocked();
+        pausedForSleep_.store(false);
+        displayReconcilePending_.store(false);
+        displayWakeInternal_.store(false);
+        captureHealthy_.store(false);
+        mirrorMode_.store(mirrorMode);
+        logFn_ = std::move(logFn);
+        targetHost_ = targetHost.empty() ? "10.10.10.1" : targetHost;
+        reqW_ = width > 0 ? width : 2880;
+        reqH_ = height > 0 ? height : 1800;
+        reqFps_ = (fps >= 24 && fps <= 144) ? fps : 60;
+        reqDpi_ = dpiPercent;
+        if (bitrateMbps < 10) bitrateMbps = 10;
+        if (bitrateMbps > 200) bitrateMbps = 200;
+        targetMbps_.store(bitrateMbps);
+        curMbps_.store(bitrateMbps);
+        port_ = port > 0 ? port : 9922;
+
+        stats_.targetBitrateMbps = bitrateMbps;
+        stats_.bitrateMbps = bitrateMbps;
+        stats_.fps = reqFps_;
+        stats_.lastSentTick = 0;
+        {
+            std::lock_guard<std::mutex> ilk(stats_.infoMtx);
+            stats_.lastError.clear();
+        }
+
+        WinVddBounds b{};
+        if (mirrorMode) {
+            if (ReadPrimaryDisplayBounds(&b) && b.width > 0 && b.height > 0) {
+                {
+                    std::lock_guard<std::mutex> clk(captureMtx_);
+                    primaryBounds_ = b;
+                }
+                stats_.width = b.width;
+                stats_.height = b.height;
+                stats_.fps = EffectiveMirrorFps(b.hz, reqFps_);
+                char msg[192];
+                snprintf(msg, sizeof(msg), "WinHost: 镜像主屏模式启动 (%ls %dx%d @ %dHz, 上限 %dHz)，准备连接 Mac 副屏 %s:%u",
+                         b.deviceName.c_str(), b.width, b.height, stats_.fps.load(), reqFps_, targetHost_.c_str(), port_);
+                EmitLog(msg);
+            } else {
+                // 刚卸载 VDD 后系统拓扑重算有短暂异步窗口；启动后台采集循环自动重试读取物理主屏
+                {
+                    std::lock_guard<std::mutex> clk(captureMtx_);
+                    primaryBounds_ = WinVddBounds{};
+                }
+                stats_.width = 0;
+                stats_.height = 0;
+                stats_.fps = reqFps_;
+                EmitLog("WinHost: 物理主屏暂未就绪，镜像模式进入后台自动重试等待");
+            }
+        } else {
+            if (!vdd_.Start(reqW_, reqH_, reqFps_, logFn_, dpiPercent)) {
+                std::string drvDesc;
+                WinVirtualDisplay::QueryDriverStatus(&drvDesc);
+                {
+                    std::lock_guard<std::mutex> ilk(stats_.infoMtx);
+                    stats_.lastError = drvDesc.empty() ? "虚拟屏启动失败" : drvDesc;
+                }
+                EmitLog("WinHost: 虚拟屏启动失败");
+                return false;
+            }
+            b = vdd_.Bounds();
+            if (b.width <= 0 || b.height <= 0) {
+                {
+                    std::lock_guard<std::mutex> ilk(stats_.infoMtx);
+                    stats_.lastError = "虚拟屏尺寸无效";
+                }
+                EmitLog("WinHost: 虚拟屏报告无效尺寸，停止启动");
+                vdd_.Stop();
+                return false;
+            }
+            stats_.width = b.width;
+            stats_.height = b.height;
+            stats_.fps = ClampHz(b.hz, reqFps_);
+            char msg[160];
+            snprintf(msg, sizeof(msg), "WinHost: 扩展屏幕模式启动 (%dx%d @ %dHz)，准备连接 Mac 副屏 %s:%u",
+                     b.width, b.height, stats_.fps.load(), targetHost_.c_str(), port_);
+            EmitLog(msg);
+        }
+
+        {
+            std::lock_guard<std::mutex> blk(bitrateMtx_);
+            localSlowStreak_ = 0;
+            lastDownscaleTick_ = 0;
+            lastLocalCongestionTick_ = 0;
+            lastRemoteCongestionTick_ = 0;
+            lastCongestionLogTick_ = 0;
+        }
+        ClearVideoQueue();
+        activeVideoEpoch_.store(0);
+        stats_.clientConnected = false;
+        alive_.store(true);
+        acceptThread_ = std::thread(&WinHostSender::ConnectLoop, this);
+        captureThread_ = std::thread(&WinHostSender::CaptureEncodeLoop, this);
+        cursorThread_ = std::thread(&WinHostSender::CursorLoop, this);
+        videoSendThread_ = std::thread(&WinHostSender::VideoSendLoop, this);
+        kvmSendThread_ = std::thread(&WinHostSender::KvmSendLoop, this);
+        return true;
+    }
+
+    void StopLocked() {
+        alive_.store(false);
+        captureHealthy_.store(false);
+        SetKvmActive(false);
+        videoCv_.notify_all();
+        kvmCv_.notify_all();
+        // 按 sendMtx_ -> sockMtx_ 顺序校验身份并一起 shutdown+closesocket，彻底消除锁外句柄复用竞态
+        {
+            std::lock_guard<std::mutex> slk(sendMtx_);
+            std::lock_guard<std::mutex> lk(sockMtx_);
+            if (clientSock_ != INVALID_SOCKET) {
+                shutdown(clientSock_, SD_BOTH);
+                closesocket(clientSock_);
+                clientSock_ = INVALID_SOCKET;
+            }
+        }
+        activeVideoEpoch_.store(0);
+        stats_.clientConnected = false;
+
+        if (acceptThread_.joinable()) acceptThread_.join();
+        if (captureThread_.joinable()) captureThread_.join();
+        if (cursorThread_.joinable()) cursorThread_.join();
+        if (videoSendThread_.joinable()) videoSendThread_.join();
+        if (kvmSendThread_.joinable()) kvmSendThread_.join();
+        SetKvmActive(false);
+        ClearVideoQueue();
+
+        ReleaseAllInputs();
+        vdd_.Stop();
+        EmitLog("WinHost: 发送端已停止");
+    }
+
     static bool ReadPrimaryDisplayBounds(WinVddBounds* out) {
         if (!out) return false;
         WinVddBounds fallback{};
@@ -399,6 +420,7 @@ private:
             dd.cb = sizeof(dd);
             if (!EnumDisplayDevicesW(nullptr, i, &dd, 0)) break;
             if (!(dd.StateFlags & DISPLAY_DEVICE_ATTACHED_TO_DESKTOP)) continue;
+            if (wcsstr(dd.DeviceString, L"Parsec") != nullptr) continue;
             DEVMODEW dm{};
             dm.dmSize = sizeof(dm);
             if (!EnumDisplaySettingsW(dd.DeviceName, ENUM_CURRENT_SETTINGS, &dm)) continue;
@@ -499,12 +521,24 @@ private:
     WinVirtualDisplay vdd_;
     WinHostStats stats_;
     LogFn logFn_;
+    std::mutex lifecycleMtx_;
+    std::mutex kvmOpMtx_;
     std::atomic<bool> mirrorMode_{false};
+    std::atomic<bool> captureHealthy_{false};
     mutable std::mutex captureMtx_;
     WinVddBounds primaryBounds_{};
 
     static int ClampHz(int hz, int fallback) {
-        return (hz >= 24 && hz <= 240) ? hz : fallback;
+        int fb = std::clamp(fallback, 24, 144);
+        return (hz >= 24 && hz <= 144) ? hz : fb;
+    }
+
+    static int EffectiveMirrorFps(int displayHz, int capFps) {
+        int cap = std::clamp(capFps, 24, 144);
+        if (displayHz >= 24 && displayHz <= 240) {
+            return std::min(displayHz, cap);
+        }
+        return cap;
     }
 
     std::string targetHost_ = "10.10.10.1";
@@ -1301,6 +1335,15 @@ private:
                 InjectKeyboard(vk, scan, downByte != 0, flags);
                 stats_.inputRecv++;
                 pos += 7;
+            } else if (t == kTypeKvmState) {
+                if (acc.size() - pos < 2) break;
+                uint8_t active = acc[pos + 1];
+                clearConflictErr();
+                if (active == 0) {
+                    EmitLog("WinHost: Mac 端已主动解除 KVM 键鼠穿透，恢复操作 Windows");
+                    SetKvmActive(false);
+                }
+                pos += 2;
             } else if (t == kTypeFeedback) {
                 if (acc.size() - pos < 13) break;
                 uint16_t presentP95 = RdU16BE(acc.data() + pos + 1);
@@ -2360,6 +2403,7 @@ private:
 
         int initFailStreak = 0;
         auto backoffSleep = [&](const char* reason, HRESULT errHr) {
+            captureHealthy_.store(false);
             ++initFailStreak;
             if (initFailStreak == 1 || initFailStreak % 20 == 0) {
                 char msg[224];
@@ -2430,10 +2474,20 @@ private:
             int capW = (int)(od.DesktopCoordinates.right - od.DesktopCoordinates.left);
             int capH = (int)(od.DesktopCoordinates.bottom - od.DesktopCoordinates.top);
             if (capW <= 0 || capH <= 0) { capW = b.width; capH = b.height; }
+            if (mirrorMode_.load() && od.DesktopCoordinates.right > od.DesktopCoordinates.left &&
+                od.DesktopCoordinates.bottom > od.DesktopCoordinates.top) {
+                // 同步实际采集到的 DXGI 输出桌面坐标，避免多屏回退时画面与鼠标坐标错位
+                std::lock_guard<std::mutex> clk(captureMtx_);
+                primaryBounds_.left = (int)od.DesktopCoordinates.left;
+                primaryBounds_.top = (int)od.DesktopCoordinates.top;
+                primaryBounds_.width = capW;
+                primaryBounds_.height = capH;
+                if (od.DeviceName[0] != L'\0') primaryBounds_.deviceName = od.DeviceName;
+            }
 
             stats_.width = capW;
             stats_.height = capH;
-            int encFps = ClampHz(b.hz, reqFps_);
+            int encFps = mirrorMode_.load() ? EffectiveMirrorFps(b.hz, reqFps_) : ClampHz(b.hz, reqFps_);
             stats_.fps = encFps;
 
             MfH264Encoder enc;
@@ -2441,6 +2495,7 @@ private:
                 backoffSleep("H.264 编码器初始化失败", E_FAIL);
                 continue;
             }
+            captureHealthy_.store(true);
             {
                 std::lock_guard<std::mutex> lk(stats_.infoMtx);
                 stats_.encoderName = enc.friendlyName;
@@ -2458,6 +2513,10 @@ private:
             uint64_t lastStatBytes = stats_.bytesSent.load();
             bool firstFrame = true;
             bool hasCachedBgra = false;
+            bool hasDeferredBgra = false;
+            uint64_t lastMirrorEncUs = 0;
+            const bool paceMirrorFps = mirrorMode_.load() && (b.hz > encFps + 2);
+            const uint64_t minMirrorIntervalUs = (encFps > 0) ? (uint64_t)(1000000ULL / (uint64_t)encFps) : 16666ULL;
             int encFailStreak = 0;
             int badFormatCount = 0;
             bool sessionHealthy = false;
@@ -2517,7 +2576,8 @@ private:
 
                 DXGI_OUTDUPL_FRAME_INFO fi{};
                 Microsoft::WRL::ComPtr<IDXGIResource> res;
-                hr = dup->AcquireNextFrame(16, &fi, &res);
+                UINT acqTimeoutMs = (paceMirrorFps && hasDeferredBgra) ? 4U : 16U;
+                hr = dup->AcquireNextFrame(acqTimeoutMs, &fi, &res);
 
                 if (hr == DXGI_ERROR_WAIT_TIMEOUT) {
                     if (!sessionHealthy) {
@@ -2525,6 +2585,30 @@ private:
                         initFailStreak = 0;
                     }
                     if (stats_.clientConnected.load()) {
+                        if (paceMirrorFps && hasDeferredBgra && hasCachedBgra && enc.bgraCopy) {
+                            uint64_t nowUs = NowMicros();
+                            if (lastMirrorEncUs == 0 || nowUs - lastMirrorEncUs >= minMirrorIntervalUs) {
+                                hasDeferredBgra = false;
+                                LARGE_INTEGER t0{}, t1{};
+                                QueryPerformanceCounter(&t0);
+                                bool wantIdr = forceKeyframe_.exchange(false);
+                                std::vector<uint8_t> avcc;
+                                bool isIdr = false;
+                                if (enc.EncodeTexture(enc.bgraCopy.Get(), wantIdr, alive_, avcc, &isIdr, &logFn_, &stats_) && !avcc.empty()) {
+                                    QueryPerformanceCounter(&t1);
+                                    stats_.lastEncMs = (double)(t1.QuadPart - t0.QuadPart) * 1000.0 / (double)qpf.QuadPart;
+                                    stats_.framesEncoded++;
+                                    encFailStreak = 0;
+                                    lastMirrorEncUs = nowUs;
+                                    if (wantIdr && !isIdr) forceKeyframe_.store(true);
+                                    EnqueueVideoAvcc(std::move(avcc), nowUs, isIdr);
+                                    continue;
+                                } else {
+                                    stats_.encodeFail++;
+                                    if (wantIdr) forceKeyframe_.store(true);
+                                }
+                            }
+                        }
                         if (forceKeyframe_.load() && hasCachedBgra && enc.bgraCopy) {
                             forceKeyframe_.store(false);
                             uint64_t capUs = NowMicros();
@@ -2566,6 +2650,7 @@ private:
                 }
 
                 if (hr == DXGI_ERROR_ACCESS_LOST || FAILED(hr)) {
+                    captureHealthy_.store(false);
                     displayReconcilePending_.store(true);
                     needBackoff = true;
                     rebuildReason = "DXGI 输出上下文变更";
@@ -2613,9 +2698,16 @@ private:
                         hasCachedBgra = true;
                     }
                     if (needSend) {
+                        uint64_t capUs = NowMicros();
+                        if (paceMirrorFps && !forceKeyframe_.load() && lastMirrorEncUs != 0 &&
+                            capUs > lastMirrorEncUs && (capUs - lastMirrorEncUs) < minMirrorIntervalUs) {
+                            hasDeferredBgra = true;
+                            dup->ReleaseFrame();
+                            continue;
+                        }
+                        hasDeferredBgra = false;
                         LARGE_INTEGER t0{}, t1{};
                         QueryPerformanceCounter(&t0);
-                        uint64_t capUs = NowMicros();
                         bool wantIdr = forceKeyframe_.exchange(false);
                         std::vector<uint8_t> avcc;
                         bool isIdr = false;
@@ -2626,6 +2718,7 @@ private:
                             stats_.lastEncMs = encMs;
                             stats_.framesEncoded++;
                             encFailStreak = 0;
+                            lastMirrorEncUs = capUs;
                             if (!wantIdr) {
                                 NoteLocalCongestion(encMs, false);
                             }
@@ -2651,6 +2744,7 @@ private:
             }
             enc.Shutdown();
             if (needBackoff && alive_.load()) {
+                captureHealthy_.store(false);
                 backoffSleep(rebuildReason, rebuildHr);
             }
         }

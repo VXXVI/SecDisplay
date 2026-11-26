@@ -907,7 +907,7 @@ struct StatusView: View {
                             }
                         }
                     } else {
-                        Text("把文件拖到此面板即可直接发送到 Windows")
+                        Text("把文件拖到此卡片即可直接发送到 Windows")
                             .font(.system(size: 10))
                             .foregroundStyle(.tertiary)
                     }
@@ -1050,7 +1050,7 @@ func copyDiagnostics() {
     Log.info("面板: 诊断信息已复制到剪贴板")
 }
 
-private var isRestartingResolution = false
+nonisolated(unsafe) var isRestartingResolution = false
 
 func restartWithRole(_ role: SecDisplayRole, host: String) {
     restartWithConfig(role: role, displayMode: appDisplayMode, host: host)

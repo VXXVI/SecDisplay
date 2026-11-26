@@ -586,6 +586,7 @@ final class MacReceiverClient {
     private var _connected = false
     private var _streaming = false
     private var _kvmActive = false
+    private var _kvmEpoch: UInt64 = 0
     private var _listening = false
     private var _listenerError: String? = nil
     private var _rejectedPeer: String? = nil
@@ -706,6 +707,7 @@ final class MacReceiverClient {
         _connected = false
         _streaming = false
         _kvmActive = false
+        _kvmEpoch &+= 1
         _listening = false
         _listenerError = nil
         _activePeerHost = ""
@@ -744,10 +746,16 @@ final class MacReceiverClient {
     func forceReleaseLocalKvm() {
         stateLock.lock()
         let was = _kvmActive
+        let connected = _connected
         _kvmActive = false
+        _kvmEpoch &+= 1
         stateLock.unlock()
         kvmQueue.async { [weak self] in
             self?.kvmInjector.setActive(false)
+        }
+        if was && connected {
+            // 同步通知 Windows 主控端退出 KVM 钩子，保证双端状态一致
+            sendBytes(Data([0x0C, 0x00]))
         }
         if was {
             Log.info("KVM: 本机已主动解除 Windows 远程键鼠穿透")
@@ -1071,6 +1079,7 @@ final class MacReceiverClient {
         _connected = false
         _streaming = false
         _kvmActive = false
+        _kvmEpoch &+= 1
         _activePeerHost = ""
         _decodeInFlight = 0
         _needRecoveryKeyframe = false
@@ -1260,12 +1269,15 @@ final class MacReceiverClient {
             let wheel = Int16(bitPattern: readU16BE(payload, 5))
             stateLock.lock()
             let epoch = _latestEpoch
+            let kvmEp = _kvmEpoch
+            let kvmOn = _kvmActive
             _cursorRecv &+= 1
             stateLock.unlock()
+            guard kvmOn else { return }
             kvmQueue.async { [weak self] in
                 guard let self else { return }
                 self.stateLock.lock()
-                let ok = !self.stopped && self._connected && self._latestEpoch == epoch
+                let ok = !self.stopped && self._connected && self._latestEpoch == epoch && self._kvmActive && self._kvmEpoch == kvmEp
                 self.stateLock.unlock()
                 if ok { self.kvmInjector.handleMouse(dx: dx, dy: dy, buttons: buttons, wheel: wheel) }
             }
@@ -1277,11 +1289,14 @@ final class MacReceiverClient {
             let flags = payload[payload.startIndex + 5]
             stateLock.lock()
             let epoch = _latestEpoch
+            let kvmEp = _kvmEpoch
+            let kvmOn = _kvmActive
             stateLock.unlock()
+            guard kvmOn else { return }
             kvmQueue.async { [weak self] in
                 guard let self else { return }
                 self.stateLock.lock()
-                let ok = !self.stopped && self._connected && self._latestEpoch == epoch
+                let ok = !self.stopped && self._connected && self._latestEpoch == epoch && self._kvmActive && self._kvmEpoch == kvmEp
                 self.stateLock.unlock()
                 if ok { self.kvmInjector.handleKey(vk: vk, scan: scan, down: down, flags: flags) }
             }
@@ -1290,6 +1305,7 @@ final class MacReceiverClient {
             let active = payload[payload.startIndex] != 0
             stateLock.lock()
             _kvmActive = active
+            _kvmEpoch &+= 1
             stateLock.unlock()
             Log.info(active ? "KVM: Windows 主控已开启键鼠穿透 (正在远程控制本机)" : "KVM: Windows 主控已退出键鼠穿透")
             kvmQueue.async { [weak self] in
@@ -1846,7 +1862,7 @@ final class ReceiverWindowController: NSObject, NSWindowDelegate {
 
         client.onVideoFrame = { [weak view, weak self] pb, vw, vh in
             DispatchQueue.main.async {
-                if let self, !self.window.isVisible, !self.userDismissedWindow {
+                if let self, !self.window.isVisible, !self.window.isMiniaturized, !self.userDismissedWindow {
                     self.show()
                 }
                 view?.displayFrame(pb, width: vw, height: vh)
@@ -1891,9 +1907,8 @@ final class ReceiverWindowController: NSObject, NSWindowDelegate {
                 }
             }
         }
-        client.onDisconnected = { [weak view, weak win, weak self] in
+        client.onDisconnected = { [weak view, weak win] in
             DispatchQueue.main.async {
-                self?.userDismissedWindow = false
                 view?.showDisconnected("连接已断开，等待 Windows 主控重连…")
                 win?.title = "SecDisplay 副屏 (等待重连) · Ctrl+Cmd+F 全屏 · Cmd+Q 退出"
             }
@@ -1903,6 +1918,9 @@ final class ReceiverWindowController: NSObject, NSWindowDelegate {
     func show() {
         userDismissedWindow = false
         NSApp.setActivationPolicy(.regular)
+        if window.isMiniaturized {
+            window.deminiaturize(nil)
+        }
         window.makeKeyAndOrderFront(nil)
         NSApp.activate(ignoringOtherApps: true)
     }

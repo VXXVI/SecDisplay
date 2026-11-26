@@ -4942,6 +4942,7 @@ nonisolated(unsafe) var appDisplayMode: SecDisplayDisplayMode = {
 
 private let suppressAutoPanelOnLaunch: Bool = {
     let args = CommandLine.arguments
+    if args.contains("--panel") { return false }
     if args.contains("--no-panel") { return true }
     if ProcessInfo.processInfo.environment["SECDISPLAY_HIDE_PANEL"] == "1" { return true }
     if ProcessInfo.processInfo.environment["SECDISPLAY_SHOW_PANEL"] == "0" { return true }
@@ -4993,6 +4994,8 @@ do {
                     userInfo: nil,
                     deliverImmediately: true
                 )
+                // 短暂驱动主 RunLoop 冲刷分布式通知 IPC，避免进程立刻 exit(0) 丢失唤醒信号
+                RunLoop.current.run(until: Date(timeIntervalSinceNow: 0.15))
                 Log.info("已有 SecDisplay 实例在运行，已唤醒其控制面板后退出。")
                 exit(0)
             }
@@ -5274,21 +5277,25 @@ if appRole == .sender {
     sndInst.sessionHeight = cfg.height
     sndInst.sessionFps = Int(cfg.captureHz.rounded())
 
-    guard encInst.start() else { exit(3) }
+    guard encInst.start() else {
+        Log.info("编码器启动失败，退出")
+        exit(3)
+    }
 
     encInst.onFrame = { data, isKey, ts in
         sndInst.send(frame: data, isKey: isKey, captureTimeMicros: ts)
     }
 
-    if appDisplayMode == .extend {
-        if CommandLine.arguments.contains("--cleanup-orphan")
-            || ProcessInfo.processInfo.environment["SECDISPLAY_CLEANUP_ORPHAN"] == "1" {
-            let residual = listSecDisplays()
-            if !residual.isEmpty {
-                Log.info("启动前发现残留虚拟屏 \(residual.count) 块，执行显示重配置清理")
-                reconfigureDisplays()
-            }
+    if CommandLine.arguments.contains("--cleanup-orphan")
+        || ProcessInfo.processInfo.environment["SECDISPLAY_CLEANUP_ORPHAN"] == "1" {
+        let residual = listSecDisplays()
+        if !residual.isEmpty {
+            Log.info("启动前发现残留虚拟屏 \(residual.count) 块，执行显示重配置清理")
+            reconfigureDisplays()
         }
+    }
+
+    if appDisplayMode == .extend {
 
         if LinkMonitor.probe() == false {
             Log.info("雷雳链路未就绪（\(LinkMonitor.ifName) 无 carrier），最多等 8 秒…")
@@ -5881,9 +5888,8 @@ final class ClientWatchdog {
     private func tick() {
         guard !fired else { return }
         let now = CFAbsoluteTimeGetCurrent()
-        // 权限等待、镜像主屏模式（不占虚拟屏）或控制面板打开操作期间暂停看门狗自动退出，
-        // 避免用户在面板里选择模式或等待另一台电脑开机时程序意外退出。
-        if isScreenCaptureDenied() || appDisplayMode == .mirror || isControlPanelVisible {
+        // 权限等待、镜像主屏模式（不占虚拟屏）或正在切换分辨率/重启期间暂停看门狗自动退出
+        if isScreenCaptureDenied() || appDisplayMode == .mirror || isRestartingResolution {
             startedAt = now
             if everConnected { lastConnectedAt = now }
             linkDownSince = nil
@@ -5908,10 +5914,10 @@ final class ClientWatchdog {
 
         // 链路断满宽限就直接算断开。拔线后 TCP 往往要等重传超时才报错，
         // 那时 connected 还是 true，只等它变 false 会让空虚拟屏继续挂几十秒。
-        // 链路断满宽限就直接算断开，不要求「连过」。
-        // 拔线时虚拟屏必须马上消失，否则会一直挂在显示器排列里。
-        // 启动后 10 秒内的链路抖动不算（开机时网桥可能还没起来）。
-        if now - startedAt >= 10 {
+        // 若刚启动且从未连接、同时控制面板正打开（用户可能在面板里选模式或准备插线），
+        // 跳过 5 秒链路断加速退出，仍受 initialGrace(180s) 兜底保护，不致长期遗留虚拟屏。
+        let deferUnconnectedLinkDown = !everConnected && isControlPanelVisible
+        if now - startedAt >= 10 && !deferUnconnectedLinkDown {
             if link == .down {
                 if linkDownSince == nil { linkDownSince = now }
                 if let since = linkDownSince, now - since >= graceLinkDown {
@@ -5922,6 +5928,8 @@ final class ClientWatchdog {
             } else {
                 linkDownSince = nil
             }
+        } else if deferUnconnectedLinkDown {
+            linkDownSince = nil
         }
 
         if connected { return }

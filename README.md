@@ -36,7 +36,7 @@ Windows (主动连接 <Mac IP>)                  Mac (监听 9922/9923)
   SendInput 键鼠注入 ←──── 0x04/0x09 ─────       MacKeyMap 捕获键鼠与 0x07 反馈
 ```
 
-控制面板顶部（Mac 菜单栏面板与 Windows 控制面板）在启动时会自动展示，可直接点击选择哪一台电脑当副屏，以及选择「扩展屏幕」或「镜像主屏」；Mac 与 Windows 均统一支持安全退出快捷键（Mac 为 `Cmd+Q` / `Ctrl+Opt+Q`，Windows 为 `Ctrl+Alt+Q` / `Alt+F4`）。
+控制面板顶部（Mac 菜单栏面板与 Windows 控制面板）在启动时会自动展示，可直接点击选择哪一台电脑当副屏，以及选择「扩展屏幕」或「镜像主屏」；Mac 与 Windows 均统一支持全局安全退出快捷键（Mac 为 `Cmd+Q` / `Ctrl+Opt+Q`，Windows 为 `Ctrl+Alt+Q`，接收端投屏窗口另支持 `Alt+F4`）。
 
 ---
 
@@ -135,7 +135,7 @@ ping -c 5 10.10.10.2
 |---|---|---|
 | `SECDISPLAY_MODE` | 角色模式：`sender`（Mac 当主屏）或 `receiver`（Mac 当副屏） | `sender` |
 | `SECDISPLAY_DISPLAY_MODE` | 显示方式：`extend`（扩展屏幕）或 `mirror`（镜像主屏） | `extend` |
-| `SECDISPLAY_SHOW_PANEL` | 启动时自动弹出控制面板（`0` 或 `--no-panel` 可关闭） | `1` |
+| `SECDISPLAY_SHOW_PANEL` | 启动时自动弹出控制面板（`0`、`SECDISPLAY_HIDE_PANEL=1` 或 `--no-panel` 关闭，`--panel` 强制开启） | `1` |
 | `SECDISPLAY_HOST` | 记录的 Windows 地址，供中转或面板切回主屏时保留 | `10.10.10.2` |
 | `SECDISPLAY_ALLOWED_HOST` | 副屏接收模式白名单 IP（逗号分隔，或 `any`；留空为私有网段+防抢占） | 自动 |
 | `SECDISPLAY_W` / `SECDISPLAY_H` | 正向模式虚拟屏物理分辨率 | 随档位（默认 `2880x1800`） |
@@ -154,7 +154,7 @@ ping -c 5 10.10.10.2
 - `mode=receiver|sender`（对应命令行 `--mode receiver|sender`），`displaymode=extend|mirror`（对应 `--extend` / `--mirror` / `--display-mode`），`showpanel=1|0`（对应 `--panel` / `--no-panel`）
 - `hostwidth` / `hostheight` / `fps` / `bitrate` / `hostdpi`（主控虚拟屏尺寸、帧率、码率及可选独立 DPI 缩放百分比，默认 `2880x1800@60`，`50 Mbps`）
 - 控制面板启动即展示，可直接点击选择 Windows 或 Mac 当副屏、切换扩展屏幕或镜像主屏，并支持 `2880×1800` / `2560×1600` / `1920×1200`、码率档位 `30M` / `50M` / `80M`、快速断线重连以及重挂虚拟屏；面板复选框修改会自动写回 `config.ini`。
-- 快捷操作：左键托盘图标打开控制面板，`Ctrl+Alt+Q` 或 `Alt+F4` 安全退出，`F11` 或全屏按 `Esc` 返回窗口（窗口模式 `Esc` 透传给 Mac 不误退），`Ctrl+Alt+H` 让位或显隐面板，`Ctrl+Alt+B` 悬浮投递盒，`Ctrl+Alt+K` 主控键鼠穿透（Mac 端可用 `Cmd+Q` / `Ctrl+Opt+Q` 退出、`Ctrl+Opt+Esc` 本地解除 Windows KVM 穿透）。
+- 快捷操作：左键托盘图标打开控制面板，`Ctrl+Alt+Q` 全局安全退出，接收端投屏窗口按 `Alt+F4` 退出（控制面板按 `Esc` / `Alt+F4` 仅隐藏），`F11` 或全屏按 `Esc` 返回窗口（窗口模式 `Esc` 透传给 Mac 不误退），`Ctrl+Alt+H` 让位或显隐面板，`Ctrl+Alt+B` 悬浮投递盒，`Ctrl+Alt+K` 主控键鼠穿透（Mac 端可用 `Cmd+Q` / `Ctrl+Opt+Q` 退出、`Ctrl+Opt+Esc` 本地解除 Windows KVM 穿透并同步通知 Windows 端退出钩子）。
 
 ---
 

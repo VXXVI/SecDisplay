@@ -907,7 +907,7 @@ static std::vector<std::string> g_preservedArgs;
 // 前向声明：主控模式切换、显示模式切换、配置写回与面板切换
 static void SwitchAppMode(bool toHostMode);
 static void SwitchHostDisplayMode(bool mirrorMode);
-static bool SaveConfigKey(const std::string& key, const std::string& value);
+static bool SaveConfigKey(const std::string& key, const std::string& value, bool createIfMissing = false);
 static void ToggleControlPanelVisibility();
 
 static void TrayShowMenu(HWND hwnd) {
@@ -915,15 +915,17 @@ static void TrayShowMenu(HWND hwnd) {
     GetCursorPos(&pt);
     HMENU menu = CreatePopupMenu();
     if (!menu) return;
+    const bool hostBusy = g_hostActionBusy.load();
     // W 版菜单 + 宽字符：绕开 CP936 对 UTF-8 中文的 GBK 误解码
     AppendMenuW(menu, MF_STRING, ID_TRAY_PANEL, L"打开控制面板");
     AppendMenuW(menu, MF_STRING, ID_TRAY_DROPBOX, L"文件投递盒（悬浮窗）  (Ctrl+Alt+B)");
     AppendMenuW(menu, MF_STRING, ID_TRAY_MODE,
                 g_hostMode.load() ? L"切换：Windows 当副屏 (接收 Mac)" : L"切换：Mac 当副屏 (本机主控)");
     if (g_hostMode.load()) {
-        AppendMenuW(menu, MF_STRING, ID_TRAY_DISP_MODE,
+        UINT hostFlags = MF_STRING | (hostBusy ? MF_GRAYED : 0);
+        AppendMenuW(menu, hostFlags, ID_TRAY_DISP_MODE,
                     g_hostMirrorMode.load() ? L"显示方式：切为扩展屏幕" : L"显示方式：切为镜像主屏");
-        AppendMenuW(menu, MF_STRING, ID_TRAY_KVM,
+        AppendMenuW(menu, hostFlags, ID_TRAY_KVM,
                     g_winHost.IsKvmActive() ? L"退出键鼠穿透 Mac  (Ctrl+Alt+K)" : L"键鼠穿透控制 Mac  (Ctrl+Alt+K)");
     } else {
         AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
@@ -2461,7 +2463,7 @@ static void HideFullscreenHint() {
 static void ShowFullscreenHint() {
     if (!g_hwnd) return;
     const int dpi = HintTargetDpi();
-    const int hintW = MulDiv(680, dpi, 96);
+    const int hintW = MulDiv(760, dpi, 96);
     const int hintH = MulDiv(44, dpi, 96);
     if (!g_hintBrush) g_hintBrush = CreateSolidBrush(RGB(18, 18, 18));
     if (!g_hintFont || g_hintFontDpi != dpi) {
@@ -2634,7 +2636,6 @@ static const int IDC_PANEL_SENDFILE = 2030;
 static const int IDC_PANEL_OPENXFER = 2031;
 static const int IDC_PANEL_DROPBOX  = 2032;
 static const int IDC_PANEL_PASTEXFER = 2033;
-static const int IDC_PANEL_MODE      = 2034;
 static const int IDC_PANEL_RES_2880  = 2035;
 static const int IDC_PANEL_RES_2560  = 2036;
 static const int IDC_PANEL_RES_1920  = 2037;
@@ -3121,22 +3122,27 @@ static void UpdateExecutionState() {
 static const int kPanelLogicalW = 960;
 static const int kPanelLogicalH = 736;
 
-// 实时读取窗口所在显示器的有效 DPI，并在高缩放小屏上按工作区高度自动收敛，避免面板底部被裁切
-static int PanelWindowDpi(HWND h) {
+// 实时读取窗口（或目标显示器矩形）的有效 DPI，并在高缩放小屏上按工作区高度自动收敛，避免面板底部被裁切
+static int PanelWindowDpi(HWND h, const RECT* targetRect = nullptr, int overrideDpi = 0) {
     HMODULE u32 = GetModuleHandleA("user32.dll");
     typedef UINT (WINAPI *GetDpiForWindowFn)(HWND);
     typedef UINT (WINAPI *GetDpiForSystemFn)(void);
     auto fw = (GetDpiForWindowFn)GetProcAddress(u32, "GetDpiForWindow");
     auto fs = (GetDpiForSystemFn)GetProcAddress(u32, "GetDpiForSystem");
-    int dpi = 0;
-    if (fw && h) dpi = (int)fw(h);
+    int dpi = overrideDpi;
+    if (dpi <= 0 && fw && h) dpi = (int)fw(h);
     if (dpi <= 0 && fw && g_hwnd && !g_hostMode.load()) dpi = (int)fw(g_hwnd);
     if (dpi <= 0 && fs) dpi = (int)fs();
     if (dpi <= 0) dpi = 96;
 
     RECT wa{};
-    if (h) {
-        HMONITOR mon = MonitorFromWindow(h, MONITOR_DEFAULTTONEAREST);
+    HMONITOR mon = nullptr;
+    if (targetRect) {
+        mon = MonitorFromRect(targetRect, MONITOR_DEFAULTTONEAREST);
+    } else if (h) {
+        mon = MonitorFromWindow(h, MONITOR_DEFAULTTONEAREST);
+    }
+    if (mon) {
         MONITORINFO mi{}; mi.cbSize = sizeof(mi);
         if (GetMonitorInfoW(mon, &mi)) wa = mi.rcWork;
     }
@@ -3513,7 +3519,7 @@ static void UpdateControlPanel() {
         bool streaming = connected && sentF > 0;
         if (busy) {
             g_panelData.state = 1;
-            g_panelData.statusText = mirrorMode ? L"正在切换至镜像主屏…" : L"正在切换虚拟屏配置…";
+            g_panelData.statusText = mirrorMode ? L"正在切换至镜像主屏…" : L"正在切换显示配置…";
         } else if (!srcOk) {
             g_panelData.state = 3;
             g_panelData.statusText = mirrorMode
@@ -3634,7 +3640,7 @@ static void UpdateControlPanel() {
         for (int id : { IDC_PANEL_RES_2880, IDC_PANEL_RES_2560, IDC_PANEL_RES_1920 }) {
             if (HWND c = GetDlgItem(g_panel, id)) EnableWindow(c, (!mirrorMode && !busy) ? TRUE : FALSE);
         }
-        for (int id : { IDC_PANEL_DISP_EXTEND, IDC_PANEL_DISP_MIRROR, IDC_PANEL_VDD_RETRY }) {
+        for (int id : { IDC_PANEL_DISP_EXTEND, IDC_PANEL_DISP_MIRROR, IDC_PANEL_VDD_RETRY, IDC_PANEL_KVM }) {
             if (HWND c = GetDlgItem(g_panel, id)) EnableWindow(c, !busy ? TRUE : FALSE);
         }
         InvalidateRect(g_panel, nullptr, FALSE);
@@ -4278,11 +4284,11 @@ static void JoinHostActionThread() {
     if (th.joinable()) th.join();
 }
 
-static void RunHostAsyncAction(std::function<void()> fn) {
-    if (!g_alive.load()) return;
+static bool RunHostAsyncAction(std::function<void()> fn) {
+    if (!g_alive.load()) return false;
     if (g_hostActionBusy.exchange(true)) {
         Log("控制面板: 正在切换显示配置，请稍候");
-        return;
+        return false;
     }
     UpdateControlPanel();
     JoinHostActionThread();
@@ -4292,24 +4298,31 @@ static void RunHostAsyncAction(std::function<void()> fn) {
         g_hostActionBusy.store(false);
         if (g_hwnd && g_alive.load()) PostMessageW(g_hwnd, WM_APP_HOST_ACTION_DONE, 0, 0);
     });
+    return true;
 }
 
 static void SwitchHostDisplayMode(bool mirrorMode) {
     if (!g_hostMode.load()) return;
+    if (g_hostActionBusy.load()) {
+        Log("控制面板: 正在切换显示配置，请稍候");
+        return;
+    }
     if (g_hostMirrorMode.load() == mirrorMode && g_winHost.CaptureSourceReady()) return;
-    g_hostMirrorMode.store(mirrorMode);
-    SaveConfigKey("displaymode", mirrorMode ? "mirror" : "extend");
-    Log("控制面板: 切换主控显示方式 -> %s", mirrorMode ? "镜像主屏" : "扩展屏幕");
     std::string host = g_peerHost;
     int w = g_hostReqW.load(), h = g_hostReqH.load();
     int fps = g_hostReqFps.load(), mbps = g_hostReqMbps.load(), dpi = g_hostReqDpi.load();
     uint16_t port = (uint16_t)g_peerPort;
-    RunHostAsyncAction([host, w, h, fps, mbps, port, dpi, mirrorMode]() {
+    if (!RunHostAsyncAction([host, w, h, fps, mbps, port, dpi, mirrorMode]() {
+        g_hostMirrorMode.store(mirrorMode);
+        SaveConfigKey("displaymode", mirrorMode ? "mirror" : "extend", true);
+        Log("控制面板: 切换主控显示方式 -> %s", mirrorMode ? "镜像主屏" : "扩展屏幕");
         if (!g_winHost.Start(host, w, h, fps, mbps, port,
                              [](const char* s) { Log("%s", s); }, dpi, mirrorMode)) {
             Log("警告: 切换至%s模式失败", mirrorMode ? "镜像主屏" : "扩展屏幕");
         }
-    });
+    })) {
+        return;
+    }
 }
 
 static LRESULT CALLBACK PanelWndProc(HWND h, UINT msg, WPARAM w, LPARAM l) {
@@ -4408,12 +4421,13 @@ static LRESULT CALLBACK PanelWndProc(HWND h, UINT msg, WPARAM w, LPARAM l) {
         }
         return FALSE;
     case WM_DPICHANGED: {
-        const int realDpi = PanelWindowDpi(h);
+        const RECT* suggested = (const RECT*)l;
+        const int incomingDpi = HIWORD(w) > 0 ? (int)HIWORD(w) : 0;
+        const int realDpi = PanelWindowDpi(h, suggested, incomingDpi);
         DWORD style = (DWORD)GetWindowLongPtrW(h, GWL_STYLE);
         DWORD exStyle = (DWORD)GetWindowLongPtrW(h, GWL_EXSTYLE);
         RECT r2{ 0, 0, DpiPx(kPanelLogicalW, realDpi), DpiPx(kPanelLogicalH, realDpi) };
         AdjustRectDpi(&r2, style, exStyle, realDpi);
-        const RECT* suggested = (const RECT*)l;
         int x = suggested ? suggested->left : 0;
         int y = suggested ? suggested->top : 0;
         SetWindowPos(h, nullptr, x, y,
@@ -4423,17 +4437,6 @@ static LRESULT CALLBACK PanelWndProc(HWND h, UINT msg, WPARAM w, LPARAM l) {
         InvalidateRect(h, nullptr, FALSE);
         return 0;
     }
-    case WM_KEYDOWN:
-        if (w == VK_ESCAPE) {
-            KillTimer(h, 1);
-            ShowWindow(h, SW_HIDE);
-            return 0;
-        }
-        if (w == 'Q' && (GetKeyState(VK_CONTROL) & 0x8000) && !(GetKeyState(VK_SHIFT) & 0x8000)) {
-            RequestQuit();
-            return 0;
-        }
-        break;
     case WM_TIMER:
         if (w == 1) UpdateControlPanel();
         return 0;
@@ -4483,9 +4486,6 @@ static LRESULT CALLBACK PanelWndProc(HWND h, UINT msg, WPARAM w, LPARAM l) {
         case IDC_PANEL_DISP_MIRROR:
             SwitchHostDisplayMode(true);
             return 0;
-        case IDC_PANEL_MODE:
-            SwitchAppMode(!g_hostMode.load());
-            return 0;
         case IDC_PANEL_FULL:
             if (g_hostMode.load()) {
                 ShellExecuteW(nullptr, L"open", L"ms-settings:display", nullptr, nullptr, SW_SHOWNORMAL);
@@ -4509,7 +4509,7 @@ static LRESULT CALLBACK PanelWndProc(HWND h, UINT msg, WPARAM w, LPARAM l) {
             return 0;
         }
         case IDC_PANEL_RES_2880:
-            if (g_hostMode.load() && !g_hostMirrorMode.load()) {
+            if (g_hostMode.load() && !g_hostMirrorMode.load() && !g_hostActionBusy.load()) {
                 g_hostReqW = 2880; g_hostReqH = 1800;
                 SaveConfigKey("hostwidth", "2880");
                 SaveConfigKey("hostheight", "1800");
@@ -4518,7 +4518,7 @@ static LRESULT CALLBACK PanelWndProc(HWND h, UINT msg, WPARAM w, LPARAM l) {
             }
             return 0;
         case IDC_PANEL_RES_2560:
-            if (g_hostMode.load() && !g_hostMirrorMode.load()) {
+            if (g_hostMode.load() && !g_hostMirrorMode.load() && !g_hostActionBusy.load()) {
                 g_hostReqW = 2560; g_hostReqH = 1600;
                 SaveConfigKey("hostwidth", "2560");
                 SaveConfigKey("hostheight", "1600");
@@ -4527,7 +4527,7 @@ static LRESULT CALLBACK PanelWndProc(HWND h, UINT msg, WPARAM w, LPARAM l) {
             }
             return 0;
         case IDC_PANEL_RES_1920:
-            if (g_hostMode.load() && !g_hostMirrorMode.load()) {
+            if (g_hostMode.load() && !g_hostMirrorMode.load() && !g_hostActionBusy.load()) {
                 g_hostReqW = 1920; g_hostReqH = 1200;
                 SaveConfigKey("hostwidth", "1920");
                 SaveConfigKey("hostheight", "1200");
@@ -4560,7 +4560,7 @@ static LRESULT CALLBACK PanelWndProc(HWND h, UINT msg, WPARAM w, LPARAM l) {
             }
             return 0;
         case IDC_PANEL_VDD_RETRY:
-            if (g_hostMode.load()) {
+            if (g_hostMode.load() && !g_hostActionBusy.load()) {
                 bool mirror = g_hostMirrorMode.load();
                 Log(mirror ? "控制面板: 请求重新检测物理主屏并重启镜像推流"
                            : "控制面板: 请求重挂 Parsec 虚拟屏并重启主控推送");
@@ -4579,6 +4579,10 @@ static LRESULT CALLBACK PanelWndProc(HWND h, UINT msg, WPARAM w, LPARAM l) {
             return 0;
         case IDC_PANEL_KVM:
             if (g_hostMode.load()) {
+                if (g_hostActionBusy.load()) {
+                    Log("控制面板: 正在切换显示配置，暂不可切换 KVM");
+                    return 0;
+                }
                 g_winHost.ToggleKvm();
                 UpdateControlPanel();
             }
@@ -6262,7 +6266,9 @@ static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
         if (w == TIMER_SLEEP_WATCHDOG) {
             KillTimer(h, TIMER_SLEEP_WATCHDOG);
             if (g_hostMode.load() && g_winHost.IsPausedForSleep()) {
-                Log("电源事件: 休眠可能被取消或阻塞，看门狗自动恢复虚拟屏");
+                Log(g_hostMirrorMode.load()
+                    ? "电源事件: 休眠可能被取消或阻塞，看门狗自动恢复镜像主屏推流"
+                    : "电源事件: 休眠可能被取消或阻塞，看门狗自动恢复虚拟屏");
                 g_resumeRetryCount = 0;
                 SetTimer(h, TIMER_RESUME_HOST, 200, nullptr);
             }
@@ -6272,16 +6278,21 @@ static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
             KillTimer(h, TIMER_RESUME_HOST);
             if (g_hostMode.load()) {
                 if (g_winHost.IsPausedForSleep()) {
+                    const bool mirror = g_hostMirrorMode.load();
                     if (g_winHost.ResumeFromSleep()) {
                         g_resumeRetryCount = 0;
+                        UpdateExecutionState();
                         UpdateControlPanel();
                     } else if (++g_resumeRetryCount <= 3) {
-                        Log("电源恢复后重建虚拟屏未就绪，2.5 秒后第 %d 次重试", g_resumeRetryCount);
+                        Log(mirror ? "电源恢复后重检物理主屏未就绪，2.5 秒后第 %d 次重试"
+                                   : "电源恢复后重建虚拟屏未就绪，2.5 秒后第 %d 次重试", g_resumeRetryCount);
                         SetTimer(h, TIMER_RESUME_HOST, 2500, nullptr);
                     } else {
                         g_winHost.ClearPausedForSleep();
                         g_resumeRetryCount = 0;
-                        Log("警告: 电源恢复后重建虚拟屏连续失败，可点击控制面板「重挂虚拟屏」");
+                        Log(mirror ? "警告: 电源恢复后重检物理主屏连续失败，可点击控制面板「重检主屏」"
+                                   : "警告: 电源恢复后重建虚拟屏连续失败，可点击控制面板「重挂虚拟屏」");
+                        UpdateExecutionState();
                         UpdateControlPanel();
                     }
                 } else if (g_winHost.IsRunning()) {
@@ -6404,6 +6415,7 @@ static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
                 if (g_winHost.PauseForSleep()) {
                     SetTimer(h, TIMER_SLEEP_WATCHDOG, 30000, nullptr);
                 }
+                UpdateExecutionState();
                 UpdateControlPanel();
             }
             return TRUE;
@@ -6547,7 +6559,7 @@ static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
         case ID_TRAY_MODE:      SwitchAppMode(!g_hostMode.load()); return 0;
         case ID_TRAY_DISP_MODE: SwitchHostDisplayMode(!g_hostMirrorMode.load()); return 0;
         case ID_TRAY_KVM:
-            if (g_hostMode.load()) {
+            if (g_hostMode.load() && !g_hostActionBusy.load()) {
                 g_winHost.ToggleKvm();
                 UpdateControlPanel();
             }
@@ -6562,7 +6574,7 @@ static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
                 L"SecDisplay\n"
                 L"左键托盘图标：打开控制面板\n"
                 L"Ctrl+Alt+Q：全局安全退出（与 Mac 端 Ctrl+Opt+Q 统一）\n"
-                L"Alt+F4：关闭窗口退出\n"
+                L"Alt+F4：接收端投屏窗口退出（控制面板按 Esc / Alt+F4 为隐藏）\n"
                 L"F11 / 全屏按 Esc：切换全屏 / 返回窗口\n"
                 L"Ctrl+Alt+H：接收端最小化让位 / 主控端显隐控制面板\n"
                 L"Ctrl+Alt+B：呼出 / 隐藏悬浮文件投递盒\n"
@@ -6578,7 +6590,7 @@ static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
             else ToggleMinimize();
         }
         else if (w == HOTKEY_DROPBOX_ID) ToggleDropBoxWindow();
-        else if (w == HOTKEY_KVM_ID && g_hostMode.load()) {
+        else if (w == HOTKEY_KVM_ID && g_hostMode.load() && !g_hostActionBusy.load()) {
             g_winHost.ToggleKvm();
             UpdateControlPanel();
         }
@@ -6983,31 +6995,64 @@ static void LoadConfigFile(RunConfig& cfg, const std::string& path) {
     Log("已读取配置 %s（%d 项）", path.c_str(), applied);
 }
 
-static bool SaveConfigKey(const std::string& key, const std::string& value) {
+static bool WriteAllBytesWithFlush(const std::string& path, const std::string& content) {
+    HANDLE hf = CreateFileA(path.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (hf == INVALID_HANDLE_VALUE) return false;
+    const char* p = content.data();
+    size_t rem = content.size();
+    bool ok = true;
+    while (rem > 0) {
+        DWORD chunk = (rem > (1U << 20)) ? (1U << 20) : (DWORD)rem;
+        DWORD written = 0;
+        if (!WriteFile(hf, p, chunk, &written, nullptr) || written != chunk) {
+            ok = false;
+            break;
+        }
+        p += written;
+        rem -= written;
+    }
+    if (ok) FlushFileBuffers(hf);
+    CloseHandle(hf);
+    return ok;
+}
+
+static bool SaveConfigKey(const std::string& key, const std::string& value, bool createIfMissing) {
     if (!g_useConfigFile) return false;
     static std::mutex s_cfgMtx;
     std::lock_guard<std::mutex> lk(s_cfgMtx);
     std::string cfgPath = g_activeCfgPath.empty() ? (ExeDir() + "\\config.ini") : g_activeCfgPath;
+    const bool exists = (GetFileAttributesA(cfgPath.c_str()) != INVALID_FILE_ATTRIBUTES);
+    if (!exists && !createIfMissing) return false;
     std::string keyLow = key;
     std::transform(keyLow.begin(), keyLow.end(), keyLow.begin(),
                    [](unsigned char c) { return (char)std::tolower(c); });
     std::vector<std::string> lines;
     bool replaced = false;
-    {
-        std::ifstream fin(cfgPath);
+    bool hasBom = false;
+    std::string eol = "\r\n";
+    if (exists) {
+        std::ifstream fin(cfgPath, std::ios::binary);
         if (fin) {
             std::string ln;
             bool firstLine = true;
+            bool detectedEol = false;
             while (std::getline(fin, ln)) {
-                std::string check = ln;
-                if (firstLine && check.size() >= 3 &&
-                    (unsigned char)check[0] == 0xEF &&
-                    (unsigned char)check[1] == 0xBB &&
-                    (unsigned char)check[2] == 0xBF) {
-                    check.erase(0, 3);
+                if (!ln.empty() && ln.back() == '\r') {
+                    if (!detectedEol) { eol = "\r\n"; detectedEol = true; }
+                    ln.pop_back();
+                } else if (!detectedEol && !fin.eof()) {
+                    eol = "\n";
+                    detectedEol = true;
+                }
+                if (firstLine && ln.size() >= 3 &&
+                    (unsigned char)ln[0] == 0xEF &&
+                    (unsigned char)ln[1] == 0xBB &&
+                    (unsigned char)ln[2] == 0xBF) {
+                    hasBom = true;
+                    ln.erase(0, 3);
                 }
                 firstLine = false;
-                std::string t = TrimStr(check);
+                std::string t = TrimStr(ln);
                 if (!t.empty() && t[0] != '#' && t[0] != ';') {
                     size_t eq = t.find('=');
                     if (eq != std::string::npos) {
@@ -7026,31 +7071,24 @@ static bool SaveConfigKey(const std::string& key, const std::string& value) {
         }
     }
     if (!replaced) lines.push_back(keyLow + "=" + value);
+    std::string out;
+    if (hasBom) out.append("\xEF\xBB\xBF", 3);
+    for (const auto& l : lines) {
+        out += l;
+        out += eol;
+    }
     std::string tmpPath = cfgPath + ".tmp";
-    {
-        std::ofstream fout(tmpPath, std::ios::trunc | std::ios::binary);
-        if (!fout) {
-            std::ofstream direct(cfgPath, std::ios::trunc | std::ios::binary);
-            if (!direct) return false;
-            for (const auto& l : lines) direct << l << "\n";
-            return direct.good();
+    if (WriteAllBytesWithFlush(tmpPath, out)) {
+        if (MoveFileExA(tmpPath.c_str(), cfgPath.c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
+            return true;
         }
-        for (const auto& l : lines) fout << l << "\n";
-        fout.flush();
-        if (!fout.good()) return false;
-    }
-    if (!MoveFileExA(tmpPath.c_str(), cfgPath.c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
         DeleteFileA(tmpPath.c_str());
-        std::ofstream direct(cfgPath, std::ios::trunc | std::ios::binary);
-        if (!direct) return false;
-        for (const auto& l : lines) direct << l << "\n";
-        return direct.good();
     }
-    return true;
+    return WriteAllBytesWithFlush(cfgPath, out);
 }
 
 static void SaveModeToConfigFile(bool toHostMode) {
-    SaveConfigKey("mode", toHostMode ? "sender" : "receiver");
+    SaveConfigKey("mode", toHostMode ? "sender" : "receiver", true);
 }
 
 static void LaunchSelfForModeSwitch(bool toHostMode) {
@@ -7067,6 +7105,8 @@ static void LaunchSelfForModeSwitch(bool toHostMode) {
     }
     cmd += L" --mode ";
     cmd += (toHostMode ? L"sender" : L"receiver");
+    cmd += L" --display-mode ";
+    cmd += (g_hostMirrorMode.load() ? L"mirror" : L"extend");
     cmd += L" --wait-lock 3000";
 
     std::vector<wchar_t> cmdBuf(cmd.begin(), cmd.end());
