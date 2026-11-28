@@ -407,8 +407,19 @@ static const UINT WM_APP_HOST_ACTION_DONE = WM_APP + 13;
 // 会话头切换分辨率时由收流线程投递到 UI 线程：清理光标与晃动状态涉及窗口/定时器操作，
 // 必须在 UI 线程执行，避免跨线程写非原子 UI 状态。
 static const UINT WM_APP_SESSION_RESET = WM_APP + 14;
+// 网络线程检测到对端角色与本地不一致：投递到 UI 线程执行角色切换。
+static const UINT WM_APP_ROLE_FOLLOW = WM_APP + 15;
+// 切换/断线过渡层：网络线程请求显示或隐藏，窗口操作只在 UI 线程。
+static const UINT WM_APP_SHOW_TRANSITION = WM_APP + 16;
+static const UINT WM_APP_HIDE_TRANSITION = WM_APP + 17;
+// 过渡层是否可见（供呈现线程判断要不要投递隐藏消息）。
+static std::atomic<bool> g_transitionActive{false};
 // 保持屏幕常亮（防止投屏期间因无 Windows 本地输入而自动熄屏）
 static std::atomic<bool> g_keepScreenOn{true};
+// 角色跟随：macOS 切换主屏/副屏后，Windows 自动切到互补角色。
+// Mac 始终是角色基准，Windows 只跟随，避免两端互相抢角色造成乒乓重启。
+static std::atomic<bool> g_autoFollowRole{true};
+static std::atomic<uint64_t> g_lastAutoFollowMs{0};
 // 老 SDK 的 winuser.h 可能没定义 WM_DPICHANGED（需要 WINVER >= 0x0603）
 #ifndef WM_DPICHANGED
 #define WM_DPICHANGED 0x02E0
@@ -503,9 +514,9 @@ static const int kShakeMinSpanPx = 100;  // 横向/纵向累计摆幅下限，�
 // 曲线与时序对齐实测 macOS「晃动鼠标指针以定位」：
 // 约 3.8 倍快速弹出，持续晃动保持，停手约 150ms 后在 ~180ms 内利落缩回。
 static const double kShakeCursorZoom = 3.8;  // 目标放大倍数（绘制在叠加层，不受硬件光标上限限制）
-static const double kShakeGrowMs = 140.0;    // 起势时长（EaseOutBack，末端极轻微过冲）
-static const double kShakeHoldMs = 350.0;    // 最后一次指针移动后的保持时长（macOS 摇动定位约 0.3~0.5s）
-static const double kShakeShrinkMs = 220.0;  // 回落时长（EaseInOutCubic，平滑收缩）
+static const double kShakeGrowMs = 90.0;     // 起势时长：macOS 体感是「即刻」，保留极短过冲
+static const double kShakeHoldMs = 140.0;    // 可见像素停止移动后的保持时长（对齐约 150ms 起收）
+static const double kShakeShrinkMs = 170.0;  // 回落时长（EaseInOutCubic，利落缩回）
 static const double kShakeOvershootC1 = 0.8; // EaseOutBack 过冲系数（相对增量约 2.34% 峰值过冲）
 static const UINT_PTR kShakeTimer = 4004;
 
@@ -533,12 +544,22 @@ static ShakePhase g_shakePhase = SHAKE_IDLE;
 static bool g_shakeActive = false;
 // 晃动找光标总开关（可在控制面板关闭）
 static std::atomic<bool> g_shakeEnabled{true};
+// 鼠标互通：Windows 本机指针在副屏窗口内移动时，是否回传给 Mac 并操控 macOS。
+// 关闭后副屏只显示远端光标，不再把本机鼠标事件发过去。
+static std::atomic<bool> g_mouseBridgeEnabled{true};
 static double g_shakeZoom = 1.0;
 static double g_shakeAnimStartMs = 0.0;
 static double g_shakeAnimFromZoom = 1.0;
 // 最后一次指针位置真正变化的 QPC 时刻（亚毫秒，不受 GetTickCount64 15.6ms 跳变影响）。
 // 晃动触发后的 HOLD 以它为起点：指针还在移动就延长保持期，连续静止 kShakeHoldMs 后才收缩。
 static double g_shakeLastPointerQpcMs = 0.0;
+// 网络线程观察到 0x03 位置变化的时刻。窗口失焦/本地鼠标让位时 UI 线程不会走
+// DriveShakeStep，HOLD 仍应以远端真实移动为准，否则会被误判成静止提前收缩。
+static std::atomic<double> g_remoteMoveObservedQpcMs{0.0};
+// 上一次参与「是否还在移动」判定的屏幕坐标。只在坐标真的变化时续期 HOLD，
+// 避免 0x03 的亚像素死区 + 取整产生同坐标消息把保持期无限拉长。
+static int g_shakeLastDriveX = INT_MIN;
+static int g_shakeLastDriveY = INT_MIN;
 static double g_shakeLastRefreshQpcMs = 0.0;
 static bool g_shakeTimePeriodOn = false;
 
@@ -1013,10 +1034,8 @@ static void OnCursorPacket(const uint8_t* p, size_t payloadLen) {
     float ry = rdFloat(p + 4);
     uint8_t visible = p[8];
     if (!visible) {
-        // 光标离开副屏：清空坐标并通知 UI 线程隐藏本机光标。
-        // 只清坐标不隐藏，会让光标图像一直停在最后位置。
-        g_cursorX = std::nan("");
-        g_cursorY = std::nan("");
+        // 光标离开副屏：只隐藏，不清坐标。保留最后有效位置用于「回来时拉回一次」，
+        // 避免下一包到达前 NaN 被当作 (0,0) 把指针拽到左上角。
         g_pullCursorInMs.store(0);              // 离开即作废拉回凭证
         // 只在「离开的第一刻」记录时刻；指针在主屏移动时 visible=0 包会持续到达，
         // 若每包都刷新，横扫过边界时离开时长恒为一帧，凭证永不签发。
@@ -1038,6 +1057,9 @@ static void OnCursorPacket(const uint8_t* p, size_t payloadLen) {
     double oldX = g_cursorX.load(), oldY = g_cursorY.load();
     g_cursorX = rx;
     g_cursorY = ry;
+    // 供晃动 HOLD 判据使用：即使 UI 线程因失焦/本地输入让位而没有执行
+    // DriveShakeStep，也能知道远端指针仍在移动。
+    if (rx != oldX || ry != oldY) g_remoteMoveObservedQpcMs.store(QpcNowMs());
     // 只在位置真的变化时通知 UI；并用 g_cursorMsgPending 合并连发包，
     // 防止消息队列积压多条 WM_APP_REMOTE_CURSOR 后连续 SetCursorPos 引发回声震荡。
     if (rx == oldX && ry == oldY) return;
@@ -2402,6 +2424,10 @@ bool Presenter::PresentSample(IMFSample* sample) {
     if (g_lastPresentMs > 0.0) PushPresentInterval(nowMs - g_lastPresentMs);
     g_lastPresentMs = nowMs;
     g_stats.presented++;
+    // 首帧真正上屏后收起切换过渡层；只在过渡层可见时投递一次。
+    if (g_transitionActive.load() && g_hwnd) {
+        PostMessageW(g_hwnd, WM_APP_HIDE_TRANSITION, 0, 0);
+    }
     return true;
 }
 
@@ -2412,7 +2438,7 @@ void Presenter::ClearToIdle() {
     if (FAILED(swap_->GetBuffer(0, IID_PPV_ARGS(&back))) || !back) return;
     ComPtr<ID3D11RenderTargetView> rtv;
     if (FAILED(gfx_->device->CreateRenderTargetView(back.Get(), nullptr, &rtv)) || !rtv) return;
-    const float c[4] = { 0.06f, 0.06f, 0.07f, 1.0f };
+    const float c[4] = { 0.059f, 0.086f, 0.129f, 1.0f };   // 品牌深蓝，不再是纯黑
     gfx_->context->ClearRenderTargetView(rtv.Get(), c);
     gfx_->context->Flush();
     swap_->Present(0, 0);
@@ -2550,6 +2576,166 @@ static void ShowStatusHintAsync(const wchar_t* text) {
     if (g_hwnd) PostMessageW(g_hwnd, WM_APP_SHOW_STATUS, 0, 0);
 }
 
+// ---------------------------------------------------------------------------
+// 切换过渡层
+//
+// 角色切换/断线时如果直接把交换链清成黑色，用户会看到整屏黑几秒。这里用
+// 一个独立的分层窗口盖在副屏窗口上：有旧画面时半透明压暗保留内容，没有
+// 旧画面时用品牌深色背景 + 状态文字，等首帧真正上屏后再淡出。
+// 窗口本身 WS_EX_TRANSPARENT，鼠标事件直接穿透，不影响副屏交互。
+// ---------------------------------------------------------------------------
+static HWND g_transitionHwnd = nullptr;
+static HFONT g_transitionFontTitle = nullptr;
+static HFONT g_transitionFontSub = nullptr;
+static int g_transitionFontDpi = 0;
+static std::wstring g_transitionTitle;
+static std::wstring g_transitionSub;
+static bool g_transitionVisible = false;
+
+static LRESULT CALLBACK TransitionWndProc(HWND h, UINT msg, WPARAM w, LPARAM l) {
+    switch (msg) {
+    case WM_NCHITTEST:
+        return HTTRANSPARENT;
+    case WM_ERASEBKGND:
+        return 1;
+    case WM_PAINT: {
+        PAINTSTRUCT ps{};
+        HDC hdc = BeginPaint(h, &ps);
+        RECT rc{};
+        GetClientRect(h, &rc);
+        const int cw = rc.right, ch = rc.bottom;
+        // 品牌深色底，和两端面板深色画布同一色系
+        HBRUSH bg = CreateSolidBrush(RGB(15, 22, 33));
+        FillRect(hdc, &rc, bg);
+        DeleteObject(bg);
+        SetBkMode(hdc, TRANSPARENT);
+        const int dpi = g_transitionFontDpi > 0 ? g_transitionFontDpi : 96;
+        const int unit = MulDiv(1, dpi, 96);
+        // 细强调线
+        RECT accent{ cw / 2 - 28 * unit, ch / 2 - 34 * unit,
+                     cw / 2 + 28 * unit, ch / 2 - 31 * unit };
+        HBRUSH ab = CreateSolidBrush(RGB(59, 130, 246));
+        FillRect(hdc, &accent, ab);
+        DeleteObject(ab);
+        RECT rt{ 24 * unit, ch / 2 - 8 * unit, cw - 24 * unit, ch / 2 + 34 * unit };
+        if (g_transitionFontTitle) SelectObject(hdc, g_transitionFontTitle);
+        SetTextColor(hdc, RGB(230, 236, 245));
+        DrawTextW(hdc, g_transitionTitle.c_str(), -1, &rt,
+                  DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
+        RECT rs{ 24 * unit, ch / 2 + 40 * unit, cw - 24 * unit, ch / 2 + 78 * unit };
+        if (g_transitionFontSub) SelectObject(hdc, g_transitionFontSub);
+        SetTextColor(hdc, RGB(148, 163, 184));
+        DrawTextW(hdc, g_transitionSub.c_str(), -1, &rs,
+                  DT_CENTER | DT_TOP | DT_SINGLELINE | DT_END_ELLIPSIS | DT_NOPREFIX);
+        // 底部品牌标识，避免看起来像系统级黑屏
+        RECT rb{ 24 * unit, ch - 52 * unit, cw - 24 * unit, ch - 26 * unit };
+        if (g_transitionFontSub) SelectObject(hdc, g_transitionFontSub);
+        SetTextColor(hdc, RGB(100, 116, 139));
+        DrawTextW(hdc, L"SecDisplay · 有线低延迟副屏", -1, &rb,
+                  DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+        EndPaint(h, &ps);
+        return 0;
+    }
+    }
+    return DefWindowProcW(h, msg, w, l);
+}
+
+static int TransitionDpi() {
+    typedef UINT (WINAPI *GetDpiForWindowFn)(HWND);
+    static GetDpiForWindowFn fn = (GetDpiForWindowFn)GetProcAddress(
+        GetModuleHandleA("user32.dll"), "GetDpiForWindow");
+    UINT dpi = (fn && g_hwnd) ? fn(g_hwnd) : 0;
+    return dpi > 0 ? (int)dpi : 96;
+}
+
+static void EnsureTransitionResources() {
+    const int dpi = TransitionDpi();
+    if (g_transitionFontDpi != dpi) {
+        if (g_transitionFontTitle) { DeleteObject(g_transitionFontTitle); g_transitionFontTitle = nullptr; }
+        if (g_transitionFontSub)   { DeleteObject(g_transitionFontSub);   g_transitionFontSub = nullptr; }
+        g_transitionFontTitle = CreateFontW(-MulDiv(17, dpi, 72), 0, 0, 0, FW_SEMIBOLD, FALSE, FALSE, FALSE,
+            DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
+            CLEARTYPE_QUALITY, DEFAULT_PITCH, L"Microsoft YaHei UI");
+        g_transitionFontSub = CreateFontW(-MulDiv(9, dpi, 72), 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
+            DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
+            CLEARTYPE_QUALITY, DEFAULT_PITCH, L"Microsoft YaHei UI");
+        g_transitionFontDpi = dpi;
+    }
+    if (g_transitionHwnd && IsWindow(g_transitionHwnd)) return;
+    static bool clsReg = false;
+    if (!clsReg) {
+        WNDCLASSEXW wc{}; wc.cbSize = sizeof(wc);
+        wc.lpfnWndProc = TransitionWndProc;
+        wc.hInstance = (HINSTANCE)GetWindowLongPtrW(g_hwnd, GWLP_HINSTANCE);
+        wc.hCursor = LoadCursor(nullptr, IDC_ARROW);
+        wc.lpszClassName = L"SecDisplayTransition";
+        RegisterClassExW(&wc);
+        clsReg = true;
+    }
+    HINSTANCE inst = (HINSTANCE)GetWindowLongPtrW(g_hwnd, GWLP_HINSTANCE);
+    g_transitionHwnd = CreateWindowExW(
+        WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW,
+        L"SecDisplayTransition", L"",
+        WS_POPUP,
+        0, 0, 1, 1, g_hwnd, nullptr, inst, nullptr);
+}
+
+static void PositionTransitionOverlay() {
+    if (!g_transitionHwnd || !g_hwnd) return;
+    RECT cr{};
+    if (!GetClientRect(g_hwnd, &cr)) return;
+    POINT tl{ cr.left, cr.top };
+    ClientToScreen(g_hwnd, &tl);
+    SetWindowPos(g_transitionHwnd, HWND_TOP,
+                 tl.x, tl.y, cr.right - cr.left, cr.bottom - cr.top,
+                 SWP_NOACTIVATE | SWP_SHOWWINDOW);
+}
+
+static void ShowTransitionNow(const wchar_t* title, const wchar_t* sub, int alpha) {
+    if (!g_hwnd || g_hostMode.load() || IsIconic(g_hwnd)) return;
+    EnsureTransitionResources();
+    if (!g_transitionHwnd) return;
+    g_transitionTitle = title ? title : L"";
+    g_transitionSub = sub ? sub : L"";
+    g_transitionVisible = true;
+    g_transitionActive.store(true);
+    SetLayeredWindowAttributes(g_transitionHwnd, 0, (BYTE)(alpha < 0 ? 0 : (alpha > 255 ? 255 : alpha)), LWA_ALPHA);
+    PositionTransitionOverlay();
+    InvalidateRect(g_transitionHwnd, nullptr, FALSE);
+    UpdateWindow(g_transitionHwnd);
+}
+
+static void HideTransitionNow() {
+    g_transitionVisible = false;
+    g_transitionActive.store(false);
+    if (g_transitionHwnd && IsWindow(g_transitionHwnd)) ShowWindow(g_transitionHwnd, SW_HIDE);
+}
+
+static std::mutex g_transitionTextMtx;
+
+static void ShowPendingTransition(int alpha) {
+    std::wstring title, sub;
+    {
+        std::lock_guard<std::mutex> lk(g_transitionTextMtx);
+        title = g_transitionTitle;
+        sub = g_transitionSub;
+    }
+    ShowTransitionNow(title.c_str(), sub.c_str(), alpha);
+}
+
+static void ShowTransitionOverlayAsync(const wchar_t* title, const wchar_t* sub, int alpha) {
+    {
+        std::lock_guard<std::mutex> lk(g_transitionTextMtx);
+        g_transitionTitle = title ? title : L"";
+        g_transitionSub = sub ? sub : L"";
+    }
+    if (g_hwnd) PostMessageW(g_hwnd, WM_APP_SHOW_TRANSITION, (WPARAM)alpha, 0);
+}
+
+static void HideTransitionOverlayAsync() {
+    if (g_hwnd) PostMessageW(g_hwnd, WM_APP_HIDE_TRANSITION, 0, 0);
+}
+
 static void RestoreDefaultHint() {
     g_hintText = kDefaultHint;
 }
@@ -2676,6 +2862,8 @@ static const int IDC_PANEL_ROLE_WIN    = 2043;
 static const int IDC_PANEL_ROLE_MAC    = 2044;
 static const int IDC_PANEL_DISP_EXTEND = 2045;
 static const int IDC_PANEL_DISP_MIRROR = 2046;
+static const int IDC_PANEL_MOUSEBRIDGE = 2047;
+static const int IDC_PANEL_AUTOFOLLOW = 2048;
 
 static std::atomic<int> g_hostReqW{2880};
 static std::atomic<int> g_hostReqH{1800};
@@ -3148,7 +3336,7 @@ static void UpdateExecutionState() {
 }
 
 static const int kPanelLogicalW = 960;
-static const int kPanelLogicalH = 736;
+static const int kPanelLogicalH = 840;
 
 // 实时读取窗口（或目标显示器矩形）的有效 DPI，并在高缩放小屏上按工作区高度自动收敛，避免面板底部被裁切
 static int PanelWindowDpi(HWND h, const RECT* targetRect = nullptr, int overrideDpi = 0) {
@@ -3270,12 +3458,12 @@ struct PanelTheme {
         auto it = sets.find(targetDpi);
         if (it == sets.end()) {
             FontSet fs;
-            fs.title     = MakeFont(12, FW_SEMIBOLD, targetDpi);
-            fs.section   = MakeFont(9,  FW_SEMIBOLD, targetDpi);
-            fs.body      = MakeFont(9,  FW_NORMAL,   targetDpi);
-            fs.value     = MakeFont(9,  FW_SEMIBOLD, targetDpi);
-            fs.smallFont = MakeFont(8,  FW_NORMAL,   targetDpi);
-            fs.mono      = MakeFont(8,  FW_NORMAL,   targetDpi, L"Consolas");
+            fs.title     = MakeFont(13, FW_SEMIBOLD, targetDpi);
+            fs.section   = MakeFont(10, FW_SEMIBOLD, targetDpi);
+            fs.body      = MakeFont(10, FW_NORMAL,   targetDpi);
+            fs.value     = MakeFont(10, FW_SEMIBOLD, targetDpi);
+            fs.smallFont = MakeFont(9,  FW_NORMAL,   targetDpi);
+            fs.mono      = MakeFont(9,  FW_NORMAL,   targetDpi, L"Consolas");
             it = sets.emplace(targetDpi, fs).first;
         }
         dpi         = targetDpi;
@@ -3779,8 +3967,8 @@ static void UpdateControlPanel() {
     bool connected = g_sock.load() != INVALID_SOCKET;
     bool receiving = connected && g_stats.packets.load() > 0;
     g_panelData.state = receiving ? 2 : (connected ? 1 : 0);
-    g_panelData.statusText = receiving ? L"已连接 · 正在接收"
-                         : (connected ? L"已连接 · 等待画面" : L"未连接 · 等待重连");
+    g_panelData.statusText = receiving ? L"副屏接收中"
+                         : (connected ? L"已连接 · 等待画面" : L"等待 Mac 发送端");
 
     wchar_t buf[256];
     std::wstring host = ToWide(g_peerHost.c_str(), (int)g_peerHost.size());
@@ -3989,7 +4177,7 @@ static void PaintControlPanel(HWND h) {
     FillRect(hdc, &cli, g_theme.canvasBrush);
 
     const COLORREF cardFill   = g_pal.card;
-    const COLORREF cardBorder = g_pal.border;
+    const COLORREF cardBorder = g_pal.sep;
     const COLORREF sepColor   = g_pal.sep;
     const COLORREF titleCol   = g_pal.title;
     const COLORREF mutedCol   = g_pal.muted;
@@ -3998,8 +4186,8 @@ static void PaintControlPanel(HWND h) {
     const COLORREF warnCol    = g_pal.warn;
     const COLORREF errCol     = g_pal.err;
 
-    // 1. 顶部状态横幅 (20, 12, 920, 44)
-    DrawPanelCard(hdc, S(20), S(12), S(920), S(44), S(8), cardFill, cardBorder);
+    // 1. 顶部状态横幅 (20, 12, 920, 48)
+    DrawPanelCard(hdc, S(20), S(12), S(920), S(48), S(10), cardFill, cardBorder);
     COLORREF dotCol = g_panelData.state == 2 ? okCol
                     : (g_panelData.state == 1 ? warnCol
                     : ((g_panelData.state == 3 || g_panelData.state == 4) ? errCol : RGB(148, 163, 184)));
@@ -4030,55 +4218,60 @@ static void PaintControlPanel(HWND h) {
                   DT_RIGHT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
     }
 
-    // 1.5 副屏归属与扩展/镜像选择卡片 (20, 64, 920, 50)
-    DrawPanelCard(hdc, S(20), S(64), S(920), S(50), S(8), cardFill, cardBorder);
+    // 1.5 副屏归属与扩展/镜像选择卡片 (20, 70, 920, 162)
+    // 结构对齐 Mac 面板：两行大号选择卡，每行「标签 + 两张卡 + 右侧说明/开关」。
+    DrawPanelCard(hdc, S(20), S(70), S(920), S(162), S(10), cardFill, cardBorder);
     {
-        RECT rlRole{ S(36), S(64), S(148), S(114) };
+        RECT rlRole{ S(36), S(80), S(430), S(102) };
         SelectObject(hdc, g_theme.fontSection);
         SetTextColor(hdc, titleCol);
-        DrawTextW(hdc, L"哪台当副屏", -1, &rlRole, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
+        DrawTextW(hdc, L"哪台电脑当副屏", -1, &rlRole, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
 
-        HPEN sp = CreatePen(PS_SOLID, 1, sepColor);
-        HGDIOBJ op = SelectObject(hdc, sp);
-        MoveToEx(hdc, S(444), S(74), nullptr);
-        LineTo(hdc, S(444), S(104));
-        SelectObject(hdc, op);
-        DeleteObject(sp);
-
-        RECT rlDisp{ S(460), S(64), S(530), S(114) };
+        RECT rlDisp{ S(36), S(156), S(430), S(178) };
         SelectObject(hdc, g_theme.fontSection);
         SetTextColor(hdc, titleCol);
         DrawTextW(hdc, L"显示方式", -1, &rlDisp, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
 
+        RECT rlHint{ S(500), S(182), S(924), S(226) };
+        SelectObject(hdc, g_theme.fontBody);
+        SetTextColor(hdc, mutedCol);
         if (!g_hostMode.load()) {
-            RECT rlHint{ S(534), S(64), S(924), S(114) };
-            SelectObject(hdc, g_theme.fontBody);
-            SetTextColor(hdc, mutedCol);
-            DrawTextW(hdc, L"当前 Windows 当副屏 · 扩展 / 镜像请在 Mac 控制面板切换",
+            DrawTextW(hdc, L"扩展 / 镜像模式请在对端控制面板切换",
+                      -1, &rlHint, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
+        } else {
+            DrawTextW(hdc, L"Windows 主屏时可用 Ctrl+Alt+K 键鼠控 Mac",
                       -1, &rlHint, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
         }
     }
 
-    // 2. 中部三张信息卡片 (y=122, h=226)
+    // 2. 中部三张信息卡片 (y=242, h=218)
     auto drawSectionHeader = [&](int x, int y, int w, const wchar_t* title) {
         RECT rt{ x + S(16), y + S(9), x + w - S(16), y + S(32) };
         SelectObject(hdc, g_theme.fontSection);
         SetTextColor(hdc, titleCol);
         DrawTextW(hdc, title, -1, &rt, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
-        HPEN sp = CreatePen(PS_SOLID, 1, sepColor);
-        HGDIOBJ op = SelectObject(hdc, sp);
-        MoveToEx(hdc, x + S(16), y + S(36), nullptr);
-        LineTo(hdc, x + w - S(16), y + S(36));
-        SelectObject(hdc, op);
-        DeleteObject(sp);
+        // Mac 面板的小节标题是「文字 + 右侧发丝线」，不是压一条全宽下划线
+        SIZE sz{};
+        GetTextExtentPoint32W(hdc, title, (int)wcslen(title), &sz);
+        int lineX = rt.left + sz.cx + S(8);
+        int lineR = x + w - S(16);
+        if (lineX < lineR) {
+            HPEN sp = CreatePen(PS_SOLID, 1, sepColor);
+            HGDIOBJ op = SelectObject(hdc, sp);
+            int ly = rt.top + (rt.bottom - rt.top) / 2;
+            MoveToEx(hdc, lineX, ly, nullptr);
+            LineTo(hdc, lineR, ly);
+            SelectObject(hdc, op);
+            DeleteObject(sp);
+        }
     };
 
-    // 卡片 1：连接与速率 (20, 122, 286, 226)
-    const int c1x = S(20), c1w = S(286), cy = S(122), chCard = S(226);
-    DrawPanelCard(hdc, c1x, cy, c1w, chCard, S(8), cardFill, cardBorder);
+    // 卡片 1：连接与速率 (20, 242, 286, 218)
+    const int c1x = S(20), c1w = S(286), cy = S(242), chCard = S(218);
+    DrawPanelCard(hdc, c1x, cy, c1w, chCard, S(10), cardFill, cardBorder);
     drawSectionHeader(c1x, cy, c1w, L"连接与速率");
     {
-        int px = c1x + S(16), pw = c1w - S(32), rowY = cy + S(44), step = S(29), rh = S(25);
+        int px = c1x + S(16), pw = c1w - S(32), rowY = cy + S(42), step = S(27), rh = S(24);
         const bool hm = g_hostMode.load();
         const wchar_t* shortSt = g_panelData.state == 2 ? (hm ? (g_hostMirrorMode.load() ? L"镜像推送中" : L"扩展推送中") : L"正在接收")
                                : (g_panelData.state == 1 ? (hm ? L"准备推流" : L"等待首帧")
@@ -4093,12 +4286,12 @@ static void PaintControlPanel(HWND h) {
         DrawKVRow(hdc, px, rowY + step * 5, pw, rh, L"实时码率", g_panelData.mbpsText.c_str(), valCol);
     }
 
-    // 卡片 2：延迟与质量 (320, 122, 292, 226)
+    // 卡片 2：延迟与质量 (320, 242, 292, 218)
     const int c2x = S(320), c2w = S(292);
-    DrawPanelCard(hdc, c2x, cy, c2w, chCard, S(8), cardFill, cardBorder);
+    DrawPanelCard(hdc, c2x, cy, c2w, chCard, S(10), cardFill, cardBorder);
     drawSectionHeader(c2x, cy, c2w, g_hostMode.load() ? L"编码与输入" : L"延迟与质量");
     {
-        int px = c2x + S(16), pw = c2w - S(32), rowY = cy + S(44), step = S(29), rh = S(25);
+        int px = c2x + S(16), pw = c2w - S(32), rowY = cy + S(42), step = S(27), rh = S(24);
         const bool hm = g_hostMode.load();
         DrawKVRow(hdc, px, rowY, pw, rh, hm ? L"编码耗时" : L"源端延迟", g_panelData.srcLatText.c_str(), valCol);
         DrawKVRow(hdc, px, rowY + step * 1, pw, rh, hm ? L"光标与输入" : L"呈现延迟", g_panelData.presLatText.c_str(), valCol);
@@ -4111,26 +4304,26 @@ static void PaintControlPanel(HWND h) {
                   g_panelData.dropWarn ? warnCol : valCol);
     }
 
-    // 卡片 3：硬件与资源 (626, 122, 314, 226)
+    // 卡片 3：硬件与资源 (626, 242, 314, 218)
     const int c3x = S(626), c3w = S(314);
-    DrawPanelCard(hdc, c3x, cy, c3w, chCard, S(8), cardFill, cardBorder);
+    DrawPanelCard(hdc, c3x, cy, c3w, chCard, S(10), cardFill, cardBorder);
     drawSectionHeader(c3x, cy, c3w, L"硬件与资源");
     {
-        int px = c3x + S(16), pw = c3w - S(32), rowY = cy + S(44), rh = S(25);
+        int px = c3x + S(16), pw = c3w - S(32), rowY = cy + S(42), rh = S(24);
         // 解码器/编码器名往往较长，给 42dp 双行空间不截断
         RECT rDecL{ px, rowY, px + S(72), rowY + rh };
         SelectObject(hdc, g_theme.fontBody);
         SetTextColor(hdc, mutedCol);
         DrawTextW(hdc, g_hostMode.load() ? L"编码器" : L"解码器", -1, &rDecL, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
 
-        RECT rDecV{ px + S(66), rowY + S(2), px + pw, rowY + S(42) };
+        RECT rDecV{ px + S(66), rowY + S(2), px + pw, rowY + S(40) };
         SelectObject(hdc, g_theme.fontValue);
         SetTextColor(hdc, valCol);
         DrawTextW(hdc, g_panelData.decoderText.c_str(), -1, &rDecV,
                   DT_RIGHT | DT_WORDBREAK | DT_END_ELLIPSIS);
 
         const bool hm = g_hostMode.load();
-        int r2 = rowY + S(46), step = S(31);
+        int r2 = rowY + S(44), step = S(28);
         DrawKVRow(hdc, px, r2,            pw, rh, L"进程内存", g_panelData.procMemText.c_str(), valCol);
         DrawKVRow(hdc, px, r2 + step * 1, pw, rh, hm ? L"编码管线" : L"CPU 占用", g_panelData.cpuText.c_str(), valCol);
         DrawKVRow(hdc, px, r2 + step * 2, pw, rh, hm ? (g_hostMirrorMode.load() ? L"画面来源" : L"虚拟副屏") : L"GPU 显存", g_panelData.gpuMemText.c_str(), valCol);
@@ -4138,11 +4331,11 @@ static void PaintControlPanel(HWND h) {
                   g_panelData.keepOnActive ? okCol : warnCol);
     }
 
-    // 3. 雷电双向文件中转站卡片 (20, 356, 920, 64)
-    DrawPanelCard(hdc, S(20), S(356), S(920), S(64), S(8), cardFill, cardBorder);
+    // 3. 雷电双向文件中转站卡片 (20, 476, 920, 60)
+    DrawPanelCard(hdc, S(20), S(476), S(920), S(60), S(10), cardFill, cardBorder);
     {
         COLORREF xCol = g_panelData.xferConnected ? okCol : RGB(148, 163, 184);
-        int xd = S(8), xdx = S(36), xdy = S(368) + (S(20) - xd) / 2;
+        int xd = S(8), xdx = S(36), xdy = S(488) + (S(20) - xd) / 2;
         HPEN xpen = CreatePen(PS_SOLID, 1, xCol);
         HBRUSH xbr = CreateSolidBrush(xCol);
         HGDIOBJ op = SelectObject(hdc, xpen), ob = SelectObject(hdc, xbr);
@@ -4150,7 +4343,7 @@ static void PaintControlPanel(HWND h) {
         SelectObject(hdc, ob); SelectObject(hdc, op);
         DeleteObject(xbr); DeleteObject(xpen);
 
-        RECT rxt{ S(52), S(364), S(490), S(388) };
+        RECT rxt{ S(52), S(482), S(490), S(506) };
         SelectObject(hdc, g_theme.fontSection);
         SetTextColor(hdc, titleCol);
         DrawTextW(hdc, g_panelData.xferConnected
@@ -4158,35 +4351,35 @@ static void PaintControlPanel(HWND h) {
                   : L"雷电文件中转站 · 等待连接 (9923)",
                   -1, &rxt, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
 
-        RECT rxs{ S(36), S(389), S(495), S(414) };
+        RECT rxs{ S(36), S(507), S(495), S(532) };
         SelectObject(hdc, g_theme.fontBody);
         SetTextColor(hdc, mutedCol);
         DrawTextW(hdc, g_panelData.xferStatusText.c_str(), -1, &rxs,
                   DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
     }
 
-    // 4. 控制区卡片 (20, 428, 920, 156)
-    DrawPanelCard(hdc, S(20), S(428), S(920), S(156), S(8), cardFill, cardBorder);
+    // 4. 控制区卡片 (20, 546, 920, 156)
+    DrawPanelCard(hdc, S(20), S(546), S(920), S(156), S(10), cardFill, cardBorder);
     {
         HPEN sp = CreatePen(PS_SOLID, 1, sepColor);
         HGDIOBJ op = SelectObject(hdc, sp);
-        MoveToEx(hdc, S(38), S(532), nullptr);
-        LineTo(hdc, S(922), S(532));
+        MoveToEx(hdc, S(38), S(644), nullptr);
+        LineTo(hdc, S(922), S(644));
         SelectObject(hdc, op);
         DeleteObject(sp);
     }
 
-    // 5. 内嵌实时运行日志卡片 (20, 592, 920, 106) —— 替代后台 cmd 黑框
-    DrawPanelCard(hdc, S(20), S(592), S(920), S(106), S(8), cardFill, cardBorder);
+    // 5. 内嵌实时运行日志卡片 (20, 704, 920, 96) —— 替代后台 cmd 黑框
+    DrawPanelCard(hdc, S(20), S(704), S(920), S(96), S(10), cardFill, cardBorder);
     {
-        RECT rlh{ S(36), S(599), S(240), S(621) };
+        RECT rlh{ S(36), S(711), S(240), S(733) };
         SelectObject(hdc, g_theme.fontSection);
         SetTextColor(hdc, titleCol);
         DrawTextW(hdc, L"运行日志（实时）", -1, &rlh, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
 
         if (!g_logPath.empty()) {
             std::wstring wp = ToWide(g_logPath.c_str(), (int)g_logPath.size());
-            RECT rlp{ S(240), S(599), S(924), S(621) };
+            RECT rlp{ S(240), S(711), S(924), S(733) };
             SelectObject(hdc, g_theme.fontSmall);
             SetTextColor(hdc, mutedCol);
             DrawTextW(hdc, wp.c_str(), -1, &rlp, DT_RIGHT | DT_VCENTER | DT_SINGLELINE | DT_PATH_ELLIPSIS);
@@ -4194,19 +4387,19 @@ static void PaintControlPanel(HWND h) {
 
         HPEN sp = CreatePen(PS_SOLID, 1, sepColor);
         HGDIOBJ op = SelectObject(hdc, sp);
-        MoveToEx(hdc, S(36), S(624), nullptr);
-        LineTo(hdc, S(924), S(624));
+        MoveToEx(hdc, S(36), S(736), nullptr);
+        LineTo(hdc, S(924), S(736));
         SelectObject(hdc, op);
         DeleteObject(sp);
 
         SelectObject(hdc, g_theme.fontMono ? g_theme.fontMono : g_theme.fontSmall);
         SetTextColor(hdc, g_pal.logText);
         if (g_panelData.recentLogs.empty()) {
-            RECT rle{ S(36), S(630), S(924), S(690) };
+            RECT rle{ S(36), S(740), S(924), S(790) };
             DrawTextW(hdc, L"暂无日志输出", -1, &rle, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
         } else {
-            for (size_t i = 0; i < g_panelData.recentLogs.size() && i < 4; ++i) {
-                int ly = S(629) + (int)i * S(15);
+            for (size_t i = 0; i < g_panelData.recentLogs.size() && i < 3; ++i) {
+                int ly = S(741) + (int)i * S(15);
                 RECT rl{ S(36), ly, S(924), ly + S(15) };
                 DrawTextW(hdc, g_panelData.recentLogs[i].c_str(), -1, &rl,
                           DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS | DT_NOPREFIX);
@@ -4214,9 +4407,9 @@ static void PaintControlPanel(HWND h) {
         }
     }
 
-    // 6. 最底部快捷键提示 (20, 704, 920, 24)
+    // 6. 最底部快捷键提示 (20, 808, 920, 24)
     {
-        RECT rf{ S(20), S(704), S(940), S(728) };
+        RECT rf{ S(20), S(806), S(940), S(830) };
         SelectObject(hdc, g_theme.fontSmall);
         SetTextColor(hdc, mutedCol);
         const wchar_t* footerHint = g_hostMode.load()
@@ -4299,6 +4492,54 @@ static void DrawPanelButton(const DRAWITEMSTRUCT* dis, int dpi) {
     wchar_t text[128] = {};
     GetWindowTextW(dis->hwndItem, text, 128);
     SetBkMode(hdc, TRANSPARENT);
+
+    // 角色/显示方式选择卡：两行（标题 + 副标题）+ 选中勾，对齐 Mac 面板的 ModeChoiceButton
+    const bool isChoiceCard =
+        (id == IDC_PANEL_ROLE_WIN) || (id == IDC_PANEL_ROLE_MAC) ||
+        (id == IDC_PANEL_DISP_EXTEND) || (id == IDC_PANEL_DISP_MIRROR);
+    if (isChoiceCard) {
+        wchar_t line1[128] = {};
+        wchar_t line2[128] = {};
+        const wchar_t* nl = wcschr(text, L'\n');
+        if (nl) {
+            size_t n = (size_t)(nl - text);
+            if (n >= 127) n = 127;
+            wmemcpy(line1, text, n);
+            line1[n] = L'\0';
+            lstrcpynW(line2, nl + 1, 128);
+        } else {
+            lstrcpynW(line1, text, 128);
+        }
+        const int padX = DpiPx(14, dpi);
+        RECT r1 = rc;
+        r1.left += padX;
+        r1.right -= DpiPx(30, dpi);
+        r1.top += DpiPx(7, dpi);
+        r1.bottom = r1.top + DpiPx(17, dpi);
+        SelectObject(hdc, g_theme.fontSection);
+        SetTextColor(hdc, fg);
+        DrawTextW(hdc, line1, -1, &r1, DT_LEFT | DT_TOP | DT_SINGLELINE | DT_END_ELLIPSIS);
+
+        RECT r2 = rc;
+        r2.left += padX;
+        r2.right -= DpiPx(30, dpi);
+        r2.top += DpiPx(25, dpi);
+        r2.bottom = r2.top + DpiPx(15, dpi);
+        SelectObject(hdc, g_theme.fontSmall);
+        SetTextColor(hdc, isSelectedChoice ? fg : g_pal.muted);
+        DrawTextW(hdc, line2, -1, &r2, DT_LEFT | DT_TOP | DT_SINGLELINE | DT_END_ELLIPSIS);
+
+        if (isSelectedChoice) {
+            RECT rk = rc;
+            rk.left = rk.right - DpiPx(28, dpi);
+            rk.right -= DpiPx(8, dpi);
+            SelectObject(hdc, g_theme.fontValue);
+            SetTextColor(hdc, g_pal.accent);
+            DrawTextW(hdc, L"✓", -1, &rk, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+        }
+        return;
+    }
+
     SelectObject(hdc, g_theme.fontValue);
     SetTextColor(hdc, fg);
     RECT tr = rc;
@@ -4320,33 +4561,38 @@ static void LayoutPanelControls(HWND h) {
         MoveWindow(c, S(x), S(y), S(w), S(ch), TRUE);
     };
 
-    // 副屏归属与扩展/镜像选择栏 (y=64..114)
-    mv(IDC_PANEL_ROLE_WIN,    150, 73, 140, 32);
-    mv(IDC_PANEL_ROLE_MAC,    298, 73, 130, 32);
+    // 副屏归属与扩展/镜像选择：与 Mac 面板一致的两行大按钮（标题 + 副标题）
+    // 卡片 70..232，行 1 按钮 106..150，行 2 按钮 182..226。
+    mv(IDC_PANEL_ROLE_WIN,    36,  106, 218, 44);
+    mv(IDC_PANEL_ROLE_MAC,    266, 106, 218, 44);
     const int dispShow = g_hostMode.load() ? SW_SHOW : SW_HIDE;
-    mv(IDC_PANEL_DISP_EXTEND, 534, 73, 186, 32);
-    mv(IDC_PANEL_DISP_MIRROR, 730, 73, 190, 32);
+    mv(IDC_PANEL_DISP_EXTEND, 36,  182, 218, 44);
+    mv(IDC_PANEL_DISP_MIRROR, 266, 182, 218, 44);
     if (HWND c = GetDlgItem(h, IDC_PANEL_DISP_EXTEND)) ShowWindow(c, dispShow);
     if (HWND c = GetDlgItem(h, IDC_PANEL_DISP_MIRROR)) ShowWindow(c, dispShow);
 
+    // 角色卡右侧：两个跨角色常驻开关，不与接收端/主控端专属开关混排
+    mv(IDC_PANEL_MOUSEBRIDGE, 500, 108, 210, 26);
+    mv(IDC_PANEL_AUTOFOLLOW,  500, 138, 320, 26);
+
     // 中转站右侧按钮（发送文件 / 粘贴截图 / 悬浮盒 / 打开目录）
-    mv(IDC_PANEL_SENDFILE,   504, 371, 108, 34);
-    mv(IDC_PANEL_PASTEXFER,  620, 371, 102, 34);
-    mv(IDC_PANEL_DROPBOX,    730, 371, 94,  34);
-    mv(IDC_PANEL_OPENXFER,   832, 371, 90,  34);
+    mv(IDC_PANEL_SENDFILE,   504, 485, 108, 34);
+    mv(IDC_PANEL_PASTEXFER,  620, 485, 102, 34);
+    mv(IDC_PANEL_DROPBOX,    730, 485, 94,  34);
+    mv(IDC_PANEL_OPENXFER,   832, 485, 90,  34);
 
     // 两行 4 列按钮：卡片宽 920 (20..940)，内边距 18 -> 38..922 (宽 884)，
     // 4 * 210 + 3 * 14 = 882，左右居中
     const int bx[4] = { 39, 263, 487, 711 };
     const int bw = 210, bh = 36;
-    mv(IDC_PANEL_FULL,   bx[0], 442, bw, bh);
-    mv(IDC_PANEL_TOP,    bx[1], 442, bw, bh);
-    mv(IDC_PANEL_KEY,    bx[2], 442, bw, bh);
-    mv(IDC_PANEL_RECONN, bx[3], 442, bw, bh);
-    mv(IDC_PANEL_LOG,    bx[0], 486, bw, bh);
-    mv(IDC_PANEL_CFG,    bx[1], 486, bw, bh);
-    mv(IDC_PANEL_COPY,   bx[2], 486, bw, bh);
-    mv(IDC_PANEL_EXIT,   bx[3], 486, bw, bh);
+    mv(IDC_PANEL_FULL,   bx[0], 554, bw, bh);
+    mv(IDC_PANEL_TOP,    bx[1], 554, bw, bh);
+    mv(IDC_PANEL_KEY,    bx[2], 554, bw, bh);
+    mv(IDC_PANEL_RECONN, bx[3], 554, bw, bh);
+    mv(IDC_PANEL_LOG,    bx[0], 598, bw, bh);
+    mv(IDC_PANEL_CFG,    bx[1], 598, bw, bh);
+    mv(IDC_PANEL_COPY,   bx[2], 598, bw, bh);
+    mv(IDC_PANEL_EXIT,   bx[3], 598, bw, bh);
 
     // 5 个选项开关均匀排在分隔线下方（主控发送模式下隐藏接收端开关，改为展示主控虚拟屏/码率控制）
     const int chkShow = g_hostMode.load() ? SW_HIDE : SW_SHOW;
@@ -4359,20 +4605,20 @@ static void LayoutPanelControls(HWND h) {
         mv(id, x, y, w, ch);
         if (HWND c = GetDlgItem(h, id)) ShowWindow(c, hostShow);
     };
-    mvChk(IDC_PANEL_VSYNC,    39,  544, 130, 28);
-    mvChk(IDC_PANEL_PACE,     185, 544, 130, 28);
-    mvChk(IDC_PANEL_FEEDBACK, 331, 544, 130, 28);
-    mvChk(IDC_PANEL_SHAKE,    477, 544, 165, 28);
-    mvChk(IDC_PANEL_KEEPON,   658, 544, 250, 28);
+    mvChk(IDC_PANEL_VSYNC,    39,  656, 130, 28);
+    mvChk(IDC_PANEL_PACE,     185, 656, 130, 28);
+    mvChk(IDC_PANEL_FEEDBACK, 331, 656, 130, 28);
+    mvChk(IDC_PANEL_SHAKE,    477, 656, 165, 28);
+    mvChk(IDC_PANEL_KEEPON,   658, 656, 250, 28);
 
-    mvHost(IDC_PANEL_RES_2880,  39,  541, 88,  32);
-    mvHost(IDC_PANEL_RES_2240,  133, 541, 88,  32);
-    mvHost(IDC_PANEL_RES_1920,  227, 541, 88,  32);
-    mvHost(IDC_PANEL_MBPS_30,   327, 541, 62,  32);
-    mvHost(IDC_PANEL_MBPS_50,   395, 541, 62,  32);
-    mvHost(IDC_PANEL_MBPS_80,   463, 541, 62,  32);
-    mvHost(IDC_PANEL_VDD_RETRY, 537, 541, 118, 32);
-    mvHost(IDC_PANEL_KVM,       663, 541, 258, 32);
+    mvHost(IDC_PANEL_RES_2880,  39,  654, 88,  32);
+    mvHost(IDC_PANEL_RES_2240,  133, 654, 88,  32);
+    mvHost(IDC_PANEL_RES_1920,  227, 654, 88,  32);
+    mvHost(IDC_PANEL_MBPS_30,   327, 654, 62,  32);
+    mvHost(IDC_PANEL_MBPS_50,   395, 654, 62,  32);
+    mvHost(IDC_PANEL_MBPS_80,   463, 654, 62,  32);
+    mvHost(IDC_PANEL_VDD_RETRY, 537, 654, 118, 32);
+    mvHost(IDC_PANEL_KVM,       663, 654, 258, 32);
 }
 
 static void JoinHostActionThread() {
@@ -4453,10 +4699,10 @@ static LRESULT CALLBACK PanelWndProc(HWND h, UINT msg, WPARAM w, LPARAM l) {
             return c;
         };
 
-        mkBtn(L"Windows 当副屏", IDC_PANEL_ROLE_WIN);
-        mkBtn(L"Mac 当副屏", IDC_PANEL_ROLE_MAC);
-        mkBtn(L"扩展屏幕 (独立副屏)", IDC_PANEL_DISP_EXTEND);
-        mkBtn(L"镜像主屏 (同步主屏)", IDC_PANEL_DISP_MIRROR);
+        mkBtn(L"Windows 当副屏\nMac 画面投到 Windows", IDC_PANEL_ROLE_WIN);
+        mkBtn(L"Mac 当副屏\n接收 Windows 画面", IDC_PANEL_ROLE_MAC);
+        mkBtn(L"扩展屏幕\n独立虚拟副屏，多出一块桌面", IDC_PANEL_DISP_EXTEND);
+        mkBtn(L"镜像主屏\n同步显示主屏画面", IDC_PANEL_DISP_MIRROR);
         mkBtn(L"发送文件", IDC_PANEL_SENDFILE);
         mkBtn(L"粘贴发送", IDC_PANEL_PASTEXFER);
         mkBtn(L"悬浮盒", IDC_PANEL_DROPBOX);
@@ -4475,6 +4721,8 @@ static LRESULT CALLBACK PanelWndProc(HWND h, UINT msg, WPARAM w, LPARAM l) {
         mkChk(L"状态反馈", IDC_PANEL_FEEDBACK, g_feedbackEnabled.load());
         mkChk(L"晃动找光标", IDC_PANEL_SHAKE, g_shakeEnabled.load());
         mkChk(L"保持屏幕常亮 (防熄屏)", IDC_PANEL_KEEPON, g_keepScreenOn.load());
+        mkChk(L"鼠标互通", IDC_PANEL_MOUSEBRIDGE, g_mouseBridgeEnabled.load());
+        mkChk(L"跟随 Mac 自动切换", IDC_PANEL_AUTOFOLLOW, g_autoFollowRole.load());
 
         mkBtn(L"2880×1800", IDC_PANEL_RES_2880);
         mkBtn(L"2240×1400", IDC_PANEL_RES_2240);
@@ -4759,6 +5007,21 @@ static LRESULT CALLBACK PanelWndProc(HWND h, UINT msg, WPARAM w, LPARAM l) {
             if (g_hwnd) PostMessageW(g_hwnd, WM_APP_UPDATE_POWER, 0, 0);
             UpdateControlPanel();
             Log("控制面板: 保持屏幕常亮 %s", on ? "开" : "关");
+            return 0;
+        }
+        case IDC_PANEL_MOUSEBRIDGE: {
+            bool on = (SendMessageW((HWND)l, BM_GETCHECK, 0, 0) == BST_CHECKED);
+            g_mouseBridgeEnabled = on;
+            SaveConfigKey("mousebridge", on ? "1" : "0");
+            Log("控制面板: 鼠标互通 %s（Windows 本机指针%s操控 macOS）",
+                on ? "开" : "关", on ? "可以" : "不再");
+            return 0;
+        }
+        case IDC_PANEL_AUTOFOLLOW: {
+            bool on = (SendMessageW((HWND)l, BM_GETCHECK, 0, 0) == BST_CHECKED);
+            g_autoFollowRole = on;
+            SaveConfigKey("autofollow", on ? "1" : "0");
+            Log("控制面板: 跟随 Mac 自动切换角色 %s", on ? "开" : "关");
             return 0;
         }
         }
@@ -5920,7 +6183,9 @@ static void ApplyCursorImage() {
     if (maxSide > (double)hwMax) k *= (double)hwMax / maxSide;
     const int scalePm = (int)(k * nativeScale * 1000.0 + 0.5);
     const int capInt = hwMax;
-    g_steadySpriteK = k;   // 叠加层按同一基准放大，避免起晃第一帧尺寸跳变
+    // 放大动画期间换光标图（例如箭头→I 型）时冻结稳态基准，避免叠加层几何突跳；
+    // 动画结束后下一次 ApplyCursorImage 会自然刷新。
+    if (!g_zoomOverlayShown) g_steadySpriteK = k;   // 叠加层按同一基准放大，避免起晃第一帧尺寸跳变
 
     // 放大动画用的高分辨率源：始终保留原生位图（未缩放），由叠加层按需重采样。
     {
@@ -6128,6 +6393,8 @@ static bool DetectShake(int64_t now, int x, int y) {
 static void ResetShakeSamples() {
     g_shakeCount = 0;
     g_shakeHead = 0;
+    g_shakeLastDriveX = INT_MIN;
+    g_shakeLastDriveY = INT_MIN;
 }
 
 // 末端带轻微过冲的缓出曲线，逼近 macOS 的弹簧起势（切换点不会出现速度突变）。
@@ -6170,7 +6437,10 @@ static bool TickShakeAnim(double nowQpc) {
         }
     }
     if (g_shakePhase == SHAKE_HOLD) {
-        if (nowQpc - g_shakeLastPointerQpcMs < kShakeHoldMs) {
+        // 只有「可见像素真的移动」才续期；网络线程看到的远端移动也算，
+        // 这样失焦/让位期间不会把仍在移动的指针误判成静止。
+        const double lastMove = std::max(g_shakeLastPointerQpcMs, g_remoteMoveObservedQpcMs.load());
+        if (nowQpc - lastMove < kShakeHoldMs) {
             UpdateZoomOverlay(g_shakeZoom);
             return true;
         }
@@ -6259,10 +6529,30 @@ static void DriveShakeStep(int screenX, int screenY) {
     }
     const int64_t nowMs = (int64_t)QpcNowMs();
     const bool wasActive = g_shakeActive;
-    // 每次真实指针移动都刷新「最后一次移动」时刻：HOLD 以它为起点，
-    // 指针持续移动时保持放大，静止满 kShakeHoldMs 后才收缩。
+    // 只有屏幕坐标真的变化才刷新「最后一次移动」时刻：
+    // 0x03 的亚像素死区 + 取整会送来同坐标消息，旧逻辑会把 HOLD 无限续期，
+    // 表现为停手后光标迟迟不缩小。坐标不变时不续期，按静止处理。
     const double moveQpc = QpcNowMs();
-    g_shakeLastPointerQpcMs = moveQpc;
+    const int prevDriveX = g_shakeLastDriveX, prevDriveY = g_shakeLastDriveY;
+    const bool moved = (screenX != prevDriveX || screenY != prevDriveY);
+    const int restartEps = (int)(3.0 * WindowDpiScale(g_hwnd) + 0.5);
+    const bool movedEnough = moved && prevDriveX != INT_MIN &&
+        (std::abs(screenX - prevDriveX) >= restartEps || std::abs(screenY - prevDriveY) >= restartEps);
+    if (moved) {
+        g_shakeLastDriveX = screenX;
+        g_shakeLastDriveY = screenY;
+        g_shakeLastPointerQpcMs = moveQpc;
+        g_remoteMoveObservedQpcMs.store(moveQpc);
+    }
+    // 收缩期间用户继续晃：从当前倍率立刻回到放大，不等重新凑满 3 次反转。
+    // 用 3dp 阈值过滤收缩末端的 1px 抖动，避免一丁点噪声又把光标弹回 3.8x。
+    if (movedEnough && g_shakeActive && g_shakePhase == SHAKE_SHRINK) {
+        g_shakePhase = SHAKE_GROW;
+        g_shakeAnimStartMs = moveQpc;
+        g_shakeAnimFromZoom = g_shakeZoom;
+        SetShakeTimePeriod(true);
+        if (g_hwnd) SetTimer(g_hwnd, kShakeTimer, (UINT)ShakeTickMs(), nullptr);
+    }
     DetectShake(nowMs, screenX, screenY);
     if (g_shakeActive) {
         const double nowQpc = moveQpc;
@@ -6337,6 +6627,7 @@ static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
         // 否则交换链被切成 2x2 会直接黑屏。
         if (w == SIZE_MINIMIZED) {
             KillTimer(h, TIMER_SYNC_SWAP);
+            if (g_transitionVisible) ShowWindow(g_transitionHwnd, SW_HIDE);
             UpdateExecutionState();
         } else {
             const int cw = LOWORD(l), ch = HIWORD(l);
@@ -6345,6 +6636,7 @@ static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
                 g_pendingClientH = ch;
                 g_syncSwapRetry = 0;
                 SetTimer(h, TIMER_SYNC_SWAP, 120, nullptr);
+                if (g_transitionVisible) PositionTransitionOverlay();
                 // 客户区尺寸变了，远程坐标到屏幕坐标的换算比例也变了
                 ResetShakeSamples();
                 AbortShake();
@@ -6476,6 +6768,18 @@ static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
         ResetShakeSamples();
         AbortShake();
         return 0;
+    case WM_APP_ROLE_FOLLOW:
+        // 只有面板/消息线程能真正发起重启，网络线程只投递意向。
+        if (g_autoFollowRole.load() && !g_switchRoleRequested.load()) {
+            SwitchAppMode(w != 0);
+        }
+        return 0;
+    case WM_APP_SHOW_TRANSITION:
+        ShowPendingTransition((int)w);
+        return 0;
+    case WM_APP_HIDE_TRANSITION:
+        HideTransitionNow();
+        return 0;
     case WM_APP_SET_CLIP_TEXT: {
         std::deque<PendingClipText> batch;
         {
@@ -6602,6 +6906,7 @@ static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
         }
         break;   // 焦点状态仍交给 DefWindowProc
     case WM_MOVE:
+        if (g_transitionVisible) PositionTransitionOverlay();
         ResetShakeSamples();
         return 0;
     case WM_DPICHANGED:
@@ -6615,6 +6920,12 @@ static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
         AbortShake();
         ApplyCursorImage();
         ResetShakeSamples();
+        if (g_transitionVisible) {
+            // 字体按新 DPI 重建后再定位
+            EnsureTransitionResources();
+            PositionTransitionOverlay();
+            InvalidateRect(g_transitionHwnd, nullptr, FALSE);
+        }
         break;   // 窗口位置/尺寸仍交给 DefWindowProc
     case WM_APP_REMOTE_CURSOR: {
         // 先清合并标志再读坐标：确保读取之后若网络线程又收到更新，不会漏掉下一次通知。
@@ -6639,9 +6950,10 @@ static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
         // 点击和滚轮仍保留短暂让位，覆盖事件回传到 Mac 再返回的一个 RTT。
         // WM_MOUSEMOVE 不参与：它可能正是 SetCursorPos 的迟到回声，加入门控会
         // 形成「移动 → 冻结 → 再移动」循环。Raw Input 不可用时才用本地事件兜底。
+        // 350ms 比原来的 60ms 更稳：本机鼠标短暂停顿后不会被远端位置立刻拽走。
         const bool localBusy = g_rawInputReady.load()
-            ? gateNow - (uint64_t)g_lastHardwareMouseMs.load() < 60
-            : gateNow - (uint64_t)g_lastLocalInputMs.load() < 60;
+            ? gateNow - (uint64_t)g_lastHardwareMouseMs.load() < 350
+            : gateNow - (uint64_t)g_lastLocalInputMs.load() < 350;
         if (localBusy && owned) return 0;
         double cx = g_cursorX.load(), cy = g_cursorY.load();
         if (!std::isfinite(cx) || !std::isfinite(cy) || cx < 0 || cy < 0) return 0;
@@ -6798,6 +7110,7 @@ static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
         }
         float vx, vy;
         if (ClientToVideo(GET_X_LPARAM(l), GET_Y_LPARAM(l), &vx, &vy)) {
+            if (!g_mouseBridgeEnabled.load()) return 0;
             // Raw Input 正常时，远程 SetCursorPos 的迟到回声不能冻结后续跟随。
             if (!g_rawInputReady.load()) g_lastLocalInputMs = GetTickCount64();
             // 只记最新位置，由 inputThread 8ms 合并发送，避免逐消息刷包
@@ -6827,6 +7140,7 @@ static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
         }
         float vx, vy;
         if (ClientToVideo(GET_X_LPARAM(l), GET_Y_LPARAM(l), &vx, &vy)) {
+            if (!g_mouseBridgeEnabled.load()) return 0;
             // 按键事件逐条排队：down 和 up 各自成包，不再合并成最终状态。
             g_moveX = vx;
             g_moveY = vy;
@@ -6839,6 +7153,7 @@ static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
         ScreenToClient(h, &pt);
         float vx, vy;
         if (ClientToVideo(pt.x, pt.y, &vx, &vy)) {
+            if (!g_mouseBridgeEnabled.load()) return 0;
             int delta = GET_WHEEL_DELTA_WPARAM(w);
             g_lastLocalInputMs = GetTickCount64();
             g_moveX = vx;
@@ -6940,6 +7255,8 @@ struct RunConfig {
     int hostDpi = 0;          // 虚拟屏独立 DPI 缩放百分比（0=跟随系统，100..300）
     bool shake = true;        // 晃动找光标开关
     bool keepScreenOn = true; // 投屏期间保持屏幕常亮
+    bool autoFollow = true;   // 对端切换主/副屏后自动跟随（Mac 为角色基准）
+    bool mouseBridge = true;  // Windows 本机鼠标在副屏窗口内可直接操控 macOS
     bool showPanelOnStart = true; // 启动时自动显示控制面板（--no-panel 可关闭）
     int waitLockMs = 0;       // 角色切换重启时等待旧实例释放单实例锁的毫秒数
     std::string logFile;      // 非空则同时写日志文件
@@ -6987,6 +7304,14 @@ static void ParseArgs(int argc, char** argv, RunConfig& cfg) {
             cfg.shake = false;
         } else if (a == "--no-keepon") {
             cfg.keepScreenOn = false;
+        } else if (a == "--no-autofollow") {
+            cfg.autoFollow = false;
+        } else if (a == "--autofollow") {
+            cfg.autoFollow = true;
+        } else if (a == "--no-mousebridge") {
+            cfg.mouseBridge = false;
+        } else if (a == "--mousebridge") {
+            cfg.mouseBridge = true;
         } else if (a == "--mode" && i + 1 < argc) {
             std::string m = argv[++i];
             std::transform(m.begin(), m.end(), m.begin(), [](unsigned char c) { return (char)std::tolower(c); });
@@ -7118,6 +7443,8 @@ static void LoadConfigFile(RunConfig& cfg, const std::string& path) {
         else if (key == "hostdpi") cfg.hostDpi = atoi(val.c_str());
         else if (key == "shake") cfg.shake = Truthy(val);
         else if (key == "keepon") cfg.keepScreenOn = Truthy(val);
+        else if (key == "autofollow") cfg.autoFollow = Truthy(val);
+        else if (key == "mousebridge") cfg.mouseBridge = Truthy(val);
         else if (key == "showpanel") cfg.showPanelOnStart = Truthy(val);
         else continue;
         ++applied;
@@ -7254,7 +7581,29 @@ static void SwitchAppMode(bool toHostMode) {
     g_switchRoleToHost = toHostMode;
     SaveModeToConfigFile(toHostMode);
     Log("角色切换请求: %s，准备重启进程", toHostMode ? "主控模式 (Mac 当副屏)" : "副屏模式 (接收 Mac)");
+    // 先盖上过渡层，再关窗口；新进程启动时也会立刻显示同款过渡层，
+    // 中间不会出现整屏纯黑。
+    ShowTransitionOverlayAsync(toHostMode ? L"正在切换为 Windows 主屏" : L"正在切换为 Windows 副屏",
+                               toHostMode ? L"重建虚拟显示器与编码管线…" : L"重建解码与呈现管线…",
+                               255);
     RequestQuit();
+}
+
+// 网络线程调用：对端角色与本机不一致时，把切换请求投递到 UI 线程。
+// Mac 是角色基准，Windows 只做跟随；8 秒冷却避免与手工切换/重连互相打架。
+static void RequestRoleFollow(bool toHost, const char* reason) {
+    if (!g_autoFollowRole.load()) {
+        Log("角色跟随已关闭，忽略对端角色变化（%s）", reason);
+        return;
+    }
+    if (g_switchRoleRequested.load()) return;
+    const uint64_t now = GetTickCount64();
+    const uint64_t last = g_lastAutoFollowMs.load();
+    if (last != 0 && now - last < 8000) return;
+    g_lastAutoFollowMs.store(now);
+    Log("角色跟随: %s，Windows 自动切为%s", reason,
+        toHost ? "主控（Mac 当副屏）" : "副屏（接收 Mac）");
+    if (g_hwnd) PostMessageW(g_hwnd, WM_APP_ROLE_FOLLOW, toHost ? 1 : 0, 0);
 }
 
 // ---------------------------------------------------------------------------
@@ -7291,14 +7640,22 @@ static void OnSessionPacket(const uint8_t* p, size_t n) {
     g_sessW = w; g_sessH = h; g_sessFps = fps;
     // 坐标基准立即跟随会话头，不与 presenter->Resize 成败绑定：
     // 否则 Resize 失败时 g_coordW 停在旧值，会把远程光标压缩进画面左上角。
+    const int oldCoordW = g_coordW.load();
+    const int oldCoordH = g_coordH.load();
     if (!g_coordUserSpecified) {
         g_coordW = w;
         g_coordH = h;
     }
-    // 坐标基准变化：清掉旧坐标与拉回凭证，避免用旧尺寸换算出的位置把光标拽到边缘。
-    // 晃动/叠加层的清理必须在 UI 线程做（涉及 KillTimer/ShowWindow/SetCursor），这里只投递消息。
-    g_cursorX = std::nan("");
-    g_cursorY = std::nan("");
+    // 坐标基准变化：按比例重映射最后有效位置，而不是直接清成 NaN。
+    // 清 NaN 后如果恰好还有拉回凭证，下一包会用旧尺寸换算过的位置把指针拽到边缘，
+    // 表现就是「偶发鼠标位置重置」。只有从未拿到有效坐标时才保持无效值。
+    if (!g_coordUserSpecified && oldCoordW > 0 && oldCoordH > 0) {
+        const double cx = g_cursorX.load(), cy = g_cursorY.load();
+        if (std::isfinite(cx) && std::isfinite(cy) && cx >= 0.0 && cy >= 0.0) {
+            g_cursorX = cx * (double)w / (double)oldCoordW;
+            g_cursorY = cy * (double)h / (double)oldCoordH;
+        }
+    }
     g_pullCursorInMs.store(0);
     if (g_hwnd) PostMessageA(g_hwnd, WM_APP_SESSION_RESET, 0, 0);
     Log("会话头: 协议 v%u  虚拟屏 %dx%d @ %d fps  scale=%.1fx",
@@ -7346,6 +7703,7 @@ static void ResizeWindowForVideo(int w, int h) {
 static void NetworkLoop(RunConfig cfg, Graphics* gfx, Presenter* presenter) {
     // 还没连上时先给一个明确的等待状态，避免全屏黑屏被当成卡死
     presenter->ClearToIdle();
+    ShowTransitionOverlayAsync(L"正在连接 Mac", L"等待 Mac 发送端，首帧到达后自动显示", 255);
     ShowStatusHintAsync(L"等待 Mac 发送端…");
     // 交换链改尺寸失败过的尺寸，避免每次重连都反复尝试同一个值
     int failedW = 0, failedH = 0;
@@ -7515,8 +7873,19 @@ static void NetworkLoop(RunConfig cfg, Graphics* gfx, Presenter* presenter) {
                 }
                 const uint8_t* hdr4 = reinterpret_cast<const uint8_t*>(&len);
                 if (hdr4[0] == TYPE_ROLE_HELLO && hdr4[1] == 'S' && hdr4[2] == 'D' && hdr4[3] == 'R') {
-                    Log("角色冲突: Mac 端当前也是副屏接收模式，已拒绝连接");
-                    roleConflictDetected = true;
+                    // 8 字节裸握手：role 在长度字段第 7 个字节（hdr4 只覆盖前 4 字节，
+                    // 这里按完整握手再读一次更稳妥）。
+                    uint8_t hello[8] = {};
+                    memcpy(hello, hdr4, 4);
+                    if (!RecvAll(sock, hello + 4, 4)) break;
+                    const uint8_t peerRole = hello[6];
+                    Log("收到 Mac 角色握手 role=%u（1=副屏接收端, 2=主控发送端）", (unsigned)peerRole);
+                    if (peerRole == 1) {
+                        roleConflictDetected = true;
+                        RequestRoleFollow(true, "Mac 已切换为副屏");
+                    } else {
+                        roleConflictDetected = true;
+                    }
                     break;
                 }
                 len = ntohl(len);
@@ -7563,6 +7932,10 @@ static void NetworkLoop(RunConfig cfg, Graphics* gfx, Presenter* presenter) {
                     uint8_t reason = (len > HEADER_BYTES) ? packet[HEADER_BYTES] : 0;
                     if (reason == 3) {
                         Log("协议异常: Mac 端检测到控制流越界并主动断开 (0x7F reason=3)");
+                    } else if (reason == 2) {
+                        Log("角色冲突: Mac 端当前为副屏模式，本机应切为主控，按角色跟随自动切换");
+                        roleConflictDetected = true;
+                        RequestRoleFollow(true, "Mac 已切换为副屏");
                     } else {
                         Log("角色冲突: Mac 端当前为 %s，无法与本机副屏模式配对",
                             reason == 2 ? "副屏模式" : "不兼容角色");
@@ -7692,9 +8065,9 @@ static void NetworkLoop(RunConfig cfg, Graphics* gfx, Presenter* presenter) {
                                       sinceGood >= 8000.0;
                     if (!idleCleared && lost) {
                         idleCleared = true;
-                        Log("看门狗: %.1f 秒没有成功上屏（%.1f 秒无视频包），清屏并提示无信号",
+                        Log("看门狗: %.1f 秒没有成功上屏（%.1f 秒无视频包），压暗画面并提示无信号",
                             sinceGood / 1000.0, sincePkt / 1000.0);
-                        presenter->ClearToIdle();
+                        ShowTransitionOverlayAsync(L"画面已暂停", L"正在等待新的视频帧…", 205);
                         ShowStatusHint(L"无信号，等待画面…");
                     }
                 }
@@ -7898,12 +8271,19 @@ static void NetworkLoop(RunConfig cfg, Graphics* gfx, Presenter* presenter) {
         present.join();
         watch.join();
 
-        // 断线必须把画面清掉并给出提示。否则 FLIP 交换链会一直显示最后一帧，
-        // 用户看到的是几分钟前的旧画面，容易误判成「显示的是别的屏」。
-        presenter->ClearToIdle();
+        // 断线不要清成黑色：保留最后一帧并压暗，用户仍能看清刚才的画面，
+        // 过渡层同时给出明确状态，避免把旧帧误认成当前画面。
         if (g_alive) {
-            ShowStatusHint(roleConflictDetected.load()
-                ? L"角色冲突: Mac 端也是副屏模式，请将一端切为主控"
+            const bool roleConflict = roleConflictDetected.load();
+            ShowTransitionOverlayAsync(
+                roleConflict ? (g_autoFollowRole.load() ? L"正在跟随角色切换" : L"两端角色冲突")
+                             : L"连接已断开",
+                roleConflict ? (g_autoFollowRole.load() ? L"Mac 端角色已变化，Windows 正在自动切换…"
+                                                       : L"请将一端切为主控，或开启「跟随 Mac 自动切换」")
+                             : L"2 秒后自动重连，画面会在首帧到达后恢复",
+                215);
+            ShowStatusHint(roleConflict
+                ? (g_autoFollowRole.load() ? L"正在跟随 Mac 切换角色…" : L"角色冲突: 请将一端切为主控")
                 : L"连接已断开，2 秒后重连…");
         }
 
@@ -8604,11 +8984,18 @@ static int RunCursorSelfTest() {
 
     const double tMoveDuringHold = 1000.0 + kShakeGrowMs + kShakeHoldMs - 1.0;
     g_shakeLastPointerQpcMs = tMoveDuringHold;
+    g_remoteMoveObservedQpcMs.store(0.0);
     const double tHoldExtended = tMoveDuringHold + 1.0;
     TickShakeAnim(tHoldExtended);
     check(g_shakeActive && g_shakePhase == SHAKE_HOLD &&
           std::abs(g_shakeZoom - kShakeCursorZoom) < 1e-6,
           "最后一次晃动满 HOLD 后若指针仍有移动，应保持放大");
+
+    // 网络线程看到 0x03 仍在变化，也应续期 HOLD（UI 线程可能因失焦/让位没跑 DriveShakeStep）
+    g_remoteMoveObservedQpcMs.store(tMoveDuringHold + kShakeHoldMs * 0.5);
+    TickShakeAnim(tMoveDuringHold + kShakeHoldMs + 1.0);
+    check(g_shakeActive && g_shakePhase == SHAKE_HOLD, "远端 0x03 仍在变化时 HOLD 续期");
+    g_remoteMoveObservedQpcMs.store(0.0);
 
     const double tAfterHold = tMoveDuringHold + kShakeHoldMs + 1.0;
     TickShakeAnim(tAfterHold);
@@ -8885,6 +9272,8 @@ int main(int argc, char** argv) {
     g_hostMirrorMode = cfg.hostMirror;
     g_shakeEnabled = cfg.shake;
     g_keepScreenOn = cfg.keepScreenOn;
+    g_autoFollowRole = cfg.autoFollow;
+    g_mouseBridgeEnabled = cfg.mouseBridge;
     Log(cfg.hostMode ? "================ SecDisplay 主控发送端 (Win→Mac) ================"
                      : "================ SecDisplay 接收端 ================");
     if (cfg.hostMode) {
@@ -8957,6 +9346,12 @@ int main(int argc, char** argv) {
         g_hostReqFps = cfg.hostFps;
         g_hostReqMbps = cfg.hostBitrateMbps;
         g_hostReqDpi = cfg.hostDpi;
+
+        // Mac 端同时处于主控发送模式时，WinHostSender 会收到 0x7F；
+        // 回调投递到消息线程后按「Mac 为角色基准」切回副屏接收。
+        g_winHost.SetRoleMismatchHandler([] {
+            RequestRoleFollow(false, "Mac 已切换为主屏");
+        });
 
         if (!g_winHost.Start(cfg.host, cfg.hostWidth, cfg.hostHeight, cfg.hostFps, cfg.hostBitrateMbps,
                              (uint16_t)cfg.port, [](const char* s) { Log("%s", s); }, cfg.hostDpi, cfg.hostMirror)) {

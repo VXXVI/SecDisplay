@@ -1460,6 +1460,8 @@ final class MacReceiverClient {
 final class ReceiverCanvasView: NSView {
     private let videoLayer = CALayer()
     private let cursorLayer = CALayer()
+    /// 断线/切换时压暗最后一帧，而不是直接清成纯黑。
+    private let dimLayer = CALayer()
     private let waitLabel = NSTextField(labelWithString: "正在连接 Windows 主控端…")
 
     private var videoW: Int = 2560
@@ -1495,13 +1497,19 @@ final class ReceiverCanvasView: NSView {
         super.init(frame: frameRect)
         wantsLayer = true
         layer = CALayer()
-        layer?.backgroundColor = NSColor.black.cgColor
+        // 品牌深蓝，不再是纯黑；没有首帧时也不会是一块死黑
+        layer?.backgroundColor = NSColor(calibratedRed: 0.059, green: 0.086, blue: 0.129, alpha: 1).cgColor
 
         videoLayer.contentsGravity = .resizeAspect
-        videoLayer.backgroundColor = NSColor.black.cgColor
+        videoLayer.backgroundColor = NSColor(calibratedRed: 0.059, green: 0.086, blue: 0.129, alpha: 1).cgColor
         videoLayer.magnificationFilter = .linear
         videoLayer.minificationFilter = .trilinear
         layer?.addSublayer(videoLayer)
+
+        dimLayer.backgroundColor = NSColor(calibratedWhite: 0.02, alpha: 0.62).cgColor
+        dimLayer.isHidden = true
+        dimLayer.zPosition = 5
+        layer?.addSublayer(dimLayer)
 
         cursorLayer.isHidden = true
         cursorLayer.zPosition = 10
@@ -1548,6 +1556,7 @@ final class ReceiverCanvasView: NSView {
         CATransaction.begin()
         CATransaction.setDisableActions(true)
         videoLayer.frame = bounds
+        dimLayer.frame = bounds
         if let scale = window?.backingScaleFactor, scale > 0 {
             videoLayer.contentsScale = scale
             cursorLayer.contentsScale = scale
@@ -1574,15 +1583,20 @@ final class ReceiverCanvasView: NSView {
         releaseAllInputs()
         CATransaction.begin()
         CATransaction.setDisableActions(true)
-        videoLayer.contents = nil
+        // 保留最后一帧再压暗：直接清成黑色会让每次角色切换都出现几秒纯黑。
         cursorLayer.contents = nil
         cursorLayer.isHidden = true
+        if currentPixelBuffer != nil {
+            dimLayer.isHidden = false
+        }
         CATransaction.commit()
-        currentPixelBuffer = nil
+        // 有旧帧时保持“已收到画面”状态，副屏上不显示本机光标，避免遮在冻结画面上。
+        hasReceivedFrame = currentPixelBuffer != nil
         cursorVisible = false
-        hasReceivedFrame = false
         waitLabel.stringValue = text
         waitLabel.isHidden = false
+        // 显示在当前画布之上，保证压暗后仍清晰可读
+        addSubview(waitLabel, positioned: .above, relativeTo: nil)
         window?.invalidateCursorRects(for: self)
     }
 
@@ -1593,9 +1607,11 @@ final class ReceiverCanvasView: NSView {
         videoH = max(1, height)
         if !hasReceivedFrame {
             hasReceivedFrame = true
-            waitLabel.isHidden = true
             window?.invalidateCursorRects(for: self)
         }
+        // 首帧（或断线后恢复的第一帧）到达：收起压暗层与等待文字
+        dimLayer.isHidden = true
+        waitLabel.isHidden = true
         currentPixelBuffer = pb
         CATransaction.begin()
         CATransaction.setDisableActions(true)
@@ -1847,7 +1863,7 @@ final class ReceiverWindowController: NSObject, NSWindowDelegate {
         )
         win.title = "SecDisplay 副屏 (Windows 主控) · Ctrl+Cmd+F 全屏 · Cmd+Q 退出"
         win.isReleasedWhenClosed = false
-        win.backgroundColor = .black
+        win.backgroundColor = NSColor(calibratedRed: 0.059, green: 0.086, blue: 0.129, alpha: 1)
         win.acceptsMouseMovedEvents = true
         win.collectionBehavior = [.fullScreenPrimary]
 

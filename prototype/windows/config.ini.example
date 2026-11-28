@@ -36,6 +36,10 @@ feedback=0
 shake=1
 # 投屏期间保持屏幕常亮，默认开
 keepon=1
+# Windows 本机鼠标在副屏窗口内可直接操控 macOS，默认开
+mousebridge=1
+# Mac 切换主屏/副屏后，Windows 自动跟随互补角色（Mac 为角色基准），默认开
+autofollow=1
 
 # ---- 主控发送端参数（mode=sender 时生效）----
 # 虚拟扩展屏分辨率（需先安装 Parsec Virtual Display Adapter）、帧率上限 (24~144)、目标码率 (10~200 Mbps) 与 DPI
