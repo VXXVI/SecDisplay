@@ -6959,9 +6959,10 @@ static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
         // WM_MOUSEMOVE 不参与：它可能正是 SetCursorPos 的迟到回声，加入门控会
         // 形成「移动 → 冻结 → 再移动」循环。Raw Input 不可用时才用本地事件兜底。
         // 350ms 比原来的 60ms 更稳：本机鼠标短暂停顿后不会被远端位置立刻拽走。
-        const bool localBusy = g_rawInputReady.load()
-            ? gateNow - (uint64_t)g_lastHardwareMouseMs.load() < 350
-            : gateNow - (uint64_t)g_lastLocalInputMs.load() < 350;
+        const bool localBusy = MouseBridgeActive() &&
+            (g_rawInputReady.load()
+                ? gateNow - (uint64_t)g_lastHardwareMouseMs.load() < 350
+                : gateNow - (uint64_t)g_lastLocalInputMs.load() < 350);
         if (localBusy && owned) return 0;
         double cx = g_cursorX.load(), cy = g_cursorY.load();
         if (!std::isfinite(cx) || !std::isfinite(cy) || cx < 0 || cy < 0) return 0;
