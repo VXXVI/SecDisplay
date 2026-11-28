@@ -1384,7 +1384,7 @@ private:
             } else if (t == 0x00) {
                 if (acc.size() - pos < 5) break;
                 const uint8_t* p = acc.data() + pos;
-                if (p[1] == 0x00 && p[2] == 0x00 && p[4] == kTypeRoleConflict) {
+                if (p[1] == 0x00 && p[2] == 0x00 && p[3] == 10 && p[4] == kTypeRoleConflict) {
                     // [len 4][0x7F][ts 8][reason] = 14 字节；等 reason 到齐再判断，
                     // 避免把 reason=3（协议越界）的半个包误当成主控冲突触发角色切换。
                     if (acc.size() - pos < 14) break;
@@ -1395,8 +1395,19 @@ private:
                         : "角色冲突: Mac 端当前也是主控发送模式（0x7F），已拒绝注入并断开",
                         kTypeRoleConflict);
                 }
-                if (p[1] == 0x00 && p[2] == 0x00 && p[4] == kTypeSession) {
-                    return failConflict("角色冲突: Mac 端当前也是主控发送模式（0x06），已拒绝注入并断开", kTypeSession);
+                if (p[1] == 0x00 && p[2] == 0x00 && p[3] == 16 && p[4] == kTypeSession) {
+                    // 0x06 会话头只会由发送端发：Mac 当前是主屏，Windows 应切回副屏。
+                    // 先等完整 20 字节并校验载荷，避免把小尺寸视频帧误判成会话头。
+                    if (acc.size() - pos < 20) break;
+                    const uint8_t* q = acc.data() + pos + 5;   // 跳过 4B 长度 + 1B 类型 + 8B 时间戳
+                    const uint8_t sver = q[8];
+                    const int sw = (q[9] << 8) | q[10];
+                    const int sh = (q[11] << 8) | q[12];
+                    if (sver == 1 && sw > 0 && sh > 0 && sw <= 16384 && sh <= 16384) {
+                        NotifyRoleMismatch();
+                        return failConflict("角色冲突: Mac 端当前是主控发送端（0x06），本机将自动切回副屏", kTypeSession);
+                    }
+                    return failConflict("控制通道协议异常（0x06 载荷非法），已拒绝输入并断开保护", t);
                 }
                 return failConflict("控制通道协议异常（非法帧头），已拒绝输入并断开保护", t);
             } else if (t == kTypeRoleConflict) {
