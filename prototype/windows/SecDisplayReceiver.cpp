@@ -8657,19 +8657,6 @@ int main(int argc, char** argv) {
     }
     setvbuf(stderr, nullptr, _IONBF, 0);
 
-    // 检测是否运行在 session 0（无交互桌面）。Windows 端的交换链必须绑定到
-    // 有 DWM 合成的交互会话，session 0 下 CreateSwapChainForHwnd 会返回
-    // DXGI_ERROR_NOT_CURRENTLY_AVAILABLE(0x887A0022)，表现为「连不上副屏」。
-    // 提前提示，避免用户通过 SSH/服务直接运行后误判。
-    {
-        DWORD sessId = 0;
-        if (ProcessIdToSessionId(GetCurrentProcessId(), &sessId) && sessId == 0) {
-            fprintf(stderr,
-                    "警告: 当前运行在 session 0（无交互桌面），交换链将无法创建。\n"
-                    "      Windows 端必须在用户桌面会话运行，请通过桌面双击 start.bat 或计划任务启动。\n");
-        }
-    }
-
     // 控制台输出用 UTF-8。Log() 把 UTF-8 字节直接 fwrite 到 stderr，
     // 而中文 Windows 控制台默认是 CP936(GBK)，UTF-8 字节被当 GBK 显示，
     // 就是截图里「附加延迟」变「闃勫姩浠樻儏縺」那种乱码。
@@ -8751,6 +8738,18 @@ int main(int argc, char** argv) {
         // 用标准 fopen 而不是 fopen_s：后者是 MSVC 扩展，MinGW 构建会不通过。
         g_logFile = fopen(cfg.logFile.c_str(), "a");
         if (!g_logFile) fprintf(stderr, "无法打开日志文件 %s\n", cfg.logFile.c_str());
+    }
+
+    // 检测是否运行在 session 0（无交互桌面）。Windows 端的交换链必须绑定到
+    // 有 DWM 合成的交互会话，session 0 下 CreateSwapChainForHwnd 会返回
+    // DXGI_ERROR_NOT_CURRENTLY_AVAILABLE(0x887A0022)，表现为「连不上副屏」。
+    // 放在日志文件打开之后，保证计划任务/服务启动时这条诊断也能落盘。
+    {
+        DWORD sessId = 0;
+        if (ProcessIdToSessionId(GetCurrentProcessId(), &sessId) && sessId == 0) {
+            Log("警告: 当前运行在 session 0（无交互桌面），交换链将无法创建。"
+                "Windows 端必须在用户桌面会话运行，请通过桌面双击 start.bat 或计划任务启动。");
+        }
     }
 
     g_hostMode = cfg.hostMode;
