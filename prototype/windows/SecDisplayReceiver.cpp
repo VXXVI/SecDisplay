@@ -2011,7 +2011,14 @@ bool Presenter::Init(Graphics* gfx, HWND hwnd, int width, int height) {
 
     HRESULT hr = factory->CreateSwapChainForHwnd(gfx->device.Get(), hwnd, &desc,
                                                  nullptr, nullptr, &swap_);
-    if (FAILED(hr)) { Log("交换链创建失败 %08X", hr); return false; }
+    if (FAILED(hr)) {
+        Log("交换链创建失败 %08X", hr);
+        if ((unsigned)hr == 0x887A0022u) {
+            Log("提示: DXGI_ERROR_NOT_CURRENTLY_AVAILABLE，通常是当前会话没有可用桌面（session 0）"
+                "或 DWM 合成不可用。请在用户桌面会话运行（双击 start.bat 或计划任务）。");
+        }
+        return false;
+    }
 
     // 视频设备/上下文拿不到时 CreateProcessor 会对空指针解引用直接崩溃，
     // 这里先判空，让 Init 返回 false（main 里是直接退出并返回退出码 4，
@@ -8649,6 +8656,19 @@ int main(int argc, char** argv) {
         }
     }
     setvbuf(stderr, nullptr, _IONBF, 0);
+
+    // 检测是否运行在 session 0（无交互桌面）。Windows 端的交换链必须绑定到
+    // 有 DWM 合成的交互会话，session 0 下 CreateSwapChainForHwnd 会返回
+    // DXGI_ERROR_NOT_CURRENTLY_AVAILABLE(0x887A0022)，表现为「连不上副屏」。
+    // 提前提示，避免用户通过 SSH/服务直接运行后误判。
+    {
+        DWORD sessId = 0;
+        if (ProcessIdToSessionId(GetCurrentProcessId(), &sessId) && sessId == 0) {
+            fprintf(stderr,
+                    "警告: 当前运行在 session 0（无交互桌面），交换链将无法创建。\n"
+                    "      Windows 端必须在用户桌面会话运行，请通过桌面双击 start.bat 或计划任务启动。\n");
+        }
+    }
 
     // 控制台输出用 UTF-8。Log() 把 UTF-8 字节直接 fwrite 到 stderr，
     // 而中文 Windows 控制台默认是 CP936(GBK)，UTF-8 字节被当 GBK 显示，

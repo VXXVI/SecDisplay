@@ -5934,8 +5934,15 @@ final class ClientWatchdog {
 
         if connected { return }
 
-        if !everConnected {
+        if (!everConnected) {
             let waited = now - startedAt
+            // 控制面板打开时用户正在操作/等待对端连接，不因未连接而退出，
+            // 避免「启动后没连上就自动退出」被误判为连不上。面板关闭后重新计时。
+            if isControlPanelVisible {
+                startedAt = now
+                linkDownSince = nil
+                return
+            }
             if waited >= initialGrace {
                 fire(String(format: "启动后 %.0f 秒仍无客户端连接", waited))
             }
