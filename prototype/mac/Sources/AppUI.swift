@@ -917,11 +917,11 @@ struct StatusView: View {
                 .frame(maxWidth: .infinity, alignment: .leading)
                 .background(
                     RoundedRectangle(cornerRadius: 8)
-                        .fill(model.transferDropTargeted ? Color.accentColor.opacity(0.12) : Color.secondary.opacity(0.08))
+                        .fill(model.transferDropTargeted ? accent.opacity(0.12) : Color.secondary.opacity(0.08))
                 )
                 .overlay(
                     RoundedRectangle(cornerRadius: 8)
-                        .stroke(model.transferDropTargeted ? Color.accentColor : Color.clear, lineWidth: 1.5)
+                        .stroke(model.transferDropTargeted ? accent : Color.clear, lineWidth: 1.5)
                 )
                 .onDrop(of: [.fileURL], isTargeted: $model.transferDropTargeted) { providers in
                     var accepted = false

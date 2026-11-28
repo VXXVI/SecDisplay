@@ -3435,6 +3435,7 @@ final class CursorTracker {
         // 没有连接时不记录位置，否则连上之后要等指针再次移动才会发第一包
         guard sender.connected else {
             lastX = .nan; lastY = .nan; lastVisible = false
+            insideLatched = false
             return
         }
         let now = CFAbsoluteTimeGetCurrent()

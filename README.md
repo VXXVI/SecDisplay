@@ -163,7 +163,8 @@ ping -c 5 10.10.10.2
 | 功能 | macOS | Windows |
 |---|---|---|
 | 安全退出 | `Cmd+Q` / `Ctrl+Opt+Q` | `Ctrl+Alt+Q` |
-| 退出投屏窗口 | `Cmd+Q` | `Alt+F4` |
+| 关闭副屏窗口（保留后台监听） | `Cmd+W` | 关闭投屏窗口 |
+| 退出投屏窗口 / 进程 | `Cmd+Q` | `Alt+F4` |
 | 隐藏 / 显隐控制面板 | `Cmd+W` | `Ctrl+Alt+H` |
 | 全屏切换 | `Ctrl+Cmd+F` | `F11` |
 | 全屏返回窗口 | `Esc` | `Esc` |
@@ -171,7 +172,7 @@ ping -c 5 10.10.10.2
 | 键鼠穿透（主控端） | `Ctrl+Opt+K` | `Ctrl+Alt+K` |
 | 本地解除 KVM（副屏端） | `Ctrl+Opt+Esc` | — |
 
-> 快捷键目前为内置默认值，暂不支持在面板中自定义；如需调整，可修改对应源码中的热键注册（Mac `main.swift`、Windows `SecDisplayReceiver.cpp`）后重新构建。
+> 快捷键目前为内置默认值，暂不支持在面板中自定义；如需调整，可修改对应源码中的热键注册（Mac 全局在 `main.swift`，副屏窗口在 `MacReceiver.swift`；Windows 在 `SecDisplayReceiver.cpp`）后重新构建。
 
 ---
 

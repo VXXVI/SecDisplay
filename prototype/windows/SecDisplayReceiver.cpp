@@ -404,6 +404,9 @@ static const UINT WM_APP_UPDATE_POWER = WM_APP + 6;
 // 二次启动唤醒或后台任务完成通知 UI 线程
 static const UINT WM_APP_SHOW_PANEL = WM_APP + 12;
 static const UINT WM_APP_HOST_ACTION_DONE = WM_APP + 13;
+// 会话头切换分辨率时由收流线程投递到 UI 线程：清理光标与晃动状态涉及窗口/定时器操作，
+// 必须在 UI 线程执行，避免跨线程写非原子 UI 状态。
+static const UINT WM_APP_SESSION_RESET = WM_APP + 14;
 // 保持屏幕常亮（防止投屏期间因无 Windows 本地输入而自动熄屏）
 static std::atomic<bool> g_keepScreenOn{true};
 // 老 SDK 的 winuser.h 可能没定义 WM_DPICHANGED（需要 WINVER >= 0x0603）
@@ -1015,9 +1018,11 @@ static void OnCursorPacket(const uint8_t* p, size_t payloadLen) {
         g_cursorX = std::nan("");
         g_cursorY = std::nan("");
         g_pullCursorInMs.store(0);              // 离开即作废拉回凭证
-        g_cursorOffSinceMs.store(GetTickCount64());
-        if (g_cursorVisible.exchange(false) && g_hwnd) {
-            PostMessageA(g_hwnd, WM_APP_CURSOR_VIS, 0, 0);
+        // 只在「离开的第一刻」记录时刻；指针在主屏移动时 visible=0 包会持续到达，
+        // 若每包都刷新，横扫过边界时离开时长恒为一帧，凭证永不签发。
+        if (g_cursorVisible.exchange(false)) {
+            g_cursorOffSinceMs.store(GetTickCount64());
+            if (g_hwnd) PostMessageA(g_hwnd, WM_APP_CURSOR_VIS, 0, 0);
         }
         return;
     }
@@ -5779,6 +5784,10 @@ static void UpdateZoomOverlay(double zoom) {
             // 硬件光标，再显示首帧，避免双指针，也避免失败路径反复闪烁。
             g_zoomOverlayShown = true;
             SetCursor(HiddenCursorHandle());
+            // 首次显示时重申 TOPMOST：投递盒/可置顶面板也带 TOPMOST，
+            // 只在创建时进入 topmost 带首位可能被后显示的窗盖住。之后位移用 SWP_NOZORDER 即可。
+            SetWindowPos(g_zoomOverlay, HWND_TOPMOST, 0, 0, 0, 0,
+                         SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
             ShowWindow(g_zoomOverlay, SW_SHOWNOACTIVATE);
             Log("晃动放大: 叠加层显示 %dx%d (zoom %.2fx 源 %dx%d)", dw, dh, zoom, srcW, srcH);
         }
@@ -6384,6 +6393,10 @@ static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
         UpdateControlPanel();
         UpdateExecutionState();
         return 0;
+    case WM_APP_SESSION_RESET:
+        ResetShakeSamples();
+        AbortShake();
+        return 0;
     case WM_APP_SET_CLIP_TEXT: {
         std::deque<PendingClipText> batch;
         {
@@ -6647,12 +6660,9 @@ static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
                     if (!repeat) ExitFullscreen();
                     return 0;
                 }
-                // 窗口模式：若标志残留（keyup 丢失）但 Esc 实际并未按下，
-                // 视为陈旧状态并清掉，把这次 Esc 正常转发给 Mac。
-                if (g_escConsumedLocal) {
-                    if (GetKeyState(VK_ESCAPE) & 0x8000) return 0;
-                    g_escConsumedLocal = false;
-                }
+                // 窗口模式：残留标志（全屏 Esc 的 keyup 丢失）不应静默吞掉用户真实按键。
+                // 清掉标志后照常转发本次 Esc；宁可在异常情况下多发一对 down/up，也不让用户按键消失。
+                g_escConsumedLocal = false;
             } else if (g_escConsumedLocal) {
                 g_escConsumedLocal = false;
                 return 0;
@@ -7205,13 +7215,12 @@ static void OnSessionPacket(const uint8_t* p, size_t n) {
         g_coordW = w;
         g_coordH = h;
     }
-    // 坐标基准变化：清掉旧坐标与拉回凭证，避免用旧尺寸换算出的位置把光标拽到边缘，
-    // 同时中止进行中的晃动放大（新尺寸下叠加层几何不再匹配）。
+    // 坐标基准变化：清掉旧坐标与拉回凭证，避免用旧尺寸换算出的位置把光标拽到边缘。
+    // 晃动/叠加层的清理必须在 UI 线程做（涉及 KillTimer/ShowWindow/SetCursor），这里只投递消息。
     g_cursorX = std::nan("");
     g_cursorY = std::nan("");
     g_pullCursorInMs.store(0);
-    ResetShakeSamples();
-    AbortShake();
+    if (g_hwnd) PostMessageA(g_hwnd, WM_APP_SESSION_RESET, 0, 0);
     Log("会话头: 协议 v%u  虚拟屏 %dx%d @ %d fps  scale=%.1fx",
         ver, w, h, fps, scaleTenths >= 5 ? (scaleTenths / 10.0) : 0.0);
 
