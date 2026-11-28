@@ -6661,8 +6661,9 @@ static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
                     return 0;
                 }
                 // 窗口模式：残留标志（全屏 Esc 的 keyup 丢失）不应静默吞掉用户真实按键。
-                // 清掉标志后照常转发本次 Esc；宁可在异常情况下多发一对 down/up，也不让用户按键消失。
+                // 清掉标志后照常转发本次 Esc；系统自动重复（按住不放）不转发，避免向 Mac 连发多次。
                 g_escConsumedLocal = false;
+                if (repeat) return 0;
             } else if (g_escConsumedLocal) {
                 g_escConsumedLocal = false;
                 return 0;

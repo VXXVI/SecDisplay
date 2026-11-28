@@ -163,9 +163,8 @@ ping -c 5 10.10.10.2
 | 功能 | macOS | Windows |
 |---|---|---|
 | 安全退出 | `Cmd+Q` / `Ctrl+Opt+Q` | `Ctrl+Alt+Q` |
-| 关闭副屏窗口（保留后台监听） | `Cmd+W` | 关闭投屏窗口 |
-| 退出投屏窗口 / 进程 | `Cmd+Q` | `Alt+F4` |
-| 隐藏 / 显隐控制面板 | `Cmd+W` | `Ctrl+Alt+H` |
+| 关闭当前窗口（副屏窗口 / 控制面板） | `Cmd+W` | 关闭投屏窗口 |
+| 退出进程 | `Cmd+Q` | `Alt+F4` |
 | 全屏切换 | `Ctrl+Cmd+F` | `F11` |
 | 全屏返回窗口 | `Esc` | `Esc` |
 | 文件投递盒 | `Ctrl+Opt+B` | `Ctrl+Alt+B` |
