@@ -3224,6 +3224,7 @@ struct PanelTheme {
     HFONT fontMono = nullptr;
     HBRUSH canvasBrush = nullptr;
     HBRUSH cardBrush = nullptr;
+    bool brushDark = false;
     std::unordered_map<int, FontSet> sets;
 
     static HFONT MakeFont(int pt, int weight, int targetDpi, const wchar_t* face = L"Microsoft YaHei UI") {
@@ -3234,8 +3235,14 @@ struct PanelTheme {
     }
 
     void Ensure(int targetDpi) {
-        if (!canvasBrush) canvasBrush = CreateSolidBrush(RGB(243, 245, 249));
-        if (!cardBrush)   cardBrush   = CreateSolidBrush(RGB(255, 255, 255));
+        // 主题切换（深浅色）时重建画刷，颜色取自 g_pal。
+        if (!canvasBrush || brushDark != g_pal.dark) {
+            if (canvasBrush) { DeleteObject(canvasBrush); canvasBrush = nullptr; }
+            if (cardBrush)   { DeleteObject(cardBrush);   cardBrush = nullptr; }
+            canvasBrush = CreateSolidBrush(g_pal.canvas);
+            cardBrush   = CreateSolidBrush(g_pal.card);
+            brushDark   = g_pal.dark;
+        }
         if (dpi == targetDpi && fontBody) return;
         auto it = sets.find(targetDpi);
         if (it == sets.end()) {
@@ -3279,6 +3286,64 @@ struct PanelTheme {
 };
 
 static PanelTheme g_theme;
+
+// 面板配色 token：浅色/深色两套，跟随 Windows 系统主题（AppsUseLightTheme），
+// 与 Mac 面板共用同一套语义色，保证两端视觉一致。
+struct PanelPalette {
+    COLORREF canvas    = RGB(243, 245, 249);
+    COLORREF card      = RGB(255, 255, 255);
+    COLORREF border    = RGB(224, 230, 239);
+    COLORREF sep       = RGB(238, 241, 246);
+    COLORREF title     = RGB(30, 41, 59);
+    COLORREF muted     = RGB(100, 116, 139);
+    COLORREF value     = RGB(15, 23, 42);
+    COLORREF accent    = RGB(59, 130, 246);
+    COLORREF ok        = RGB(22, 163, 74);
+    COLORREF warn      = RGB(217, 119, 6);
+    COLORREF err       = RGB(220, 38, 38);
+    COLORREF logText   = RGB(51, 65, 85);
+    COLORREF btnBg     = RGB(248, 250, 252);
+    COLORREF btnBorder = RGB(214, 221, 232);
+    COLORREF btnFg     = RGB(30, 41, 59);
+    bool dark = false;
+};
+
+static PanelPalette g_pal;
+
+static void RefreshPanelPalette() {
+    // Windows 10/11：AppsUseLightTheme=0 表示深色。读失败按浅色。
+    DWORD lightTheme = 1;
+    DWORD cb = sizeof(lightTheme);
+    HKEY key = nullptr;
+    if (RegOpenKeyExW(HKEY_CURRENT_USER,
+                      L"Software\\Microsoft\\Windows\\CurrentVersion\\Themes\\Personalize",
+                      0, KEY_QUERY_VALUE, &key) == ERROR_SUCCESS) {
+        RegQueryValueExW(key, L"AppsUseLightTheme", nullptr, nullptr,
+                         (LPBYTE)&lightTheme, &cb);
+        RegCloseKey(key);
+    }
+    const bool dark = (lightTheme == 0);
+    g_pal.dark = dark;
+    if (dark) {
+        g_pal.canvas    = RGB(15, 22, 33);
+        g_pal.card      = RGB(27, 36, 51);
+        g_pal.border    = RGB(44, 58, 79);
+        g_pal.sep       = RGB(36, 48, 68);
+        g_pal.title     = RGB(230, 236, 245);
+        g_pal.muted     = RGB(148, 163, 184);
+        g_pal.value     = RGB(241, 245, 249);
+        g_pal.accent    = RGB(59, 130, 246);
+        g_pal.ok        = RGB(34, 197, 94);
+        g_pal.warn      = RGB(245, 158, 11);
+        g_pal.err       = RGB(239, 68, 68);
+        g_pal.logText   = RGB(203, 213, 225);
+        g_pal.btnBg     = RGB(27, 36, 51);
+        g_pal.btnBorder = RGB(51, 65, 85);
+        g_pal.btnFg     = RGB(226, 232, 240);
+    } else {
+        g_pal = PanelPalette{};
+    }
+}
 
 // 面板展示指标快照（由 UpdateControlPanel 刷新，PaintControlPanel 双缓冲绘制）
 struct PanelSnapshot {
@@ -3891,11 +3956,11 @@ static void DrawPanelCard(HDC hdc, int x, int y, int w, int h, int radius,
 
 static void DrawKVRow(HDC hdc, int x, int y, int w, int rowH,
                       const wchar_t* label, const wchar_t* value,
-                      COLORREF valColor = RGB(15, 23, 42)) {
+                      COLORREF valColor) {
     RECT rL{ x, y, x + w / 2, y + rowH };
     RECT rV{ x + w / 3, y, x + w, y + rowH };
     SelectObject(hdc, g_theme.fontBody);
-    SetTextColor(hdc, RGB(100, 116, 139));
+    SetTextColor(hdc, g_pal.muted);
     DrawTextW(hdc, label, -1, &rL, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
     SelectObject(hdc, g_theme.fontValue);
     SetTextColor(hdc, valColor);
@@ -3923,15 +3988,15 @@ static void PaintControlPanel(HWND h) {
     // 画布底色
     FillRect(hdc, &cli, g_theme.canvasBrush);
 
-    const COLORREF cardFill   = RGB(255, 255, 255);
-    const COLORREF cardBorder = RGB(224, 230, 239);
-    const COLORREF sepColor   = RGB(238, 241, 246);
-    const COLORREF titleCol   = RGB(30, 41, 59);
-    const COLORREF mutedCol   = RGB(100, 116, 139);
-    const COLORREF valCol     = RGB(15, 23, 42);
-    const COLORREF okCol      = RGB(22, 163, 74);
-    const COLORREF warnCol    = RGB(217, 119, 6);
-    const COLORREF errCol     = RGB(220, 38, 38);
+    const COLORREF cardFill   = g_pal.card;
+    const COLORREF cardBorder = g_pal.border;
+    const COLORREF sepColor   = g_pal.sep;
+    const COLORREF titleCol   = g_pal.title;
+    const COLORREF mutedCol   = g_pal.muted;
+    const COLORREF valCol     = g_pal.value;
+    const COLORREF okCol      = g_pal.ok;
+    const COLORREF warnCol    = g_pal.warn;
+    const COLORREF errCol     = g_pal.err;
 
     // 1. 顶部状态横幅 (20, 12, 920, 44)
     DrawPanelCard(hdc, S(20), S(12), S(920), S(44), S(8), cardFill, cardBorder);
@@ -4024,7 +4089,7 @@ static void PaintControlPanel(HWND h) {
         DrawKVRow(hdc, px, rowY + step * 1, pw, rh, L"对端地址", g_panelData.peerText.c_str(), valCol);
         DrawKVRow(hdc, px, rowY + step * 2, pw, rh, L"分辨率",   g_panelData.sizeText.c_str(), valCol);
         DrawKVRow(hdc, px, rowY + step * 3, pw, rh, L"连接时长", g_panelData.uptimeText.c_str(), valCol);
-        DrawKVRow(hdc, px, rowY + step * 4, pw, rh, L"当前帧率", g_panelData.fpsText.c_str(), RGB(37, 99, 235));
+        DrawKVRow(hdc, px, rowY + step * 4, pw, rh, L"当前帧率", g_panelData.fpsText.c_str(), g_pal.accent);
         DrawKVRow(hdc, px, rowY + step * 5, pw, rh, L"实时码率", g_panelData.mbpsText.c_str(), valCol);
     }
 
@@ -4135,7 +4200,7 @@ static void PaintControlPanel(HWND h) {
         DeleteObject(sp);
 
         SelectObject(hdc, g_theme.fontMono ? g_theme.fontMono : g_theme.fontSmall);
-        SetTextColor(hdc, RGB(51, 65, 85));
+        SetTextColor(hdc, g_pal.logText);
         if (g_panelData.recentLogs.empty()) {
             RECT rle{ S(36), S(630), S(924), S(690) };
             DrawTextW(hdc, L"暂无日志输出", -1, &rle, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
@@ -4187,13 +4252,13 @@ static void DrawPanelButton(const DRAWITEMSTRUCT* dis, int dpi) {
     // 先用白卡底色填充四周死角，避免圆角外露出黑边
     FillRect(hdc, &rc, g_theme.cardBrush);
 
-    COLORREF bg = RGB(248, 250, 252);
-    COLORREF bd = RGB(214, 221, 232);
-    COLORREF fg = RGB(30, 41, 59);
+    COLORREF bg = g_pal.btnBg;
+    COLORREF bd = g_pal.btnBorder;
+    COLORREF fg = g_pal.btnFg;
     if (disabled) {
-        bg = RGB(241, 245, 249);
-        bd = RGB(226, 232, 240);
-        fg = RGB(148, 163, 184);
+        bg = g_pal.dark ? RGB(30, 41, 59) : RGB(241, 245, 249);
+        bd = g_pal.dark ? RGB(51, 65, 85) : RGB(226, 232, 240);
+        fg = g_pal.muted;
     } else if (isExit) {
         bg = pressed ? RGB(254, 202, 202) : (hovered ? RGB(254, 226, 226) : RGB(254, 242, 242));
         bd = RGB(252, 165, 165);
@@ -4203,15 +4268,22 @@ static void DrawPanelButton(const DRAWITEMSTRUCT* dis, int dpi) {
         bd = bg;
         fg = RGB(255, 255, 255);
     } else if (isSelectedChoice) {
-        bg = pressed ? RGB(219, 234, 254) : (hovered ? RGB(224, 242, 254) : RGB(239, 246, 255));
-        bd = RGB(37, 99, 235);
-        fg = RGB(29, 78, 216);
+        bg = g_pal.dark
+            ? (pressed ? RGB(30, 58, 95) : (hovered ? RGB(30, 58, 95) : RGB(23, 43, 72)))
+            : (pressed ? RGB(219, 234, 254) : (hovered ? RGB(224, 242, 254) : RGB(239, 246, 255)));
+        bd = g_pal.accent;
+        fg = g_pal.dark ? RGB(147, 197, 253) : RGB(29, 78, 216);
     } else {
-        if (pressed)      { bg = RGB(226, 232, 240); bd = RGB(148, 163, 184); }
-        else if (hovered) { bg = RGB(241, 245, 249); bd = RGB(180, 190, 206); }
+        if (pressed) {
+            bg = g_pal.dark ? RGB(30, 41, 59) : RGB(226, 232, 240);
+            bd = g_pal.dark ? RGB(71, 85, 105) : RGB(148, 163, 184);
+        } else if (hovered) {
+            bg = g_pal.dark ? RGB(30, 41, 59) : RGB(241, 245, 249);
+            bd = g_pal.dark ? RGB(71, 85, 105) : RGB(180, 190, 206);
+        }
     }
 
-    int rad = DpiPx(6, dpi);
+    int rad = DpiPx(8, dpi);
     Gdiplus::Graphics g(hdc);
     g.SetSmoothingMode(Gdiplus::SmoothingModeAntiAlias);
     g.SetPixelOffsetMode(Gdiplus::PixelOffsetModeHighQuality);
@@ -4434,6 +4506,13 @@ static LRESULT CALLBACK PanelWndProc(HWND h, UINT msg, WPARAM w, LPARAM l) {
         DragFinish(drop);
         return 0;
     }
+    case WM_SETTINGCHANGE:
+        // 系统切换浅色/深色主题时刷新面板配色并重绘
+        if (lParam && wcscmp(reinterpret_cast<const wchar_t*>(lParam), L"ImmersiveColorSet") == 0) {
+            RefreshPanelPalette();
+            InvalidateRect(h, nullptr, FALSE);
+        }
+        return 0;
     case WM_APP_XFER_UI:
         UpdateControlPanel();
         return 0;
@@ -4480,10 +4559,10 @@ static LRESULT CALLBACK PanelWndProc(HWND h, UINT msg, WPARAM w, LPARAM l) {
         return 0;
     case WM_CTLCOLORSTATIC:
     case WM_CTLCOLORBTN:
-        // 复选框放在底部白卡片内，用卡片纯白画刷统一底色，避免灰块
+        // 复选框放在底部卡片内，用卡片底色画刷统一底色，避免灰块（深浅色都随 g_pal）
         SetBkMode((HDC)w, OPAQUE);
-        SetBkColor((HDC)w, RGB(255, 255, 255));
-        SetTextColor((HDC)w, RGB(30, 41, 59));
+        SetBkColor((HDC)w, g_pal.card);
+        SetTextColor((HDC)w, g_pal.btnFg);
         g_theme.Ensure(PanelWindowDpi(h));
         return (LRESULT)g_theme.cardBrush;
     case WM_COMMAND:
@@ -8839,6 +8918,7 @@ int main(int argc, char** argv) {
         Gdiplus::GdiplusStartupInput gsi;
         Gdiplus::GdiplusStartup(&g_gdipToken, &gsi, nullptr);
     }
+    RefreshPanelPalette();   // 按系统深浅色初始化面板配色
 
     WNDCLASSA wc{};
     wc.lpfnWndProc = WndProc;
