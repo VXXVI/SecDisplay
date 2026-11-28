@@ -4241,10 +4241,12 @@ static void PaintControlPanel(HWND h) {
         SetTextColor(hdc, titleCol);
         DrawTextW(hdc, L"哪台电脑当副屏", -1, &rlRole, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
 
-        RECT rlDisp{ S(36), S(156), S(430), S(178) };
-        SelectObject(hdc, g_theme.fontSection);
-        SetTextColor(hdc, titleCol);
-        DrawTextW(hdc, L"显示方式", -1, &rlDisp, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
+        if (g_hostMode.load()) {
+            RECT rlDisp{ S(36), S(156), S(430), S(178) };
+            SelectObject(hdc, g_theme.fontSection);
+            SetTextColor(hdc, titleCol);
+            DrawTextW(hdc, L"显示方式", -1, &rlDisp, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
+        }
 
         RECT rlHint{ S(500), S(182), S(924), S(226) };
         SelectObject(hdc, g_theme.fontBody);
@@ -7824,6 +7826,7 @@ static void NetworkLoop(RunConfig cfg, Graphics* gfx, Presenter* presenter) {
         if (!connected) {
             closesocket(sock);
             if (!cfg.reconnect) break;
+            ShowTransitionOverlayAsync(L"正在重连 Mac", L"等待 Mac 发送端，首帧到达后自动恢复", 235);
             ShowStatusHintAsync(L"等待 Mac 发送端…");
             SleepAlive(2000);
             continue;
