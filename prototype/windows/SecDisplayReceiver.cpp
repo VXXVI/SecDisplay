@@ -2700,7 +2700,10 @@ static void PositionTransitionOverlay() {
 }
 
 static void ShowTransitionNow(const wchar_t* title, const wchar_t* sub, int alpha) {
-    if (!g_hwnd || g_hostMode.load()) return;
+    if (!g_hwnd || g_hostMode.load()) {
+        g_transitionPending = false;
+        return;
+    }
     g_transitionTitle = title ? title : L"";
     g_transitionSub = sub ? sub : L"";
     if (IsIconic(g_hwnd)) {
