@@ -290,7 +290,8 @@ private func mainPresetLabel() -> String {
 /// 写入 UserDefaults 的会是面板显示标签（如「自定义」），启动时与全局 nil 比较恒 false。
 private func currentPresetTag() -> String? { presetName }
 
-private let accent = Color(red: 0.22, green: 0.55, blue: 0.96)
+/// 与 Windows 面板统一的强调蓝 RGB(59,130,246)，确保两端视觉一致。
+private let accent = Color(red: 59.0 / 255.0, green: 130.0 / 255.0, blue: 246.0 / 255.0)
 
 private struct StatRow: View {
     let label: String
@@ -916,11 +917,11 @@ struct StatusView: View {
                 .frame(maxWidth: .infinity, alignment: .leading)
                 .background(
                     RoundedRectangle(cornerRadius: 8)
-                        .fill(model.transferDropTargeted ? Color.accentColor.opacity(0.12) : Color.secondary.opacity(0.08))
+                        .fill(model.transferDropTargeted ? accent.opacity(0.12) : Color.secondary.opacity(0.08))
                 )
                 .overlay(
                     RoundedRectangle(cornerRadius: 8)
-                        .stroke(model.transferDropTargeted ? Color.accentColor : Color.clear, lineWidth: 1.5)
+                        .stroke(model.transferDropTargeted ? accent : Color.clear, lineWidth: 1.5)
                 )
                 .onDrop(of: [.fileURL], isTargeted: $model.transferDropTargeted) { providers in
                     var accepted = false

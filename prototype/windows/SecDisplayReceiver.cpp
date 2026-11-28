@@ -53,6 +53,7 @@
 #include <cstdio>
 #include <cstdint>
 #include <cstring>
+#include <climits>
 #include <fstream>
 #include <cctype>
 #include <cmath>
@@ -353,9 +354,12 @@ static std::atomic<double> g_cursorY{-1};
 // 光标是否在副屏范围内。Mac 端把指针移回主屏时会发 visible=0，
 // 这里必须真的把 Windows 光标隐藏，否则它会一直停在最后位置。
 static std::atomic<bool> g_cursorVisible{true};
-// Mac 光标从「离开副屏」重新回到副屏时置位：下一次 0x03 允许把 Windows 光标拉回画面内，
-// 否则用户把指针滑到主屏后就再也收不回来了（远程位置只对画面内生效）。
-static std::atomic<bool> g_pullCursorIn{false};
+// Mac 光标从「离开副屏」重新回到副屏时签发一次性拉回凭证（记录签发时刻，0=无凭证）。
+// 加时刻戳而非布尔：避免陈旧凭证在很久之后把用户正在主屏操作的指针瞬移回副屏边缘。
+static std::atomic<uint64_t> g_pullCursorInMs{0};
+// 光标最近一次「离开副屏」的时刻。只有离开足够久再回来才签发拉回凭证，
+// 抑制边界 1px 抖动导致的反复拉回。
+static std::atomic<uint64_t> g_cursorOffSinceMs{0};
 // 程序 SetCursorPos 的目标点与 16 槽位历史环形缓冲，配合 WM_INPUT 硬件鼠标记时，
 // 彻底过滤连发覆盖 / 边界舍入 / 异步投递产生的 WM_MOUSEMOVE 回声。
 static std::atomic<bool> g_cursorMsgPending{ false };
@@ -400,6 +404,9 @@ static const UINT WM_APP_UPDATE_POWER = WM_APP + 6;
 // 二次启动唤醒或后台任务完成通知 UI 线程
 static const UINT WM_APP_SHOW_PANEL = WM_APP + 12;
 static const UINT WM_APP_HOST_ACTION_DONE = WM_APP + 13;
+// 会话头切换分辨率时由收流线程投递到 UI 线程：清理光标与晃动状态涉及窗口/定时器操作，
+// 必须在 UI 线程执行，避免跨线程写非原子 UI 状态。
+static const UINT WM_APP_SESSION_RESET = WM_APP + 14;
 // 保持屏幕常亮（防止投屏期间因无 Windows 本地输入而自动熄屏）
 static std::atomic<bool> g_keepScreenOn{true};
 // 老 SDK 的 winuser.h 可能没定义 WM_DPICHANGED（需要 WINVER >= 0x0603）
@@ -445,6 +452,9 @@ static uint64_t g_hiresForSeq = 0;
 static uint64_t g_spriteGen = 0;
 static std::atomic<uint64_t> g_rxCursorImageSeq{0};
 static uint64_t g_zoomMoveOnlyHits = 0;   // 纯位移快路径命中计数，供自检验证 SetWindowPos 路径
+// 叠加层上一次纯位移的目标点。位置未变时跳过 SetWindowPos，
+// 避免 HOLD 阶段每条光标消息都触发一次 z-order/合成操作造成抖动。
+static int g_zoomLastDstX = INT_MIN, g_zoomLastDstY = INT_MIN;
 // 稳态「原生像素 → 屏幕物理像素」的实际比例（已含 hwMax 钳位），供放大叠加层作为基准。
 static double g_steadySpriteK = 0.0;
 
@@ -1005,16 +1015,24 @@ static void OnCursorPacket(const uint8_t* p, size_t payloadLen) {
     if (!visible) {
         // 光标离开副屏：清空坐标并通知 UI 线程隐藏本机光标。
         // 只清坐标不隐藏，会让光标图像一直停在最后位置。
-        g_cursorX = -1;
-        g_cursorY = -1;
-        if (g_cursorVisible.exchange(false) && g_hwnd) {
-            PostMessageA(g_hwnd, WM_APP_CURSOR_VIS, 0, 0);
+        g_cursorX = std::nan("");
+        g_cursorY = std::nan("");
+        g_pullCursorInMs.store(0);              // 离开即作废拉回凭证
+        // 只在「离开的第一刻」记录时刻；指针在主屏移动时 visible=0 包会持续到达，
+        // 若每包都刷新，横扫过边界时离开时长恒为一帧，凭证永不签发。
+        if (g_cursorVisible.exchange(false)) {
+            g_cursorOffSinceMs.store(GetTickCount64());
+            if (g_hwnd) PostMessageA(g_hwnd, WM_APP_CURSOR_VIS, 0, 0);
         }
         return;
     }
     if (!g_cursorVisible.exchange(true) && g_hwnd) {
         PostMessageA(g_hwnd, WM_APP_CURSOR_VIS, 0, 0);
-        g_pullCursorIn.store(true);
+        // 只有真正离开过一段时间再回来才签发拉回凭证；边界抖动不签发。
+        const uint64_t offSince = g_cursorOffSinceMs.load();
+        if (offSince != 0 && GetTickCount64() - offSince >= 200) {
+            g_pullCursorInMs.store(GetTickCount64());
+        }
     }
 
     double oldX = g_cursorX.load(), oldY = g_cursorY.load();
@@ -2417,6 +2435,9 @@ void Presenter::Shutdown() {
 
 // --- 全屏切换 ---
 static std::atomic<bool> g_isFullscreen{false};      // 由 main 按 cfg.fullscreen 同步
+// 全屏按 Esc 后，若 keyup 丢失（失焦/Alt+Tab），本地消费标志会卡在 true，
+// 导致窗口模式 Esc 被永久吞掉。提升到文件作用域，失焦时显式复位。
+static bool g_escConsumedLocal = false;
 static LONG_PTR g_savedStyle = 0;
 static LONG_PTR g_savedExStyle = 0;
 static RECT g_savedRect{};
@@ -2644,7 +2665,7 @@ static const int IDC_PANEL_OPENXFER = 2031;
 static const int IDC_PANEL_DROPBOX  = 2032;
 static const int IDC_PANEL_PASTEXFER = 2033;
 static const int IDC_PANEL_RES_2880  = 2035;
-static const int IDC_PANEL_RES_2560  = 2036;
+static const int IDC_PANEL_RES_2240  = 2036;
 static const int IDC_PANEL_RES_1920  = 2037;
 static const int IDC_PANEL_MBPS_30   = 2038;
 static const int IDC_PANEL_MBPS_50   = 2039;
@@ -3644,7 +3665,7 @@ static void UpdateControlPanel() {
                        mirrorMode ? L"重检主屏" : L"重挂虚拟屏");
         SetWindowTextW(GetDlgItem(g_panel, IDC_PANEL_KVM),
                        hs.kvmActive.load() ? L"退出穿透 (Ctrl+Alt+K)" : L"键鼠控 Mac (Ctrl+Alt+K)");
-        for (int id : { IDC_PANEL_RES_2880, IDC_PANEL_RES_2560, IDC_PANEL_RES_1920 }) {
+        for (int id : { IDC_PANEL_RES_2880, IDC_PANEL_RES_2240, IDC_PANEL_RES_1920 }) {
             if (HWND c = GetDlgItem(g_panel, id)) EnableWindow(c, (!mirrorMode && !busy) ? TRUE : FALSE);
         }
         for (int id : { IDC_PANEL_DISP_EXTEND, IDC_PANEL_DISP_MIRROR, IDC_PANEL_VDD_RETRY, IDC_PANEL_KVM }) {
@@ -4273,7 +4294,7 @@ static void LayoutPanelControls(HWND h) {
     mvChk(IDC_PANEL_KEEPON,   658, 544, 250, 28);
 
     mvHost(IDC_PANEL_RES_2880,  39,  541, 88,  32);
-    mvHost(IDC_PANEL_RES_2560,  133, 541, 88,  32);
+    mvHost(IDC_PANEL_RES_2240,  133, 541, 88,  32);
     mvHost(IDC_PANEL_RES_1920,  227, 541, 88,  32);
     mvHost(IDC_PANEL_MBPS_30,   327, 541, 62,  32);
     mvHost(IDC_PANEL_MBPS_50,   395, 541, 62,  32);
@@ -4384,7 +4405,7 @@ static LRESULT CALLBACK PanelWndProc(HWND h, UINT msg, WPARAM w, LPARAM l) {
         mkChk(L"保持屏幕常亮 (防熄屏)", IDC_PANEL_KEEPON, g_keepScreenOn.load());
 
         mkBtn(L"2880×1800", IDC_PANEL_RES_2880);
-        mkBtn(L"2560×1600", IDC_PANEL_RES_2560);
+        mkBtn(L"2240×1400", IDC_PANEL_RES_2240);
         mkBtn(L"1920×1200", IDC_PANEL_RES_1920);
         mkBtn(L"码率 30M",  IDC_PANEL_MBPS_30);
         mkBtn(L"码率 50M",  IDC_PANEL_MBPS_50);
@@ -4524,13 +4545,13 @@ static LRESULT CALLBACK PanelWndProc(HWND h, UINT msg, WPARAM w, LPARAM l) {
                 RunHostAsyncAction([fps]() { g_winHost.SetResolution(2880, 1800, fps); });
             }
             return 0;
-        case IDC_PANEL_RES_2560:
+        case IDC_PANEL_RES_2240:
             if (g_hostMode.load() && !g_hostMirrorMode.load() && !g_hostActionBusy.load()) {
-                g_hostReqW = 2560; g_hostReqH = 1600;
-                SaveConfigKey("hostwidth", "2560");
-                SaveConfigKey("hostheight", "1600");
+                g_hostReqW = 2240; g_hostReqH = 1400;
+                SaveConfigKey("hostwidth", "2240");
+                SaveConfigKey("hostheight", "1400");
                 int fps = g_hostReqFps.load();
-                RunHostAsyncAction([fps]() { g_winHost.SetResolution(2560, 1600, fps); });
+                RunHostAsyncAction([fps]() { g_winHost.SetResolution(2240, 1400, fps); });
             }
             return 0;
         case IDC_PANEL_RES_1920:
@@ -5592,6 +5613,7 @@ static void HideZoomOverlay() {
     }
     g_zoomRenderedW = g_zoomRenderedH = 0;
     g_zoomRenderedGen = 0;
+    g_zoomLastDstX = g_zoomLastDstY = INT_MIN;
     if (g_cursorVisible.load()) {
         SetCursor(g_customCursor ? g_customCursor : LoadCursor(nullptr, IDC_ARROW));
     }
@@ -5680,8 +5702,15 @@ static void UpdateZoomOverlay(double zoom) {
     // SetWindowPos 仅移动分层窗，不触发 DWM 对整面位图的重新合成，开销远低于 UpdateLayeredWindow。
     if (moveOnly) {
         SetCursor(HiddenCursorHandle());
-        if (SetWindowPos(g_zoomOverlay, HWND_TOPMOST, dstPt.x, dstPt.y, 0, 0,
-                         SWP_NOSIZE | SWP_NOACTIVATE)) {
+        if (g_zoomLastDstX == dstPt.x && g_zoomLastDstY == dstPt.y) {
+            ++g_zoomMoveOnlyHits;
+            return;
+        }
+        // 窗口创建时已带 WS_EX_TOPMOST，无需每帧重申 z-order；nullptr + SWP_NOZORDER 只搬位置。
+        if (SetWindowPos(g_zoomOverlay, nullptr, dstPt.x, dstPt.y, 0, 0,
+                         SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE)) {
+            g_zoomLastDstX = dstPt.x;
+            g_zoomLastDstY = dstPt.y;
             ++g_zoomMoveOnlyHits;
             return;
         }
@@ -5755,6 +5784,10 @@ static void UpdateZoomOverlay(double zoom) {
             // 硬件光标，再显示首帧，避免双指针，也避免失败路径反复闪烁。
             g_zoomOverlayShown = true;
             SetCursor(HiddenCursorHandle());
+            // 首次显示时重申 TOPMOST：投递盒/可置顶面板也带 TOPMOST，
+            // 只在创建时进入 topmost 带首位可能被后显示的窗盖住。之后位移用 SWP_NOZORDER 即可。
+            SetWindowPos(g_zoomOverlay, HWND_TOPMOST, 0, 0, 0, 0,
+                         SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
             ShowWindow(g_zoomOverlay, SW_SHOWNOACTIVATE);
             Log("晃动放大: 叠加层显示 %dx%d (zoom %.2fx 源 %dx%d)", dw, dh, zoom, srcW, srcH);
         }
@@ -6360,6 +6393,10 @@ static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
         UpdateControlPanel();
         UpdateExecutionState();
         return 0;
+    case WM_APP_SESSION_RESET:
+        ResetShakeSamples();
+        AbortShake();
+        return 0;
     case WM_APP_SET_CLIP_TEXT: {
         std::deque<PendingClipText> batch;
         {
@@ -6481,6 +6518,8 @@ static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
         if (LOWORD(w) == WA_INACTIVE) {
             // 失焦时结束晃动放大：叠加层是 TOPMOST，留着会盖在别人的窗口上。
             AbortShake();
+            // 失焦时 keyup 可能丢失，清掉 Esc 本地消费标志，避免窗口模式 Esc 被永久吞掉。
+            g_escConsumedLocal = false;
         }
         break;   // 焦点状态仍交给 DefWindowProc
     case WM_MOVE:
@@ -6493,6 +6532,8 @@ static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
             std::lock_guard<std::mutex> lk(g_cursorImage.mtx);
             if (!g_cursorImage.bgra.empty()) g_cursorImage.pending = true;
         }
+        // 动画进行中切换 DPI 会重建光标位图基准，叠加层几何会突跳；先中止再重建。
+        AbortShake();
         ApplyCursorImage();
         ResetShakeSamples();
         break;   // 窗口位置/尺寸仍交给 DefWindowProc
@@ -6510,20 +6551,21 @@ static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
         // 否则每次移动都会被夹回副屏窗口，表现为「鼠标被困在副屏里出不去」。
         // 例外：Mac 光标刚重新回到副屏时允许拉回一次（g_pullCursorIn）。
         const bool owned = PortalCursorOwned();
-        if (owned) g_pullCursorIn.store(false);   // 已在画面内，凭证不再需要，避免出去后又被拽回一次
-        if (!owned && !g_pullCursorIn.load()) return 0;
-        const uint64_t gateNow = GetTickCount64();
+        const uint64_t gateNow0 = GetTickCount64();
+        const uint64_t pullMs = g_pullCursorInMs.load();
+        const bool pullValid = pullMs != 0 && gateNow0 >= pullMs && gateNow0 - pullMs <= 300;
+        if (owned) g_pullCursorInMs.store(0);   // 已在画面内，凭证不再需要
+        if (!owned && !pullValid) return 0;
+        const uint64_t gateNow = gateNow0;
         // 点击和滚轮仍保留短暂让位，覆盖事件回传到 Mac 再返回的一个 RTT。
         // WM_MOUSEMOVE 不参与：它可能正是 SetCursorPos 的迟到回声，加入门控会
         // 形成「移动 → 冻结 → 再移动」循环。Raw Input 不可用时才用本地事件兜底。
         const bool localBusy = g_rawInputReady.load()
             ? gateNow - (uint64_t)g_lastHardwareMouseMs.load() < 60
             : gateNow - (uint64_t)g_lastLocalInputMs.load() < 60;
-        // 「回到副屏」的一次性拉回必须绕过本地优先门控：用户正是用手把指针推回来，
-        // 硬件鼠标一定刚刚动过，否则这次拉回会被永久丢弃。
         if (localBusy && owned) return 0;
         double cx = g_cursorX.load(), cy = g_cursorY.load();
-        if (cx < 0 || cy < 0) return 0;
+        if (!std::isfinite(cx) || !std::isfinite(cy) || cx < 0 || cy < 0) return 0;
         int vw = g_coordW.load(), vh = g_coordH.load();
         if (vw <= 0 || vh <= 0) return 0;
         RECT rc{};
@@ -6542,7 +6584,7 @@ static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
         if (sy < tl.y + vr.top) sy = tl.y + vr.top;
         if (sy >= tl.y + vr.bottom) sy = tl.y + vr.bottom - 1;
         // 真正执行了拉回才消费一次性凭证，避免被后续 return 吞掉。
-        if (!owned) g_pullCursorIn.store(false);
+        if (!owned) g_pullCursorInMs.store(0);
         const uint64_t nowMoveMs = GetTickCount64();
         RecordRemoteTarget(sx, sy, nowMoveMs);
         SetCursorPos(sx, sy);
@@ -6611,17 +6653,19 @@ static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
         const bool repeat = (l & 0x40000000) != 0;
         // 本地快捷键优先处理且成对消费，避免向 Mac 发出无配对的 keyUp。
         // 窗口模式下 Esc 不再强杀进程，而是透传给 Mac；全屏时按 Esc 返回窗口。
-        static bool s_escConsumedLocal = false;
         if (w == VK_ESCAPE) {
             if (down) {
                 if (g_isFullscreen) {
-                    s_escConsumedLocal = true;
+                    g_escConsumedLocal = true;
                     if (!repeat) ExitFullscreen();
                     return 0;
                 }
-                if (s_escConsumedLocal) return 0;
-            } else if (s_escConsumedLocal) {
-                s_escConsumedLocal = false;
+                // 窗口模式：残留标志（全屏 Esc 的 keyup 丢失）不应静默吞掉用户真实按键。
+                // 清掉标志后照常转发本次 Esc；系统自动重复（按住不放）不转发，避免向 Mac 连发多次。
+                g_escConsumedLocal = false;
+                if (repeat) return 0;
+            } else if (g_escConsumedLocal) {
+                g_escConsumedLocal = false;
                 return 0;
             }
         }
@@ -7172,6 +7216,12 @@ static void OnSessionPacket(const uint8_t* p, size_t n) {
         g_coordW = w;
         g_coordH = h;
     }
+    // 坐标基准变化：清掉旧坐标与拉回凭证，避免用旧尺寸换算出的位置把光标拽到边缘。
+    // 晃动/叠加层的清理必须在 UI 线程做（涉及 KillTimer/ShowWindow/SetCursor），这里只投递消息。
+    g_cursorX = std::nan("");
+    g_cursorY = std::nan("");
+    g_pullCursorInMs.store(0);
+    if (g_hwnd) PostMessageA(g_hwnd, WM_APP_SESSION_RESET, 0, 0);
     Log("会话头: 协议 v%u  虚拟屏 %dx%d @ %d fps  scale=%.1fx",
         ver, w, h, fps, scaleTenths >= 5 ? (scaleTenths / 10.0) : 0.0);
 

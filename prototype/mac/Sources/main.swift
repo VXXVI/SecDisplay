@@ -3367,6 +3367,9 @@ final class CursorTracker {
     private var lastX: Float = .nan
     private var lastY: Float = .nan
     private var lastVisible = false
+    /// 可见性滞回锁存：边界 1px 抖动不应在 0/1 间反复切换，
+    /// 否则接收端会不断签发「拉回」凭证并把指针拽到边缘，表现为位置重置。
+    private var insideLatched = false
     /// 累计发出的光标包数量，用于统计展示
     private(set) var sentCount = 0
 
@@ -3432,6 +3435,7 @@ final class CursorTracker {
         // 没有连接时不记录位置，否则连上之后要等指针再次移动才会发第一包
         guard sender.connected else {
             lastX = .nan; lastY = .nan; lastVisible = false
+            insideLatched = false
             return
         }
         let now = CFAbsoluteTimeGetCurrent()
@@ -3451,9 +3455,20 @@ final class CursorTracker {
         // 避免把刚由 Windows 0x04 注入的指针移动再当作本地移动发回 Windows
         if gMouse?.isEchoOfInjected(p) == true { return }
         let b = bounds()
+        // 防御：虚拟屏重建/切换模式/休眠瞬间 activeCaptureDisplayID() 可能返回 0，
+        // logicalDisplayBounds(0) 会退化成零尺寸。此时若继续发送，接收端会把光标
+        // 误判为「离开副屏」并清坐标、再拉回，表现为鼠标位置偶尔重置。
+        guard b.width > 1, b.height > 1, p.x.isFinite, p.y.isFinite else { return }
         let rx = Float(p.x - b.minX)
         let ry = Float(p.y - b.minY)
-        let inside = rx >= 0 && ry >= 0 && rx < Float(b.width) && ry < Float(b.height)
+        // 2pt 死区滞回：完全进入内边框才算 inside=true，完全离开才 inside=false，
+        // 边界缝隙上的亚像素抖动不会产生 visible 0/1 交替（接收端反复「拉回」）。
+        let edgeHyst: Float = 2.0
+        let insideHard = rx >= 0 && ry >= 0 && rx < Float(b.width) && ry < Float(b.height)
+        let insideSoft = rx >= edgeHyst && ry >= edgeHyst
+            && rx < Float(b.width) - edgeHyst && ry < Float(b.height) - edgeHyst
+        let inside = insideSoft ? true : (insideHard ? insideLatched : false)
+        insideLatched = inside
 
         // 线上协议与 Windows g_coordW/H 用的是「视频像素」基准（cfg.width x cfg.height）。
         // 按 videoSize / CGDisplayBounds 比例换算，确保不管 1x 还是 2x Retina（或异常回退），

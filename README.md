@@ -153,8 +153,25 @@ ping -c 5 10.10.10.2
 
 - `mode=receiver|sender`（对应命令行 `--mode receiver|sender`），`displaymode=extend|mirror`（对应 `--extend` / `--mirror` / `--display-mode`），`showpanel=1|0`（对应 `--panel` / `--no-panel`）
 - `hostwidth` / `hostheight` / `fps` / `bitrate` / `hostdpi`（主控虚拟屏尺寸、帧率、码率及可选独立 DPI 缩放百分比，默认 `2880x1800@60`，`50 Mbps`）
-- 控制面板启动即展示，可直接点击选择 Windows 或 Mac 当副屏、切换扩展屏幕或镜像主屏，并支持 `2880×1800` / `2560×1600` / `1920×1200`、码率档位 `30M` / `50M` / `80M`、快速断线重连以及重挂虚拟屏；面板复选框修改会自动写回 `config.ini`。
+- 控制面板启动即展示，可直接点击选择 Windows 或 Mac 当副屏、切换扩展屏幕或镜像主屏，并支持 `2880×1800` / `2240×1400` / `1920×1200` 三档分辨率（与 Mac 端一致）、码率档位 `30M` / `50M` / `80M`、快速断线重连以及重挂虚拟屏；面板复选框修改会自动写回 `config.ini`。
 - 快捷操作：左键托盘图标打开控制面板，`Ctrl+Alt+Q` 全局安全退出，接收端投屏窗口按 `Alt+F4` 退出（控制面板按 `Esc` / `Alt+F4` 仅隐藏），`F11` 或全屏按 `Esc` 返回窗口（窗口模式 `Esc` 透传给 Mac 不误退），`Ctrl+Alt+H` 让位或显隐面板，`Ctrl+Alt+B` 悬浮投递盒，`Ctrl+Alt+K` 主控键鼠穿透（Mac 端可用 `Cmd+Q` / `Ctrl+Opt+Q` 退出、`Ctrl+Opt+Esc` 本地解除 Windows KVM 穿透并同步通知 Windows 端退出钩子）。
+
+### 两端快捷键对照
+
+两端沿用各自平台的修饰键习惯（Mac 用 `Cmd` / `Opt`，Windows 用 `Ctrl` / `Alt`），语义一一对应：
+
+| 功能 | macOS | Windows |
+|---|---|---|
+| 安全退出 | `Cmd+Q` / `Ctrl+Opt+Q` | `Ctrl+Alt+Q` |
+| 关闭当前窗口（副屏窗口 / 控制面板） | `Cmd+W` | 关闭投屏窗口 |
+| 退出进程 | `Cmd+Q` | `Alt+F4` |
+| 全屏切换 | `Ctrl+Cmd+F` | `F11` |
+| 全屏返回窗口 | `Esc` | `Esc` |
+| 文件投递盒 | `Ctrl+Opt+B` | `Ctrl+Alt+B` |
+| 键鼠穿透（主控端） | `Ctrl+Opt+K` | `Ctrl+Alt+K` |
+| 本地解除 KVM（副屏端） | `Ctrl+Opt+Esc` | — |
+
+> 快捷键目前为内置默认值，暂不支持在面板中自定义；如需调整，可修改对应源码中的热键注册（Mac 全局在 `main.swift`，副屏窗口在 `MacReceiver.swift`；Windows 在 `SecDisplayReceiver.cpp`）后重新构建。
 
 ---
 
