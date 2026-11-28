@@ -2417,6 +2417,9 @@ void Presenter::Shutdown() {
 
 // --- 全屏切换 ---
 static std::atomic<bool> g_isFullscreen{false};      // 由 main 按 cfg.fullscreen 同步
+// 全屏按 Esc 后，若 keyup 丢失（失焦/Alt+Tab），本地消费标志会卡在 true，
+// 导致窗口模式 Esc 被永久吞掉。提升到文件作用域，失焦时显式复位。
+static bool g_escConsumedLocal = false;
 static LONG_PTR g_savedStyle = 0;
 static LONG_PTR g_savedExStyle = 0;
 static RECT g_savedRect{};
@@ -2644,7 +2647,7 @@ static const int IDC_PANEL_OPENXFER = 2031;
 static const int IDC_PANEL_DROPBOX  = 2032;
 static const int IDC_PANEL_PASTEXFER = 2033;
 static const int IDC_PANEL_RES_2880  = 2035;
-static const int IDC_PANEL_RES_2560  = 2036;
+static const int IDC_PANEL_RES_2240  = 2036;
 static const int IDC_PANEL_RES_1920  = 2037;
 static const int IDC_PANEL_MBPS_30   = 2038;
 static const int IDC_PANEL_MBPS_50   = 2039;
@@ -3644,7 +3647,7 @@ static void UpdateControlPanel() {
                        mirrorMode ? L"重检主屏" : L"重挂虚拟屏");
         SetWindowTextW(GetDlgItem(g_panel, IDC_PANEL_KVM),
                        hs.kvmActive.load() ? L"退出穿透 (Ctrl+Alt+K)" : L"键鼠控 Mac (Ctrl+Alt+K)");
-        for (int id : { IDC_PANEL_RES_2880, IDC_PANEL_RES_2560, IDC_PANEL_RES_1920 }) {
+        for (int id : { IDC_PANEL_RES_2880, IDC_PANEL_RES_2240, IDC_PANEL_RES_1920 }) {
             if (HWND c = GetDlgItem(g_panel, id)) EnableWindow(c, (!mirrorMode && !busy) ? TRUE : FALSE);
         }
         for (int id : { IDC_PANEL_DISP_EXTEND, IDC_PANEL_DISP_MIRROR, IDC_PANEL_VDD_RETRY, IDC_PANEL_KVM }) {
@@ -4273,7 +4276,7 @@ static void LayoutPanelControls(HWND h) {
     mvChk(IDC_PANEL_KEEPON,   658, 544, 250, 28);
 
     mvHost(IDC_PANEL_RES_2880,  39,  541, 88,  32);
-    mvHost(IDC_PANEL_RES_2560,  133, 541, 88,  32);
+    mvHost(IDC_PANEL_RES_2240,  133, 541, 88,  32);
     mvHost(IDC_PANEL_RES_1920,  227, 541, 88,  32);
     mvHost(IDC_PANEL_MBPS_30,   327, 541, 62,  32);
     mvHost(IDC_PANEL_MBPS_50,   395, 541, 62,  32);
@@ -4384,7 +4387,7 @@ static LRESULT CALLBACK PanelWndProc(HWND h, UINT msg, WPARAM w, LPARAM l) {
         mkChk(L"保持屏幕常亮 (防熄屏)", IDC_PANEL_KEEPON, g_keepScreenOn.load());
 
         mkBtn(L"2880×1800", IDC_PANEL_RES_2880);
-        mkBtn(L"2560×1600", IDC_PANEL_RES_2560);
+        mkBtn(L"2240×1400", IDC_PANEL_RES_2240);
         mkBtn(L"1920×1200", IDC_PANEL_RES_1920);
         mkBtn(L"码率 30M",  IDC_PANEL_MBPS_30);
         mkBtn(L"码率 50M",  IDC_PANEL_MBPS_50);
@@ -4524,13 +4527,13 @@ static LRESULT CALLBACK PanelWndProc(HWND h, UINT msg, WPARAM w, LPARAM l) {
                 RunHostAsyncAction([fps]() { g_winHost.SetResolution(2880, 1800, fps); });
             }
             return 0;
-        case IDC_PANEL_RES_2560:
+        case IDC_PANEL_RES_2240:
             if (g_hostMode.load() && !g_hostMirrorMode.load() && !g_hostActionBusy.load()) {
-                g_hostReqW = 2560; g_hostReqH = 1600;
-                SaveConfigKey("hostwidth", "2560");
-                SaveConfigKey("hostheight", "1600");
+                g_hostReqW = 2240; g_hostReqH = 1400;
+                SaveConfigKey("hostwidth", "2240");
+                SaveConfigKey("hostheight", "1400");
                 int fps = g_hostReqFps.load();
-                RunHostAsyncAction([fps]() { g_winHost.SetResolution(2560, 1600, fps); });
+                RunHostAsyncAction([fps]() { g_winHost.SetResolution(2240, 1400, fps); });
             }
             return 0;
         case IDC_PANEL_RES_1920:
@@ -6481,6 +6484,8 @@ static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
         if (LOWORD(w) == WA_INACTIVE) {
             // 失焦时结束晃动放大：叠加层是 TOPMOST，留着会盖在别人的窗口上。
             AbortShake();
+            // 失焦时 keyup 可能丢失，清掉 Esc 本地消费标志，避免窗口模式 Esc 被永久吞掉。
+            g_escConsumedLocal = false;
         }
         break;   // 焦点状态仍交给 DefWindowProc
     case WM_MOVE:
@@ -6611,17 +6616,21 @@ static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
         const bool repeat = (l & 0x40000000) != 0;
         // 本地快捷键优先处理且成对消费，避免向 Mac 发出无配对的 keyUp。
         // 窗口模式下 Esc 不再强杀进程，而是透传给 Mac；全屏时按 Esc 返回窗口。
-        static bool s_escConsumedLocal = false;
         if (w == VK_ESCAPE) {
             if (down) {
                 if (g_isFullscreen) {
-                    s_escConsumedLocal = true;
+                    g_escConsumedLocal = true;
                     if (!repeat) ExitFullscreen();
                     return 0;
                 }
-                if (s_escConsumedLocal) return 0;
-            } else if (s_escConsumedLocal) {
-                s_escConsumedLocal = false;
+                // 窗口模式：若标志残留（keyup 丢失）但 Esc 实际并未按下，
+                // 视为陈旧状态并清掉，把这次 Esc 正常转发给 Mac。
+                if (g_escConsumedLocal) {
+                    if (GetKeyState(VK_ESCAPE) & 0x8000) return 0;
+                    g_escConsumedLocal = false;
+                }
+            } else if (g_escConsumedLocal) {
+                g_escConsumedLocal = false;
                 return 0;
             }
         }
