@@ -504,8 +504,8 @@ static const int kShakeMinSpanPx = 100;  // 横向/纵向累计摆幅下限，�
 // 约 3.8 倍快速弹出，持续晃动保持，停手约 150ms 后在 ~180ms 内利落缩回。
 static const double kShakeCursorZoom = 3.8;  // 目标放大倍数（绘制在叠加层，不受硬件光标上限限制）
 static const double kShakeGrowMs = 140.0;    // 起势时长（EaseOutBack，末端极轻微过冲）
-static const double kShakeHoldMs = 150.0;    // 最后一次指针移动后的保持时长
-static const double kShakeShrinkMs = 180.0;  // 回落时长（EaseInOutCubic）
+static const double kShakeHoldMs = 350.0;    // 最后一次指针移动后的保持时长（macOS 摇动定位约 0.3~0.5s）
+static const double kShakeShrinkMs = 220.0;  // 回落时长（EaseInOutCubic，平滑收缩）
 static const double kShakeOvershootC1 = 0.8; // EaseOutBack 过冲系数（相对增量约 2.34% 峰值过冲）
 static const UINT_PTR kShakeTimer = 4004;
 
