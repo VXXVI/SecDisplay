@@ -2959,7 +2959,7 @@ final class InputInjector {
     private var injectedRing: [(at: CFAbsoluteTime, pt: CGPoint)] = []
     private var injectedHead = 0
 
-    /// 刚刚由 Windows 0x04 回放过移动的位置（8 槽位历史环），用于避免 CursorTracker
+    /// 刚刚由 Windows 0x04 回放过移动的位置（16 槽位历史环），用于避免 CursorTracker
     /// 把自己注入的移动或前一跳滞后位置当成用户移动再发回 Windows，形成双向自激震荡。
     func isEchoOfInjected(_ p: CGPoint) -> Bool {
         let now = CFAbsoluteTimeGetCurrent()
@@ -2968,7 +2968,7 @@ final class InputInjector {
         injectLock.unlock()
         for item in snap {
             let dt = now - item.at
-            guard dt >= 0 && dt < 0.08 else { continue }
+            guard dt >= 0 && dt < 0.15 else { continue }
             let dx = p.x - item.pt.x, dy = p.y - item.pt.y
             if (dx * dx + dy * dy) < 16.0 { return true }
         }
@@ -3022,11 +3022,11 @@ final class InputInjector {
             mv.flags = mods
             injectLock.lock()
             let nowInj = CFAbsoluteTimeGetCurrent()
-            if injectedRing.count < 8 {
+            if injectedRing.count < 16 {
                 injectedRing.append((nowInj, p))
             } else {
                 injectedRing[injectedHead] = (nowInj, p)
-                injectedHead = (injectedHead + 1) % 8
+                injectedHead = (injectedHead + 1) % 16
             }
             injectLock.unlock()
             mv.post(tap: .cghidEventTap)
@@ -3479,7 +3479,9 @@ final class CursorTracker {
         let ox = rx * sx
         let oy = ry * sy
 
-        let moved = !(abs(ox - lastX) < 0.5 && abs(oy - lastY) < 0.5)
+        // 死区从 0.5 收到 0.2：副屏晃动放大时，用户常以很慢的速度微调找指针，
+        // 0.5 视频像素在 90Hz 采样下会漏掉慢速移动，Windows 叠加层就会误判为停止。
+        let moved = !(abs(ox - lastX) < 0.2 && abs(oy - lastY) < 0.2)
         guard moved || inside != lastVisible else { return }
 
         lastX = ox; lastY = oy; lastVisible = inside
@@ -3653,7 +3655,7 @@ final class CursorImageTracker {
 
         guard let pointer = CGEvent(source: nil)?.location else { return }
         if lastPointerMoveAt == 0 || hypot(pointer.x - lastPointerLocation.x,
-                                           pointer.y - lastPointerLocation.y) >= 1.0 {
+                                           pointer.y - lastPointerLocation.y) >= 0.5 {
             lastPointerMoveAt = now
         }
         lastPointerLocation = pointer
@@ -3666,14 +3668,19 @@ final class CursorImageTracker {
             // 已处于永久大指针模式（例如无障碍 64pt+）时的正常形状切换
             largeCursorSince = 0
         } else {
-            // macOS 的晃动放大可能在停止后继续存活。移动期间始终抑制，
-            // 停止 2.2 秒后放行原生大图，保证关闭 Windows 本地晃动时仍可定位。
-            // 显示与基线提交解耦：连续静止 5 秒仍是大图才认定为永久大指针，
-            // 延迟回落的系统动画永远不会抬高稳态基线。
+            // macOS 原生「晃动放大」只在物理 Mac 指针上生效，副屏的放大由
+            // Windows 叠加层负责。这里绝不能把瞬态大图当成新光标发过去：
+            // 旧逻辑「静止 2.2 秒后放行」会在 Windows 已经缩回后再送一张大图，
+            // 形成迟到的第二次放大-缩小。改为尺寸门：
+            // 只有持续静止 5 秒仍是大图，才认定为用户设置的永久大指针并更新基线；
+            // 其余瞬态大图一律跳过（保持上一张稳态精灵），首连时例外发一次。
             if largeCursorSince == 0 { largeCursorSince = now }
-            if now - lastPointerMoveAt < 2.2 { return }
-            if now - lastPointerMoveAt >= 5.0 && now - largeCursorSince >= 5.0 {
+            let settledPermanent = (now - lastPointerMoveAt >= 5.0) &&
+                                   (now - largeCursorSince >= 5.0)
+            if settledPermanent {
                 normalCursorMaxDim = logicalMax
+            } else if lastFingerprint != 0 {
+                return
             }
         }
 
