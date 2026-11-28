@@ -4174,7 +4174,8 @@ static void PaintControlPanel(HWND h) {
     FillRect(hdc, &cli, g_theme.canvasBrush);
 
     const COLORREF cardFill   = g_pal.card;
-    const COLORREF cardBorder = g_pal.sep;
+    // 浅色主题下 sep 与画布太接近，卡片轮廓会消失；用 border 保留可见的弱描边。
+    const COLORREF cardBorder = g_pal.dark ? g_pal.sep : g_pal.border;
     const COLORREF sepColor   = g_pal.sep;
     const COLORREF titleCol   = g_pal.title;
     const COLORREF mutedCol   = g_pal.muted;
@@ -4332,7 +4333,7 @@ static void PaintControlPanel(HWND h) {
     DrawPanelCard(hdc, S(20), S(476), S(920), S(60), S(10), cardFill, cardBorder);
     {
         COLORREF xCol = g_panelData.xferConnected ? okCol : RGB(148, 163, 184);
-        int xd = S(8), xdx = S(36), xdy = S(488) + (S(20) - xd) / 2;
+        int xd = S(8), xdx = S(36), xdy = S(486) + (S(20) - xd) / 2;
         HPEN xpen = CreatePen(PS_SOLID, 1, xCol);
         HBRUSH xbr = CreateSolidBrush(xCol);
         HGDIOBJ op = SelectObject(hdc, xpen), ob = SelectObject(hdc, xbr);
@@ -4360,8 +4361,8 @@ static void PaintControlPanel(HWND h) {
     {
         HPEN sp = CreatePen(PS_SOLID, 1, sepColor);
         HGDIOBJ op = SelectObject(hdc, sp);
-        MoveToEx(hdc, S(38), S(644), nullptr);
-        LineTo(hdc, S(922), S(644));
+        MoveToEx(hdc, S(36), S(644), nullptr);
+        LineTo(hdc, S(924), S(644));
         SelectObject(hdc, op);
         DeleteObject(sp);
     }
@@ -4396,8 +4397,8 @@ static void PaintControlPanel(HWND h) {
             DrawTextW(hdc, L"暂无日志输出", -1, &rle, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
         } else {
             for (size_t i = 0; i < g_panelData.recentLogs.size() && i < 3; ++i) {
-                int ly = S(741) + (int)i * S(15);
-                RECT rl{ S(36), ly, S(924), ly + S(15) };
+                int ly = S(741) + (int)i * S(16);
+                RECT rl{ S(36), ly, S(924), ly + S(16) };
                 DrawTextW(hdc, g_panelData.recentLogs[i].c_str(), -1, &rl,
                           DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS | DT_NOPREFIX);
             }
@@ -4571,6 +4572,11 @@ static void LayoutPanelControls(HWND h) {
     // 角色卡右侧：两个跨角色常驻开关，不与接收端/主控端专属开关混排
     mv(IDC_PANEL_MOUSEBRIDGE, 500, 108, 210, 26);
     mv(IDC_PANEL_AUTOFOLLOW,  500, 138, 320, 26);
+    // 主控模式的键鼠控制走 Ctrl+Alt+K 的 WinHostSender KVM 通路，本开关只作用于
+    // Windows 当副屏时；主控模式隐藏，避免出现"勾了没反应"的死控件。
+    if (HWND c = GetDlgItem(h, IDC_PANEL_MOUSEBRIDGE)) {
+        ShowWindow(c, g_hostMode.load() ? SW_HIDE : SW_SHOW);
+    }
 
     // 中转站右侧按钮（发送文件 / 粘贴截图 / 悬浮盒 / 打开目录）
     mv(IDC_PANEL_SENDFILE,   504, 485, 108, 34);
