@@ -3479,7 +3479,9 @@ final class CursorTracker {
         let ox = rx * sx
         let oy = ry * sy
 
-        let moved = !(abs(ox - lastX) < 0.5 && abs(oy - lastY) < 0.5)
+        // 死区从 0.5 收到 0.2：副屏晃动放大时，用户常以很慢的速度微调找指针，
+        // 0.5 视频像素在 90Hz 采样下会漏掉慢速移动，Windows 叠加层就会误判为停止。
+        let moved = !(abs(ox - lastX) < 0.2 && abs(oy - lastY) < 0.2)
         guard moved || inside != lastVisible else { return }
 
         lastX = ox; lastY = oy; lastVisible = inside
