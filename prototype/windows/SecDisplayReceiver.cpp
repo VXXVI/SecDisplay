@@ -53,6 +53,7 @@
 #include <cstdio>
 #include <cstdint>
 #include <cstring>
+#include <climits>
 #include <fstream>
 #include <cctype>
 #include <cmath>
@@ -353,9 +354,12 @@ static std::atomic<double> g_cursorY{-1};
 // 光标是否在副屏范围内。Mac 端把指针移回主屏时会发 visible=0，
 // 这里必须真的把 Windows 光标隐藏，否则它会一直停在最后位置。
 static std::atomic<bool> g_cursorVisible{true};
-// Mac 光标从「离开副屏」重新回到副屏时置位：下一次 0x03 允许把 Windows 光标拉回画面内，
-// 否则用户把指针滑到主屏后就再也收不回来了（远程位置只对画面内生效）。
-static std::atomic<bool> g_pullCursorIn{false};
+// Mac 光标从「离开副屏」重新回到副屏时签发一次性拉回凭证（记录签发时刻，0=无凭证）。
+// 加时刻戳而非布尔：避免陈旧凭证在很久之后把用户正在主屏操作的指针瞬移回副屏边缘。
+static std::atomic<uint64_t> g_pullCursorInMs{0};
+// 光标最近一次「离开副屏」的时刻。只有离开足够久再回来才签发拉回凭证，
+// 抑制边界 1px 抖动导致的反复拉回。
+static std::atomic<uint64_t> g_cursorOffSinceMs{0};
 // 程序 SetCursorPos 的目标点与 16 槽位历史环形缓冲，配合 WM_INPUT 硬件鼠标记时，
 // 彻底过滤连发覆盖 / 边界舍入 / 异步投递产生的 WM_MOUSEMOVE 回声。
 static std::atomic<bool> g_cursorMsgPending{ false };
@@ -445,6 +449,9 @@ static uint64_t g_hiresForSeq = 0;
 static uint64_t g_spriteGen = 0;
 static std::atomic<uint64_t> g_rxCursorImageSeq{0};
 static uint64_t g_zoomMoveOnlyHits = 0;   // 纯位移快路径命中计数，供自检验证 SetWindowPos 路径
+// 叠加层上一次纯位移的目标点。位置未变时跳过 SetWindowPos，
+// 避免 HOLD 阶段每条光标消息都触发一次 z-order/合成操作造成抖动。
+static int g_zoomLastDstX = INT_MIN, g_zoomLastDstY = INT_MIN;
 // 稳态「原生像素 → 屏幕物理像素」的实际比例（已含 hwMax 钳位），供放大叠加层作为基准。
 static double g_steadySpriteK = 0.0;
 
@@ -1005,8 +1012,10 @@ static void OnCursorPacket(const uint8_t* p, size_t payloadLen) {
     if (!visible) {
         // 光标离开副屏：清空坐标并通知 UI 线程隐藏本机光标。
         // 只清坐标不隐藏，会让光标图像一直停在最后位置。
-        g_cursorX = -1;
-        g_cursorY = -1;
+        g_cursorX = std::nan("");
+        g_cursorY = std::nan("");
+        g_pullCursorInMs.store(0);              // 离开即作废拉回凭证
+        g_cursorOffSinceMs.store(GetTickCount64());
         if (g_cursorVisible.exchange(false) && g_hwnd) {
             PostMessageA(g_hwnd, WM_APP_CURSOR_VIS, 0, 0);
         }
@@ -1014,7 +1023,11 @@ static void OnCursorPacket(const uint8_t* p, size_t payloadLen) {
     }
     if (!g_cursorVisible.exchange(true) && g_hwnd) {
         PostMessageA(g_hwnd, WM_APP_CURSOR_VIS, 0, 0);
-        g_pullCursorIn.store(true);
+        // 只有真正离开过一段时间再回来才签发拉回凭证；边界抖动不签发。
+        const uint64_t offSince = g_cursorOffSinceMs.load();
+        if (offSince != 0 && GetTickCount64() - offSince >= 200) {
+            g_pullCursorInMs.store(GetTickCount64());
+        }
     }
 
     double oldX = g_cursorX.load(), oldY = g_cursorY.load();
@@ -5595,6 +5608,7 @@ static void HideZoomOverlay() {
     }
     g_zoomRenderedW = g_zoomRenderedH = 0;
     g_zoomRenderedGen = 0;
+    g_zoomLastDstX = g_zoomLastDstY = INT_MIN;
     if (g_cursorVisible.load()) {
         SetCursor(g_customCursor ? g_customCursor : LoadCursor(nullptr, IDC_ARROW));
     }
@@ -5683,8 +5697,15 @@ static void UpdateZoomOverlay(double zoom) {
     // SetWindowPos 仅移动分层窗，不触发 DWM 对整面位图的重新合成，开销远低于 UpdateLayeredWindow。
     if (moveOnly) {
         SetCursor(HiddenCursorHandle());
-        if (SetWindowPos(g_zoomOverlay, HWND_TOPMOST, dstPt.x, dstPt.y, 0, 0,
-                         SWP_NOSIZE | SWP_NOACTIVATE)) {
+        if (g_zoomLastDstX == dstPt.x && g_zoomLastDstY == dstPt.y) {
+            ++g_zoomMoveOnlyHits;
+            return;
+        }
+        // 窗口创建时已带 WS_EX_TOPMOST，无需每帧重申 z-order；nullptr + SWP_NOZORDER 只搬位置。
+        if (SetWindowPos(g_zoomOverlay, nullptr, dstPt.x, dstPt.y, 0, 0,
+                         SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE)) {
+            g_zoomLastDstX = dstPt.x;
+            g_zoomLastDstY = dstPt.y;
             ++g_zoomMoveOnlyHits;
             return;
         }
@@ -6498,6 +6519,8 @@ static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
             std::lock_guard<std::mutex> lk(g_cursorImage.mtx);
             if (!g_cursorImage.bgra.empty()) g_cursorImage.pending = true;
         }
+        // 动画进行中切换 DPI 会重建光标位图基准，叠加层几何会突跳；先中止再重建。
+        AbortShake();
         ApplyCursorImage();
         ResetShakeSamples();
         break;   // 窗口位置/尺寸仍交给 DefWindowProc
@@ -6515,20 +6538,21 @@ static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
         // 否则每次移动都会被夹回副屏窗口，表现为「鼠标被困在副屏里出不去」。
         // 例外：Mac 光标刚重新回到副屏时允许拉回一次（g_pullCursorIn）。
         const bool owned = PortalCursorOwned();
-        if (owned) g_pullCursorIn.store(false);   // 已在画面内，凭证不再需要，避免出去后又被拽回一次
-        if (!owned && !g_pullCursorIn.load()) return 0;
-        const uint64_t gateNow = GetTickCount64();
+        const uint64_t gateNow0 = GetTickCount64();
+        const uint64_t pullMs = g_pullCursorInMs.load();
+        const bool pullValid = pullMs != 0 && gateNow0 >= pullMs && gateNow0 - pullMs <= 300;
+        if (owned) g_pullCursorInMs.store(0);   // 已在画面内，凭证不再需要
+        if (!owned && !pullValid) return 0;
+        const uint64_t gateNow = gateNow0;
         // 点击和滚轮仍保留短暂让位，覆盖事件回传到 Mac 再返回的一个 RTT。
         // WM_MOUSEMOVE 不参与：它可能正是 SetCursorPos 的迟到回声，加入门控会
         // 形成「移动 → 冻结 → 再移动」循环。Raw Input 不可用时才用本地事件兜底。
         const bool localBusy = g_rawInputReady.load()
             ? gateNow - (uint64_t)g_lastHardwareMouseMs.load() < 60
             : gateNow - (uint64_t)g_lastLocalInputMs.load() < 60;
-        // 「回到副屏」的一次性拉回必须绕过本地优先门控：用户正是用手把指针推回来，
-        // 硬件鼠标一定刚刚动过，否则这次拉回会被永久丢弃。
         if (localBusy && owned) return 0;
         double cx = g_cursorX.load(), cy = g_cursorY.load();
-        if (cx < 0 || cy < 0) return 0;
+        if (!std::isfinite(cx) || !std::isfinite(cy) || cx < 0 || cy < 0) return 0;
         int vw = g_coordW.load(), vh = g_coordH.load();
         if (vw <= 0 || vh <= 0) return 0;
         RECT rc{};
@@ -6547,7 +6571,7 @@ static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
         if (sy < tl.y + vr.top) sy = tl.y + vr.top;
         if (sy >= tl.y + vr.bottom) sy = tl.y + vr.bottom - 1;
         // 真正执行了拉回才消费一次性凭证，避免被后续 return 吞掉。
-        if (!owned) g_pullCursorIn.store(false);
+        if (!owned) g_pullCursorInMs.store(0);
         const uint64_t nowMoveMs = GetTickCount64();
         RecordRemoteTarget(sx, sy, nowMoveMs);
         SetCursorPos(sx, sy);
@@ -7181,6 +7205,13 @@ static void OnSessionPacket(const uint8_t* p, size_t n) {
         g_coordW = w;
         g_coordH = h;
     }
+    // 坐标基准变化：清掉旧坐标与拉回凭证，避免用旧尺寸换算出的位置把光标拽到边缘，
+    // 同时中止进行中的晃动放大（新尺寸下叠加层几何不再匹配）。
+    g_cursorX = std::nan("");
+    g_cursorY = std::nan("");
+    g_pullCursorInMs.store(0);
+    ResetShakeSamples();
+    AbortShake();
     Log("会话头: 协议 v%u  虚拟屏 %dx%d @ %d fps  scale=%.1fx",
         ver, w, h, fps, scaleTenths >= 5 ? (scaleTenths / 10.0) : 0.0);
 

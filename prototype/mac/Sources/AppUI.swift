@@ -290,7 +290,8 @@ private func mainPresetLabel() -> String {
 /// 写入 UserDefaults 的会是面板显示标签（如「自定义」），启动时与全局 nil 比较恒 false。
 private func currentPresetTag() -> String? { presetName }
 
-private let accent = Color(red: 0.22, green: 0.55, blue: 0.96)
+/// 与 Windows 面板统一的强调蓝 RGB(59,130,246)，确保两端视觉一致。
+private let accent = Color(red: 59.0 / 255.0, green: 130.0 / 255.0, blue: 246.0 / 255.0)
 
 private struct StatRow: View {
     let label: String
