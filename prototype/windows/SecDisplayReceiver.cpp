@@ -4190,7 +4190,11 @@ static void PaintControlPanel(HWND h) {
                     : (g_panelData.state == 1 ? warnCol
                     : ((g_panelData.state == 3 || g_panelData.state == 4) ? errCol : RGB(148, 163, 184)));
     {
-        int d = S(10), dx = S(38), dy = S(12) + (S(48) - d) / 2;
+        // 应用图标：与 Mac 面板头部一致，先图标再状态
+        if (HICON appIcon = LoadIconW(GetModuleHandleW(nullptr), MAKEINTRESOURCEW(1))) {
+            DrawIconEx(hdc, S(30), S(22), appIcon, S(28), S(28), 0, nullptr, DI_NORMAL);
+        }
+        int d = S(10), dx = S(66), dy = S(12) + (S(48) - d) / 2;
         HPEN dp = CreatePen(PS_SOLID, 1, dotCol);
         HBRUSH db = CreateSolidBrush(dotCol);
         HGDIOBJ op = SelectObject(hdc, dp), ob = SelectObject(hdc, db);
@@ -4199,7 +4203,7 @@ static void PaintControlPanel(HWND h) {
         DeleteObject(db); DeleteObject(dp);
     }
     {
-        RECT rt{ S(58), S(12), S(540), S(60) };
+        RECT rt{ S(84), S(12), S(540), S(60) };
         SelectObject(hdc, g_theme.fontTitle);
         SetTextColor(hdc, titleCol);
         DrawTextW(hdc, g_panelData.statusText.c_str(), -1, &rt,
