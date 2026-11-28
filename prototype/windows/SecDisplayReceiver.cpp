@@ -3205,6 +3205,29 @@ static void AdjustRectDpi(RECT* rc, DWORD style, DWORD exStyle, int dpi) {
     }
 }
 
+// 面板配色 token：浅色/深色两套，跟随 Windows 系统主题（AppsUseLightTheme），
+// 与 Mac 面板共用同一套语义色，保证两端视觉一致。
+struct PanelPalette {
+    COLORREF canvas    = RGB(243, 245, 249);
+    COLORREF card      = RGB(255, 255, 255);
+    COLORREF border    = RGB(224, 230, 239);
+    COLORREF sep       = RGB(238, 241, 246);
+    COLORREF title     = RGB(30, 41, 59);
+    COLORREF muted     = RGB(100, 116, 139);
+    COLORREF value     = RGB(15, 23, 42);
+    COLORREF accent    = RGB(59, 130, 246);
+    COLORREF ok        = RGB(22, 163, 74);
+    COLORREF warn      = RGB(217, 119, 6);
+    COLORREF err       = RGB(220, 38, 38);
+    COLORREF logText   = RGB(51, 65, 85);
+    COLORREF btnBg     = RGB(248, 250, 252);
+    COLORREF btnBorder = RGB(214, 221, 232);
+    COLORREF btnFg     = RGB(30, 41, 59);
+    bool dark = false;
+};
+
+static PanelPalette g_pal;
+
 // 面板主题与字体资源：按 DPI 分组缓存，避免跨屏混合 DPI 下切换绘制时删除另一窗口仍在使用的 HFONT
 struct PanelTheme {
     struct FontSet {
@@ -3286,29 +3309,6 @@ struct PanelTheme {
 };
 
 static PanelTheme g_theme;
-
-// 面板配色 token：浅色/深色两套，跟随 Windows 系统主题（AppsUseLightTheme），
-// 与 Mac 面板共用同一套语义色，保证两端视觉一致。
-struct PanelPalette {
-    COLORREF canvas    = RGB(243, 245, 249);
-    COLORREF card      = RGB(255, 255, 255);
-    COLORREF border    = RGB(224, 230, 239);
-    COLORREF sep       = RGB(238, 241, 246);
-    COLORREF title     = RGB(30, 41, 59);
-    COLORREF muted     = RGB(100, 116, 139);
-    COLORREF value     = RGB(15, 23, 42);
-    COLORREF accent    = RGB(59, 130, 246);
-    COLORREF ok        = RGB(22, 163, 74);
-    COLORREF warn      = RGB(217, 119, 6);
-    COLORREF err       = RGB(220, 38, 38);
-    COLORREF logText   = RGB(51, 65, 85);
-    COLORREF btnBg     = RGB(248, 250, 252);
-    COLORREF btnBorder = RGB(214, 221, 232);
-    COLORREF btnFg     = RGB(30, 41, 59);
-    bool dark = false;
-};
-
-static PanelPalette g_pal;
 
 static void RefreshPanelPalette() {
     // Windows 10/11：AppsUseLightTheme=0 表示深色。读失败按浅色。
@@ -4508,7 +4508,7 @@ static LRESULT CALLBACK PanelWndProc(HWND h, UINT msg, WPARAM w, LPARAM l) {
     }
     case WM_SETTINGCHANGE:
         // 系统切换浅色/深色主题时刷新面板配色并重绘
-        if (lParam && wcscmp(reinterpret_cast<const wchar_t*>(lParam), L"ImmersiveColorSet") == 0) {
+        if (l && wcscmp(reinterpret_cast<const wchar_t*>(l), L"ImmersiveColorSet") == 0) {
             RefreshPanelPalette();
             InvalidateRect(h, nullptr, FALSE);
         }
