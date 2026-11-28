@@ -1385,8 +1385,11 @@ private:
                 if (acc.size() - pos < 5) break;
                 const uint8_t* p = acc.data() + pos;
                 if (p[1] == 0x00 && p[2] == 0x00 && p[4] == kTypeRoleConflict) {
-                    const uint8_t reason = (acc.size() - pos >= 14) ? acc[pos + 13] : 0;
-                    if (reason == 1 || reason == 0) NotifyRoleMismatch();
+                    // [len 4][0x7F][ts 8][reason] = 14 字节；等 reason 到齐再判断，
+                    // 避免把 reason=3（协议越界）的半个包误当成主控冲突触发角色切换。
+                    if (acc.size() - pos < 14) break;
+                    const uint8_t reason = acc[pos + 13];
+                    if (reason == 1) NotifyRoleMismatch();
                     return failConflict(reason == 1
                         ? "角色冲突: Mac 端当前也是主控发送模式（0x7F），本机将自动切回副屏"
                         : "角色冲突: Mac 端当前也是主控发送模式（0x7F），已拒绝注入并断开",

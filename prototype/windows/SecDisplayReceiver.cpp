@@ -2461,6 +2461,12 @@ void Presenter::Shutdown() {
 
 // --- 全屏切换 ---
 static std::atomic<bool> g_isFullscreen{false};      // 由 main 按 cfg.fullscreen 同步
+// 本机鼠标是否允许回传给 Mac：开关打开，且副屏窗口在前台（全屏时天然满足）。
+// 窗口只是被悬停、没有聚焦时不动 Mac 光标，避免"扫过窗口就把 Mac 指针拽走"。
+static bool MouseBridgeActive() {
+    return g_mouseBridgeEnabled.load() && g_hwnd &&
+           (g_isFullscreen.load() || GetForegroundWindow() == g_hwnd);
+}
 // 全屏按 Esc 后，若 keyup 丢失（失焦/Alt+Tab），本地消费标志会卡在 true，
 // 导致窗口模式 Esc 被永久吞掉。提升到文件作用域，失焦时显式复位。
 static bool g_escConsumedLocal = false;
@@ -2711,29 +2717,20 @@ static void HideTransitionNow() {
     if (g_transitionHwnd && IsWindow(g_transitionHwnd)) ShowWindow(g_transitionHwnd, SW_HIDE);
 }
 
-static std::mutex g_transitionTextMtx;
-
-static void ShowPendingTransition(int alpha) {
-    std::wstring title, sub;
-    {
-        std::lock_guard<std::mutex> lk(g_transitionTextMtx);
-        title = g_transitionTitle;
-        sub = g_transitionSub;
-    }
-    ShowTransitionNow(title.c_str(), sub.c_str(), alpha);
-}
+// 跨线程请求：标题/副标题随消息一起传，不共享 wstring，避免网络线程写、
+// UI 线程画的时候产生数据竞争。
+struct TransitionRequest {
+    std::wstring title;
+    std::wstring sub;
+    int alpha = 255;
+};
 
 static void ShowTransitionOverlayAsync(const wchar_t* title, const wchar_t* sub, int alpha) {
-    {
-        std::lock_guard<std::mutex> lk(g_transitionTextMtx);
-        g_transitionTitle = title ? title : L"";
-        g_transitionSub = sub ? sub : L"";
+    if (!g_hwnd) return;
+    auto* req = new TransitionRequest{title ? title : L"", sub ? sub : L"", alpha};
+    if (!PostMessageW(g_hwnd, WM_APP_SHOW_TRANSITION, (WPARAM)req, 0)) {
+        delete req;
     }
-    if (g_hwnd) PostMessageW(g_hwnd, WM_APP_SHOW_TRANSITION, (WPARAM)alpha, 0);
-}
-
-static void HideTransitionOverlayAsync() {
-    if (g_hwnd) PostMessageW(g_hwnd, WM_APP_HIDE_TRANSITION, 0, 0);
 }
 
 static void RestoreDefaultHint() {
@@ -6774,9 +6771,14 @@ static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
             SwitchAppMode(w != 0);
         }
         return 0;
-    case WM_APP_SHOW_TRANSITION:
-        ShowPendingTransition((int)w);
+    case WM_APP_SHOW_TRANSITION: {
+        auto* req = reinterpret_cast<TransitionRequest*>(w);
+        if (req) {
+            ShowTransitionNow(req->title.c_str(), req->sub.c_str(), req->alpha);
+            delete req;
+        }
         return 0;
+    }
     case WM_APP_HIDE_TRANSITION:
         HideTransitionNow();
         return 0;
@@ -7110,7 +7112,7 @@ static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
         }
         float vx, vy;
         if (ClientToVideo(GET_X_LPARAM(l), GET_Y_LPARAM(l), &vx, &vy)) {
-            if (!g_mouseBridgeEnabled.load()) return 0;
+            if (!MouseBridgeActive()) return 0;
             // Raw Input 正常时，远程 SetCursorPos 的迟到回声不能冻结后续跟随。
             if (!g_rawInputReady.load()) g_lastLocalInputMs = GetTickCount64();
             // 只记最新位置，由 inputThread 8ms 合并发送，避免逐消息刷包
@@ -7140,7 +7142,7 @@ static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
         }
         float vx, vy;
         if (ClientToVideo(GET_X_LPARAM(l), GET_Y_LPARAM(l), &vx, &vy)) {
-            if (!g_mouseBridgeEnabled.load()) return 0;
+            if (!MouseBridgeActive()) return 0;
             // 按键事件逐条排队：down 和 up 各自成包，不再合并成最终状态。
             g_moveX = vx;
             g_moveY = vy;
@@ -7153,7 +7155,7 @@ static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
         ScreenToClient(h, &pt);
         float vx, vy;
         if (ClientToVideo(pt.x, pt.y, &vx, &vy)) {
-            if (!g_mouseBridgeEnabled.load()) return 0;
+            if (!MouseBridgeActive()) return 0;
             int delta = GET_WHEEL_DELTA_WPARAM(w);
             g_lastLocalInputMs = GetTickCount64();
             g_moveX = vx;
