@@ -8069,7 +8069,7 @@ static void NetworkLoop(RunConfig cfg, Graphics* gfx, Presenter* presenter) {
                         idleCleared = true;
                         Log("看门狗: %.1f 秒没有成功上屏（%.1f 秒无视频包），压暗画面并提示无信号",
                             sinceGood / 1000.0, sincePkt / 1000.0);
-                        ShowTransitionOverlayAsync(L"画面已暂停", L"正在等待新的视频帧…", 205);
+                        ShowTransitionOverlayAsync(L"画面已暂停", L"正在等待新的视频帧…", 190);
                         ShowStatusHint(L"无信号，等待画面…");
                     }
                 }
@@ -8283,7 +8283,7 @@ static void NetworkLoop(RunConfig cfg, Graphics* gfx, Presenter* presenter) {
                 roleConflict ? (g_autoFollowRole.load() ? L"Mac 端角色已变化，Windows 正在自动切换…"
                                                        : L"请将一端切为主控，或开启「跟随 Mac 自动切换」")
                              : L"2 秒后自动重连，画面会在首帧到达后恢复",
-                215);
+                190);
             ShowStatusHint(roleConflict
                 ? (g_autoFollowRole.load() ? L"正在跟随 Mac 切换角色…" : L"角色冲突: 请将一端切为主控")
                 : L"连接已断开，2 秒后重连…");
