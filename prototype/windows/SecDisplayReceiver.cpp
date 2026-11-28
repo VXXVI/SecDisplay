@@ -4519,7 +4519,7 @@ static void DrawPanelButton(const DRAWITEMSTRUCT* dis, int dpi) {
         r1.top += DpiPx(7, dpi);
         r1.bottom = r1.top + DpiPx(17, dpi);
         SelectObject(hdc, g_theme.fontSection);
-        SetTextColor(hdc, fg);
+        SetTextColor(hdc, disabled ? g_pal.muted : g_pal.title);
         DrawTextW(hdc, line1, -1, &r1, DT_LEFT | DT_TOP | DT_SINGLELINE | DT_END_ELLIPSIS);
 
         RECT r2 = rc;
@@ -4528,7 +4528,7 @@ static void DrawPanelButton(const DRAWITEMSTRUCT* dis, int dpi) {
         r2.top += DpiPx(25, dpi);
         r2.bottom = r2.top + DpiPx(15, dpi);
         SelectObject(hdc, g_theme.fontSmall);
-        SetTextColor(hdc, isSelectedChoice ? fg : g_pal.muted);
+        SetTextColor(hdc, g_pal.muted);
         DrawTextW(hdc, line2, -1, &r2, DT_LEFT | DT_TOP | DT_SINGLELINE | DT_END_ELLIPSIS);
 
         if (isSelectedChoice) {
