@@ -83,6 +83,8 @@ final class AppModel: ObservableObject {
 
     // ---- 角色模式与 Mac 副屏接收状态 ----
     @Published var isReceiverMode = false
+    @Published var isMirrorMode = false
+    @Published var switchingMessage: String? = nil
     @Published var winHost = "10.10.10.2"
     @Published var winHostDraft = ""
     @Published var allowedHostsDraft = ""
@@ -123,7 +125,10 @@ final class AppModel: ObservableObject {
 
     /// 主线程每秒调用
     func refresh() {
-        isReceiverMode = (appRole == .receiver)
+        if !isRestartingResolution {
+            isReceiverMode = (appRole == .receiver)
+            isMirrorMode = (appDisplayMode == .mirror)
+        }
         if winHost != winHostAddress {
             winHost = winHostAddress
         }
@@ -131,6 +136,7 @@ final class AppModel: ObservableObject {
             draftsInitialized = true
             winHostDraft = winHostAddress
             allowedHostsDraft = UserDefaults.standard.string(forKey: "SecDisplayAllowedHost") ?? ""
+            showGuide = (UserDefaults.standard.object(forKey: "SecDisplayShowGuide") as? Bool) ?? true
         }
         logLine = Log.currentPath
 
@@ -189,7 +195,6 @@ final class AppModel: ObservableObject {
             .min(by: { abs($0.element - hzNow) < abs($1.element - hzNow) })?.offset ?? 2
         bitrateIndex = AppModel.bitrateOptions.enumerated()
             .min(by: { abs($0.element - mbNow) < abs($1.element - mbNow) })?.offset ?? 2
-        showGuide = (UserDefaults.standard.object(forKey: "SecDisplayShowGuide") as? Bool) ?? true
         suppressResolutionChange = false
 
         // 链路与对端
@@ -318,6 +323,55 @@ private struct SectionHeader: View {
     }
 }
 
+private struct ModeChoiceButton: View {
+    let title: String
+    let subtitle: String
+    let icon: String
+    let selected: Bool
+    var disabled: Bool = false
+    let action: () -> Void
+
+    var body: some View {
+        Button(action: action) {
+            HStack(spacing: 8) {
+                Image(systemName: icon)
+                    .font(.system(size: 15, weight: .semibold))
+                    .foregroundStyle(selected ? accent : .secondary)
+                    .frame(width: 22)
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(title)
+                        .font(.system(size: 12, weight: .semibold))
+                        .foregroundStyle(.primary)
+                    Text(subtitle)
+                        .font(.system(size: 10))
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
+                        .truncationMode(.tail)
+                }
+                Spacer(minLength: 0)
+                if selected {
+                    Image(systemName: "checkmark.circle.fill")
+                        .font(.system(size: 13))
+                        .foregroundStyle(accent)
+                }
+            }
+            .padding(.horizontal, 10)
+            .padding(.vertical, 8)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .background(
+                RoundedRectangle(cornerRadius: 8)
+                    .fill(selected ? accent.opacity(0.14) : Color.secondary.opacity(0.06))
+            )
+            .overlay(
+                RoundedRectangle(cornerRadius: 8)
+                    .stroke(selected ? accent.opacity(0.75) : Color.secondary.opacity(0.18), lineWidth: selected ? 1.5 : 1)
+            )
+        }
+        .buttonStyle(.plain)
+        .disabled(disabled)
+    }
+}
+
 private func fmtUptime(_ s: Double) -> String {
     let t = Int(max(0, s))
     if t >= 3600 { return String(format: "%d:%02d:%02d", t / 3600, (t / 60) % 60, t % 60) }
@@ -333,26 +387,36 @@ struct QualitySettingsCard: View {
         VStack(alignment: .leading, spacing: 10) {
             SectionHeader(title: "画质与性能")
             VStack(spacing: 9) {
-                HStack {
-                    Text("分辨率").foregroundStyle(.secondary)
-                    Spacer()
-                    Picker("", selection: Binding(
-                        get: { model.resolutionIndex },
-                        set: { idx in
-                            guard !model.suppressResolutionChange, idx >= 0,
-                                  idx < AppModel.resolutions.count else { return }
-                            let r = AppModel.resolutions[idx]
-                            restartWithResolution(r.w, r.h, r.lw, r.lh)
-                        })) {
-                        ForEach(Array(AppModel.resolutions.enumerated()), id: \.offset) { i, r in
-                            Text(r.label).tag(i)
-                        }
-                        if model.resolutionIndex < 0 {
-                            Text("自定义").tag(-1)
-                        }
+                if model.isMirrorMode {
+                    HStack {
+                        Text("画面源").foregroundStyle(.secondary)
+                        Spacer()
+                        Text("Mac 主屏 \(model.width)×\(model.height)")
+                            .font(.system(size: 11, design: .monospaced))
+                            .foregroundStyle(.secondary)
                     }
-                    .labelsHidden()
-                    .frame(width: 190)
+                } else {
+                    HStack {
+                        Text("分辨率").foregroundStyle(.secondary)
+                        Spacer()
+                        Picker("", selection: Binding(
+                            get: { model.resolutionIndex },
+                            set: { idx in
+                                guard !model.suppressResolutionChange, idx >= 0,
+                                      idx < AppModel.resolutions.count else { return }
+                                let r = AppModel.resolutions[idx]
+                                restartWithResolution(r.w, r.h, r.lw, r.lh)
+                            })) {
+                            ForEach(Array(AppModel.resolutions.enumerated()), id: \.offset) { i, r in
+                                Text(r.label).tag(i)
+                            }
+                            if model.resolutionIndex < 0 {
+                                Text("自定义").tag(-1)
+                            }
+                        }
+                        .labelsHidden()
+                        .frame(width: 190)
+                    }
                 }
                 HStack {
                     Text("采集帧率").foregroundStyle(.secondary)
@@ -389,18 +453,27 @@ struct QualitySettingsCard: View {
                         Log.info(on ? "面板开启光标图像(0x05)" : "面板关闭光标图像(0x05)")
                     }))
                     .toggleStyle(.switch)
-                Toggle("连接时播放位置引导", isOn: Binding(
-                    get: { model.showGuide },
-                    set: { model.setShowGuide($0) }))
-                    .toggleStyle(.switch)
-                HStack(spacing: 8) {
-                    Button("播放连接引导") {
-                        ConnectionGuideOverlay.shared.show(vdID: vd?.displayID ?? 0)
+                if !model.isMirrorMode {
+                    Toggle("连接时播放位置引导", isOn: Binding(
+                        get: { model.showGuide },
+                        set: { model.setShowGuide($0) }))
+                        .toggleStyle(.switch)
+                    HStack(spacing: 8) {
+                        Button("播放连接引导") {
+                            ConnectionGuideOverlay.shared.show(vdID: vd?.displayID ?? 0)
+                        }
+                        Spacer()
+                        Text("帧率/码率即时生效")
+                            .font(.system(size: 10))
+                            .foregroundStyle(.tertiary)
                     }
-                    Spacer()
-                    Text("帧率/码率即时生效")
-                        .font(.system(size: 10))
-                        .foregroundStyle(.tertiary)
+                } else {
+                    HStack {
+                        Text("帧率/码率即时生效，分辨率自动跟随 Mac 主屏")
+                            .font(.system(size: 10))
+                            .foregroundStyle(.tertiary)
+                        Spacer()
+                    }
                 }
             }
             .padding(10)
@@ -470,7 +543,9 @@ struct StatusView: View {
                     }
                     VStack(alignment: .leading, spacing: 1) {
                         Text("SecDisplay").font(.headline)
-                        Text(model.isReceiverMode ? "Mac 当副屏" : "Mac 当主屏 · 投到 Windows")
+                        Text(model.isReceiverMode
+                             ? "Mac 当副屏 · 接收 Windows"
+                             : (model.isMirrorMode ? "Windows 当副屏 · 镜像主屏" : "Windows 当副屏 · 扩展屏幕"))
                             .font(.caption)
                             .foregroundStyle(.secondary)
                     }
@@ -494,24 +569,94 @@ struct StatusView: View {
                         .fill(Color.secondary.opacity(0.07))
                 )
 
-                // 角色切换（Mac 当主屏 <-> Mac 当副屏）
-                HStack(spacing: 8) {
-                    Text("角色模式").foregroundStyle(.secondary)
-                    Spacer()
-                    Picker("", selection: Binding(
-                        get: { model.isReceiverMode ? 1 : 0 },
-                        set: { idx in
-                            let target: SecDisplayRole = (idx == 1) ? .receiver : .sender
-                            if target != appRole {
-                                restartWithRole(target, host: model.winHost)
+                // 投屏设置：选择哪台电脑当副屏 + 扩展 / 镜像显示模式
+                VStack(alignment: .leading, spacing: 10) {
+                    SectionHeader(title: "投屏与副屏设置")
+
+                    VStack(alignment: .leading, spacing: 5) {
+                        Text("哪台电脑当副屏")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                        HStack(spacing: 8) {
+                            ModeChoiceButton(
+                                title: "Windows 当副屏",
+                                subtitle: "Mac 画面投到 Windows",
+                                icon: "macbook.and.iphone",
+                                selected: !model.isReceiverMode,
+                                disabled: model.switchingMessage != nil
+                            ) {
+                                if appRole != .sender {
+                                    model.isReceiverMode = false
+                                    restartWithConfig(role: .sender, displayMode: appDisplayMode, host: model.winHost)
+                                }
                             }
-                        })) {
-                        Text("Mac 当主屏").tag(0)
-                        Text("Mac 当副屏").tag(1)
+                            ModeChoiceButton(
+                                title: "Mac 当副屏",
+                                subtitle: "接收 Windows 画面",
+                                icon: "display",
+                                selected: model.isReceiverMode,
+                                disabled: model.switchingMessage != nil
+                            ) {
+                                if appRole != .receiver {
+                                    model.isReceiverMode = true
+                                    restartWithConfig(role: .receiver, displayMode: appDisplayMode, host: model.winHost)
+                                }
+                            }
+                        }
                     }
-                    .pickerStyle(.segmented)
-                    .frame(width: 210)
+
+                    if !model.isReceiverMode {
+                        VStack(alignment: .leading, spacing: 5) {
+                            Text("显示方式")
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                            HStack(spacing: 8) {
+                                ModeChoiceButton(
+                                    title: "扩展屏幕",
+                                    subtitle: "独立虚拟副屏，多出一块桌面",
+                                    icon: "rectangle.split.2x1",
+                                    selected: !model.isMirrorMode,
+                                    disabled: model.switchingMessage != nil
+                                ) {
+                                    if appDisplayMode != .extend {
+                                        model.isMirrorMode = false
+                                        restartWithConfig(role: .sender, displayMode: .extend, host: model.winHost)
+                                    }
+                                }
+                                ModeChoiceButton(
+                                    title: "镜像主屏",
+                                    subtitle: "同步显示 Mac 主屏画面",
+                                    icon: "rectangle.on.rectangle",
+                                    selected: model.isMirrorMode,
+                                    disabled: model.switchingMessage != nil
+                                ) {
+                                    if appDisplayMode != .mirror {
+                                        model.isMirrorMode = true
+                                        restartWithConfig(role: .sender, displayMode: .mirror, host: model.winHost)
+                                    }
+                                }
+                            }
+                        }
+                    } else {
+                        Text("当前 Mac 作为副屏接收画面；扩展 / 镜像模式请在 Windows 主控面板中选择。")
+                            .font(.system(size: 11))
+                            .foregroundStyle(.secondary)
+                    }
+
+                    if let sw = model.switchingMessage {
+                        HStack(spacing: 6) {
+                            ProgressView().controlSize(.small)
+                            Text(sw)
+                                .font(.caption)
+                                .foregroundStyle(accent)
+                        }
+                    }
                 }
+                .padding(10)
+                .background(
+                    RoundedRectangle(cornerRadius: 10)
+                        .fill(Color.secondary.opacity(0.07))
+                )
 
                 if model.isReceiverMode {
                     SectionHeader(title: "副屏连接（Windows 主控）")
@@ -538,7 +683,14 @@ struct StatusView: View {
                         }
                         StatRow(label: "对端", value: model.recvPeer)
                         if model.recvKvmActive {
-                            StatRow(label: "KVM 穿透", value: "Windows 正在控制本机 (Ctrl+Alt+K 退出)", mono: false, warn: .orange)
+                            HStack(spacing: 6) {
+                                StatRow(label: "KVM 穿透", value: "Windows 正在控制本机", mono: false, warn: .orange)
+                                Button("解除") {
+                                    macReceiverClient?.forceReleaseLocalKvm()
+                                    model.refresh()
+                                }
+                                .controlSize(.mini)
+                            }
                         }
                         if let rej = model.recvRejectedPeer {
                             StatRow(label: "已拦截", value: rej, mono: false, warn: .orange)
@@ -755,7 +907,7 @@ struct StatusView: View {
                             }
                         }
                     } else {
-                        Text("把文件拖到此面板即可直接发送到 Windows")
+                        Text("把文件拖到此卡片即可直接发送到 Windows")
                             .font(.system(size: 10))
                             .foregroundStyle(.tertiary)
                     }
@@ -770,6 +922,16 @@ struct StatusView: View {
                     RoundedRectangle(cornerRadius: 8)
                         .stroke(model.transferDropTargeted ? Color.accentColor : Color.clear, lineWidth: 1.5)
                 )
+                .onDrop(of: [.fileURL], isTargeted: $model.transferDropTargeted) { providers in
+                    var accepted = false
+                    for p in providers where p.canLoadObject(ofClass: URL.self) {
+                        accepted = true
+                        _ = p.loadObject(ofClass: URL.self) { url, _ in
+                            if let url { transferService.enqueue(urls: [url]) }
+                        }
+                    }
+                    return accepted
+                }
 
                 Divider()
 
@@ -792,12 +954,15 @@ struct StatusView: View {
                     Button("复制诊断") { copyDiagnostics() }
                     Spacer()
                     Button("隐藏") { hideControlPanel() }
-                        .keyboardShortcut(.cancelAction)
                     Button("退出") {
                         DispatchQueue.main.async { shutdown(signal: SIGTERM) }
                     }
-                    .keyboardShortcut("q")
+                    .keyboardShortcut("q", modifiers: .command)
                 }
+
+                Text("快捷键：⌘Q / Ctrl+Opt+Q 安全退出 · ⌘W / Esc 隐藏面板 · Ctrl+Opt+B 投递盒")
+                    .font(.system(size: 10))
+                    .foregroundStyle(.tertiary)
 
                 if !model.logLine.isEmpty {
                     Text(model.logLine)
@@ -813,17 +978,7 @@ struct StatusView: View {
         }
         // 自己管顶部让位，就不要 SwiftUI 再叠一次安全区
         .ignoresSafeArea(.container, edges: .top)
-        .frame(width: 400, height: 620)
-        .onDrop(of: [.fileURL], isTargeted: $model.transferDropTargeted) { providers in
-            var accepted = false
-            for p in providers where p.canLoadObject(ofClass: URL.self) {
-                accepted = true
-                _ = p.loadObject(ofClass: URL.self) { url, _ in
-                    if let url { transferService.enqueue(urls: [url]) }
-                }
-            }
-            return accepted
-        }
+        .frame(minWidth: 420, idealWidth: 440, maxWidth: .infinity, minHeight: 560, idealHeight: 680, maxHeight: .infinity)
     }
 
     private func applyAllowedHosts() {
@@ -869,7 +1024,7 @@ func copyDiagnostics() {
     } else {
         let fb = sender?.latestFeedback() ?? FeedbackSignals()
         text = """
-        SecDisplay 发送端诊断
+        SecDisplay 发送端诊断 (\(m.isMirrorMode ? "镜像主屏" : "扩展屏幕"))
         ==================
         连接: \(m.connected ? "已连接" : "未连接")
         对端: \(m.peer)  记录WindowsIP: \(m.winHost)
@@ -895,33 +1050,51 @@ func copyDiagnostics() {
     Log.info("面板: 诊断信息已复制到剪贴板")
 }
 
-private var isRestartingResolution = false
+nonisolated(unsafe) var isRestartingResolution = false
 
 func restartWithRole(_ role: SecDisplayRole, host: String) {
+    restartWithConfig(role: role, displayMode: appDisplayMode, host: host)
+}
+
+func restartWithConfig(role: SecDisplayRole, displayMode: SecDisplayDisplayMode, host: String) {
     guard !isRestartingResolution else { return }
     isRestartingResolution = true
     let trimmedHost = host.trimmingCharacters(in: .whitespacesAndNewlines)
     let targetHost = trimmedHost.isEmpty ? winHostAddress : trimmedHost
-    UserDefaults.standard.set(role.rawValue, forKey: "SecDisplayRole")
-    UserDefaults.standard.set(targetHost, forKey: "SecDisplayWinHost")
-    UserDefaults.standard.synchronize()
 
     let dir = FileManager.default.currentDirectoryPath
     let pid = ProcessInfo.processInfo.processIdentifier
-    Log.info("面板切换角色 -> \(role.rawValue) (winHost=\(targetHost))，准备重启")
+    let desc = role == .receiver
+        ? "正在切换至 Mac 当副屏…"
+        : (displayMode == .mirror ? "正在切换至镜像主屏…" : "正在切换至扩展屏幕…")
+    AppModel.shared.switchingMessage = desc
+    Log.info("面板切换配置 -> role=\(role.rawValue) displayMode=\(displayMode.rawValue) winHost=\(targetHost)，准备重启")
+
     let p = Process()
     p.executableURL = URL(fileURLWithPath: "/bin/zsh")
     if FileManager.default.fileExists(atPath: dir + "/run.sh") {
-        p.arguments = ["-c", "while kill -0 \(pid) 2>/dev/null; do sleep 0.15; done; sleep 0.3; cd \"$1\" && SECDISPLAY_MODE=\"$2\" SECDISPLAY_HOST=\"$3\" ./run.sh restart",
-                       "restart", dir, role.rawValue, targetHost]
+        p.arguments = ["-c", "while kill -0 \(pid) 2>/dev/null; do sleep 0.15; done; sleep 0.3; cd \"$1\" && SECDISPLAY_MODE=\"$2\" SECDISPLAY_DISPLAY_MODE=\"$3\" SECDISPLAY_HOST=\"$4\" ./run.sh restart",
+                       "restart", dir, role.rawValue, displayMode.rawValue, targetHost]
     } else {
         let appPath = Bundle.main.bundlePath
-        p.arguments = ["-c", "while kill -0 \(pid) 2>/dev/null; do sleep 0.15; done; sleep 0.3; open -n \"$1\" --env SECDISPLAY_MODE=\"$2\" --env SECDISPLAY_HOST=\"$3\" --args --mode \"$2\" --host \"$3\" --wait-lock 3000",
-                       "restart", appPath, role.rawValue, targetHost]
+        p.arguments = ["-c", "while kill -0 \(pid) 2>/dev/null; do sleep 0.15; done; sleep 0.3; open -n \"$1\" --env SECDISPLAY_MODE=\"$2\" --env SECDISPLAY_DISPLAY_MODE=\"$3\" --env SECDISPLAY_HOST=\"$4\" --args --mode \"$2\" --display-mode \"$3\" --host \"$4\" --wait-lock 3000",
+                       "restart", appPath, role.rawValue, displayMode.rawValue, targetHost]
     }
     p.standardOutput = FileHandle.nullDevice
     p.standardError = FileHandle.nullDevice
-    try? p.run()
+    do {
+        try p.run()
+    } catch {
+        Log.info("切换重启拉起失败: \(error.localizedDescription)")
+        isRestartingResolution = false
+        AppModel.shared.switchingMessage = nil
+        AppModel.shared.refresh()
+        return
+    }
+    UserDefaults.standard.set(role.rawValue, forKey: "SecDisplayRole")
+    UserDefaults.standard.set(displayMode.rawValue, forKey: "SecDisplayDisplayMode")
+    UserDefaults.standard.set(targetHost, forKey: "SecDisplayWinHost")
+    UserDefaults.standard.synchronize()
     DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
         shutdown(signal: SIGTERM)
     }
@@ -967,23 +1140,31 @@ func applyStreamTuning(captureHz: Double?, maxMbps: Int?) -> Bool {
 func restartWithResolution(_ w: Int, _ h: Int, _ lw: Int, _ lh: Int) {
     guard !isRestartingResolution else { return }
     isRestartingResolution = true
+    AppModel.shared.switchingMessage = "正在切换分辨率 \(w)×\(h)…"
     let dir = FileManager.default.currentDirectoryPath
     let pid = ProcessInfo.processInfo.processIdentifier
     Log.info("面板切换分辨率 \(w)x\(h)，准备重启")
     let p = Process()
     p.executableURL = URL(fileURLWithPath: "/bin/zsh")
     if FileManager.default.fileExists(atPath: dir + "/run.sh") {
-        p.arguments = ["-c", "while kill -0 \(pid) 2>/dev/null; do sleep 0.15; done; sleep 0.3; cd \"$1\" && SECDISPLAY_W=\"$2\" SECDISPLAY_H=\"$3\" SECDISPLAY_LOGICAL_W=\"$4\" SECDISPLAY_LOGICAL_H=\"$5\" ./run.sh restart",
-                       "restart", dir, "\(w)", "\(h)", "\(lw)", "\(lh)"]
+        p.arguments = ["-c", "while kill -0 \(pid) 2>/dev/null; do sleep 0.15; done; sleep 0.3; cd \"$1\" && SECDISPLAY_W=\"$2\" SECDISPLAY_H=\"$3\" SECDISPLAY_LOGICAL_W=\"$4\" SECDISPLAY_LOGICAL_H=\"$5\" SECDISPLAY_MODE=\"$6\" SECDISPLAY_DISPLAY_MODE=\"$7\" ./run.sh restart",
+                       "restart", dir, "\(w)", "\(h)", "\(lw)", "\(lh)", appRole.rawValue, appDisplayMode.rawValue]
     } else {
         // .app 场景：等待旧进程退出后用 open 重新拉起 bundle，保持 TCC 归属在 bundle 上。
         let appPath = Bundle.main.bundlePath
-        p.arguments = ["-c", "while kill -0 \(pid) 2>/dev/null; do sleep 0.15; done; sleep 0.3; open -n \"$1\" --env SECDISPLAY_W=\"$2\" --env SECDISPLAY_H=\"$3\" --env SECDISPLAY_LOGICAL_W=\"$4\" --env SECDISPLAY_LOGICAL_H=\"$5\"",
-                       "restart", appPath, "\(w)", "\(h)", "\(lw)", "\(lh)"]
+        p.arguments = ["-c", "while kill -0 \(pid) 2>/dev/null; do sleep 0.15; done; sleep 0.3; open -n \"$1\" --env SECDISPLAY_W=\"$2\" --env SECDISPLAY_H=\"$3\" --env SECDISPLAY_LOGICAL_W=\"$4\" --env SECDISPLAY_LOGICAL_H=\"$5\" --env SECDISPLAY_MODE=\"$6\" --env SECDISPLAY_DISPLAY_MODE=\"$7\" --args --mode \"$6\" --display-mode \"$7\" --wait-lock 3000",
+                       "restart", appPath, "\(w)", "\(h)", "\(lw)", "\(lh)", appRole.rawValue, appDisplayMode.rawValue]
     }
     p.standardOutput = FileHandle.nullDevice
     p.standardError = FileHandle.nullDevice
-    try? p.run()
+    do {
+        try p.run()
+    } catch {
+        Log.info("切换分辨率重启拉起失败: \(error.localizedDescription)")
+        isRestartingResolution = false
+        AppModel.shared.switchingMessage = nil
+        return
+    }
     DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
         shutdown(signal: SIGTERM)
     }
@@ -1029,7 +1210,10 @@ private var panelWindow: NSWindow?
 private final class PanelWindowDelegate: NSObject, NSWindowDelegate {
     func windowWillClose(_ notification: Notification) {
         setPanelVisible(false)
-        NSApp.setActivationPolicy(.accessory)
+        let receiverWinVisible = (macReceiverWindow?.window.isVisible == true)
+        if !receiverWinVisible {
+            NSApp.setActivationPolicy(.accessory)
+        }
         Log.info("面板通过关闭按钮隐藏")
     }
 }
@@ -1040,7 +1224,10 @@ private let panelWindowDelegate = PanelWindowDelegate()
 func hideControlPanel() {
     setPanelVisible(false)
     panelWindow?.orderOut(nil)
-    NSApp.setActivationPolicy(.accessory)
+    let receiverWinVisible = (macReceiverWindow?.window.isVisible == true)
+    if !receiverWinVisible {
+        NSApp.setActivationPolicy(.accessory)
+    }
     Log.info("面板已隐藏")
 }
 
@@ -1078,11 +1265,12 @@ func showControlPanel() {
         Log.info("面板已前置 key=\(w.isKeyWindow) visible=\(w.isVisible) frame=\(w.frame)")
     } else {
         let w = NSWindow(
-            contentRect: NSRect(x: 0, y: 0, width: 400, height: 620),
-            styleMask: [.titled, .closable, .miniaturizable, .fullSizeContentView],
+            contentRect: NSRect(x: 0, y: 0, width: 440, height: 680),
+            styleMask: [.titled, .closable, .miniaturizable, .resizable, .fullSizeContentView],
             backing: .buffered,
             defer: false)
-        w.title = "SecDisplay 发送端"
+        w.title = appRole == .receiver ? "SecDisplay 控制面板 (Mac 当副屏)" : "SecDisplay 控制面板"
+        w.minSize = NSSize(width: 420, height: 560)
         w.titlebarAppearsTransparent = true
         w.isReleasedWhenClosed = false
         w.hidesOnDeactivate = false
@@ -1102,6 +1290,7 @@ func showControlPanel() {
         targetWindow = w
         Log.info("面板已创建 frame=\(w.frame) key=\(w.isKeyWindow) visible=\(w.isVisible)")
     }
+    AppModel.shared.refresh()
 
     DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) {
         guard isControlPanelVisible else { return }
@@ -1221,13 +1410,22 @@ private var pasteKeyMonitor: Any?
 private func ensurePasteKeyMonitor() {
     guard pasteKeyMonitor == nil else { return }
     pasteKeyMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { ev in
-        let cmd = ev.modifierFlags.intersection(.deviceIndependentFlagsMask) == .command
-        if cmd, ev.charactersIgnoringModifiers?.lowercased() == "v" {
+        let mods = ev.modifierFlags.intersection(.deviceIndependentFlagsMask)
+        let isEditingText = (panelWindow?.isKeyWindow == true) && (panelWindow?.firstResponder is NSTextView)
+        if mods == .command, ev.charactersIgnoringModifiers?.lowercased() == "v" {
+            if isEditingText {
+                return ev
+            }
             let panelActive = (panelWindow?.isKeyWindow == true) || (dropBoxPanel?.isKeyWindow == true)
             if panelActive {
                 pasteClipboardToTransfer()
                 return nil
             }
+        }
+        // 非文本编辑状态下按 Esc 隐藏控制面板，避免输入 IP 时误关面板丢失草稿
+        if mods.isEmpty, ev.keyCode == 53, panelWindow?.isKeyWindow == true, !isEditingText {
+            hideControlPanel()
+            return nil
         }
         return ev
     }

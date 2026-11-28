@@ -92,7 +92,7 @@ def parse_mac(text):
         coord_w, coord_h = int(m.group(1)), int(m.group(2))
 
     video_w = video_h = cap_hz = None
-    m = re.search(r"虚拟屏就绪\s*id=\d+\s*(\d+)x(\d+)", text)
+    m = re.search(r"(?:虚拟屏就绪\s*id=\d+|镜像主屏模式启动:\s*displayID=\d+)\s*(\d+)x(\d+)", text)
     if m:
         video_w, video_h = int(m.group(1)), int(m.group(2))
     m = re.search(r"采集上限\s*(\d+)\s*fps", text)

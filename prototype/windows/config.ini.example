@@ -6,10 +6,16 @@
 host=10.10.10.1
 port=9922
 
-# ---- 角色切换 ----
+# ---- 角色与显示方式 ----
 # receiver = Windows 当副屏（默认，Mac 主屏 -> Windows）
-# sender   = Mac 当 Windows 副屏（Windows 虚拟屏 -> Mac）
+# sender   = Mac 当 Windows 副屏（Windows 主控 -> Mac）
 mode=receiver
+# 主控发送时的画面来源（mode=sender 时生效）：
+# extend = 扩展屏幕（独立虚拟副屏，需安装 Parsec Virtual Display Adapter）
+# mirror = 镜像主屏（同步 Windows 物理主屏，无需虚拟屏驱动）
+displaymode=extend
+# 启动时是否自动显示控制面板（1=显示，0=后台启动；命令行 --no-panel 可临时覆盖）
+showpanel=1
 
 # ---- 副屏接收端参数（mode=receiver 时生效）----
 # 初始窗口尺寸；连接后会自动跟随 Mac 会话头调整
@@ -26,6 +32,10 @@ vsync=1
 pace=0
 # 0x07 健康度回传，默认关
 feedback=0
+# 晃动鼠标找光标，默认开
+shake=1
+# 投屏期间保持屏幕常亮，默认开
+keepon=1
 
 # ---- 主控发送端参数（mode=sender 时生效）----
 # 虚拟扩展屏分辨率（需先安装 Parsec Virtual Display Adapter）、帧率上限 (24~144)、目标码率 (10~200 Mbps) 与 DPI

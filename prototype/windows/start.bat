@@ -25,7 +25,7 @@ echo.
 echo   SecDisplay 全屏副屏
 echo   连接 %MAC_IP%:9922   初始尺寸 %SECDISPLAY_W%x%SECDISPLAY_H%（实际以码流为准）
 echo.
-echo   Esc / 左键托盘 / 右键菜单 / Ctrl+Alt+Q 退出    F11 或双击 切换全屏/窗口
+echo   左键托盘打开控制面板    Ctrl+Alt+Q 全局安全退出 / 投屏窗口 Alt+F4 退出    F11 或全屏按 Esc 切回窗口    Ctrl+Alt+H 让位
 echo.
 
 if not exist "logs" mkdir "logs"
