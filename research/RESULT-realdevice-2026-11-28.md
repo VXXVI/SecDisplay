@@ -4,8 +4,8 @@
 
 ## 环境
 
-- Mac：MacBook Pro（Apple Silicon），macOS，Tailscale `100.94.140.116`。
-- Windows：Lenovo Yoga Slim 7 Pro 14IHU5，Windows 11，Intel Iris Xe，Tailscale `100.119.194.106`，控制台会话 ID 1。
+- Mac：MacBook Pro（Apple Silicon），macOS，Tailscale `100.94.x.x`。
+- Windows：Lenovo Yoga Slim 7 Pro 14IHU5，Windows 11，Intel Iris Xe，Tailscale `100.119.x.x`，控制台会话 ID 1。
 - 构建：Mac `build_app.sh`（Apple Development 签名，保留 TCC）；Windows VS2022 Community `build.bat`，另用 MinGW-w64 14 交叉编译验证。
 - 链路：Thunderbolt 的 `10.10.10.2` 当前单向异常（Windows→Mac 可 ping，Mac→Windows ARP 不解析），本次回归改用 Tailscale 地址，协议与端口不变。Thunderbolt 问题另行排查。
 
