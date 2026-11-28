@@ -2597,6 +2597,9 @@ static int g_transitionFontDpi = 0;
 static std::wstring g_transitionTitle;
 static std::wstring g_transitionSub;
 static bool g_transitionVisible = false;
+// 最小化期间到达的过渡请求：恢复窗口时再补显示，避免一次性消息被丢弃。
+static bool g_transitionPending = false;
+static int g_transitionPendingAlpha = 255;
 
 static LRESULT CALLBACK TransitionWndProc(HWND h, UINT msg, WPARAM w, LPARAM l) {
     switch (msg) {
@@ -2675,8 +2678,7 @@ static void EnsureTransitionResources() {
         wc.hInstance = (HINSTANCE)GetWindowLongPtrW(g_hwnd, GWLP_HINSTANCE);
         wc.hCursor = LoadCursor(nullptr, IDC_ARROW);
         wc.lpszClassName = L"SecDisplayTransition";
-        RegisterClassExW(&wc);
-        clsReg = true;
+        if (RegisterClassExW(&wc) || GetLastError() == ERROR_CLASS_ALREADY_EXISTS) clsReg = true;
     }
     HINSTANCE inst = (HINSTANCE)GetWindowLongPtrW(g_hwnd, GWLP_HINSTANCE);
     g_transitionHwnd = CreateWindowExW(
@@ -2698,11 +2700,17 @@ static void PositionTransitionOverlay() {
 }
 
 static void ShowTransitionNow(const wchar_t* title, const wchar_t* sub, int alpha) {
-    if (!g_hwnd || g_hostMode.load() || IsIconic(g_hwnd)) return;
-    EnsureTransitionResources();
-    if (!g_transitionHwnd) return;
+    if (!g_hwnd || g_hostMode.load()) return;
     g_transitionTitle = title ? title : L"";
     g_transitionSub = sub ? sub : L"";
+    if (IsIconic(g_hwnd)) {
+        g_transitionPending = true;
+        g_transitionPendingAlpha = alpha;
+        return;
+    }
+    g_transitionPending = false;
+    EnsureTransitionResources();
+    if (!g_transitionHwnd) return;
     g_transitionVisible = true;
     g_transitionActive.store(true);
     SetLayeredWindowAttributes(g_transitionHwnd, 0, (BYTE)(alpha < 0 ? 0 : (alpha > 255 ? 255 : alpha)), LWA_ALPHA);
@@ -2713,6 +2721,7 @@ static void ShowTransitionNow(const wchar_t* title, const wchar_t* sub, int alph
 
 static void HideTransitionNow() {
     g_transitionVisible = false;
+    g_transitionPending = false;
     g_transitionActive.store(false);
     if (g_transitionHwnd && IsWindow(g_transitionHwnd)) ShowWindow(g_transitionHwnd, SW_HIDE);
 }
@@ -6643,7 +6652,12 @@ static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
                 g_pendingClientH = ch;
                 g_syncSwapRetry = 0;
                 SetTimer(h, TIMER_SYNC_SWAP, 120, nullptr);
-                if (g_transitionVisible) PositionTransitionOverlay();
+                if (g_transitionVisible) {
+                    PositionTransitionOverlay();
+                } else if (g_transitionPending) {
+                    std::wstring t = g_transitionTitle, s = g_transitionSub;
+                    ShowTransitionNow(t.c_str(), s.c_str(), g_transitionPendingAlpha);
+                }
                 // 客户区尺寸变了，远程坐标到屏幕坐标的换算比例也变了
                 ResetShakeSamples();
                 AbortShake();
@@ -7615,10 +7629,12 @@ static void RequestRoleFollow(bool toHost, const char* reason) {
     const uint64_t now = GetTickCount64();
     const uint64_t last = g_lastAutoFollowMs.load();
     if (last != 0 && now - last < 8000) return;
-    g_lastAutoFollowMs.store(now);
     Log("角色跟随: %s，Windows 自动切为%s", reason,
         toHost ? "主控（Mac 当副屏）" : "副屏（接收 Mac）");
-    if (g_hwnd) PostMessageW(g_hwnd, WM_APP_ROLE_FOLLOW, toHost ? 1 : 0, 0);
+    // 只有消息真正投递成功才消耗冷却，避免投递失败后 8 秒内不再重试。
+    if (g_hwnd && PostMessageW(g_hwnd, WM_APP_ROLE_FOLLOW, toHost ? 1 : 0, 0)) {
+        g_lastAutoFollowMs.store(now);
+    }
 }
 
 // ---------------------------------------------------------------------------
