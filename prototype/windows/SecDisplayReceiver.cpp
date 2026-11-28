@@ -6938,6 +6938,8 @@ static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
     case WM_APP_REMOTE_CURSOR: {
         // 先清合并标志再读坐标：确保读取之后若网络线程又收到更新，不会漏掉下一次通知。
         g_cursorMsgPending.store(false);
+        // 光标已经离开副屏：不要再用队列里最后一次有效坐标移动本机指针。
+        if (!g_cursorVisible.load()) return 0;
         // 门控：
         //   1. 最小化时不移动光标
         //   2. 窗口模式下非前台不抢夺用户在其他软件里的光标；全屏副屏时允许跨弹窗操作
